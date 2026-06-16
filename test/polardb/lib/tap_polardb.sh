@@ -84,6 +84,68 @@ counter_delta() {
     echo $((after - before))
 }
 
+# Snapshot the counters most LSN TAP scenarios compare around a protected read.
+# The values are stored as <prefix>_prepared, <prefix>_wait,
+# <prefix>_bypass, and <prefix>_query_lsn.
+snapshot_consistency_counters() {
+    local prefix="$1"
+    local value
+
+    value=$(counter PolarDB_Wait_Wrap_Prepared)
+    printf -v "${prefix}_prepared" '%s' "$value"
+    value=$(counter PolarDB_Wait_LSN_Sent)
+    printf -v "${prefix}_wait" '%s' "$value"
+    value=$(counter PolarDB_Wait_Wrap_Bypassed)
+    printf -v "${prefix}_bypass" '%s' "$value"
+    value=$(counter PolarDB_Server_LSN_Updates_From_RFQ)
+    printf -v "${prefix}_query_lsn" '%s' "$value"
+}
+
+snapshot_counter_delta() {
+    local before_prefix="$1"
+    local after_prefix="$2"
+    local field="$3"
+    local before_var="${before_prefix}_${field}"
+    local after_var="${after_prefix}_${field}"
+
+    echo $((${!after_var} - ${!before_var}))
+}
+
+snapshot_protect_delta() {
+    local before_prefix="$1"
+    local after_prefix="$2"
+
+    echo $(($(snapshot_counter_delta "$before_prefix" "$after_prefix" wait) + $(snapshot_counter_delta "$before_prefix" "$after_prefix" bypass)))
+}
+
+snapshot_wrap_or_bypass_delta() {
+    local before_prefix="$1"
+    local after_prefix="$2"
+
+    echo $(($(snapshot_counter_delta "$before_prefix" "$after_prefix" prepared) + $(snapshot_counter_delta "$before_prefix" "$after_prefix" bypass)))
+}
+
+# -----------------------------------------------------------------------------
+# Global variable helpers
+# -----------------------------------------------------------------------------
+
+global_var() {
+    admin_sql "SELECT variable_value FROM global_variables WHERE variable_name='$1';" | tr -d '\r[:space:]'
+}
+
+runtime_var() {
+    admin_sql "SELECT variable_value FROM runtime_global_variables WHERE variable_name='$1';" | tr -d '\r[:space:]'
+}
+
+set_global_var() {
+    admin_sql "UPDATE global_variables SET variable_value='$2' WHERE variable_name='$1';" >/dev/null
+}
+
+set_global_var_runtime() {
+    set_global_var "$1" "$2"
+    admin_sql "LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null
+}
+
 # -----------------------------------------------------------------------------
 # Server-endpoint extraction
 # -----------------------------------------------------------------------------
@@ -100,6 +162,26 @@ extract_endpoint() {
     local regex="${2:-^[0-9.]+:[0-9]+$}"
     local which="${3:-tail}"
     printf '%s\n' "$text" | grep -E "$regex" | "$which" -1 | tr -d '[:space:]'
+}
+
+first_endpoint_from_output() {
+    extract_endpoint "$1" '^[0-9.]+:[0-9]+$' head
+}
+
+last_endpoint_from_output() {
+    extract_endpoint "$1" '^[0-9.]+:[0-9]+$' tail
+}
+
+endpoint_list_from_output() {
+    printf '%s\n' "$1" | grep -E '^[0-9.]+:[0-9]+$' | tr '\n' ' ' | sed 's/[[:space:]]*$//'
+}
+
+first_endpoint_payload_from_output() {
+    extract_endpoint "$1" '^[0-9.]+:[0-9]+\|' head
+}
+
+last_endpoint_payload_from_output() {
+    extract_endpoint "$1" '^[0-9.]+:[0-9]+\|' tail
 }
 
 # -----------------------------------------------------------------------------
@@ -141,9 +223,45 @@ debug_fault_available() {
 
     command -v strings >/dev/null 2>&1 || return 1
     if [ ! -s "$strings_file" ]; then
-        strings "$PROXYSQL_BINARY" > "$strings_file" 2>/dev/null || true
+        strings "$PROXYSQL_BINARY" >"$strings_file" 2>/dev/null || true
     fi
     grep -q "$token" "$strings_file"
+}
+
+debug_fault_file_available() {
+    local file_var="$1"
+    local strings_file="$2"
+    local path="${!file_var:-}"
+
+    [ -n "$path" ] || return 1
+    debug_fault_available "$file_var" "$strings_file"
+}
+
+debug_fault_file_ready() {
+    local file_var="$1"
+    local strings_file="$2"
+    local path="${!file_var:-}"
+
+    debug_fault_file_available "$file_var" "$strings_file" || return 1
+    : >"$path" || return 1
+    [ -f "$path" ] && [ -r "$path" ] && [ -w "$path" ]
+}
+
+set_debug_fault_file() {
+    local file_var="$1"
+    local value="$2"
+    local path="${!file_var:-}"
+
+    [ -n "$path" ] || return 1
+    printf '%s\n' "$value" >"$path"
+}
+
+clear_debug_fault_file() {
+    local file_var="$1"
+    local path="${!file_var:-}"
+
+    [ -n "$path" ] || return 1
+    : >"$path"
 }
 
 # -----------------------------------------------------------------------------
@@ -170,9 +288,58 @@ wait_until() {
         if "${cmd[@]}"; then
             return 0
         fi
-        [ $(( $(date +%s) - start )) -ge "$timeout_s" ] && return 1
+        [ $(($(date +%s) - start)) -ge "$timeout_s" ] && return 1
         sleep "$interval_s"
     done
+}
+
+# -----------------------------------------------------------------------------
+# Trace helpers
+# -----------------------------------------------------------------------------
+
+trace_file() {
+    if [ -n "${POLARDB_TRACE_FILE:-}" ]; then
+        printf '%s\n' "$POLARDB_TRACE_FILE"
+    elif [ -n "${PROXYSQL_DATA_DIR:-}" ]; then
+        printf '%s/proxysql.log\n' "$PROXYSQL_DATA_DIR"
+    else
+        return 1
+    fi
+}
+
+_trace_present() {
+    local file
+    file=$(trace_file)
+    [ -n "$file" ] && grep -Eq "$1" "$file" 2>/dev/null
+}
+
+wait_for_trace() {
+    local pattern="$1"
+    local timeout_sec="${2:-10}"
+    wait_until _trace_present "$pattern" -- "$timeout_sec" 0.2
+}
+
+trace_count() {
+    local pattern="$1"
+    local file
+    file=$(trace_file)
+    if [ -z "$file" ]; then
+        echo 0
+        return 0
+    fi
+
+    grep -Ec "$pattern" "$file" 2>/dev/null || true
+}
+
+_trace_count_gt() {
+    [ "$(trace_count "$1")" -gt "$2" ]
+}
+
+wait_for_trace_increment() {
+    local pattern="$1"
+    local before="$2"
+    local timeout_sec="${3:-10}"
+    wait_until _trace_count_gt "$pattern" "$before" -- "$timeout_sec" 0.2
 }
 
 # -----------------------------------------------------------------------------
