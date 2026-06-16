@@ -725,6 +725,19 @@ hg_metrics_map = std::make_tuple(
 			"The number of times that 'auto_increment_delay_multiplex' has been triggered.",
 			metric_tags {}
 		),
+#if POLARDB_PROXY
+		// PolarDB counters. These mirror stats_pgsql_global PolarDB_* rows and
+		// are updated only during Prometheus/TSDB metric collection.
+#define X(name, display_name, prom_name, help) \
+		std::make_tuple ( \
+			PgSQL_p_hg_counter::polardb_##name, \
+			prom_name, \
+			help, \
+			metric_tags {} \
+		),
+		POLARDB_ALL_COUNTER_LIST(X)
+#undef X
+#endif // POLARDB_PROXY
 	},
 	// prometheus gauges
 	hg_gauge_vector {
@@ -3907,6 +3920,27 @@ void PgSQL_HostGroups_Manager::p_update_metrics() {
 	p_update_counter(status.p_counter_array[PgSQL_p_hg_counter::pghgm_pgconnpool_destroy], status.pgconnpoll_destroy);
 
 	p_update_counter(status.p_counter_array[PgSQL_p_hg_counter::auto_increment_delay_multiplex], status.auto_increment_delay_multiplex);
+
+#if POLARDB_PROXY
+	// PolarDB thread counters are stored per worker thread to avoid query-path
+	// global-atomic contention. PolarDB global counters stay as PgHGM->status
+	// atomics. Prometheus consumes the same absolute totals as stats_pgsql_global;
+	// p_update_counter() turns them into scrape deltas.
+	if (GloPTH) {
+#define X(name, display_name, prom_name, help) \
+		p_update_counter( \
+			status.p_counter_array[PgSQL_p_hg_counter::polardb_##name], \
+			GloPTH->get_polardb_counter(polardb_st_var_##name, status.polardb_##name));
+		POLARDB_THREAD_COUNTER_LIST(X)
+#undef X
+	}
+#define X(name, display_name, prom_name, help) \
+	p_update_counter( \
+		status.p_counter_array[PgSQL_p_hg_counter::polardb_##name], \
+		status.polardb_##name.load(std::memory_order_relaxed));
+	POLARDB_GLOBAL_COUNTER_LIST(X)
+#undef X
+#endif // POLARDB_PROXY
 
 	// Update the *connection_pool* metrics
 	this->p_update_connection_pool();

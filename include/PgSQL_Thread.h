@@ -9,6 +9,7 @@
 
 #include "Base_Thread.h"
 #include "ProxySQL_Poll.h"
+#include "PgSQL_PolarDB_Counters.h"
 #include "PgSQL_Variables.h"
 #ifdef IDLE_THREADS
 #include <sys/epoll.h>
@@ -60,6 +61,34 @@ constexpr int POLARDB_RFQ_POLICY_STRICT      = 2;
 
 constexpr int POLARDB_SESSION_LSN_BASELINE_OBSERVED = 1;
 constexpr int POLARDB_SESSION_LSN_BASELINE_PRIMARY  = 2;
+
+enum PolarDB_ThreadStatusVariable {
+#define X(name, display_name, prom_name, help) polardb_st_var_##name,
+	POLARDB_THREAD_COUNTER_LIST(X)
+#undef X
+	POLARDB_st_var_END
+};
+
+static_assert(POLARDB_st_var_END == POLARDB_THREAD_COUNTER_COUNT,
+	"Update PolarDB thread-counter aggregation/export coverage");
+
+struct alignas(64) PolarDB_ThreadStatusVariables {
+	unsigned long long stvar[POLARDB_st_var_END] = {};
+};
+
+static inline const char* polardb_thread_counter_display_name(
+	PolarDB_ThreadStatusVariable idx)
+{
+	switch (idx) {
+#define X(name, display_name, prom_name, help) \
+	case polardb_st_var_##name: \
+		return display_name;
+	POLARDB_THREAD_COUNTER_LIST(X)
+#undef X
+	default:
+		return "PolarDB_Unknown_Thread_Counter";
+	}
+}
 #endif // POLARDB_PROXY
 
 #define ADMIN_HOSTGROUP	(-2)
@@ -272,6 +301,14 @@ public:
 		unsigned long long tx_poisoned_recovered_total;
 		unsigned long long tx_poisoned_rejected_statements_total;
 	} status_variables;
+
+#if POLARDB_PROXY
+	// Worker-owned PolarDB counters. Query-path increments hit this per-thread
+	// storage; non-worker paths fall back to the matching global counter atomic.
+	// Aggregation/export is wired separately so the metadata, storage, and
+	// operator-facing row order remain explicit.
+	PolarDB_ThreadStatusVariables polardb_status_variables;
+#endif // POLARDB_PROXY
 
 	struct {
 		int min_num_servers_lantency_awareness;
@@ -751,6 +788,29 @@ public:
 	 */
 	void Scan_Sessions_to_Kill_All();
 };
+
+#if POLARDB_PROXY
+static inline void polardb_thread_count(
+	PgSQL_Thread* thread,
+	PolarDB_ThreadStatusVariable idx,
+	std::atomic<unsigned long long>& global_counter,
+	unsigned long long value = 1)
+{
+	if (thread) {
+		thread->polardb_status_variables.stvar[idx] += value;
+	} else {
+		global_counter.fetch_add(value, std::memory_order_relaxed);
+	}
+}
+
+#define POLARDB_THREAD_COUNT(thread, name, value) \
+	polardb_thread_count((thread), polardb_st_var_##name, \
+		PgHGM->status.polardb_##name, (value))
+
+#define POLARDB_THREAD_COUNT_ONE(thread, name) \
+	POLARDB_THREAD_COUNT((thread), name, 1)
+
+#endif // POLARDB_PROXY
 
 
 typedef PgSQL_Thread* create_PgSQL_Thread_t();
@@ -1680,6 +1740,12 @@ public:
 	unsigned long long get_tx_poisoned_total();
 	unsigned long long get_tx_poisoned_recovered_total();
 	unsigned long long get_tx_poisoned_rejected_statements_total();
+
+#if POLARDB_PROXY
+	unsigned long long get_polardb_counter(
+		PolarDB_ThreadStatusVariable idx,
+		std::atomic<unsigned long long>& global_counter);
+#endif // POLARDB_PROXY
 
 #ifdef IDLE_THREADS
 	/**

@@ -372,6 +372,11 @@ struct PgSQL_p_hg_counter {
 		pghgm_pgconnpool_reset,
 		pghgm_pgconnpool_destroy,
 		auto_increment_delay_multiplex,
+#if POLARDB_PROXY
+#define X(name, display_name, prom_name, help) polardb_##name,
+		POLARDB_ALL_COUNTER_LIST(X)
+#undef X
+#endif // POLARDB_PROXY
 		SIZE_
 	};
 };

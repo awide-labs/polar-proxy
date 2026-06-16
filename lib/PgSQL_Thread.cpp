@@ -56,6 +56,19 @@ extern PgSQL_Monitor* GloPgMon;
 extern PgSQL_Logger* GloPgSQL_Logger;
 
 #if POLARDB_PROXY
+static void polardb_fold_thread_counters_to_global(
+	const PolarDB_ThreadStatusVariables& counters)
+{
+	if (!PgHGM) {
+		return;
+	}
+#define X(name, display_name, prom_name, help) \
+	PgHGM->status.polardb_##name.fetch_add( \
+		counters.stvar[polardb_st_var_##name], std::memory_order_relaxed);
+	POLARDB_THREAD_COUNTER_LIST(X)
+#undef X
+}
+
 static bool polardb_parse_proxy_identity_port(const char* value, int* port) {
 	if (!value || !*value || !port) return false;
 
@@ -2957,6 +2970,14 @@ PgSQL_Threads_Handler::~PgSQL_Threads_Handler() {
 
 PgSQL_Thread::~PgSQL_Thread() {
 
+#if POLARDB_PROXY
+	// shutdown_threads() sets shutdown_ before workers exit, so live scrapes stop
+	// reading per-thread slots before this destructor folds them into the global
+	// counters. This preserves final shutdown totals without promising safety for
+	// arbitrary runtime thread deletion. The PgHGM guard keeps helper threads safe.
+	polardb_fold_thread_counters_to_global(polardb_status_variables);
+#endif // POLARDB_PROXY
+
 	if (mysql_sessions) {
 		while (mysql_sessions->len) {
 			PgSQL_Session* sess = (PgSQL_Session*)mysql_sessions->remove_index_fast(0);
@@ -4481,6 +4502,9 @@ PgSQL_Thread::PgSQL_Thread() {
 	for (unsigned int i = 0; i < PG_st_var_END; i++) {
 		status_variables.stvar[i] = 0;
 	}
+#if POLARDB_PROXY
+	polardb_status_variables = PolarDB_ThreadStatusVariables{};
+#endif // POLARDB_PROXY
 	match_regexes = NULL;
 	copy_cmd_matcher = NULL;
 
@@ -4627,6 +4651,40 @@ void PgSQL_Thread::listener_handle_new_connection(PgSQL_Data_Stream * myds, unsi
 		// because multiple threads try to handle the same incoming connection, this is OK
 	}
 }
+
+#if POLARDB_PROXY
+// Append the PolarDB session-consistency counters to the global status result.
+// This build exports LSN and wait-wrap counters; split-read counters are not part
+// of the session-consistency surface.
+static void polardb_export_stats(PgSQL_Threads_Handler* handler, SQLite3_result* result, char** pta, char* buf) {
+	auto thread_counter = [handler](
+		PolarDB_ThreadStatusVariable idx,
+		std::atomic<unsigned long long>& global_counter) -> unsigned long long {
+		return handler->get_polardb_counter(idx, global_counter);
+	};
+
+#define POLARDB_ADD_THREAD_COUNTER_ROW(name, display_name, prom_name, help) do { \
+		pta[0] = (char*)display_name; \
+		sprintf(buf, "%llu", thread_counter( \
+			polardb_st_var_##name, \
+			PgHGM->status.polardb_##name)); \
+		pta[1] = buf; \
+		result->add_row(pta); \
+	} while (0);
+
+#define POLARDB_ADD_GLOBAL_COUNTER_ROW(name, display_name, prom_name, help) do { \
+		pta[0] = (char*)display_name; \
+		sprintf(buf, "%llu", PgHGM->status.polardb_##name.load(std::memory_order_relaxed)); \
+		pta[1] = buf; \
+		result->add_row(pta); \
+	} while (0);
+
+	POLARDB_COUNTER_LIST(POLARDB_ADD_THREAD_COUNTER_ROW, POLARDB_ADD_GLOBAL_COUNTER_ROW)
+
+#undef POLARDB_ADD_GLOBAL_COUNTER_ROW
+#undef POLARDB_ADD_THREAD_COUNTER_ROW
+}
+#endif // POLARDB_PROXY
 
 SQLite3_result* PgSQL_Threads_Handler::SQL3_GlobalStatus(bool _memory) {
 	const int colnum = 2;
@@ -4981,6 +5039,9 @@ SQLite3_result* PgSQL_Threads_Handler::SQL3_GlobalStatus(bool _memory) {
 			pta[1] = buf;
 			result->add_row(pta);
 		}
+#if POLARDB_PROXY
+		polardb_export_stats(this, result, pta, buf);
+#endif // POLARDB_PROXY
 		{
 			pta[0] = (char*)"PgSQL_Monitor_dns_cache_queried";
 			snprintf(buf, sizeof(buf), "%llu", GloPgMon->dns_cache_queried.load());
@@ -5846,6 +5907,31 @@ DEFINE_PG_TXPOISON_GETTER(tx_poisoned_recovered_total)
 DEFINE_PG_TXPOISON_GETTER(tx_poisoned_rejected_statements_total)
 
 #undef DEFINE_PG_TXPOISON_GETTER
+
+#if POLARDB_PROXY
+unsigned long long PgSQL_Threads_Handler::get_polardb_counter(
+	PolarDB_ThreadStatusVariable idx,
+	std::atomic<unsigned long long>& global_counter)
+{
+	unsigned long long total = global_counter.load(std::memory_order_relaxed);
+	if ((__sync_fetch_and_add(&status_variables.threads_initialized, 0) == 0) ||
+			this->shutdown_) {
+		return total;
+	}
+
+	for (unsigned int i = 0; i < num_threads; i++) {
+		if (!pgsql_threads) break;
+		PgSQL_Thread* thr = (PgSQL_Thread*)pgsql_threads[i].worker;
+		if (thr) {
+			// Same read-while-writer aggregation pattern used by PgSQL stvar
+			// counters: each worker owns its field; stats reads sum them.
+			total += __sync_fetch_and_add(
+				&(thr->polardb_status_variables.stvar[idx]), 0);
+		}
+	}
+	return total;
+}
+#endif // POLARDB_PROXY
 
 #ifdef IDLE_THREADS
 unsigned int PgSQL_Threads_Handler::get_non_idle_client_connections() {
