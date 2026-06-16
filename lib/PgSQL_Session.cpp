@@ -5718,12 +5718,18 @@ void PgSQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 		mc = thread->get_MyConn_local_polardb_reader(
 			mybe->hostgroup_id, this, polardb_query.reader_plan);
 		if (mc) {
-			// The local cached backend is RFQ-LSN capable and already caught up.
-			// Keep the wait state for query wrapping, but consume the reader
-			// acquisition intent exactly as the shared HGM path does.
+			// The local cached backend is RFQ-LSN capable and its fresh cached
+			// LSN already reaches the consistency target. Clear the staged wait:
+			// the wrapper is not needed for this selected backend.
+			POLARDB_THREAD_COUNT_ONE(thread, wait_wrap_bypassed);
+			POLARDB_TRACE(
+				"PolarDB WRAP BYPASS: thread-local reader reached "
+				"consistency_target_lsn=%lu\n",
+				(unsigned long)polardb_query.reader_plan.consistency_target_lsn);
+			polardb_query.reset_wait();
 			polardb_query.reset_reader_target();
 		} else {
-			PgHGM->status.polardb_tl_cache_bypassed_for_target.fetch_add(1, std::memory_order_relaxed);
+			POLARDB_THREAD_COUNT_ONE(thread, tl_cache_bypassed_for_target);
 			POLARDB_TRACE(
 				"PolarDB consistency: thread-local backend cache miss; "
 				"using route-smart reader selection (consistency_target_lsn=%lu)\n",
@@ -5776,10 +5782,18 @@ void PgSQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 				reader_result.conn, (unsigned long)polardb_query.reader_plan.consistency_target_lsn,
 				mybe->hostgroup_id, polardb_query.reader_plan.fallback_writer_hg);
 			if (reader_result.acquired()) {
-				// The selected reader satisfies the per-query RFQ/lag requirements.
-				// Consume only the acquisition intent. The wait state is still needed
-				// by finalize_wait_timeout_injection() to install the LSN wrapper.
+				// The selected reader satisfies the per-query RFQ/lag
+				// requirements. If HGM acquired it from the target-reached prefix,
+				// the wrapper can be skipped safely for this backend.
 				mc = reader_result.conn;
+				if (reader_result.wait_bypass_allowed) {
+					POLARDB_THREAD_COUNT_ONE(thread, wait_wrap_bypassed);
+					POLARDB_TRACE(
+						"PolarDB WRAP BYPASS: route-smart reader reached "
+						"consistency_target_lsn=%lu\n",
+						(unsigned long)polardb_query.reader_plan.consistency_target_lsn);
+					polardb_query.reset_wait();
+				}
 				polardb_query.reset_reader_target();
 				polardb_reader_acquisition_handled = true;
 			} else if (reader_result.status == PolarDB_ReaderStatus::RFQ_UNAVAILABLE &&
@@ -5791,6 +5805,7 @@ void PgSQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 				// target. Queue a client-visible notice and retry normal reader acquisition.
 				int reader_hg = mybe->hostgroup_id;
 				int writer_hg = polardb_query.reader_plan.fallback_writer_hg;
+				POLARDB_THREAD_COUNT_ONE(thread, rfq_best_effort_degraded_routes);
 				polardb_enqueue_degraded_rfq_notice(
 					polardb_reader_status_name(reader_result.status),
 					reader_hg, writer_hg);

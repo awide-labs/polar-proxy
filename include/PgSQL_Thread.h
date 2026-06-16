@@ -681,15 +681,14 @@ public:
 	PgSQL_Connection* get_MyConn_local(unsigned int, PgSQL_Session * sess, char* gtid_uuid, uint64_t gtid_trxid, int max_lag_ms);
 #if POLARDB_PROXY
 	/**
-	 * @brief Try the thread-local cache for a PolarDB target-aware reader.
+	 * @brief Try the thread-local cache for a PolarDB consistency-target reader.
 	 *
 	 * This is a conservative fast path for LSN-protected reads. It returns a
 	 * cached backend only when the normal local-cache requirements match and the
 	 * backend was created with an RFQ-LSN startup profile. It also requires a
-	 * fresh cached server LSN that already satisfies the reader plan, so taking
-	 * the local cache does not bypass route-smart's caught-up-reader preference
-	 * or byte-lag safety checks. Misses fall through to HostGroups Manager reader
-	 * selection.
+	 * fresh cached server LSN that already reaches the consistency target, so
+	 * taking the local cache does not bypass route-smart's safety checks. Misses
+	 * fall through to HostGroups Manager reader selection.
 	 */
 	PgSQL_Connection* get_MyConn_local_polardb_reader(unsigned int, PgSQL_Session* sess,
 		const PolarDB_Query_ReaderPlan& reader_plan);

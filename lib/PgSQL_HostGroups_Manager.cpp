@@ -123,6 +123,15 @@ static PgSQL_Connection* pgsql_create_backend_connection_locked(PgSQL_SrvC* mysr
 	return conn;
 }
 
+#if POLARDB_PROXY
+static bool pgsql_srv_latency_allowed(const PgSQL_SrvC* mysrvc) {
+	unsigned int max_latency_us = mysrvc->max_latency_us
+		? mysrvc->max_latency_us
+		: pgsql_thread___default_max_latency_ms * 1000;
+	return mysrvc->current_latency_us < max_latency_us;
+}
+#endif
+
 /**
  * @brief Helper function used to try to extract a value from the JSON field 'servers_defaults'.
  *
@@ -4983,12 +4992,33 @@ uint64_t PgSQL_HostGroups_Manager::get_polardb_primary_lsn(unsigned int writer_h
 	return it->second.primary_lsn->load(std::memory_order_relaxed);
 }
 
+/**
+ * @brief Get a connection to one reader server, honoring the RFQ-LSN profile.
+ *
+ * When there is no LSN target this is an ordinary free-connection fetch. When a
+ * target is present the read needs a backend whose startup negotiated LSN
+ * feedback in ReadyForQuery (RFQ), so this prefers a free connection with that
+ * profile. If none is free and the caller allows creating connections, it may
+ * evict just enough incompatible idle connections to make room for one new
+ * RFQ-capable connection, respecting the server's max-connection limit and
+ * creation throttle.
+ *
+ * Precondition: caller must hold the HostGroups_Manager write lock (it mutates
+ * the server's connection lists).
+ *
+ * @param consistency_target_lsn            Target LSN, or 0 for no target.
+ * @param startup_requests_rfq_lsn Whether this pair's protocol negotiates RFQ LSN.
+ * @param only_pooled             If true, never create a connection.
+ * @param[out] status             Set to the outcome (ACQUIRED, RFQ_UNAVAILABLE, ...).
+ * @return A usable connection, or nullptr.
+ */
 static PgSQL_Connection* polardb_get_rfq_profile_compatible_conn(
 		PgSQL_SrvC* mysrvc, PgSQL_Session* sess, uint64_t consistency_target_lsn,
 		bool startup_requests_rfq_lsn, bool only_pooled, PolarDB_ReaderStatus* status) {
 	if (status) {
 		*status = PolarDB_ReaderStatus::READER_BUSY;
 	}
+	// No LSN target: any free connection is fine, the profile does not matter.
 	if (consistency_target_lsn == 0) {
 		PgSQL_Connection* conn =
 			mysrvc->ConnectionsFree->get_random_MyConn(sess, false, only_pooled);
@@ -4998,6 +5028,8 @@ static PgSQL_Connection* polardb_get_rfq_profile_compatible_conn(
 		return conn;
 	}
 
+	// A target exists but this pair's protocol does not negotiate RFQ LSN, so no
+	// connection here can confirm it reached the target. Report it as unavailable.
 	if (!startup_requests_rfq_lsn) {
 		if (status) {
 			*status = PolarDB_ReaderStatus::RFQ_UNAVAILABLE;
@@ -5005,8 +5037,25 @@ static PgSQL_Connection* polardb_get_rfq_profile_compatible_conn(
 		return nullptr;
 	}
 
+	// Scan the free list for a connection that can carry an RFQ-LSN read. A
+	// not-yet-connected entry counts as usable: it will negotiate the right
+	// profile when it actually connects. Among RFQ-capable entries, use the same
+	// reuse preference as the regular PostgreSQL pool path: same connection
+	// options first, then avoid RESET, then prefer the entry with more matching
+	// session variables/schema. This keeps the PolarDB RFQ filter from turning
+	// pooled acquisition into "first compatible entry wins" and causing
+	// avoidable reset/variable-sync work before the query.
 	bool skipped_incompatible = false;
 	const unsigned int initial_free = mysrvc->ConnectionsFree->conns_length();
+	PgSQL_Connection* client_conn =
+		(sess && sess->client_myds && sess->client_myds->myconn &&
+		 sess->client_myds->myconn->userinfo)
+			? sess->client_myds->myconn
+			: nullptr;
+	bool found_compatible = false;
+	unsigned int best_idx = 0;
+	unsigned int best_quality = 0;
+	unsigned int best_matching_session_vars = 0;
 	for (unsigned int i = 0; i < initial_free; i++) {
 		PgSQL_Connection* candidate = mysrvc->ConnectionsFree->index(i);
 		if (!candidate) {
@@ -5015,18 +5064,62 @@ static PgSQL_Connection* polardb_get_rfq_profile_compatible_conn(
 		if (candidate &&
 				(candidate->get_pg_connection() == nullptr ||
 				 candidate->polardb_startup_profile.has_rfq_lsn())) {
-			if (status) {
-				*status = PolarDB_ReaderStatus::ACQUIRED;
+			if (!client_conn) {
+				if (status) {
+					*status = PolarDB_ReaderStatus::ACQUIRED;
+				}
+				return mysrvc->ConnectionsFree->remove(i);
 			}
-			return mysrvc->ConnectionsFree->remove(i);
+
+			unsigned int quality = 0;
+			unsigned int matching_session_vars = 0;
+			if (candidate->has_same_connection_options(client_conn)) {
+				quality = 1;
+				if (!candidate->requires_RESETTING_CONNECTION(client_conn)) {
+					quality = 2;
+					unsigned int not_matching = 0;
+					matching_session_vars =
+						candidate->number_of_matching_session_variables(
+							client_conn, not_matching);
+					if (not_matching == 0) {
+						if (status) {
+							*status = PolarDB_ReaderStatus::ACQUIRED;
+						}
+						return mysrvc->ConnectionsFree->remove(i);
+					}
+				}
+			}
+
+			const bool better =
+				!found_compatible ||
+				quality > best_quality ||
+				(quality == best_quality && quality == 2 &&
+				 matching_session_vars > best_matching_session_vars);
+			if (better) {
+				found_compatible = true;
+				best_idx = i;
+				best_quality = quality;
+				best_matching_session_vars = matching_session_vars;
+			}
+			continue;
 		}
+		// Free, but its startup profile cannot report LSN. Count and pass over it.
 		skipped_incompatible = true;
-		PgHGM->status.polardb_rfq_profile_skipped.fetch_add(1, std::memory_order_relaxed);
+		POLARDB_THREAD_COUNT_ONE(sess ? sess->thread : NULL, rfq_profile_skipped);
 		proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5,
 			"PolarDB route smart: skipped pooled connection %p from %s:%d because startup profile lacks RFQ LSN request\n",
 			candidate, mysrvc->address, mysrvc->port);
 	}
+	if (found_compatible) {
+		if (status) {
+			*status = PolarDB_ReaderStatus::ACQUIRED;
+		}
+		return mysrvc->ConnectionsFree->remove(best_idx);
+	}
 
+	// only_pooled callers may not create a connection. If the sole reason we
+	// failed was incompatible idle connections, report that precisely so the
+	// caller can choose to fall back to the writer.
 	if (only_pooled) {
 		if (status && skipped_incompatible) {
 			*status = PolarDB_ReaderStatus::RFQ_UNAVAILABLE;
@@ -5045,6 +5138,9 @@ static PgSQL_Connection* polardb_get_rfq_profile_compatible_conn(
 	if (conns_used >= max_connections) {
 		return nullptr;
 	}
+	// If the pool is already at capacity, we must free room for one new
+	// RFQ-capable connection. Evict only as many incompatible idle connections as
+	// it takes to get under the limit by one, and only if that many are free.
 	const unsigned int total_connections = conns_free + conns_used;
 	const unsigned int incompatible_to_evict =
 		total_connections >= max_connections
@@ -5058,8 +5154,9 @@ static PgSQL_Connection* polardb_get_rfq_profile_compatible_conn(
 		return nullptr;
 	}
 
-	// The scan above found no compatible usable free connection, and the caller
-	// holds the HGM write lock, so no compatible entry can appear before create.
+	// The scan above found no usable free connection, and the caller holds the
+	// write lock, so no compatible entry can appear before we create one. Evict
+	// the incompatible idle connections that block capacity, then create.
 	for (unsigned int i = 0; i < incompatible_to_evict; i++) {
 		PgSQL_Connection* evicted = mysrvc->ConnectionsFree->remove(0);
 		PgHGM->status.polardb_rfq_profile_evicted.fetch_add(1, std::memory_order_relaxed);
@@ -5105,6 +5202,21 @@ static PolarDB_ReaderStatus polardb_reader_status_prefer(
 	return priority(next) > priority(current) ? next : current;
 }
 
+/**
+ * @brief Pick one reader from a candidate set by weighted random choice, then
+ *        fall back to a linear scan.
+ *
+ * First chooses a candidate at random in proportion to server weight and tries
+ * to get a connection from it. If that one cannot be used (another thread took
+ * its last slot, or it had only profile-incompatible idle connections), the
+ * fallback scan tries the remaining candidates in order. The accumulated
+ * failure reason is the highest by polardb_reader_status_prefer().
+ *
+ * Precondition: caller must hold the HostGroups_Manager write lock.
+ *
+ * @return The acquired connection and ACQUIRED, or no connection and the best
+ *         failure reason seen.
+ */
 static PolarDB_ReaderResult polardb_try_weighted_rfq_candidates(
 		PgSQL_SrvC** candidates, unsigned int num_candidates,
 		unsigned int weight_sum, PgSQL_Session* sess, uint64_t consistency_target_lsn,
@@ -5115,14 +5227,17 @@ static PolarDB_ReaderResult polardb_try_weighted_rfq_candidates(
 	}
 
 	result.status = PolarDB_ReaderStatus::READER_BUSY;
+	// Weighted pick: land in [1, weight_sum] and walk the running weight total.
 	unsigned int k = rand_fast() % weight_sum;
 	k++;  // 1-based for comparison
 	unsigned int running_sum = 0;
+	int weighted_pick_idx = -1;
 
 	for (unsigned int j = 0; j < num_candidates; j++) {
 		PgSQL_SrvC* mysrvc = candidates[j];
 		running_sum += mysrvc->weight;
 		if (k <= running_sum) {
+			weighted_pick_idx = (int)j;
 			PolarDB_ReaderStatus status =
 				PolarDB_ReaderStatus::READER_BUSY;
 			PgSQL_Connection* conn = polardb_get_rfq_profile_compatible_conn(
@@ -5134,14 +5249,18 @@ static PolarDB_ReaderResult polardb_try_weighted_rfq_candidates(
 				return result;
 			}
 			result.status = polardb_reader_status_prefer(result.status, status);
-			// Connection was taken by another thread between filter and
-			// select; fall through to the remaining candidates.
+			// The weighted pick did not yield a usable connection; fall through
+			// to the linear scan over the remaining candidates.
+			break;
 		}
 	}
 
-	// Weighted selection raced or hit incompatible pooled connections; try the
-	// remaining candidates in order without closing old-profile pooled backends.
+	// Second pass: try every other candidate in order. The caller holds the HGM
+	// write lock, so retrying the already-failed weighted pick immediately cannot
+	// reveal a new free slot; it only repeats free-list scans and throttle checks.
 	for (unsigned int j = 0; j < num_candidates; j++) {
+		if (weighted_pick_idx >= 0 && (int)j == weighted_pick_idx)
+			continue;
 		PgSQL_SrvC* mysrvc = candidates[j];
 		PolarDB_ReaderStatus status =
 			PolarDB_ReaderStatus::READER_BUSY;
@@ -5162,10 +5281,10 @@ static PolarDB_ReaderResult polardb_try_weighted_rfq_candidates(
 PolarDB_ReaderResult PgSQL_HostGroups_Manager::get_MyConn_polardb_reader(unsigned int _hid, PgSQL_Session* sess,
 	const PolarDB_Query_ReaderPlan& reader_plan, bool only_pooled) {
 	const uint64_t consistency_target_lsn = reader_plan.consistency_target_lsn;
-	// consistency_target_lsn narrows preference to fresh cached caught-up readers when
-	// possible, but never rejects the original replica set unless a byte-lag cap
-	// is explicitly enabled. The wrapped query's polar_xact_split_wait_lsn remains
-	// the session target correctness gate.
+	// A consistency target narrows preference to readers whose fresh cached LSN
+	// already reaches that target. It never rejects the original replica set
+	// unless a byte-lag cap is enabled; fallback readers still rely on the wait
+	// wrapper as the correctness gate.
 	PolarDB_ReaderResult result;
 	wrlock();
 	status.pgconnpoll_get++;
@@ -5181,7 +5300,7 @@ PolarDB_ReaderResult PgSQL_HostGroups_Manager::get_MyConn_polardb_reader(unsigne
 				polardb_proxy_protocol_from_int(protocol)).has_rfq_lsn();
 
 		if (reader_plan.lag_cap_enabled() && reader_plan.primary_lsn == 0) {
-			status.polardb_lsn_stale_count.fetch_add(1, std::memory_order_relaxed);
+			POLARDB_THREAD_COUNT_ONE(sess ? sess->thread : NULL, lsn_stale_count);
 			result.status = PolarDB_ReaderStatus::PRIMARY_LSN_UNKNOWN;
 			POLARDB_TRACE(
 				"PolarDB route smart: primary LSN unknown under lag cap "
@@ -5237,6 +5356,11 @@ PolarDB_ReaderResult PgSQL_HostGroups_Manager::get_MyConn_polardb_reader(unsigne
 				continue;
 			if (mysrvc->weight <= 0)
 				continue;
+			// Keep PolarDB reader acquisition aligned with the regular PostgreSQL
+			// server selector: a reader whose monitor latency is above its limit
+			// is not a candidate for new traffic.
+			if (!pgsql_srv_latency_allowed(mysrvc))
+				continue;
 
 			// Filter 2: must have connection capacity.
 			if (mysrvc->max_connections <= 0 ||
@@ -5261,7 +5385,7 @@ PolarDB_ReaderResult PgSQL_HostGroups_Manager::get_MyConn_polardb_reader(unsigne
 				uint64_t updated_us =
 					mysrvc->lsn_updated_at.load(std::memory_order_relaxed);
 				if (!polardb_lsn_cache_fresh(updated_us, now_us, (uint32_t)fresh_ms)) {
-					status.polardb_lsn_stale_count.fetch_add(1, std::memory_order_relaxed);
+					POLARDB_THREAD_COUNT_ONE(sess ? sess->thread : NULL, lsn_stale_count);
 					continue;  // stale under an enabled cap -> skip this reader
 				}
 				if (!polardb_lag_ms_within_cap(
@@ -5270,25 +5394,25 @@ PolarDB_ReaderResult PgSQL_HostGroups_Manager::get_MyConn_polardb_reader(unsigne
 			}
 #endif
 
-			bool lsn_fresh = false;
+			bool reader_lsn_fresh = false;
 			uint64_t reader_lsn = 0;
 			if (has_consistency_target_lsn || lag_cap_enabled) {
 				uint64_t updated_us =
 					mysrvc->lsn_updated_at.load(std::memory_order_relaxed);
 				reader_lsn = mysrvc->polardb_current_lsn.load(std::memory_order_relaxed);
-				lsn_fresh = polardb_lsn_cache_fresh(updated_us, now_us, (uint32_t)fresh_ms);
+				reader_lsn_fresh = polardb_lsn_cache_fresh(updated_us, now_us, (uint32_t)fresh_ms);
 			}
 
 			if (lag_cap_enabled) {
 				if (reader_lsn == 0) {
-					status.polardb_lsn_stale_count.fetch_add(1, std::memory_order_relaxed);
+					POLARDB_THREAD_COUNT_ONE(sess ? sess->thread : NULL, lsn_stale_count);
 					filter_status = polardb_reader_status_prefer(
 						filter_status,
 						PolarDB_ReaderStatus::READER_LSN_UNKNOWN);
 					continue;
 				}
-				if (!lsn_fresh) {
-					status.polardb_lsn_stale_count.fetch_add(1, std::memory_order_relaxed);
+				if (!reader_lsn_fresh) {
+					POLARDB_THREAD_COUNT_ONE(sess ? sess->thread : NULL, lsn_stale_count);
 					filter_status = polardb_reader_status_prefer(
 						filter_status,
 						PolarDB_ReaderStatus::READER_LSN_STALE);
@@ -5302,7 +5426,13 @@ PolarDB_ReaderResult PgSQL_HostGroups_Manager::get_MyConn_polardb_reader(unsigne
 				}
 			}
 
-			const bool reader_lsn_reaches_consistency_target = reader_plan.reader_lsn_reaches_consistency_target(reader_lsn) && lsn_fresh;
+			// Target-reached means this reader's cached LSN sample is fresh and
+			// already at or beyond the consistency target. Keep those candidates
+			// as a contiguous prefix so selection can prove wrapper bypass safety
+			// only for a backend actually acquired from that prefix.
+			const bool reader_lsn_reaches_consistency_target =
+				reader_lsn_fresh &&
+				reader_plan.reader_lsn_reaches_consistency_target(reader_lsn);
 			mysrvcCandidates[num_candidates] = mysrvc;
 			num_candidates++;
 			weight_sum += mysrvc->weight;
@@ -5314,21 +5444,31 @@ PolarDB_ReaderResult PgSQL_HostGroups_Manager::get_MyConn_polardb_reader(unsigne
 			}
 		}
 
-		bool got_target_reached_reader = false;
 		bool fallback_to_wait_set = false;
 		result.status = filter_status;
 
 		// === SELECTION PHASE: preferred weighted subset, then wait-capable set ===
+		// First try only the target-reached prefix, so a consistency-target read
+		// can use a reader already known to satisfy the target and skip the wait.
 		if (has_consistency_target_lsn && num_target_reached_candidates > 0 && target_reached_weight_sum > 0) {
-			result = polardb_try_weighted_rfq_candidates(
-				mysrvcCandidates, num_target_reached_candidates, target_reached_weight_sum,
-				sess, consistency_target_lsn, startup_requests_rfq_lsn, only_pooled);
-			if (result.acquired()) {
-				got_target_reached_reader = true;
-				status.polardb_target_lsn_preferred.fetch_add(1, std::memory_order_relaxed);
+			PolarDB_ReaderResult preferred_result =
+				polardb_try_weighted_rfq_candidates(
+					mysrvcCandidates, num_target_reached_candidates, target_reached_weight_sum,
+					sess, consistency_target_lsn, startup_requests_rfq_lsn, only_pooled);
+			if (preferred_result.acquired()) {
+				result = preferred_result;
+				result.wait_bypass_allowed = true;
+				POLARDB_THREAD_COUNT_ONE(sess ? sess->thread : NULL, target_lsn_preferred);
+			} else {
+				result.status = polardb_reader_status_prefer(
+					result.status, preferred_result.status);
 			}
 		}
 
+		// Nothing acquired from the preferred prefix (or there was none): fall
+		// back to the rest of the eligible set. These may be behind the target,
+		// which is safe here because the backend wait in the wrapped query is the
+		// real correctness gate; this only affects which replica is chosen.
 		if (!result.acquired()) {
 			const bool preferred_attempted =
 				has_consistency_target_lsn && num_target_reached_candidates > 0;
@@ -5354,10 +5494,9 @@ PolarDB_ReaderResult PgSQL_HostGroups_Manager::get_MyConn_polardb_reader(unsigne
 					result.status, fallback_result.status);
 			}
 			if (result.acquired() && fallback_to_wait_set) {
-				status.polardb_target_lsn_fallback_wait.fetch_add(1, std::memory_order_relaxed);
+				POLARDB_THREAD_COUNT_ONE(sess ? sess->thread : NULL, target_lsn_fallback_wait);
 			}
 		}
-		(void)got_target_reached_reader;
 
 		if (result.acquired()) {
 			result.srv->ConnectionsUsed->add(result.conn);
@@ -5367,7 +5506,7 @@ PolarDB_ReaderResult PgSQL_HostGroups_Manager::get_MyConn_polardb_reader(unsigne
 				"PolarDB route smart: got connection from %s:%d (LSN=%lu, consistency_target_lsn=%lu, target_preferred=%d, fallback_wait=%d, weight=%ld, only_pooled=%d)\n",
 				result.srv->address, result.srv->port,
 				(unsigned long)result.srv->polardb_current_lsn.load(std::memory_order_relaxed),
-				(unsigned long)consistency_target_lsn, got_target_reached_reader ? 1 : 0,
+				(unsigned long)consistency_target_lsn, result.wait_bypass_allowed ? 1 : 0,
 				fallback_to_wait_set ? 1 : 0,
 				result.srv->weight, only_pooled ? 1 : 0);
 			if (num_servers > 32) {

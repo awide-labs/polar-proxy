@@ -6182,7 +6182,7 @@ PgSQL_Connection* PgSQL_Thread::get_MyConn_local_polardb_reader(
 		// LSNs. Local cached backends created before the PolarDB profile changed
 		// are skipped; shared HGM selection can evict/replace them if needed.
 		if (!c->polardb_startup_profile.has_rfq_lsn()) {
-			PgHGM->status.polardb_rfq_profile_skipped.fetch_add(1, std::memory_order_relaxed);
+			POLARDB_THREAD_COUNT_ONE(this, rfq_profile_skipped);
 			continue;
 		}
 
@@ -6207,8 +6207,7 @@ PgSQL_Connection* PgSQL_Thread::get_MyConn_local_polardb_reader(
 			continue;
 
 		c = (PgSQL_Connection*)cached_connections->remove_index_fast(i);
-		PgHGM->status.polardb_target_lsn_preferred.fetch_add(
-			1, std::memory_order_relaxed);
+		POLARDB_THREAD_COUNT_ONE(this, target_lsn_preferred);
 		POLARDB_TRACE(
 			"PolarDB consistency: thread-local RFQ reader hit conn=%p "
 			"hg=%u lsn=%lu consistency_target_lsn=%lu\n",
@@ -6222,6 +6221,10 @@ PgSQL_Connection* PgSQL_Thread::get_MyConn_local_polardb_reader(
 #endif // POLARDB_PROXY
 
 void PgSQL_Thread::push_MyConn_local(PgSQL_Connection * c) {
+	if (!cached_connections) {
+		cached_connections = new PtrArray();
+	}
+
 	// Bounded local cache: cache 1-in-N releases (N = pgsql_threads), push the
 	// rest to the shared HGM pool so peer workers can pick them up.
 	// At N=1 always cache (no sibling to share with).

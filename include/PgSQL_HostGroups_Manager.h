@@ -758,8 +758,8 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 		//    route-plan decision: a read was sent to a reader with an LSN wait
 		//    requirement.
 		//  - PolarDB_Wait_Wrap_Prepared / polardb_wait_wrap_prepared counts the
-		//    wrapper preparation for that decision. Today these normally
-		//    move together because every LSN-routing decision prepares exactly one LSN
+		//    wrapper preparation for that decision. Today these normally move
+		//    together because every LSN-routing decision prepares exactly one LSN
 		//    wait wrapper. They are kept separate so that if other wait kinds are
 		//    added later (such as CSN or transaction-split waits) they can
 		//    distinguish route intent from wrapper construction.
