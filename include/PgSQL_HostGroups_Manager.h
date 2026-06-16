@@ -4,10 +4,14 @@
 #include "cpp.h"
 #include "proxysql_gtid.h"
 #include "proxysql_admin.h"
+#include "PgSQL_PolarDB_Counters.h"
 #include <atomic>
+#include <memory>
 #include <thread>
 #include <iostream>
 #include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 
 // Headers for declaring Prometheus counters
 #include "prometheus/counter.h"
@@ -47,7 +51,14 @@
 #define MYHGM_PgSQL_SERVERS_INCOMING "CREATE TABLE pgsql_servers_incoming ( hostgroup_id INT NOT NULL DEFAULT 0 , hostname VARCHAR NOT NULL , port INT NOT NULL DEFAULT 5432 , weight INT NOT NULL DEFAULT 1 , status INT NOT NULL DEFAULT 0 , compression INT NOT NULL DEFAULT 0 , max_connections INT NOT NULL DEFAULT 1000 , max_replication_lag INT NOT NULL DEFAULT 0 , use_ssl INT NOT NULL DEFAULT 0 , max_latency_ms INT UNSIGNED NOT NULL DEFAULT 0 , comment VARCHAR NOT NULL DEFAULT '' , PRIMARY KEY (hostgroup_id, hostname, port))"
 #endif /* DEBUG */
 #define MYHGM_PgSQL_SERVERS_SSL_PARAMS "CREATE TABLE pgsql_servers_ssl_params (hostname VARCHAR NOT NULL , port INT CHECK (port >= 0 AND port <= 65535) NOT NULL DEFAULT 5432 , username VARCHAR NOT NULL DEFAULT '' , ssl_ca VARCHAR NOT NULL DEFAULT '' , ssl_cert VARCHAR NOT NULL DEFAULT '' , ssl_key VARCHAR NOT NULL DEFAULT '' , ssl_crl VARCHAR NOT NULL DEFAULT '' , ssl_crlpath VARCHAR NOT NULL DEFAULT '' , ssl_protocol_version_range VARCHAR NOT NULL DEFAULT '' , comment VARCHAR NOT NULL DEFAULT '' , PRIMARY KEY (hostname, port, username) )"
+#if POLARDB_PROXY
+// HGM-internal mirror of pgsql_replication_hostgroups for PolarDB topology and
+// LSN consistency policy. Must stay in sync with
+// ADMIN_SQLITE_TABLE_PGSQL_REPLICATION_HOSTGROUPS_V3_0_4.
+#define MYHGM_PgSQL_REPLICATION_HOSTGROUPS "CREATE TABLE pgsql_replication_hostgroups (writer_hostgroup INT CHECK (writer_hostgroup>=0) NOT NULL PRIMARY KEY , reader_hostgroup INT NOT NULL CHECK (reader_hostgroup<>writer_hostgroup AND reader_hostgroup>=0) , check_type VARCHAR CHECK (LOWER(check_type) IN ('read_only', 'polardb')) NOT NULL DEFAULT 'read_only' , consistency_mode VARCHAR CHECK (LOWER(consistency_mode) IN ('default', 'off', 'lsn', 'primary')) NOT NULL DEFAULT 'default' , max_lag_bytes INT NOT NULL DEFAULT -1 , lsn_wait_timeout_ms INT NOT NULL DEFAULT -1 , proxy_protocol VARCHAR CHECK (LOWER(proxy_protocol) IN ('default', 'v15', 'legacy', 'off')) NOT NULL DEFAULT 'default' , comment VARCHAR NOT NULL DEFAULT '' , UNIQUE (reader_hostgroup))"
+#else
 #define MYHGM_PgSQL_REPLICATION_HOSTGROUPS "CREATE TABLE pgsql_replication_hostgroups (writer_hostgroup INT CHECK (writer_hostgroup>=0) NOT NULL PRIMARY KEY , reader_hostgroup INT NOT NULL CHECK (reader_hostgroup<>writer_hostgroup AND reader_hostgroup>=0) , check_type VARCHAR CHECK (LOWER(check_type) IN ('read_only')) NOT NULL DEFAULT 'read_only' , comment VARCHAR NOT NULL DEFAULT '' , UNIQUE (reader_hostgroup))"
+#endif // POLARDB_PROXY
 
 #define PGHGM_GEN_ADMIN_RUNTIME_SERVERS "SELECT hostgroup_id, hostname, port, CASE status WHEN 0 THEN \"ONLINE\" WHEN 1 THEN \"SHUNNED\" WHEN 2 THEN \"OFFLINE_SOFT\" WHEN 3 THEN \"OFFLINE_HARD\" WHEN 4 THEN \"SHUNNED\" END status, weight, compression, max_connections, max_replication_lag, use_ssl, max_latency_ms, comment FROM pgsql_servers ORDER BY hostgroup_id, hostname, port"
 
@@ -107,6 +118,7 @@ class PgSQL_SrvConnList;
 class PgSQL_SrvC;
 class PgSQL_SrvList;
 class PgSQL_HGC;
+class PgSQL_Connection;
 
 // Forward declaration for WebUI monitoring metrics collector
 namespace ProxySQL {
@@ -166,7 +178,7 @@ class PgSQL_SrvConnList {
 		conns->remove_index_fast((unsigned int)i);
 	}
 	PgSQL_Connection *remove(int);
-	PgSQL_Connection * get_random_MyConn(PgSQL_Session *sess, bool ff);
+	PgSQL_Connection * get_random_MyConn(PgSQL_Session *sess, bool ff, bool only_pooled = false);
 	void get_random_MyConn_inner_search(unsigned int start, unsigned int end, unsigned int& conn_found_idx, unsigned int& connection_quality_level, unsigned int& number_of_matching_session_variables, const PgSQL_Connection * client_conn);
 	unsigned int conns_length() { return conns->len; }
 	void drop_all_connections();
@@ -203,6 +215,29 @@ class PgSQL_SrvC {	// MySQL Server Container
 	char *comment;
 	PgSQL_SrvConnList *ConnectionsUsed;
 	PgSQL_SrvConnList *ConnectionsFree;
+#if POLARDB_PROXY
+	// =========================================================================
+	// PolarDB per-server LSN tracking (read-your-writes consistency)
+	// =========================================================================
+	// Updated by PgSQL_HostGroups_Manager::polardb_update_server_lsn() from two
+	// sources: monitor health checks, and the LSN that a backend reports in the
+	// extended ReadyForQuery (RFQ) message after running a query. Read without a
+	// lock by reader acquisition and by the byte-lag / cache-freshness helpers.
+	//
+	// There is no per-reader millisecond replication lag value here on purpose:
+	// the PostgreSQL/PolarDB path does not yet produce one, and the MySQL/Aurora
+	// field aws_aurora_current_lag_us must not be reused for it.
+	//
+	// polardb_current_lsn : latest WAL LSN seen for this server. Advanced with a
+	//                       compare-and-swap to the maximum, so a stale
+	//                       observation can never lower it.
+	// lsn_updated_at      : monotonic_time() microseconds when this server's LSN
+	//                       was last observed; used by the lag-cap freshness check.
+	// Keep the LSN pair isolated from unrelated PgSQL_SrvC state. Monitor/RFQ
+	// writers update it while routing threads read it on reader selection.
+	alignas(64) std::atomic<uint64_t> polardb_current_lsn{0};
+	std::atomic<unsigned long long> lsn_updated_at{0};
+#endif // POLARDB_PROXY
 	/**
 	 * @brief Constructs a new MySQL Server Container.
 	 * @details For 'server_defaults' parameters, if '-1' is supplied, they try to be obtained from
@@ -229,6 +264,9 @@ class PgSQL_SrvC {	// MySQL Server Container
 	~PgSQL_SrvC();
 	void connect_error(int, bool get_mutex=true);
 	void shun_and_killall();
+#if POLARDB_PROXY
+	bool polardb_advance_lsn(uint64_t lsn, uint64_t observed_at_us);
+#endif // POLARDB_PROXY
 	/**
 	 * @brief Update the maximum number of used connections
 	 * @return The maximum number of used connections
@@ -253,6 +291,53 @@ class PgSQL_HGC: public BaseHGC<PgSQL_HGC> {
 	public:
 	PgSQL_HGC(int _hid) : BaseHGC<PgSQL_HGC>(_hid) {}
 	PgSQL_SrvC *get_random_MySrvC(char * gtid_uuid, uint64_t gtid_trxid, int max_lag_ms, PgSQL_Session *sess);
+#if POLARDB_PROXY
+	/**
+	 * @brief Cached PolarDB writer/reader pairing and consistency policy for one
+	 *        hostgroup (mutable runtime State).
+	 *
+	 * Loaded from the pgsql_replication_hostgroups admin table on each config
+	 * commit, and kept on the writer hostgroup container so routing can look up
+	 * the policy quickly. Supported consistency modes are off, lsn, and primary.
+	 *
+	 * The two shared_ptr<atomic> cells (primary LSN mirror and writer epoch) are
+	 * the only fields a query thread reads at request time. They are copied by
+	 * value into the published topology snapshot, so a query thread reads them
+	 * through that snapshot without taking the HostGroups_Manager lock and without
+	 * keeping a pointer to this container.
+	 *
+	 * Writer-epoch invariant: when the set of live (non-OFFLINE_HARD) writer
+	 * servers changes, the epoch is bumped and the primary mirror plus the
+	 * affected per-server LSN caches are reset, so stale positions from the old
+	 * writer set are never carried forward.
+	 *
+	 * Rationale and full field semantics: see
+	 * doc/polardb-arch/05-MONITOR-AND-HGM-LSN-STATE.md.
+	 */
+	struct {
+		bool configured{false};            // true if this HG is in replication_hostgroups
+		unsigned int reader_hostgroup{0};  // corresponding reader HG (if this is writer)
+		unsigned int writer_hostgroup{0};  // corresponding writer HG (if this is reader)
+		int max_lag_bytes{0};              // max LSN lag in bytes (lag-cap safety; 0 = off)
+		std::string check_type;            // e.g. "polardb", "read_only"
+		std::string consistency_mode;      // consistency mode string (off/lsn/primary)
+		int consistency_mode_enum{-1};     // parsed enum value; -1 = use global default
+		int lsn_wait_timeout_ms{0};        // polar_xact_split_wait_lsn timeout in ms
+		std::string proxy_protocol;        // default/v15/legacy/off
+		int proxy_protocol_enum{-1};       // parsed enum value; -1 = inherit global
+		// Shared cells are copied into the published PolarDB topology snapshot so
+		// query threads can read them without holding an HGM lock or retaining an
+		// HGC pointer.
+		std::shared_ptr<std::atomic<uint64_t>> polardb_primary_lsn{
+			std::make_shared<std::atomic<uint64_t>>(0)
+		};                                  // latest LSN from primary (for lag calc)
+		std::shared_ptr<std::atomic<uint64_t>> polardb_writer_epoch{
+			std::make_shared<std::atomic<uint64_t>>(0)
+		};                                  // bumps when the writer identity set changes
+		std::string polardb_writer_identity; // sorted non-OFFLINE_HARD address:port set
+		bool polardb_writer_identity_initialized{false};
+	} repl_config;
+#endif // POLARDB_PROXY
 };
 
 struct PgSQL_p_hg_counter {
@@ -634,6 +719,70 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 		unsigned long long select_for_update_or_equivalent;
 		unsigned long long auto_increment_delay_multiplex;
 
+#if POLARDB_PROXY
+		// =====================================================================
+		// PolarDB LSN tracking stats
+		// =====================================================================
+		// Keep this storage block explicit. PgSQL_PolarDB_Counters.h owns
+		// counter metadata (per-thread entries, SQL/Prometheus names, and
+		// worker-total merge lists), but this struct owns storage, comments, and
+		// cache-line layout.
+		// Do not replace these declarations with POLARDB_ALL_COUNTER_LIST(X).
+		std::atomic<unsigned long long> polardb_server_lsn_updates_from_rfq{0}; // accepted current-group/current-epoch per-server LSN cache updates from query RFQ
+		std::atomic<unsigned long long> polardb_lsn_updates_from_monitor{0}; // LSN advances seen by the monitor
+		std::atomic<unsigned long long> polardb_monitor_health_invalid_role{0}; // monitor role is not routable, including PolarDB "unknown" for POLAR_UNKNOWN/POLAR_STANDALONE_DATAMAX
+		std::atomic<unsigned long long> polardb_monitor_health_invalid_values{0}; // PolarDB monitor health row has invalid availability or LSN text
+		std::atomic<unsigned long long> polardb_lsn_stale_count{0};          // stale-LSN skips in reader acquisition
+		std::atomic<unsigned long long> polardb_write_missing_lsn{0};        // writer RFQ carried no LSN; automatic RYW reads forced to writer
+		std::atomic<unsigned long long> polardb_read_missing_lsn{0};         // read RFQ carried no LSN while SESSION_LSN tracked observations
+		std::atomic<unsigned long long> polardb_primary_lsn_unknown{0};      // PRIMARY baseline requested but writer mirror had no LSN
+		std::atomic<unsigned long long> polardb_rfq_best_effort_degraded_routes{0}; // RFQ-unavailable reads sent to reader without wait
+		std::atomic<unsigned long long> polardb_consistency_writer_fallback{0}; // consistency reads redirected to writer after reader acquisition status
+		std::atomic<unsigned long long> polardb_wait_reads_retried_on_writer{0}; // wait-wrapped reads retried once on the writer after timeout or reader loss
+		std::atomic<unsigned long long> polardb_rfq_profile_skipped{0};      // incompatible pooled-backend skip attempts for RFQ-LSN reads
+		std::atomic<unsigned long long> polardb_rfq_profile_evicted{0};      // incompatible free pooled backends evicted to create RFQ-LSN-capable replacements
+		std::atomic<unsigned long long> polardb_tl_cache_bypassed_for_target{0}; // thread-local cache bypasses for consistency-target RFQ-LSN reads
+		std::atomic<unsigned long long> polardb_target_lsn_preferred{0};     // reader choice narrowed to fresh cached LSN >= target
+		std::atomic<unsigned long long> polardb_target_lsn_fallback_wait{0}; // no target-reached reader acquired; wrapper remains correctness gate
+		std::atomic<unsigned long long> polardb_session_target_epoch_reset{0}; // session LSN targets/latches cleared after writer group/epoch change
+
+		// Wait wrapping / RYW routing counters.
+		//
+		// Counter meaning:
+		//  - PolarDB_Session_LSN_Routing / polardb_session_lsn_routing counts the
+		//    route-plan decision: a read was sent to a reader with an LSN wait
+		//    requirement.
+		//  - PolarDB_Wait_Wrap_Prepared / polardb_wait_wrap_prepared counts the
+		//    wrapper preparation for that decision. Today these normally
+		//    move together because every LSN-routing decision prepares exactly one LSN
+		//    wait wrapper. They are kept separate so that if other wait kinds are
+		//    added later (such as CSN or transaction-split waits) they can
+		//    distinguish route intent from wrapper construction.
+		//
+		// Timeout counters follow total/subset semantics:
+		//  - PolarDB_Wait_Error_Timeout / polardb_wait_error_timeout is the total
+		//    wait-timeout counter.
+		//  - PolarDB_Wait_Error_LSN_Wait_Timeout /
+		//    polardb_wait_error_lsn_wait_timeout is the LSN-wait subset. LSN is
+		//    currently the only implemented wait type, so total and subset are
+		//    expected to be equal. They can diverge if other wait-timeout kinds
+		//    are added later.
+		std::atomic<unsigned long long> polardb_session_lsn_routing{0};      // reads routed to a reader with a session-LSN wait
+		std::atomic<unsigned long long> polardb_wait_wrap_prepared{0};        // wait wrapper intent prepared (REPLICA_WITH_WAIT)
+		std::atomic<unsigned long long> polardb_wait_wrap_bypassed{0};       // selected reader reached consistency target -> wrapper skipped
+		std::atomic<unsigned long long> polardb_wait_lsn_sent{0};             // LSN wait wrapper successfully installed/sent
+		std::atomic<unsigned long long> polardb_wait_lsn_sum_us{0};          // total time spent in LSN waits (microseconds)
+		std::atomic<unsigned long long> polardb_wait_wrap_safety_abort{0};   // wrap build failed -> wait aborted
+		std::atomic<unsigned long long> polardb_wait_error_timeout{0};       // wait-timeout notices accounted
+		std::atomic<unsigned long long> polardb_wait_error_lsn_wait_timeout{0}; // LSN wait-timeout notices accounted
+		std::atomic<unsigned long long> polardb_wait_error_connection_lost{0}; // wait-wrapped reader lost its backend connection
+
+		// Fast gate read on every routing decision; true while any PolarDB
+		// hostgroup is configured. Set from the published snapshot on each commit.
+		// Own cache line so the hot read does not false-share with the counters above.
+		alignas(64) std::atomic<bool> polardb_active{false};  // true when polardb_hostgroups_ is non-empty
+#endif // POLARDB_PROXY
+
 		//////////////////////////////////////////////////////
 		///              Prometheus Metrics                ///
 		//////////////////////////////////////////////////////
@@ -825,7 +974,7 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 	 */
 	int remove_server_in_hg(uint32_t hid, const string& addr, uint16_t port);
 
-	PgSQL_Connection * get_MyConn_from_pool(unsigned int hid, PgSQL_Session *sess, bool ff, char * gtid_uuid, uint64_t gtid_trxid, int max_lag_ms);
+	PgSQL_Connection * get_MyConn_from_pool(unsigned int hid, PgSQL_Session *sess, bool ff, char * gtid_uuid, uint64_t gtid_trxid, int max_lag_ms, bool only_pooled = false);
 
 	void drop_all_idle_connections();
 	int get_multiple_idle_connections(int, unsigned long long, PgSQL_Connection **, int);
@@ -857,10 +1006,152 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 	void unshun_server_all_hostgroups(const char * address, uint16_t port, time_t t, int max_wait_sec, unsigned int *skip_hid);
 	PgSQL_SrvC* find_server_in_hg(unsigned int _hid, const std::string& addr, int port);
 
+#if POLARDB_PROXY
+	// =========================================================================
+	// PolarDB LSN session-consistency support
+	// =========================================================================
+	// Topology helpers (writer/reader pairing) + the per-server LSN cache the
+	// monitor feeds. The HG policy/topology cache itself is populated by the
+	// admin loader. Until configuration is loaded these accessors fail safe
+	// (polardb_active is false, so they return "not configured" / 0).
+	//
+	// Reload safety / hot path:
+	// generate_pgsql_replication_hostgroups_table() builds a complete plain-value
+	// topology/policy snapshot under the existing commit lock, then publishes it
+	// atomically with a generation. Query threads refresh a thread-local cached
+	// shared_ptr only when the generation changes, so polardb_collect() and
+	// attach-time PolarDB checks do not take the HGM global lock in steady state.
+	// The snapshot deliberately contains no PgSQL_HGC/PgSQL_SrvC pointers.
+
+	/**
+	 * @brief Map a reader hostgroup to its writer hostgroup.
+	 * @return writer hostgroup id, or -1 if not configured.
+	 */
+	int get_writer_hostgroup_for_reader(unsigned int reader_hostgroup_id);
+
+	/**
+	 * @brief Map a writer hostgroup to its reader hostgroup.
+	 * @return reader hostgroup id, or -1 if not configured.
+	 */
+	int get_reader_hostgroup_for_writer(unsigned int writer_hostgroup_id);
+
+	/**
+	 * @brief Whether a hostgroup is part of a PolarDB replication configuration.
+	 */
+	bool is_polardb_hostgroup(unsigned int hostgroup_id);
+
+	/**
+	 * @brief Resolved PolarDB policy for a hostgroup (tri-state values).
+	 * -1 = not configured (inherit global), 0 = explicitly disabled, >0 = explicit value.
+	 */
+	struct PolarDB_HG_Policy {
+		int consistency_mode{-1};
+		int lsn_wait_timeout_ms{-1};
+		int max_lag_bytes{-1};
+		int proxy_protocol{-1};
+	};
+
+	struct PolarDB_HG_Config {
+		bool is_polardb_hostgroup{false};
+		int writer_hostgroup{-1};
+		int reader_hostgroup{-1};
+		PolarDB_HG_Policy policy;
+		std::shared_ptr<std::atomic<uint64_t>> primary_lsn;
+		std::shared_ptr<std::atomic<uint64_t>> writer_epoch;
+	};
+
+	struct PolarDB_TopologySnapshot {
+		uint64_t generation{0};
+		std::unordered_map<unsigned int, PolarDB_HG_Config> by_hostgroup;
+	};
+
+	/**
+	 * @brief Read PolarDB topology and policy from the generation snapshot.
+	 */
+	PolarDB_HG_Config get_polardb_hg_config(unsigned int hostgroup_id);
+
+	PolarDB_HG_Policy get_polardb_hg_policy(unsigned int hostgroup_id);
+
+	/**
+	 * @brief Warn about loaded PolarDB policy combinations whose effective
+	 * global/HG resolution disables expected RFQ LSN behavior.
+	 */
+	void polardb_warn_config_mismatches();
+
+	/**
+	 * @brief Update the per-server LSN cache.
+	 * @param address Server address.
+	 * @param port Server port.
+	 * @param lsn Current LSN value observed by monitor or RFQ result update.
+	 * @return true if this call advanced the cached server LSN.
+	 */
+	bool polardb_update_server_lsn(const char* address, uint16_t port, uint64_t lsn);
+	/**
+	 * @brief Process an RFQ LSN through a direct server pointer.
+	 *
+	 * The server pointer is used only for PgSQL_SrvC's atomic LSN cache.
+	 * The caller resolves the backend hostgroup's generation-snapshot config once
+	 * and passes it here, so RFQ result update stays off the global HGM lock and avoids
+	 * rereading mutable PgSQL_HGC fields in the result hot path.
+	 *
+	 * @return true when the RFQ LSN was accepted for the current
+	 * replication-group writer epoch, even if the cached LSN was already equal
+	 * or newer.
+	 */
+	bool polardb_update_server_lsn(PgSQL_SrvC* srv, unsigned int backend_hostgroup_id,
+		const PolarDB_HG_Config& backend_config, uint64_t lsn,
+		const PolarDB_WriterScope& request_scope);
+
+	/**
+	 * @brief Latest fresh primary LSN in the writer hostgroup.
+	 * @return primary LSN, or 0 if no fresh data is available.
+	 */
+	uint64_t get_polardb_primary_lsn(unsigned int writer_hostgroup_id);
+
+	/**
+	 * @brief Select a reader connection from a reader hostgroup.
+	 *
+	 * The reader keeps ONLINE status, connection capacity, lag-cap safety, and
+	 * RFQ startup-profile compatibility filters. When consistency_target_lsn is present it
+	 * prefers fresh cached readers already at or beyond that LSN, but it MUST NOT
+	 * reject the original replica set merely because cached polardb_current_lsn is
+	 * below the session target or stale; polar_xact_split_wait_lsn in the wrapped
+	 * query is what waits to the session target.
+	 *
+	 * Consistency reads pass only_pooled=false, so a cold eligible replica can
+	 * create a new backend connection and still execute the current query on the
+	 * replica. Future pooled-only callers can pass only_pooled=true to require an
+	 * already-free backend.
+	 *
+	 * @param hid           Reader hostgroup id.
+	 * @param sess          Session requesting the connection.
+	 * @param reader_plan  Required target and per-reader lag-cap filters.
+	 * @param only_pooled   If true, return only already-pooled connections.
+	 * @return Connection plus the precise acquisition outcome.
+	 */
+	PolarDB_ReaderResult get_MyConn_polardb_reader(unsigned int hid, PgSQL_Session* sess,
+		const PolarDB_Query_ReaderPlan& reader_plan, bool only_pooled);
+#endif // POLARDB_PROXY
+
 private:
 	void update_hostgroup_manager_mappings();
 	uint64_t get_pgsql_servers_checksum(SQLite3_result* runtime_pgsql_servers = nullptr);
 	uint64_t get_pgsql_servers_v2_checksum(SQLite3_result* incoming_pgsql_servers_v2 = nullptr);
+#if POLARDB_PROXY
+	std::shared_ptr<const PolarDB_TopologySnapshot> get_polardb_topology_snapshot_cached() const;
+	std::string polardb_writer_identity_locked(unsigned int writer_hostgroup_id);
+	void polardb_reset_lsn_cache_for_hostgroup_locked(unsigned int hostgroup_id);
+	void polardb_refresh_writer_epoch_locked(unsigned int writer_hostgroup_id, const char* reason);
+	void polardb_refresh_all_writer_epochs_locked(const char* reason);
+
+	// PolarDB HG topology cache populated from pgsql_replication_hostgroups;
+	// empty until then, so accessors fail safe.
+	std::unordered_map<unsigned int, unsigned int> polardb_writer_to_reader_;
+	std::unordered_map<unsigned int, unsigned int> polardb_reader_to_writer_;
+	std::unordered_set<unsigned int> polardb_hostgroups_;  // all HGs in the PolarDB config
+	std::shared_ptr<const PolarDB_TopologySnapshot> polardb_topology_snapshot_;
+	std::atomic<uint64_t> polardb_topology_generation_{0};
+#endif // POLARDB_PROXY
 };
 
 

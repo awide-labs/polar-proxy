@@ -1403,10 +1403,14 @@ public:
 
     /**
      * @brief Convert node type to the hostgroup-manager read_only value.
-     * @return 0 for primary or unknown (not reader), 1 for replica/standby.
+     * @return 0 for primary, 1 for replica/standby/unknown.
+     *
+     * UNKNOWN is not a writer role. Monitor callers count it separately and
+     * fail it closed through availability; this conversion must never promote
+     * POLAR_UNKNOWN or POLAR_STANDALONE_DATAMAX to writer.
      */
     static int node_type_to_read_only(PolarDB_NodeType node_type) {
-        return is_reader(node_type) ? 1 : 0;
+        return is_writer(node_type) ? 0 : 1;
     }
 
     /**

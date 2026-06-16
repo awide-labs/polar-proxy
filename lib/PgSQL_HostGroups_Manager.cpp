@@ -3,16 +3,23 @@ using json = nlohmann::json;
 #define PROXYJSON
 
 #include "PgSQL_HostGroups_Manager.h"
+#include "PgSQL_PolarDB.h"
 #include "ConnectionPoolDecision.h"
 #include "proxysql.h"
 #include "cpp.h"
 
 #include "PgSQL_PreparedStatement.h"
+#include "PgSQL_Connection.h"
 #include "PgSQL_Data_Stream.h"
 
 #include <memory>
+#include <algorithm>
 #include <pthread.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <string>
+#include <vector>
 
 #include "prometheus/counter.h"
 #include "prometheus/detail/builder.h"
@@ -60,6 +67,61 @@ class PgSQL_SrvList;
 class PgSQL_HGC;
 
 const int PgSQL_ERRORS_STATS_FIELD_NUM = 11;
+
+#if POLARDB_PROXY
+static bool polardb_atomic_max_u64(std::atomic<uint64_t>& target, uint64_t value) {
+	uint64_t cur = target.load(std::memory_order_relaxed);
+	while (cur < value) {
+		if (target.compare_exchange_weak(cur, value,
+				std::memory_order_relaxed, std::memory_order_relaxed)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool polardb_atomic_max_u64(
+		const std::shared_ptr<std::atomic<uint64_t>>& target, uint64_t value) {
+	return target ? polardb_atomic_max_u64(*target, value) : false;
+}
+
+#endif // POLARDB_PROXY
+
+static bool pgsql_connection_creation_throttled_locked(PgSQL_SrvC* mysrvc) {
+	unsigned long long curtime = monotonic_time();
+	curtime = curtime / 1000 / 1000; // convert to second
+	PgSQL_HGC* myhgc = mysrvc->myhgc;
+	if (curtime > myhgc->current_time_now) {
+		myhgc->current_time_now = curtime;
+		myhgc->new_connections_now = 0;
+	}
+	myhgc->new_connections_now++;
+	unsigned int throttle_connections_per_sec_to_hostgroup =
+		(unsigned int)pgsql_thread___throttle_connections_per_sec_to_hostgroup;
+	if (myhgc->attributes.configured == true) {
+		// pgsql_hostgroup_attributes takes priority
+		throttle_connections_per_sec_to_hostgroup = myhgc->attributes.throttle_connections_per_sec;
+	}
+	if (should_throttle_connection_creation(
+			myhgc->new_connections_now, throttle_connections_per_sec_to_hostgroup)) {
+		__sync_fetch_and_add(&PgHGM->status.server_connections_delayed, 1);
+		return true;
+	}
+	return false;
+}
+
+static PgSQL_Connection* pgsql_create_backend_connection_locked(PgSQL_SrvC* mysrvc) {
+	PgSQL_Connection* conn = new PgSQL_Connection(false);
+	conn->parent = mysrvc;
+	// if attributes.multiplex == true , STATUS_PGSQL_CONNECTION_NO_MULTIPLEX_HG is set to false. And vice-versa
+	conn->set_status(!conn->parent->myhgc->attributes.multiplex,
+		STATUS_PGSQL_CONNECTION_NO_MULTIPLEX_HG);
+	__sync_fetch_and_add(&PgHGM->status.server_connections_created, 1);
+	proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7,
+		"Returning PostgreSQL Connection %p, server %s:%d\n",
+		conn, conn->parent->address, conn->parent->port);
+	return conn;
+}
 
 /**
  * @brief Helper function used to try to extract a value from the JSON field 'servers_defaults'.
@@ -283,6 +345,18 @@ PgSQL_SrvC::PgSQL_SrvC(
 	ConnectionsUsed=new PgSQL_SrvConnList(this);
 	ConnectionsFree=new PgSQL_SrvConnList(this);
 }
+
+#if POLARDB_PROXY
+bool PgSQL_SrvC::polardb_advance_lsn(uint64_t lsn, uint64_t observed_at_us) {
+	if (lsn == 0) return false;
+
+	bool advanced = polardb_atomic_max_u64(polardb_current_lsn, lsn);
+	// LSN and timestamp are separate relaxed atomics. Readers use the timestamp
+	// only as a freshness hint; the backend wait remains the correctness check.
+	lsn_updated_at.store(observed_at_us, std::memory_order_relaxed);
+	return advanced;
+}
+#endif // POLARDB_PROXY
 
 void PgSQL_SrvC::connect_error(int err_num, bool get_mutex) {
 	// NOTE: this function operates without any mutex
@@ -1323,6 +1397,7 @@ bool PgSQL_HostGroups_Manager::commit(
 
 	unsigned long long curtime1=monotonic_time();
 	wrlock();
+	bool pgsql_servers_mutated = false;
 	// purge table
 	purge_pgsql_servers_table();
 
@@ -1360,6 +1435,7 @@ bool PgSQL_HostGroups_Manager::commit(
 			SQLite3_row *r=*it;
 			long long ptr=atoll(r->fields[0]);
 			proxy_warning("Removed server at address %lld, hostgroup %s, address %s port %s. Setting status OFFLINE HARD and immediately dropping all free connections. Used connections will be dropped when trying to use them\n", ptr, r->fields[1], r->fields[2], r->fields[3]);
+			pgsql_servers_mutated = true;
 			PgSQL_SrvC *mysrvc=(PgSQL_SrvC *)ptr;
 			mysrvc->status=MYSQL_SERVER_STATUS_OFFLINE_HARD;
 			mysrvc->ConnectionsFree->drop_all_connections();
@@ -1407,6 +1483,7 @@ bool PgSQL_HostGroups_Manager::commit(
 			proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5, "Server %s:%d , weight=%d, status=%d, mem_pointer=%llu, hostgroup=%d, compression=%d\n", r->fields[1], atoi(r->fields[2]), atoi(r->fields[3]), (MySerStatus) atoi(r->fields[4]), ptr, atoi(r->fields[0]), atoi(r->fields[5]));
 			//fprintf(stderr,"%lld\n", ptr);
 			if (ptr==0) {
+				pgsql_servers_mutated = true;
 				if (GloPTH->variables.hostgroup_manager_verbose) {
 					proxy_info("Creating new server in HG %d : %s:%d , weight=%d, status=%d\n", atoi(r->fields[0]), r->fields[1], atoi(r->fields[2]), atoi(r->fields[3]), (MySerStatus) atoi(r->fields[4]));
 				}
@@ -1423,15 +1500,18 @@ bool PgSQL_HostGroups_Manager::commit(
 				rc=(*proxy_sqlite3_reset)(statement1); ASSERT_SQLITE_OK(rc, mydb);
 			} else {
 				bool run_update=false;
+				bool server_mutated=false;
 				PgSQL_SrvC *mysrvc=(PgSQL_SrvC *)ptr;
 				// carefully increase the 2nd index by 1 for every new column added
 
 				if (atoi(r->fields[3])!=atoi(r->fields[12])) {
+					server_mutated=true;
 					if (GloPTH->variables.hostgroup_manager_verbose)
 						proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5, "Changing weight for server %d:%s:%d (%s:%d) from %d (%ld) to %d\n" , mysrvc->myhgc->hid , mysrvc->address, mysrvc->port, r->fields[1], atoi(r->fields[2]), atoi(r->fields[3]) , mysrvc->weight , atoi(r->fields[12]));
 					mysrvc->weight=atoi(r->fields[12]);
 				}
 				if (atoi(r->fields[4])!=atoi(r->fields[13])) {
+					server_mutated=true;
 					if (GloPTH->variables.hostgroup_manager_verbose)
 						proxy_info("Changing status for server %d:%s:%d (%s:%d) from %d (%d) to %d\n" , mysrvc->myhgc->hid , mysrvc->address, mysrvc->port, r->fields[1], atoi(r->fields[2]), atoi(r->fields[4]) , mysrvc->status , atoi(r->fields[13]));
 					mysrvc->status=(MySerStatus)atoi(r->fields[13]);
@@ -1440,16 +1520,19 @@ bool PgSQL_HostGroups_Manager::commit(
 					}
 				}
 				if (atoi(r->fields[5])!=atoi(r->fields[14])) {
+					server_mutated=true;
 					if (GloPTH->variables.hostgroup_manager_verbose)
 						proxy_info("Changing compression for server %d:%s:%d (%s:%d) from %d (%d) to %d\n" , mysrvc->myhgc->hid , mysrvc->address, mysrvc->port, r->fields[1], atoi(r->fields[2]), atoi(r->fields[5]) , mysrvc->compression , atoi(r->fields[14]));
 					mysrvc->compression=atoi(r->fields[14]);
 				}
 				if (atoi(r->fields[6])!=atoi(r->fields[15])) {
+					server_mutated=true;
 					if (GloPTH->variables.hostgroup_manager_verbose)
 					proxy_info("Changing max_connections for server %d:%s:%d (%s:%d) from %d (%ld) to %d\n" , mysrvc->myhgc->hid , mysrvc->address, mysrvc->port, r->fields[1], atoi(r->fields[2]), atoi(r->fields[6]) , mysrvc->max_connections , atoi(r->fields[15]));
 					mysrvc->max_connections=atoi(r->fields[15]);
 				}
 				if (atoi(r->fields[7])!=atoi(r->fields[16])) {
+					server_mutated=true;
 					if (GloPTH->variables.hostgroup_manager_verbose)
 						proxy_info("Changing max_replication_lag for server %u:%s:%d (%s:%d) from %d (%d) to %d\n" , mysrvc->myhgc->hid , mysrvc->address, mysrvc->port, r->fields[1], atoi(r->fields[2]), atoi(r->fields[7]) , mysrvc->max_replication_lag , atoi(r->fields[16]));
 					mysrvc->max_replication_lag=atoi(r->fields[16]);
@@ -1463,20 +1546,26 @@ bool PgSQL_HostGroups_Manager::commit(
 					}
 				}
 				if (atoi(r->fields[8])!=atoi(r->fields[17])) {
+					server_mutated=true;
 					if (GloPTH->variables.hostgroup_manager_verbose)
 						proxy_info("Changing use_ssl for server %d:%s:%d (%s:%d) from %d (%d) to %d\n" , mysrvc->myhgc->hid , mysrvc->address, mysrvc->port, r->fields[1], atoi(r->fields[2]), atoi(r->fields[8]) , mysrvc->use_ssl , atoi(r->fields[17]));
 					mysrvc->use_ssl=atoi(r->fields[17]);
 				}
 				if (atoi(r->fields[9])!=atoi(r->fields[18])) {
+					server_mutated=true;
 					if (GloPTH->variables.hostgroup_manager_verbose)
 						proxy_info("Changing max_latency_ms for server %d:%s:%d (%s:%d) from %d (%d) to %d\n" , mysrvc->myhgc->hid , mysrvc->address, mysrvc->port, r->fields[1], atoi(r->fields[2]), atoi(r->fields[9]) , mysrvc->max_latency_us/1000 , atoi(r->fields[18]));
 					mysrvc->max_latency_us=1000*atoi(r->fields[18]);
 				}
 				if (strcmp(r->fields[10],r->fields[19])) {
+					server_mutated=true;
 					if (GloPTH->variables.hostgroup_manager_verbose)
 						proxy_info("Changing comment for server %d:%s:%d (%s:%d) from '%s' to '%s'\n" , mysrvc->myhgc->hid , mysrvc->address, mysrvc->port, r->fields[1], atoi(r->fields[2]), r->fields[10], r->fields[19]);
 					free(mysrvc->comment);
 					mysrvc->comment=strdup(r->fields[19]);
+				}
+				if (server_mutated) {
+					pgsql_servers_mutated=true;
 				}
 				if (run_update) {
 					rc=(*proxy_sqlite3_bind_int64)(statement2, 1, mysrvc->weight); ASSERT_SQLITE_OK(rc, mydb);
@@ -1534,6 +1623,15 @@ bool PgSQL_HostGroups_Manager::commit(
 
 		global_checksum_v2 = gen_global_pgsql_servers_v2_checksum(new_hash);
 		proxy_info("New computed global checksum for 'pgsql_servers_v2' is '%s'\n", global_checksum_v2.c_str());
+	}
+
+	// pgsql_servers mutations affect writer identity even for runtime-only
+	// commits. Keep this under the HGM write lock; the helper bumps epochs only
+	// when the active writer address:port set really changed.
+	if (pgsql_servers_mutated) {
+#if POLARDB_PROXY
+		polardb_refresh_all_writer_epochs_locked("pgsql_servers reload");
+#endif // POLARDB_PROXY
 	}
 
 	// Update 'pgsql_servers' and global checksums
@@ -1773,12 +1871,188 @@ void PgSQL_HostGroups_Manager::generate_pgsql_servers_table(int *_onlyhg) {
 	delete lst;
 }
 
+#if POLARDB_PROXY
+static int current_global_polardb_consistency_mode() {
+	const char* value = GloPTH ? GloPTH->variables.polardb_consistency_mode : nullptr;
+	return polardb_consistency_mode_from_string(value, POLARDB_CONSISTENCY_OFF);
+}
+
+static int current_global_polardb_proxy_protocol() {
+	const char* value = GloPTH ? GloPTH->variables.polardb_proxy_protocol : nullptr;
+	return polardb_proxy_protocol_from_string(value, POLARDB_PROXY_PROTOCOL_V15);
+}
+
+static void polardb_warn_effective_config_mismatches(
+		const PgSQL_HostGroups_Manager::PolarDB_TopologySnapshot& snapshot,
+		int global_consistency_mode, int global_proxy_protocol,
+		const char* global_identity_host, int global_identity_port) {
+	bool saw_rfq_capable_polardb_row = false;
+
+	for (const auto& entry : snapshot.by_hostgroup) {
+		const PgSQL_HostGroups_Manager::PolarDB_HG_Config& hg_config = entry.second;
+		if (!hg_config.is_polardb_hostgroup ||
+				entry.first != static_cast<unsigned int>(hg_config.writer_hostgroup)) {
+			continue;
+		}
+
+		const int effective_consistency_mode =
+			hg_config.policy.consistency_mode >= 0 ?
+				hg_config.policy.consistency_mode : global_consistency_mode;
+		const int effective_proxy_protocol =
+			hg_config.policy.proxy_protocol >= 0 ?
+				hg_config.policy.proxy_protocol : global_proxy_protocol;
+		if (effective_proxy_protocol != POLARDB_PROXY_PROTOCOL_OFF) {
+			saw_rfq_capable_polardb_row = true;
+		}
+		if (effective_consistency_mode == POLARDB_CONSISTENCY_LSN &&
+				effective_proxy_protocol == POLARDB_PROXY_PROTOCOL_OFF) {
+			proxy_warning("PolarDB replication hostgroup writer=%d reader=%d resolves consistency_mode=lsn but effective proxy_protocol=off; RFQ LSN startup requests are disabled for this group\n",
+				hg_config.writer_hostgroup, hg_config.reader_hostgroup);
+		}
+	}
+
+	const bool fallback_identity_partially_set =
+		(global_identity_host && global_identity_host[0] != '\0') ||
+		global_identity_port != 0;
+	if (saw_rfq_capable_polardb_row &&
+			fallback_identity_partially_set &&
+			!PolarDB_StartupIdentity{
+				global_identity_host ? global_identity_host : "",
+				global_identity_port}.valid(true)) {
+		proxy_warning("PolarDB replication hostgroups include an RFQ-capable proxy_protocol, but configured fallback startup identity '%s:%d' is incomplete or invalid; client/listener identity may still satisfy client-backed connections\n",
+			global_identity_host ? global_identity_host : "", global_identity_port);
+	}
+}
+
+#endif // POLARDB_PROXY
+
 void PgSQL_HostGroups_Manager::generate_pgsql_replication_hostgroups_table() {
 	if (incoming_replication_hostgroups==NULL)
 		return;
 	if (pgsql_thread___hostgroup_manager_verbose) {
 		proxy_info("New pgsql_replication_hostgroups table\n");
 	}
+#if POLARDB_PROXY
+	// Besides mirroring the table into mydb, populate the PolarDB topology cache
+	// (writer<->reader pairing) and the per-writer-HGC repl_config consumed by
+	// the routing pipeline. The incoming resultset carries the PolarDB columns:
+	//   0=writer_hostgroup, 1=reader_hostgroup, 2=check_type, 3=consistency_mode,
+	//   4=max_lag_bytes, 5=lsn_wait_timeout_ms, 6=proxy_protocol, 7=comment
+
+	// Mark all HGCs as not configured (same pattern as hostgroup_attributes).
+	for (unsigned int i = 0; i < MyHostGroups->len; i++) {
+		PgSQL_HGC* myhgc = (PgSQL_HGC*)MyHostGroups->index(i);
+		myhgc->repl_config.configured = false;
+	}
+
+	// Clear PolarDB caches before repopulating (O(1) lookups, not SQLite queries).
+	polardb_hostgroups_.clear();
+	polardb_writer_to_reader_.clear();
+	polardb_reader_to_writer_.clear();
+	auto next_polardb_snapshot = std::make_shared<PolarDB_TopologySnapshot>();
+
+	const int global_consistency_mode = current_global_polardb_consistency_mode();
+	const int global_proxy_protocol = current_global_polardb_proxy_protocol();
+	const char* global_identity_host =
+		(GloPTH && GloPTH->variables.polardb_proxy_identity_host) ?
+			GloPTH->variables.polardb_proxy_identity_host : "";
+	const int global_identity_port =
+		GloPTH ? GloPTH->variables.polardb_proxy_identity_port : 0;
+
+	for (std::vector<SQLite3_row *>::iterator it = incoming_replication_hostgroups->rows.begin() ; it != incoming_replication_hostgroups->rows.end(); ++it) {
+		SQLite3_row *r=*it;
+		int writer_hg = atoi(r->fields[0]);
+		int reader_hg = atoi(r->fields[1]);
+		const char* check_type = r->fields[2];
+		const char* consistency_mode = r->fields[3];
+		int max_lag_bytes = atoi(r->fields[4]);
+		int lsn_wait_timeout_ms = atoi(r->fields[5]);
+		const char* proxy_protocol = r->fields[6];
+		const bool is_polardb_check = (strcasecmp(check_type, "polardb") == 0);
+		const int parsed_consistency_mode =
+			polardb_consistency_mode_from_string(consistency_mode, -1);
+		const int parsed_proxy_protocol =
+			polardb_proxy_protocol_from_string(proxy_protocol, -1);
+
+		// Populate PolarDB caches for hot-path lookups.
+		if (is_polardb_check) {
+			polardb_hostgroups_.insert(writer_hg);
+			polardb_hostgroups_.insert(reader_hg);
+			polardb_reader_to_writer_[reader_hg] = writer_hg;
+			polardb_writer_to_reader_[writer_hg] = reader_hg;
+			POLARDB_TRACE("PolarDB CACHE: added writer_hg %d <-> reader_hg %d mapping\n",
+				writer_hg, reader_hg);
+		}
+
+		// Cache the replication config on the writer HGC.
+		PgSQL_HGC* writer_hgc = MyHGC_lookup(writer_hg);
+		if (writer_hgc) {
+			writer_hgc->repl_config.configured = true;
+			writer_hgc->repl_config.reader_hostgroup = reader_hg;
+			writer_hgc->repl_config.writer_hostgroup = writer_hg;
+			writer_hgc->repl_config.check_type = check_type;
+			writer_hgc->repl_config.consistency_mode = consistency_mode;
+			writer_hgc->repl_config.consistency_mode_enum = parsed_consistency_mode;
+			writer_hgc->repl_config.max_lag_bytes = max_lag_bytes;
+			writer_hgc->repl_config.lsn_wait_timeout_ms = lsn_wait_timeout_ms;
+			writer_hgc->repl_config.proxy_protocol = proxy_protocol;
+			writer_hgc->repl_config.proxy_protocol_enum = parsed_proxy_protocol;
+			// Note: runtime LSN/epoch cells are NOT replaced on reload. The
+			// epoch helper below resets them only when the writer identity set
+			// actually changes.
+		}
+
+		if (is_polardb_check) {
+			PolarDB_HG_Config hg_config;
+			hg_config.is_polardb_hostgroup = true;
+			hg_config.writer_hostgroup = writer_hg;
+			hg_config.reader_hostgroup = reader_hg;
+			hg_config.policy.consistency_mode = parsed_consistency_mode;
+			hg_config.policy.max_lag_bytes = max_lag_bytes;
+			hg_config.policy.lsn_wait_timeout_ms = lsn_wait_timeout_ms;
+			hg_config.policy.proxy_protocol = parsed_proxy_protocol;
+			if (writer_hgc) {
+				hg_config.primary_lsn = writer_hgc->repl_config.polardb_primary_lsn;
+				hg_config.writer_epoch = writer_hgc->repl_config.polardb_writer_epoch;
+			}
+			next_polardb_snapshot->by_hostgroup[(unsigned int)writer_hg] = hg_config;
+			next_polardb_snapshot->by_hostgroup[(unsigned int)reader_hg] = hg_config;
+		}
+
+		char *comment_escaped=escape_string_single_quotes(r->fields[7],false);
+		int comment_length=strlen(comment_escaped);
+		char *query=(char *)malloc(512+comment_length);
+		sprintf(query,"INSERT INTO pgsql_replication_hostgroups VALUES(%s,%s,'%s','%s',%s,%s,'%s','%s')",
+			r->fields[0], r->fields[1], r->fields[2], r->fields[3],
+			r->fields[4], r->fields[5], r->fields[6], comment_escaped);
+		if (comment_escaped!=r->fields[7]) {
+			free(comment_escaped);
+		}
+		mydb->execute(query);
+		if (pgsql_thread___hostgroup_manager_verbose) {
+			fprintf(stderr,"writer_hostgroup: %s , reader_hostgroup: %s, check_type: %s, "
+				"consistency_mode: %s, max_lag_bytes: %s, lsn_wait_timeout_ms: %s, proxy_protocol: %s, comment: %s\n",
+				r->fields[0], r->fields[1], r->fields[2], r->fields[3],
+				r->fields[4], r->fields[5], r->fields[6], r->fields[7]);
+		}
+		free(query);
+	}
+	polardb_warn_effective_config_mismatches(*next_polardb_snapshot,
+		global_consistency_mode, global_proxy_protocol,
+		global_identity_host, global_identity_port);
+	polardb_refresh_all_writer_epochs_locked("replication-hostgroups reload");
+
+	next_polardb_snapshot->generation =
+		polardb_topology_generation_.load(std::memory_order_relaxed) + 1;
+	std::shared_ptr<const PolarDB_TopologySnapshot> published_snapshot =
+		next_polardb_snapshot;
+	std::atomic_store_explicit(&polardb_topology_snapshot_, published_snapshot,
+		std::memory_order_release);
+	polardb_topology_generation_.store(next_polardb_snapshot->generation,
+		std::memory_order_release);
+	status.polardb_active.store(!next_polardb_snapshot->by_hostgroup.empty(),
+		std::memory_order_release);
+#else
 	for (std::vector<SQLite3_row *>::iterator it = incoming_replication_hostgroups->rows.begin() ; it != incoming_replication_hostgroups->rows.end(); ++it) {
 		SQLite3_row *r=*it;
 		char *o=NULL;
@@ -1802,6 +2076,7 @@ void PgSQL_HostGroups_Manager::generate_pgsql_replication_hostgroups_table() {
 		}
 		free(query);
 	}
+#endif // POLARDB_PROXY
 	incoming_replication_hostgroups=NULL;
 }
 
@@ -1844,7 +2119,13 @@ void PgSQL_HostGroups_Manager::update_table_pgsql_servers_for_monitor(bool lock)
 SQLite3_result * PgSQL_HostGroups_Manager::dump_table_pgsql(const string& name) {
 	char * query = (char *)"";
 	if (name == "pgsql_replication_hostgroups") {
+#if POLARDB_PROXY
+		// Dump the PolarDB routing columns alongside the upstream
+		// writer/reader/check_type/comment.
+		query=(char *)"SELECT writer_hostgroup, reader_hostgroup, check_type, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment FROM pgsql_replication_hostgroups";
+#else
 		query=(char *)"SELECT writer_hostgroup, reader_hostgroup, check_type, comment FROM pgsql_replication_hostgroups";
+#endif
 	} else if (name == "pgsql_hostgroup_attributes") {
 		query=(char *)"SELECT hostgroup_id, max_num_online_servers, autocommit, free_connections_pct, init_connect, multiplex, connection_warming, throttle_connections_per_sec, ignore_session_variables, hostgroup_settings, servers_defaults, comment FROM pgsql_hostgroup_attributes ORDER BY hostgroup_id";
 	} else if (name == "pgsql_servers") {
@@ -2342,11 +2623,16 @@ void PgSQL_SrvConnList::get_random_MyConn_inner_search(unsigned int start, unsig
 	}
 }
 
-PgSQL_Connection * PgSQL_SrvConnList::get_random_MyConn(PgSQL_Session *sess, bool ff) {
+PgSQL_Connection * PgSQL_SrvConnList::get_random_MyConn(PgSQL_Session *sess, bool ff, bool only_pooled) {
 	PgSQL_Connection * conn=NULL;
 	unsigned int i;
 	unsigned int conn_found_idx = 0;
 	unsigned int l=conns_length();
+
+	if (only_pooled && l == 0) {
+		return NULL;
+	}
+
 	unsigned int connection_quality_level = 0;
 	bool needs_warming = false;
 	// connection_quality_level:
@@ -2389,6 +2675,16 @@ PgSQL_Connection * PgSQL_SrvConnList::get_random_MyConn(PgSQL_Session *sess, boo
 			// 2 : tracked options are OK , RESETTING SESSION is not required, but some SET statement or INIT_DB needs to be executed
 			switch (connection_quality_level) {
 				case 0: // not found any good connection, tracked options are not OK
+					if (only_pooled) {
+						if (l > 0) {
+							conn=(PgSQL_Connection *)conns->remove_index_fast(rand_fast() % l);
+							proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7,
+								"Returning PostgreSQL pooled-only Connection %p, server %s:%d\n",
+								conn, conn->parent->address, conn->parent->port);
+							return conn;
+						}
+						return NULL;
+					}
 					// we must check if connections need to be freed before
 					// creating a new connection
 					{
@@ -2405,27 +2701,21 @@ PgSQL_Connection * PgSQL_SrvConnList::get_random_MyConn(PgSQL_Session *sess, boo
 						}
 
 						// we must create a new connection
-						conn = new PgSQL_Connection(false);
-						conn->parent=mysrvc;
-						// if attributes.multiplex == true , STATUS_PGSQL_CONNECTION_NO_MULTIPLEX_HG is set to false. And vice-versa
-						conn->set_status(!conn->parent->myhgc->attributes.multiplex, STATUS_PGSQL_CONNECTION_NO_MULTIPLEX_HG);
-						__sync_fetch_and_add(&PgHGM->status.server_connections_created, 1);
-						proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Returning PostgreSQL Connection %p, server %s:%d\n", conn, conn->parent->address, conn->parent->port);
+						conn = pgsql_create_backend_connection_locked(mysrvc);
 					}
 					break;
 				case 1: //tracked options are OK , but RESETTING SESSION is required
 					// we may consider creating a new connection
 					{
-					if (decision.create_new_connection) {
-						conn = new PgSQL_Connection(false);
-						conn->parent=mysrvc;
-						// if attributes.multiplex == true , STATUS_PGSQL_CONNECTION_NO_MULTIPLEX_HG is set to false. And vice-versa
-						conn->set_status(!conn->parent->myhgc->attributes.multiplex, STATUS_PGSQL_CONNECTION_NO_MULTIPLEX_HG);
-						__sync_fetch_and_add(&PgHGM->status.server_connections_created, 1);
-						proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Returning PostgreSQL Connection %p, server %s:%d\n", conn, conn->parent->address, conn->parent->port);
-					} else {
-						conn=(PgSQL_Connection *)conns->remove_index_fast(conn_found_idx);
-					}
+						if (only_pooled) {
+							conn=(PgSQL_Connection *)conns->remove_index_fast(conn_found_idx);
+							break;
+						}
+						if (decision.create_new_connection) {
+							conn = pgsql_create_backend_connection_locked(mysrvc);
+						} else {
+							conn=(PgSQL_Connection *)conns->remove_index_fast(conn_found_idx);
+						}
 					}
 					break;
 				case 2: // tracked options are OK , RESETTING SESSION is not required, but some SET statement or INIT_DB needs to be executed
@@ -2445,29 +2735,20 @@ PgSQL_Connection * PgSQL_SrvConnList::get_random_MyConn(PgSQL_Session *sess, boo
 		proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Returning PostgreSQL Connection %p, server %s:%d\n", conn, conn->parent->address, conn->parent->port);
 		return conn;
 	} else {
-		unsigned long long curtime = monotonic_time();
-		curtime = curtime / 1000 / 1000; // convert to second
-		PgSQL_HGC *_myhgc = mysrvc->myhgc;
-		if (curtime > _myhgc->current_time_now) {
-			_myhgc->current_time_now = curtime;
-			_myhgc->new_connections_now = 0;
+		if (only_pooled) {
+			if (l > 0) {
+				conn = (PgSQL_Connection *)conns->remove_index_fast(rand_fast() % l);
+				proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7,
+					"Returning PostgreSQL pooled-only Connection %p (fallback path), server %s:%d\n",
+					conn, conn->parent->address, conn->parent->port);
+				return conn;
+			}
+			return NULL;
 		}
-		_myhgc->new_connections_now++;
-		unsigned int throttle_connections_per_sec_to_hostgroup = (unsigned int) pgsql_thread___throttle_connections_per_sec_to_hostgroup;
-		if (_myhgc->attributes.configured == true) {
-			// pgsql_hostgroup_attributes takes priority
-			throttle_connections_per_sec_to_hostgroup = _myhgc->attributes.throttle_connections_per_sec;
-		}
-		if (should_throttle_connection_creation(_myhgc->new_connections_now, throttle_connections_per_sec_to_hostgroup)) {
-			__sync_fetch_and_add(&PgHGM->status.server_connections_delayed, 1);
+		if (pgsql_connection_creation_throttled_locked(mysrvc)) {
 			return NULL;
 		} else {
-			conn = new PgSQL_Connection(false);
-			conn->parent=mysrvc;
-			// if attributes.multiplex == true , STATUS_PGSQL_CONNECTION_NO_MULTIPLEX_HG is set to false. And vice-versa
-			conn->set_status(!conn->parent->myhgc->attributes.multiplex, STATUS_PGSQL_CONNECTION_NO_MULTIPLEX_HG);
-			__sync_fetch_and_add(&PgHGM->status.server_connections_created, 1);
-			proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Returning PostgreSQL Connection %p, server %s:%d\n", conn, conn->parent->address, conn->parent->port);
+			conn = pgsql_create_backend_connection_locked(mysrvc);
 			return  conn;
 		}
 	}
@@ -2527,7 +2808,7 @@ void PgSQL_HostGroups_Manager::unshun_server_all_hostgroups(const char * address
 	}
 }
 
-PgSQL_Connection * PgSQL_HostGroups_Manager::get_MyConn_from_pool(unsigned int _hid, PgSQL_Session *sess, bool ff, char * gtid_uuid, uint64_t gtid_trxid, int max_lag_ms) {
+PgSQL_Connection * PgSQL_HostGroups_Manager::get_MyConn_from_pool(unsigned int _hid, PgSQL_Session *sess, bool ff, char * gtid_uuid, uint64_t gtid_trxid, int max_lag_ms, bool only_pooled) {
 	PgSQL_Connection * conn=NULL;
 	wrlock();
 	status.pgconnpoll_get++;
@@ -2538,7 +2819,7 @@ PgSQL_Connection * PgSQL_HostGroups_Manager::get_MyConn_from_pool(unsigned int _
 #endif // TEST_AURORA
 	mysrvc = myhgc->get_random_MySrvC(gtid_uuid, gtid_trxid, max_lag_ms, sess);
 	if (mysrvc) { // a PgSQL_SrvC exists. If not, we return NULL = no targets
-		conn=mysrvc->ConnectionsFree->get_random_MyConn(sess, ff);
+		conn=mysrvc->ConnectionsFree->get_random_MyConn(sess, ff, only_pooled);
 		if (conn) {
 			mysrvc->ConnectionsUsed->add(conn);
 			status.pgconnpoll_get_ok++;
@@ -3492,6 +3773,9 @@ void PgSQL_HostGroups_Manager::read_only_action_v2(
 			update_glovars_pgsql_servers_checksum(mysrvs_checksum);
 			pthread_mutex_unlock(&GloVars.checksum_mutex);
 		}
+#if POLARDB_PROXY
+		polardb_refresh_all_writer_epochs_locked("read_only_action_v2");
+#endif // POLARDB_PROXY
 	}
 	wrunlock();
 	unsigned long long curtime2 = monotonic_time();
@@ -4299,3 +4583,762 @@ void PgSQL_HostGroups_Manager::HostGroup_Server_Mapping::remove_HGM(PgSQL_SrvC* 
 	srv->status = MYSQL_SERVER_STATUS_OFFLINE_HARD;
 	srv->ConnectionsFree->drop_all_connections();
 }
+
+#if POLARDB_PROXY
+// ===========================================================================
+// PolarDB LSN session-consistency support
+// ===========================================================================
+//
+// Topology lookups (writer/reader pairing), the per-server LSN cache fed by the
+// monitor, and a byte-lag/cache-freshness reader-acquisition plan. The HG topology cache is
+// populated by the admin loader; until then polardb_active stays false and
+// every accessor below fails safe (returns "not configured" / 0 / no reader).
+//
+// Fallback default for pgsql-polardb_lsn_freshness_ms (max age of a cached
+// per-server LSN to trust) used when the knob is unset or non-positive.
+//
+// TODO: pgsql-polardb_lag_ms is deferred. The PgSQL path does not currently
+// produce a real millisecond replica-lag value; use LSN byte lag and cache
+// freshness as the supported LSN-only safety controls.
+static constexpr int POLARDB_LSN_FRESHNESS_MS_DEFAULT = 5000;
+
+std::string PgSQL_HostGroups_Manager::polardb_writer_identity_locked(
+		unsigned int writer_hostgroup_id) {
+	PgSQL_HGC* hgc = MyHGC_find(writer_hostgroup_id);
+	if (!hgc) {
+		return {};
+	}
+
+	std::vector<std::string> identities;
+	identities.reserve(hgc->mysrvs->cnt());
+	for (unsigned int i = 0; i < hgc->mysrvs->cnt(); i++) {
+		PgSQL_SrvC* srv = hgc->mysrvs->idx(i);
+		if (!srv || srv->status == MYSQL_SERVER_STATUS_OFFLINE_HARD) {
+			continue;
+		}
+		std::string identity = srv->address ? srv->address : "";
+		identity.push_back('\t');
+		identity += std::to_string(srv->port);
+		identities.push_back(identity);
+	}
+
+	std::sort(identities.begin(), identities.end());
+	std::string result;
+	for (const std::string& identity : identities) {
+		result += identity;
+		result.push_back('\n');
+	}
+	return result;
+}
+
+void PgSQL_HostGroups_Manager::polardb_reset_lsn_cache_for_hostgroup_locked(
+		unsigned int hostgroup_id) {
+	PgSQL_HGC* hgc = MyHGC_find(hostgroup_id);
+	if (!hgc) {
+		return;
+	}
+
+	for (unsigned int i = 0; i < hgc->mysrvs->cnt(); i++) {
+		PgSQL_SrvC* srv = hgc->mysrvs->idx(i);
+		if (!srv) {
+			continue;
+		}
+		polardb_reset_server_lsn_cache(
+			srv->polardb_current_lsn, srv->lsn_updated_at);
+	}
+}
+
+/**
+ * @brief Detect a writer change for one pair and, if so, bump its writer epoch
+ *        and drop stale LSN state.
+ *
+ * The "writer epoch" is a per-pair counter that marks the WAL timeline currently
+ * in effect. It increments every time the writer's backend set changes (a
+ * failover or a config edit). Sessions tag their saved LSN target with the epoch
+ * they observed and discard the target when the epoch has moved on, so a read
+ * never waits for an LSN that belongs to a previous primary.
+ *
+ * The first call after a writer becomes configured only records the current
+ * identity; it does not count as a change. A later call that finds a different
+ * identity clears the primary LSN mirror and the per-server LSN caches of both
+ * the writer and reader hostgroups, then increments the epoch last.
+ *
+ * Precondition: caller must hold the HostGroups_Manager write lock.
+ *
+ * @param reason Short description recorded in the log line (may be null).
+ */
+void PgSQL_HostGroups_Manager::polardb_refresh_writer_epoch_locked(
+		unsigned int writer_hostgroup_id, const char* reason) {
+	PgSQL_HGC* writer_hgc = MyHGC_find(writer_hostgroup_id);
+	if (!writer_hgc || !writer_hgc->repl_config.configured) {
+		return;
+	}
+
+	std::string current_identity =
+		polardb_writer_identity_locked(writer_hostgroup_id);
+	if (!writer_hgc->repl_config.polardb_writer_identity_initialized) {
+		writer_hgc->repl_config.polardb_writer_identity = current_identity;
+		writer_hgc->repl_config.polardb_writer_identity_initialized = true;
+		return;
+	}
+
+	if (current_identity == writer_hgc->repl_config.polardb_writer_identity) {
+		return;
+	}
+
+	writer_hgc->repl_config.polardb_writer_identity = current_identity;
+	if (writer_hgc->repl_config.polardb_primary_lsn) {
+		writer_hgc->repl_config.polardb_primary_lsn->store(0, std::memory_order_relaxed);
+	}
+
+	polardb_reset_lsn_cache_for_hostgroup_locked(writer_hostgroup_id);
+	if (writer_hgc->repl_config.reader_hostgroup != writer_hostgroup_id) {
+		polardb_reset_lsn_cache_for_hostgroup_locked(
+			writer_hgc->repl_config.reader_hostgroup);
+	}
+
+	// Make the cache reset visible as the epoch boundary. Query threads
+	// acquire-load this epoch before trusting any session target or primary-LSN
+	// mirror.
+	const uint64_t new_epoch = writer_hgc->repl_config.polardb_writer_epoch
+		? writer_hgc->repl_config.polardb_writer_epoch->fetch_add(
+			1, std::memory_order_acq_rel) + 1
+		: 0;
+
+	proxy_info(
+		"PolarDB writer epoch advanced for writer HG %u to %lu after %s; "
+		"cleared primary and per-server LSN cache for the replication group\n",
+		writer_hostgroup_id, (unsigned long)new_epoch,
+		reason ? reason : "writer identity change");
+}
+
+void PgSQL_HostGroups_Manager::polardb_refresh_all_writer_epochs_locked(
+		const char* reason) {
+	for (const auto& writer_reader : polardb_writer_to_reader_) {
+		polardb_refresh_writer_epoch_locked(writer_reader.first, reason);
+	}
+}
+
+std::shared_ptr<const PgSQL_HostGroups_Manager::PolarDB_TopologySnapshot>
+PgSQL_HostGroups_Manager::get_polardb_topology_snapshot_cached() const {
+	const uint64_t generation = polardb_topology_generation_.load(std::memory_order_acquire);
+	static thread_local const PgSQL_HostGroups_Manager* cached_owner = nullptr;
+	static thread_local uint64_t cached_generation = 0;
+	static thread_local std::shared_ptr<const PolarDB_TopologySnapshot> cached_snapshot;
+
+	if (cached_owner != this) {
+		cached_owner = this;
+		cached_generation = 0;
+		cached_snapshot.reset();
+	}
+
+	if (cached_generation != generation) {
+		auto snapshot = std::atomic_load_explicit(&polardb_topology_snapshot_,
+			std::memory_order_acquire);
+		if (!snapshot || snapshot->generation != generation) {
+			return snapshot;
+		}
+		cached_snapshot = snapshot;
+		cached_generation = generation;
+	}
+
+	return cached_snapshot;
+}
+
+bool PgSQL_HostGroups_Manager::is_polardb_hostgroup(unsigned int hostgroup_id) {
+	if (!status.polardb_active.load(std::memory_order_relaxed)) return false;
+	auto snapshot = get_polardb_topology_snapshot_cached();
+	if (!snapshot) return false;
+	bool result = snapshot->by_hostgroup.count(hostgroup_id) > 0;
+	proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5,
+		"PolarDB SNAPSHOT: is_polardb_hostgroup(%u) = %d (generation=%lu cache size=%zu)\n",
+		hostgroup_id, result ? 1 : 0, (unsigned long)snapshot->generation,
+		snapshot->by_hostgroup.size());
+	return result;
+}
+
+int PgSQL_HostGroups_Manager::get_writer_hostgroup_for_reader(unsigned int reader_hostgroup_id) {
+	if (!status.polardb_active.load(std::memory_order_relaxed)) return -1;
+	auto snapshot = get_polardb_topology_snapshot_cached();
+	if (!snapshot) return -1;
+	auto it = snapshot->by_hostgroup.find(reader_hostgroup_id);
+	return (it != snapshot->by_hostgroup.end()) ? it->second.writer_hostgroup : -1;
+}
+
+int PgSQL_HostGroups_Manager::get_reader_hostgroup_for_writer(unsigned int writer_hostgroup_id) {
+	if (!status.polardb_active.load(std::memory_order_relaxed)) return -1;
+	auto snapshot = get_polardb_topology_snapshot_cached();
+	if (!snapshot) return -1;
+	auto it = snapshot->by_hostgroup.find(writer_hostgroup_id);
+	int result = (it != snapshot->by_hostgroup.end()) ? it->second.reader_hostgroup : -1;
+	proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5,
+		"PolarDB SNAPSHOT: get_reader_hostgroup_for_writer(%u) = %d (generation=%lu cache size=%zu)\n",
+		writer_hostgroup_id, result, (unsigned long)snapshot->generation,
+		snapshot->by_hostgroup.size());
+	return result;
+}
+
+PgSQL_HostGroups_Manager::PolarDB_HG_Config PgSQL_HostGroups_Manager::get_polardb_hg_config(unsigned int hostgroup_id) {
+	PolarDB_HG_Config config;
+	if (!status.polardb_active.load(std::memory_order_relaxed)) return config;
+
+	auto snapshot = get_polardb_topology_snapshot_cached();
+	if (!snapshot) return config;
+	auto it = snapshot->by_hostgroup.find(hostgroup_id);
+	if (it == snapshot->by_hostgroup.end()) {
+		return config;
+	}
+	return it->second;
+}
+
+PgSQL_HostGroups_Manager::PolarDB_HG_Policy PgSQL_HostGroups_Manager::get_polardb_hg_policy(unsigned int hostgroup_id) {
+	return get_polardb_hg_config(hostgroup_id).policy;
+}
+
+void PgSQL_HostGroups_Manager::polardb_warn_config_mismatches() {
+	auto snapshot = get_polardb_topology_snapshot_cached();
+	if (!snapshot || snapshot->by_hostgroup.empty()) {
+		return;
+	}
+
+	const int global_consistency_mode = current_global_polardb_consistency_mode();
+	const int global_proxy_protocol = current_global_polardb_proxy_protocol();
+	const char* global_identity_host =
+		(GloPTH && GloPTH->variables.polardb_proxy_identity_host) ?
+			GloPTH->variables.polardb_proxy_identity_host : "";
+	const int global_identity_port =
+		GloPTH ? GloPTH->variables.polardb_proxy_identity_port : 0;
+
+	polardb_warn_effective_config_mismatches(*snapshot,
+		global_consistency_mode, global_proxy_protocol,
+		global_identity_host, global_identity_port);
+}
+
+bool PgSQL_HostGroups_Manager::polardb_update_server_lsn(const char* hostname, uint16_t port, uint64_t lsn) {
+	if (!status.polardb_active.load(std::memory_order_relaxed)) return false;
+	if (hostname == nullptr) return false;
+	const uint64_t now_us = monotonic_time();
+	bool any_advanced = false;
+	bool matched = false;
+	POLARDB_TRACE("PolarDB LSN CACHE: polardb_update_server_lsn enter host=%s port=%u lsn=%lu\n",
+		hostname, port, (unsigned long)lsn);
+
+	wrlock();
+
+	for (unsigned int i = 0; i < MyHostGroups->len; i++) {
+		PgSQL_HGC* hgc = (PgSQL_HGC*)MyHostGroups->index(i);
+		if (!hgc) continue;
+
+		for (unsigned int j = 0; j < hgc->mysrvs->cnt(); j++) {
+			PgSQL_SrvC* srv = hgc->mysrvs->idx(j);
+			if (srv && strcmp(srv->address, hostname) == 0 && srv->port == port) {
+				matched = true;
+				if (srv->status != MYSQL_SERVER_STATUS_ONLINE) {
+					POLARDB_TRACE(
+						"PolarDB LSN CACHE: skip non-ONLINE host=%s port=%u "
+						"hg=%u status=%d lsn=%lu\n",
+						hostname, port, hgc->hid, srv->status, (unsigned long)lsn);
+					continue;
+				}
+
+				bool advanced = srv->polardb_advance_lsn(lsn, now_us);
+
+				// Mirror onto the writer HGC's cached primary LSN for byte-lag
+				// checks. PolarDB has one primary for the writer HG; keep this
+				// mirror monotonic inside the current writer epoch. Entries that
+				// are not ONLINE are not routable and are skipped above.
+				if (hgc->repl_config.configured) {
+					polardb_atomic_max_u64(hgc->repl_config.polardb_primary_lsn, lsn);
+				}
+
+				POLARDB_TRACE("PolarDB LSN CACHE: polardb_update_server_lsn matched host=%s port=%u lsn=%lu advanced=%d\n",
+					hostname, port, (unsigned long)lsn, advanced ? 1 : 0);
+				any_advanced = any_advanced || advanced;
+			}
+		}
+	}
+
+	wrunlock();
+	return matched && any_advanced;
+}
+
+bool PgSQL_HostGroups_Manager::polardb_update_server_lsn(
+		PgSQL_SrvC* srv, unsigned int backend_hostgroup_id,
+		const PolarDB_HG_Config& backend_config, uint64_t lsn,
+		const PolarDB_WriterScope& request_scope) {
+	if (!status.polardb_active.load(std::memory_order_relaxed)) return false;
+	if (!srv || lsn == 0) return false;
+
+	if (!request_scope.valid()) {
+		POLARDB_TRACE(
+			"PolarDB LSN CACHE: skip direct RFQ update without request "
+			"writer group/epoch hg=%u request_hg=%d lsn=%lu\n",
+			backend_hostgroup_id, request_scope.hg, (unsigned long)lsn);
+		return false;
+	}
+
+	if (!backend_config.is_polardb_hostgroup || !backend_config.writer_epoch) {
+		POLARDB_TRACE(
+			"PolarDB LSN CACHE: skip direct RFQ update without current "
+			"writer epoch hg=%u lsn=%lu request_epoch=%lu\n",
+			backend_hostgroup_id, (unsigned long)lsn,
+			(unsigned long)request_scope.epoch);
+		return false;
+	}
+
+	const uint64_t current_writer_epoch =
+		backend_config.writer_epoch->load(std::memory_order_acquire);
+	if (!request_scope.matches(
+			PolarDB_WriterScope{
+				backend_config.writer_hostgroup,
+				current_writer_epoch})) {
+		POLARDB_TRACE(
+			"PolarDB LSN CACHE: skip stale/cross-group direct RFQ update "
+			"hg=%u request_hg=%d current_hg=%d request_epoch=%lu "
+			"current_epoch=%lu lsn=%lu\n",
+			backend_hostgroup_id,
+			request_scope.hg, backend_config.writer_hostgroup,
+			(unsigned long)request_scope.epoch,
+			(unsigned long)current_writer_epoch,
+			(unsigned long)lsn);
+		return false;
+	}
+
+	// The connection using this parent is still in ConnectionsUsed while result processing
+	// runs, and OFFLINE_HARD deletion waits for both used and free lists to drain.
+	// Therefore the PgSQL_SrvC object is alive here. Only PgSQL_SrvC atomics are
+	// touched; topology and primary-LSN state come from the immutable snapshot.
+	// The epoch was checked immediately above. A writer change just after this
+	// point can only publish a monotonic LSN that future scope checks may ignore;
+	// it cannot make a later session wait target go backwards.
+	const uint64_t now_us = monotonic_time();
+	bool advanced = srv->polardb_advance_lsn(lsn, now_us);
+	(void)advanced;
+	polardb_atomic_max_u64(backend_config.primary_lsn, lsn);
+
+	POLARDB_TRACE(
+		"PolarDB LSN CACHE: accepted direct RFQ update hg=%u lsn=%lu "
+			"advanced=%d request_hg=%d current_hg=%d request_epoch=%lu "
+			"current_epoch=%lu\n",
+			backend_hostgroup_id, (unsigned long)lsn, advanced ? 1 : 0,
+			request_scope.hg, backend_config.writer_hostgroup,
+			(unsigned long)request_scope.epoch,
+			(unsigned long)current_writer_epoch);
+	return true;
+}
+
+uint64_t PgSQL_HostGroups_Manager::get_polardb_primary_lsn(unsigned int writer_hostgroup_id) {
+	if (!status.polardb_active.load(std::memory_order_relaxed)) return 0;
+
+	auto snapshot = get_polardb_topology_snapshot_cached();
+	if (!snapshot) return 0;
+	auto it = snapshot->by_hostgroup.find(writer_hostgroup_id);
+	if (it == snapshot->by_hostgroup.end() || !it->second.primary_lsn) {
+		return 0;
+	}
+	return it->second.primary_lsn->load(std::memory_order_relaxed);
+}
+
+static PgSQL_Connection* polardb_get_rfq_profile_compatible_conn(
+		PgSQL_SrvC* mysrvc, PgSQL_Session* sess, uint64_t consistency_target_lsn,
+		bool startup_requests_rfq_lsn, bool only_pooled, PolarDB_ReaderStatus* status) {
+	if (status) {
+		*status = PolarDB_ReaderStatus::READER_BUSY;
+	}
+	if (consistency_target_lsn == 0) {
+		PgSQL_Connection* conn =
+			mysrvc->ConnectionsFree->get_random_MyConn(sess, false, only_pooled);
+		if (conn && status) {
+			*status = PolarDB_ReaderStatus::ACQUIRED;
+		}
+		return conn;
+	}
+
+	if (!startup_requests_rfq_lsn) {
+		if (status) {
+			*status = PolarDB_ReaderStatus::RFQ_UNAVAILABLE;
+		}
+		return nullptr;
+	}
+
+	bool skipped_incompatible = false;
+	const unsigned int initial_free = mysrvc->ConnectionsFree->conns_length();
+	for (unsigned int i = 0; i < initial_free; i++) {
+		PgSQL_Connection* candidate = mysrvc->ConnectionsFree->index(i);
+		if (!candidate) {
+			continue;
+		}
+		if (candidate &&
+				(candidate->get_pg_connection() == nullptr ||
+				 candidate->polardb_startup_profile.has_rfq_lsn())) {
+			if (status) {
+				*status = PolarDB_ReaderStatus::ACQUIRED;
+			}
+			return mysrvc->ConnectionsFree->remove(i);
+		}
+		skipped_incompatible = true;
+		PgHGM->status.polardb_rfq_profile_skipped.fetch_add(1, std::memory_order_relaxed);
+		proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5,
+			"PolarDB route smart: skipped pooled connection %p from %s:%d because startup profile lacks RFQ LSN request\n",
+			candidate, mysrvc->address, mysrvc->port);
+	}
+
+	if (only_pooled) {
+		if (status && skipped_incompatible) {
+			*status = PolarDB_ReaderStatus::RFQ_UNAVAILABLE;
+		}
+		return nullptr;
+	}
+
+	if (mysrvc->max_connections <= 0) {
+		return nullptr;
+	}
+
+	const unsigned int max_connections =
+		static_cast<unsigned int>(mysrvc->max_connections);
+	const unsigned int conns_free = mysrvc->ConnectionsFree->conns_length();
+	const unsigned int conns_used = mysrvc->ConnectionsUsed->conns_length();
+	if (conns_used >= max_connections) {
+		return nullptr;
+	}
+	const unsigned int total_connections = conns_free + conns_used;
+	const unsigned int incompatible_to_evict =
+		total_connections >= max_connections
+			? total_connections - max_connections + 1
+			: 0;
+	if (incompatible_to_evict > conns_free) {
+		return nullptr;
+	}
+
+	if (pgsql_connection_creation_throttled_locked(mysrvc)) {
+		return nullptr;
+	}
+
+	// The scan above found no compatible usable free connection, and the caller
+	// holds the HGM write lock, so no compatible entry can appear before create.
+	for (unsigned int i = 0; i < incompatible_to_evict; i++) {
+		PgSQL_Connection* evicted = mysrvc->ConnectionsFree->remove(0);
+		PgHGM->status.polardb_rfq_profile_evicted.fetch_add(1, std::memory_order_relaxed);
+		proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5,
+			"PolarDB route smart: evicted pooled connection %p from %s:%d because startup profile lacks RFQ LSN request\n",
+			evicted, mysrvc->address, mysrvc->port);
+		delete evicted;
+	}
+
+	PgSQL_Connection* conn = pgsql_create_backend_connection_locked(mysrvc);
+	if (conn && status) {
+		*status = PolarDB_ReaderStatus::ACQUIRED;
+	}
+	return conn;
+}
+
+static PolarDB_ReaderStatus polardb_reader_status_prefer(
+		PolarDB_ReaderStatus current,
+		PolarDB_ReaderStatus next) {
+	auto priority = [](PolarDB_ReaderStatus status) -> int {
+		// Preserve the most actionable cause: RFQ policy first, then
+		// consistency-safety failures, then ordinary capacity/availability.
+		switch (status) {
+		case PolarDB_ReaderStatus::RFQ_UNAVAILABLE:
+			return 80;
+		case PolarDB_ReaderStatus::PRIMARY_LSN_UNKNOWN:
+			return 70;
+		case PolarDB_ReaderStatus::READER_LSN_UNKNOWN:
+			return 60;
+		case PolarDB_ReaderStatus::READER_LSN_STALE:
+			return 50;
+		case PolarDB_ReaderStatus::READER_LAG_EXCEEDED:
+			return 40;
+		case PolarDB_ReaderStatus::READER_BUSY:
+			return 30;
+		case PolarDB_ReaderStatus::READER_UNAVAILABLE:
+			return 10;
+		case PolarDB_ReaderStatus::ACQUIRED:
+			return 0;
+		}
+		return 0;
+	};
+	return priority(next) > priority(current) ? next : current;
+}
+
+static PolarDB_ReaderResult polardb_try_weighted_rfq_candidates(
+		PgSQL_SrvC** candidates, unsigned int num_candidates,
+		unsigned int weight_sum, PgSQL_Session* sess, uint64_t consistency_target_lsn,
+		bool startup_requests_rfq_lsn, bool only_pooled) {
+	PolarDB_ReaderResult result;
+	if (num_candidates == 0 || weight_sum == 0) {
+		return result;
+	}
+
+	result.status = PolarDB_ReaderStatus::READER_BUSY;
+	unsigned int k = rand_fast() % weight_sum;
+	k++;  // 1-based for comparison
+	unsigned int running_sum = 0;
+
+	for (unsigned int j = 0; j < num_candidates; j++) {
+		PgSQL_SrvC* mysrvc = candidates[j];
+		running_sum += mysrvc->weight;
+		if (k <= running_sum) {
+			PolarDB_ReaderStatus status =
+				PolarDB_ReaderStatus::READER_BUSY;
+			PgSQL_Connection* conn = polardb_get_rfq_profile_compatible_conn(
+				mysrvc, sess, consistency_target_lsn, startup_requests_rfq_lsn, only_pooled, &status);
+			if (conn) {
+				result.conn = conn;
+				result.srv = mysrvc;
+				result.status = PolarDB_ReaderStatus::ACQUIRED;
+				return result;
+			}
+			result.status = polardb_reader_status_prefer(result.status, status);
+			// Connection was taken by another thread between filter and
+			// select; fall through to the remaining candidates.
+		}
+	}
+
+	// Weighted selection raced or hit incompatible pooled connections; try the
+	// remaining candidates in order without closing old-profile pooled backends.
+	for (unsigned int j = 0; j < num_candidates; j++) {
+		PgSQL_SrvC* mysrvc = candidates[j];
+		PolarDB_ReaderStatus status =
+			PolarDB_ReaderStatus::READER_BUSY;
+		PgSQL_Connection* conn = polardb_get_rfq_profile_compatible_conn(
+			mysrvc, sess, consistency_target_lsn, startup_requests_rfq_lsn, only_pooled, &status);
+		if (conn) {
+			result.conn = conn;
+			result.srv = mysrvc;
+			result.status = PolarDB_ReaderStatus::ACQUIRED;
+			return result;
+		}
+		result.status = polardb_reader_status_prefer(result.status, status);
+	}
+
+	return result;
+}
+
+PolarDB_ReaderResult PgSQL_HostGroups_Manager::get_MyConn_polardb_reader(unsigned int _hid, PgSQL_Session* sess,
+	const PolarDB_Query_ReaderPlan& reader_plan, bool only_pooled) {
+	const uint64_t consistency_target_lsn = reader_plan.consistency_target_lsn;
+	// consistency_target_lsn narrows preference to fresh cached caught-up readers when
+	// possible, but never rejects the original replica set unless a byte-lag cap
+	// is explicitly enabled. The wrapped query's polar_xact_split_wait_lsn remains
+	// the session target correctness gate.
+	PolarDB_ReaderResult result;
+	wrlock();
+	status.pgconnpoll_get++;
+
+	PgSQL_HGC* myhgc = MyHGC_lookup(_hid);
+	if (myhgc) {
+		const PgSQL_HostGroups_Manager::PolarDB_HG_Policy policy =
+			get_polardb_hg_policy(_hid);
+		const int protocol =
+			policy.proxy_protocol >= 0 ? policy.proxy_protocol : current_global_polardb_proxy_protocol();
+		const bool startup_requests_rfq_lsn =
+			PolarDB_StartupProfile::from_protocol(
+				polardb_proxy_protocol_from_int(protocol)).has_rfq_lsn();
+
+		if (reader_plan.lag_cap_enabled() && reader_plan.primary_lsn == 0) {
+			status.polardb_lsn_stale_count.fetch_add(1, std::memory_order_relaxed);
+			result.status = PolarDB_ReaderStatus::PRIMARY_LSN_UNKNOWN;
+			POLARDB_TRACE(
+				"PolarDB route smart: primary LSN unknown under lag cap "
+				"(reader_hg=%u max_lag_bytes=%d)\n",
+				_hid, reader_plan.max_lag_bytes);
+			wrunlock();
+			return result;
+		}
+
+		// Stack-allocated array for small N (same pattern as get_random_MySrvC);
+		// falls back to heap allocation for larger deployments.
+		PgSQL_SrvC* mysrvcCandidates_static[32];
+		PgSQL_SrvC** mysrvcCandidates = mysrvcCandidates_static;
+		unsigned int num_candidates = 0;
+		unsigned int num_target_reached_candidates = 0;
+		unsigned int weight_sum = 0;
+		unsigned int target_reached_weight_sum = 0;
+		PolarDB_ReaderStatus filter_status =
+			PolarDB_ReaderStatus::READER_UNAVAILABLE;
+
+		unsigned int num_servers = myhgc->mysrvs->cnt();
+		if (num_servers > 32) {
+			mysrvcCandidates = (PgSQL_SrvC**)malloc(sizeof(PgSQL_SrvC*) * num_servers);
+		}
+
+		const bool has_consistency_target_lsn = reader_plan.has_consistency_target_lsn();
+		const bool lag_cap_enabled = reader_plan.lag_cap_enabled();
+		const uint64_t now_us = (has_consistency_target_lsn || lag_cap_enabled) ? monotonic_time() : 0;
+		int fresh_ms = pgsql_thread___polardb_lsn_freshness_ms > 0
+			? pgsql_thread___polardb_lsn_freshness_ms : POLARDB_LSN_FRESHNESS_MS_DEFAULT;
+
+#if POLARDB_PROXY_TODO
+		// TODO: disabled in T13. pgsql-polardb_lag_ms is reserved until PgSQL
+		// has a real per-reader millisecond-lag producer. Do not use
+		// aws_aurora_current_lag_us here; that field is MySQL/Aurora state.
+		// Future implementation should estimate catch-up time from monitor LSN
+		// samples:
+		//
+		//     estimated_catchup_ms = byte_lag / recent_replay_bytes_per_ms
+		//
+		// Missing/stale/zero-rate samples under an enabled cap should reject
+		// the reader and let the caller use the writer.
+		int max_lag_ms = pgsql_thread___polardb_lag_ms;
+#endif
+
+		// === FILTER PHASE: single O(N) pass ===
+		for (unsigned int j = 0; j < num_servers; j++) {
+			PgSQL_SrvC* mysrvc = myhgc->mysrvs->idx(j);
+			if (!mysrvc) continue;
+
+			// Filter 1: must be ONLINE.
+			if (mysrvc->status != MYSQL_SERVER_STATUS_ONLINE)
+				continue;
+			if (mysrvc->weight <= 0)
+				continue;
+
+			// Filter 2: must have connection capacity.
+			if (mysrvc->max_connections <= 0 ||
+				mysrvc->ConnectionsUsed->conns_length() >=
+					static_cast<unsigned int>(mysrvc->max_connections)) {
+				filter_status = polardb_reader_status_prefer(
+					filter_status, PolarDB_ReaderStatus::READER_BUSY);
+				continue;
+			}
+
+			// Filter 3: pooled-only callers require an already-free backend.
+			if (only_pooled && mysrvc->ConnectionsFree->conns_length() == 0) {
+				filter_status = polardb_reader_status_prefer(
+					filter_status, PolarDB_ReaderStatus::READER_BUSY);
+				continue;
+			}
+
+#if POLARDB_PROXY_TODO
+			// Filter 4: future millisecond-lag safety. Disabled in T13 because
+			// PgSQL/PolarDB currently has no valid producer for max_lag_ms.
+			if (max_lag_ms > 0) {
+				uint64_t updated_us =
+					mysrvc->lsn_updated_at.load(std::memory_order_relaxed);
+				if (!polardb_lsn_cache_fresh(updated_us, now_us, (uint32_t)fresh_ms)) {
+					status.polardb_lsn_stale_count.fetch_add(1, std::memory_order_relaxed);
+					continue;  // stale under an enabled cap -> skip this reader
+				}
+				if (!polardb_lag_ms_within_cap(
+						mysrvc->aws_aurora_current_lag_us, max_lag_ms))
+					continue;
+			}
+#endif
+
+			bool lsn_fresh = false;
+			uint64_t reader_lsn = 0;
+			if (has_consistency_target_lsn || lag_cap_enabled) {
+				uint64_t updated_us =
+					mysrvc->lsn_updated_at.load(std::memory_order_relaxed);
+				reader_lsn = mysrvc->polardb_current_lsn.load(std::memory_order_relaxed);
+				lsn_fresh = polardb_lsn_cache_fresh(updated_us, now_us, (uint32_t)fresh_ms);
+			}
+
+			if (lag_cap_enabled) {
+				if (reader_lsn == 0) {
+					status.polardb_lsn_stale_count.fetch_add(1, std::memory_order_relaxed);
+					filter_status = polardb_reader_status_prefer(
+						filter_status,
+						PolarDB_ReaderStatus::READER_LSN_UNKNOWN);
+					continue;
+				}
+				if (!lsn_fresh) {
+					status.polardb_lsn_stale_count.fetch_add(1, std::memory_order_relaxed);
+					filter_status = polardb_reader_status_prefer(
+						filter_status,
+						PolarDB_ReaderStatus::READER_LSN_STALE);
+					continue;
+				}
+				if (!reader_plan.within_byte_cap(reader_lsn)) {
+					filter_status = polardb_reader_status_prefer(
+						filter_status,
+						PolarDB_ReaderStatus::READER_LAG_EXCEEDED);
+					continue;
+				}
+			}
+
+			const bool reader_lsn_reaches_consistency_target = reader_plan.reader_lsn_reaches_consistency_target(reader_lsn) && lsn_fresh;
+			mysrvcCandidates[num_candidates] = mysrvc;
+			num_candidates++;
+			weight_sum += mysrvc->weight;
+			if (reader_lsn_reaches_consistency_target) {
+				std::swap(mysrvcCandidates[num_target_reached_candidates],
+					mysrvcCandidates[num_candidates - 1]);
+				num_target_reached_candidates++;
+				target_reached_weight_sum += mysrvc->weight;
+			}
+		}
+
+		bool got_target_reached_reader = false;
+		bool fallback_to_wait_set = false;
+		result.status = filter_status;
+
+		// === SELECTION PHASE: preferred weighted subset, then wait-capable set ===
+		if (has_consistency_target_lsn && num_target_reached_candidates > 0 && target_reached_weight_sum > 0) {
+			result = polardb_try_weighted_rfq_candidates(
+				mysrvcCandidates, num_target_reached_candidates, target_reached_weight_sum,
+				sess, consistency_target_lsn, startup_requests_rfq_lsn, only_pooled);
+			if (result.acquired()) {
+				got_target_reached_reader = true;
+				status.polardb_target_lsn_preferred.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+
+		if (!result.acquired()) {
+			const bool preferred_attempted =
+				has_consistency_target_lsn && num_target_reached_candidates > 0;
+			const unsigned int fallback_candidates =
+				preferred_attempted
+					? num_candidates - num_target_reached_candidates : num_candidates;
+			const unsigned int fallback_weight_sum =
+				preferred_attempted
+					? weight_sum - target_reached_weight_sum : weight_sum;
+			PgSQL_SrvC** fallback_set =
+				preferred_attempted
+					? mysrvcCandidates + num_target_reached_candidates : mysrvcCandidates;
+			fallback_to_wait_set =
+				has_consistency_target_lsn && fallback_candidates > 0 && fallback_weight_sum > 0;
+			PolarDB_ReaderResult fallback_result =
+				polardb_try_weighted_rfq_candidates(
+					fallback_set, fallback_candidates, fallback_weight_sum,
+					sess, consistency_target_lsn, startup_requests_rfq_lsn, only_pooled);
+			if (fallback_result.acquired()) {
+				result = fallback_result;
+			} else {
+				result.status = polardb_reader_status_prefer(
+					result.status, fallback_result.status);
+			}
+			if (result.acquired() && fallback_to_wait_set) {
+				status.polardb_target_lsn_fallback_wait.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+		(void)got_target_reached_reader;
+
+		if (result.acquired()) {
+			result.srv->ConnectionsUsed->add(result.conn);
+			status.pgconnpoll_get_ok++;
+			result.srv->update_max_connections_used();
+			proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5,
+				"PolarDB route smart: got connection from %s:%d (LSN=%lu, consistency_target_lsn=%lu, target_preferred=%d, fallback_wait=%d, weight=%ld, only_pooled=%d)\n",
+				result.srv->address, result.srv->port,
+				(unsigned long)result.srv->polardb_current_lsn.load(std::memory_order_relaxed),
+				(unsigned long)consistency_target_lsn, got_target_reached_reader ? 1 : 0,
+				fallback_to_wait_set ? 1 : 0,
+				result.srv->weight, only_pooled ? 1 : 0);
+			if (num_servers > 32) {
+				free(mysrvcCandidates);
+			}
+			wrunlock();
+			return result;
+		}
+
+		if (num_servers > 32) {
+			free(mysrvcCandidates);
+		}
+	}
+
+	wrunlock();
+	return result;
+}
+#endif // POLARDB_PROXY

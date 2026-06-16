@@ -1,6 +1,7 @@
 #include "PgSQL_HostGroups_Manager.h"
 #include "PgSQL_Monitor.hpp"
 #include "PgSQL_Thread.h"
+#include "PgSQL_PolarDB.h"
 
 #include "gen_utils.h"
 
@@ -8,7 +9,9 @@
 #include <poll.h>
 
 #include <cassert>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <queue>
@@ -36,6 +39,32 @@ const char PING_QUERY[] { "" };
  * @details If the server is not in this mode would be assumed to be a primary.
  */
 const char READ_ONLY_QUERY[] { "SELECT pg_is_in_recovery()" };
+#if POLARDB_PROXY
+/**
+ * @brief PolarDB health check query with LSN for consistency routing.
+ *
+ * @details Returns three columns from a PolarDB backend:
+ * - Col 0: polar_node_type() -> 'primary', 'replica', or 'standby'
+ * - Col 1: polar_is_available() -> 't' (normal) or 'f' (maintenance mode)
+ * - Col 2: current WAL LSN (pg_current_wal_lsn on primary, pg_last_wal_replay_lsn on replica)
+ *
+ * The 3-column result is detected by col_count >= 3 in the monitor and parsed by
+ * parse_polardb_full_health_check(). Standard PG backends use READ_ONLY_QUERY
+ * (1-column) and fall through to the pg_is_in_recovery() path.
+ *
+ * polar_is_available() returns 'f' while PolarDB has the node in maintenance
+ * mode (for example controlled failover, online DDL drain, or pg_ctl stop -m
+ * fast); the monitor then shuns it via shun_and_killall(). Recovery is automatic:
+ * the standard shun-recovery timer (pgsql-shun_recovery_time_sec) brings the
+ * server back, and once a later check returns is_available=true it is no longer
+ * re-shunned. Rationale: see doc/polardb-arch/05-MONITOR-AND-HGM-LSN-STATE.md.
+ */
+const char POLARDB_CHECK_WITH_LSN_QUERY[] {
+	"SELECT polar_node_type() as node_type, polar_is_available() as is_available, "
+	"CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()::text "
+	"ELSE pg_current_wal_lsn()::text END as current_lsn"
+};
+#endif // POLARDB_PROXY
 /**
  * @brief Used to detect the current replication lag in a PostgreSQL instance.
  * @details Lag measurement is based in a difference between the most recent WAL location that has been
@@ -308,7 +337,59 @@ struct mon_srv_t {
 		string ssl_min_protocol_version;
 		string ssl_max_protocol_version;
 	} ssl_opt;
+#if POLARDB_PROXY
+	// Per-task immutable copy of the replication pair's check_type column:
+	// 'polardb' for a PolarDB pair, else 'read_only'. get_task_query() reads it
+	// to pick the health query (PolarDB 3-column LSN query vs pg_is_in_recovery).
+	string check_type;
+#endif // POLARDB_PROXY
 };
+
+#if POLARDB_PROXY && POLARDB_DEBUG
+struct PolarDB_DebugMonitorHealth {
+	char node_type[64];
+	char is_available[16];
+	char lsn[64];
+};
+
+static bool polardb_debug_monitor_health_override(
+		const mon_srv_t& srv, PolarDB_DebugMonitorHealth& out) {
+	char buf[256] = {0};
+	bool matched = false;
+	if (polardb_debug_consume_fault_file(
+			"POLARDB_DEBUG_MONITOR_HEALTH_FILE", buf, sizeof(buf))) {
+		char* node_type = strchr(buf, '|');
+		char* is_available = node_type ? strchr(node_type + 1, '|') : NULL;
+		char* lsn = is_available ? strchr(is_available + 1, '|') : NULL;
+
+		if (node_type && is_available && lsn) {
+			*node_type++ = '\0';
+			*is_available++ = '\0';
+			*lsn++ = '\0';
+
+			char endpoint[192] = {0};
+			snprintf(endpoint, sizeof(endpoint), "%s:%u",
+				srv.addr.c_str(), (unsigned int)srv.port);
+			matched = (strcmp(buf, "*") == 0 || strcmp(buf, endpoint) == 0);
+			if (matched) {
+				snprintf(out.node_type, sizeof(out.node_type), "%s", node_type);
+				snprintf(out.is_available, sizeof(out.is_available), "%s", is_available);
+				snprintf(out.lsn, sizeof(out.lsn), "%s", lsn);
+			}
+		}
+	}
+
+	if (matched) {
+		polardb_debug_clear_fault_file("POLARDB_DEBUG_MONITOR_HEALTH_FILE");
+		POLARDB_TRACE(
+			"PolarDB monitor: debug forced health row for %s:%u "
+			"node_type=%s is_available=%s lsn=%s\n",
+			srv.addr.c_str(), (unsigned int)srv.port,
+			out.node_type, out.is_available, out.lsn);
+	}
+	return matched;
+}
+#endif // POLARDB_PROXY && POLARDB_DEBUG
 
 struct mon_user_t {
 	string user;
@@ -325,6 +406,10 @@ struct ping_params_t {
 
 struct readonly_res_t {
 	int32_t val;
+#if POLARDB_PROXY
+	uint64_t lsn;           // PolarDB: current WAL LSN from the health check
+	bool is_available;      // PolarDB: polar_is_available(); true for standard PG
+#endif // POLARDB_PROXY
 };
 
 struct repl_lag_res_t {
@@ -440,6 +525,10 @@ unique_ptr<SQLite3_result> fetch_hgm_srvs_conf(PgSQL_HostGroups_Manager* hgm, co
 vector<mon_srv_t> ext_srvs(const unique_ptr<SQLite3_result>& srvs_info) {
 	vector<mon_srv_t> srvs {};
 	srvs.reserve(srvs_info->rows.size());
+#if POLARDB_PROXY
+	// Readonly queries have >=5 fields (including check_type); ping/connect have 3.
+	bool has_check_type = (srvs_info->columns >= 5);
+#endif // POLARDB_PROXY
 	for (const auto& row : srvs_info->rows) {
 		srvs.push_back({
 			static_cast<int32_t>(std::atoi(row->fields[0])),
@@ -478,6 +567,10 @@ vector<mon_srv_t> ext_srvs(const unique_ptr<SQLite3_result>& srvs_info) {
 					string { "" }
 				};
 			}()
+#if POLARDB_PROXY
+			,
+			has_check_type && row->fields[4] ? string { row->fields[4] } : string {}
+#endif // POLARDB_PROXY
 		});
 	}
 	return srvs;
@@ -687,6 +780,105 @@ short handle_async_check_cont(state_t& st, short _) {
 
 			if (row_count > 0) {
 				if (st.task.type == task_type_t::readonly) {
+#if POLARDB_PROXY
+					int col_count = PQnfields(res);
+					int32_t read_only_val = 0;
+					uint64_t lsn = 0;
+					bool is_available = true;
+
+					if (col_count >= 3) {
+						// PolarDB query result: node_type, is_available, current_lsn.
+						const char* col0 { PQgetvalue(res, 0, 0) };
+						const char* col1 { PQgetvalue(res, 0, 1) };
+						const char* col2 { PQgetvalue(res, 0, 2) };
+#if POLARDB_PROXY && POLARDB_DEBUG
+						PolarDB_DebugMonitorHealth debug_health;
+						if (polardb_debug_monitor_health_override(
+									st.task.op_st.srv_info, debug_health)) {
+							col0 = debug_health.node_type;
+							col1 = debug_health.is_available;
+							col2 = debug_health.lsn;
+						}
+#endif
+
+						PolarDB_HealthCheck health;
+						parse_polardb_full_health_check(col0, col1, col2, health);
+						uint32_t lsn_logid = 0;
+						uint32_t lsn_offset = 0;
+						const bool availability_valid =
+							col1 && (col1[0] == 't' || col1[0] == 'T' ||
+								col1[0] == 'f' || col1[0] == 'F') &&
+							col1[1] == '\0';
+						int parsed_lsn_len = 0;
+						const bool invalid_lsn_text =
+							!col2 ||
+							sscanf(col2, "%X/%X%n", &lsn_logid, &lsn_offset, &parsed_lsn_len) != 2 ||
+							col2[parsed_lsn_len] != '\0';
+						// ProxySQL routes only primary/master, replica, and standby
+						// roles. PolarDB can return the literal role "unknown" for
+						// POLAR_UNKNOWN while a node has no established role yet, or
+						// for POLAR_STANDALONE_DATAMAX. Both parse as UNKNOWN here.
+						// Treat that as an invalid routing role, not corrupt data. A
+						// valid zero LSN is allowed; the LSN update gate ignores it.
+						const bool invalid_role =
+							health.node_type == PolarDB_NodeType::UNKNOWN;
+						const bool invalid_values =
+							!availability_valid || invalid_lsn_text;
+						// Use only the strictly parsed LSN. A partial parse such as
+						// "FFFFFFFF/FFFFFFFFjunk" must not seed the per-server cache
+						// or the primary LSN mirror with a value that never came from
+						// a valid monitor row.
+						if (!invalid_lsn_text) {
+							health.current_lsn =
+								(static_cast<uint64_t>(lsn_logid) << 32) | lsn_offset;
+						} else {
+							health.current_lsn = 0;
+						}
+						if (invalid_role) {
+							PgHGM->status.polardb_monitor_health_invalid_role.fetch_add(
+								1, std::memory_order_relaxed);
+						}
+						if (invalid_values) {
+							PgHGM->status.polardb_monitor_health_invalid_values.fetch_add(
+								1, std::memory_order_relaxed);
+						}
+						if (invalid_role || invalid_values) {
+							proxy_warning(
+								"PolarDB: monitor health row from %s:%d has invalid role or values "
+								"(node_type='%s', is_available='%s', lsn='%s', "
+								"invalid_role=%d, invalid_availability=%d, invalid_lsn=%d); "
+								"using safe monitor defaults for the invalid fields\n",
+								st.task.op_st.srv_info.addr.c_str(),
+								st.task.op_st.srv_info.port,
+								col0 ? col0 : "",
+								col1 ? col1 : "",
+								col2 ? col2 : "",
+								invalid_role ? 1 : 0,
+								availability_valid ? 0 : 1,
+								invalid_lsn_text ? 1 : 0);
+							if (invalid_role) {
+								health.is_available = false;
+							} else if (!availability_valid) {
+								health.is_available = true;
+							}
+						}
+
+						read_only_val = PolarDB_Protocol::node_type_to_read_only(health.node_type);
+						is_available = health.is_available;
+						lsn = health.current_lsn;
+					} else {
+						// Standard PostgreSQL: pg_is_in_recovery() = 't' or 'f'.
+						const char* value_str { PQgetvalue(res, 0, 0) };
+						read_only_val = (strcmp(value_str, "t") == 0) ? 1 : 0;
+					}
+
+					set_finish_st(st, ASYNC_QUERY_END,
+						op_result_t {
+							new readonly_res_t { read_only_val, lsn, is_available },
+							[] (void* v) { delete static_cast<readonly_res_t*>(v); }
+						}
+					);
+#else
 					const char* value_str { PQgetvalue(res, 0, 0) };
 					bool value { strcmp(value_str, "t") == 0 };
 
@@ -696,6 +888,7 @@ short handle_async_check_cont(state_t& st, short _) {
 							[] (void* v) { delete static_cast<readonly_res_t*>(v); }
 						}
 					);
+#endif // POLARDB_PROXY
 				} else if (st.task.type == task_type_t::repl_lag) {
 					const char* value_str { PQgetvalue(res, 0, 0) };
 					int32_t value { std::atoi(value_str) };
@@ -821,6 +1014,14 @@ string get_task_query(const state_t& st) {
 	if (task_type == task_type_t::ping) {
 		return PING_QUERY;
 	} else if (task_type == task_type_t::readonly) {
+#if POLARDB_PROXY
+		// PolarDB hostgroups use the 3-column health query (node_type /
+		// is_available / current_lsn); standard PG uses pg_is_in_recovery().
+		const mon_srv_t& srv { st.task.op_st.srv_info };
+		if (strcasecmp(srv.check_type.c_str(), "polardb") == 0) {
+			return POLARDB_CHECK_WITH_LSN_QUERY;
+		}
+#endif // POLARDB_PROXY
 		return READ_ONLY_QUERY;
 	} else if (task_type == task_type_t::repl_lag) {
 		repl_lag_params_t* params {
@@ -1856,9 +2057,42 @@ void perf_readonly_actions(SQLite3DB* db, state_t& state) {
 
 		if (is_task_success(state.conn, state.task)) {
 			readonly_res_t* op_result { static_cast<readonly_res_t*>(op_st.op_result.get()) };
-			PgHGM->read_only_action_v2(
-				{{ srv.addr, srv.port, op_result->val }}, params->writer_is_also_reader
-			);
+			bool apply_read_only_action = true;
+
+#if POLARDB_PROXY
+			// PolarDB: shun the server if polar_is_available() reported maintenance
+			// mode. Standard PG backends always report is_available=true, so this is
+			// a no-op for them. Recovery is automatic once a later check returns
+			// is_available=true (shun recovery timer).
+			if (!op_result->is_available) {
+				proxy_warning(
+					"PolarDB: server %s:%d reports not available (maintenance mode), shunning\n",
+					srv.addr.c_str(), srv.port
+				);
+				PgHGM->shun_and_killall(const_cast<char*>(srv.addr.c_str()), srv.port);
+				apply_read_only_action = false;
+			}
+#endif // POLARDB_PROXY
+
+			if (apply_read_only_action) {
+				PgHGM->read_only_action_v2(
+					{{ srv.addr, srv.port, op_result->val }}, params->writer_is_also_reader
+				);
+			}
+
+#if POLARDB_PROXY
+			// PolarDB: feed the per-server LSN cache for consistency routing.
+			// Gated by pgsql-polardb_monitor_lsn_updates (default on). polardb_update_server_lsn()
+			// itself no-ops unless a PolarDB hostgroup is configured. The monitor worker
+			// refreshes thread-locals (refresh_variables()), so this per-thread copy is valid.
+			if (op_result->is_available &&
+					polardb_should_update_monitor_lsn(
+						pgsql_thread___polardb_monitor_lsn_updates, op_result->lsn)) {
+				if (PgHGM->polardb_update_server_lsn(srv.addr.c_str(), srv.port, op_result->lsn)) {
+					PgHGM->status.polardb_lsn_updates_from_monitor.fetch_add(1, std::memory_order_relaxed);
+				}
+			}
+#endif // POLARDB_PROXY
 		} else {
 			char* err { nullptr };
 			unique_ptr<SQLite3_result> resultset { db->execute_statement(q_fmt.str.c_str(), &err) };
