@@ -88,16 +88,25 @@ static void polardb_account_wrapper_set_error(PgSQL_Connection* conn, const PGre
 	// With no live wait there is nothing to charge; still mark the wrap-state
 	// failed so the result loop stops consuming and surfaces the error.
 	PgSQL_Session* sess = conn->myds ? conn->myds->sess : nullptr;
-	if (!sess || !sess->polardb_wait_active()) {
+	const bool wait_active = sess && sess->polardb_wait_active();
+	const bool is_lsn_timeout = wait_active && polardb_is_lsn_wait_timeout_result(result);
+	const PolarDB_WrapperErrorAccounting accounting =
+		polardb_wrapper_error_accounting(
+			conn->polardb_query_wrap_state.was_wrapped,
+			wait_active,
+			is_lsn_timeout,
+			conn->polardb_query_wrap_state.consuming_wrapper_set());
+	if (!wait_active) {
 		POLARDB_TRACE("PolarDB WAIT: mark wrapper failed without accounting "
 			"sess=%p wait_active=%d pending=%u\n",
-			(void*)sess, sess && sess->polardb_wait_active() ? 1 : 0,
+			(void*)sess, wait_active ? 1 : 0,
 			conn->polardb_query_wrap_state.stmt_pending);
-		conn->polardb_query_wrap_state.mark_wrapper_set_failed();
+		if (accounting.mark_wrapper_failed) {
+			conn->polardb_query_wrap_state.mark_wrapper_set_failed();
+		}
 		return;
 	}
 
-	const bool is_lsn_timeout = polardb_is_lsn_wait_timeout_result(result);
 	POLARDB_TRACE("PolarDB WAIT: account check sess=%p wait_active=%d "
 		"wait_type=%d wait_started=%lu pending=%u is_lsn_timeout=%d\n",
 		(void*)sess, sess->polardb_wait_active() ? 1 : 0,
@@ -111,11 +120,14 @@ static void polardb_account_wrapper_set_error(PgSQL_Connection* conn, const PGre
 	// then the backend raises ERROR before running the user SELECT. Count it only
 	// when the structured marker is present AND the wait is still active, so an
 	// ordinary user-query error that happens to resemble a timeout is not counted.
-	if (is_lsn_timeout) {
+	if (accounting.mark_timeout_error) {
+		sess->polardb_query.wait.timeout_error = true;
+	}
+	if (accounting.account_wait_timeout) {
 		sess->polardb_account_wait_timeout("result-error");
 	}
 
-	if (conn->polardb_query_wrap_state.consuming_wrapper_set()) {
+	if (accounting.mark_wrapper_failed) {
 		conn->polardb_query_wrap_state.mark_wrapper_set_failed();
 		POLARDB_TRACE("PolarDB WAIT: wrapper SET failure marked\n");
 	}

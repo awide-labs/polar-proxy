@@ -932,7 +932,31 @@ public:
 private:
 #if POLARDB_PROXY
 	/**
-	 * @brief Fail closed when the wait wrapper cannot be built or installed.
+	 * @brief Captured state for one failed wait-wrapped replica read.
+	 *
+	 * This snapshot is collected before normal error handling mutates the
+	 * replica data stream. Retry code uses it to decide whether one autocommit
+	 * wait-wrapped read can run again on the primary after a strict wait timeout
+	 * or a lost replica connection. It does not cover ordinary SQL errors,
+	 * transaction retry, or split reads.
+	 */
+	struct PolarDB_WaitReadFailure {
+		PgSQL_Data_Stream* failed_myds = NULL;
+		bool wait_read = false;
+		bool result_started = false;
+		bool wrapper_set_failure = false;
+		bool timeout_error = false;
+		bool connection_lost = false;
+		bool can_return_to_pool = false;
+		int reader_hg = -1;
+		std::string reader_address;
+		int reader_port = 0;
+		int fallback_writer_hg = -1;
+		std::string original_query;
+	};
+
+	/**
+	 * @brief Stop safely when the wait wrapper cannot be built or installed.
 	 *
 	 * Counts the abort, logs @p reason, latches polardb_wait_disabled so later
 	 * reads in this session go to the writer until RESET, and clears the half-built
@@ -940,6 +964,18 @@ private:
 	 * caller must stop before running the query and return a clean error.
 	 */
 	PolarDB_WrapFinalizeResult fail_wait_wrap_finalize(const char* reason);
+	/** @brief Capture retry-relevant details from a failed wait-wrapped replica read. */
+	PolarDB_WaitReadFailure polardb_capture_wait_read_failure(PgSQL_Data_Stream* failed_myds);
+	/**
+	 * @brief Handle a failed wait-wrapped read without redispatching wrapper SETs.
+	 *
+	 * A safe pre-result replica failure is redirected to the primary as the
+	 * original SQL. Otherwise the wrapper packet is removed and the normal
+	 * error path returns a clean client error.
+	 */
+	bool polardb_handle_failed_wait_read(const PolarDB_WaitReadFailure& failure);
+	/** @brief Build a PostgreSQL simple-query packet owned by the caller. */
+	void build_simple_query_packet(const std::string& sql, PtrSize_t& out);
 #endif // POLARDB_PROXY
 
 	int32_t extract_pid_from_param(const PgSQL_Param_Value& param, uint16_t format) const;

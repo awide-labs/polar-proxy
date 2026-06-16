@@ -62,6 +62,19 @@ public:
 		pkt.ptr = NULL;
 		QueryPtr = NULL;
 	}
+	void move_from(PgSQL_MyDS_real_query& other) {
+		// Transfer ownership of the client packet without copying bytes. This is
+		// needed when routing changes after the packet was attached to another
+		// backend data stream.
+		assert(QueryPtr == NULL);
+		assert(QuerySize == 0);
+		assert(pkt.ptr == NULL);
+		assert(pkt.size == 0);
+		pkt = other.pkt;
+		QueryPtr = other.QueryPtr;
+		QuerySize = other.QuerySize;
+		other.reset();
+	}
 };
 
 enum pgsql_sslstatus { PGSQL_SSLSTATUS_OK, PGSQL_SSLSTATUS_WANT_IO, PGSQL_SSLSTATUS_FAIL };

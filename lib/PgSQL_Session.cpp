@@ -3742,18 +3742,48 @@ handler_again:
 				if (rc == -1) {
 					// the query failed
 #if POLARDB_PROXY
-					// If the failed query (rc==-1) was the prepended wrapper SET
-					// path -- the SET failed, or its result was still being
-					// consumed -- tear down staged PolarDB wait
-					// state. Timeout accounting is deliberately not done here: only
+					// Capture the failed wait-wrapped replica read before any
+					// normal error handling mutates the replica data stream. The
+					// captured query can be retried once on the primary only if no
+					// user result reached the client; otherwise we keep the normal
+					// error path.
+					const PolarDB_WaitReadFailure polardb_failure =
+						polardb_capture_wait_read_failure(myds);
+					POLARDB_TRACE(
+						"PolarDB WAIT: rc=-1 wait_active=%d wait_read=%d wrapper_set_failure=%d "
+						"timeout_error=%d connection_lost=%d result_started=%d "
+						"wrapper_finalized=%d original_query_saved=%d can_return_to_pool=%d "
+						"retry_writer_hg=%d\n",
+						polardb_wait_active() ? 1 : 0,
+						polardb_failure.wait_read ? 1 : 0,
+						polardb_failure.wrapper_set_failure ? 1 : 0,
+						polardb_failure.timeout_error ? 1 : 0,
+						polardb_failure.connection_lost ? 1 : 0,
+						polardb_failure.result_started ? 1 : 0,
+						polardb_query.wait.wrapper_finalized ? 1 : 0,
+						polardb_failure.original_query.empty() ? 0 : 1,
+						polardb_failure.can_return_to_pool ? 1 : 0,
+						polardb_failure.fallback_writer_hg);
+					if (polardb_failure.wait_read && polardb_failure.connection_lost) {
+						POLARDB_THREAD_COUNT_ONE(thread, wait_error_connection_lost);
+					}
+					if (polardb_handle_failed_wait_read(polardb_failure)) {
+						NEXT_IMMEDIATE(CONNECTING_SERVER);
+					}
+
+					// If the failed query was the prepended wrapper SET path and
+					// retry was not possible, tear down staged PolarDB wait state
+					// before falling through to ProxySQL's existing error handling.
+					// Timeout accounting is deliberately not done here: only
 					// marker-confirmed PolarDB timeout events are charged by
 					// polardb_account_wait_timeout() in the notice/result paths.
-					const bool wrapper_set_failure = myconn &&
-						(myconn->polardb_query_wrap_state.wrapper_set_failed() ||
-						 myconn->polardb_query_wrap_state.consuming_wrapper_set());
-					POLARDB_TRACE("PolarDB WAIT: rc=-1 wait_active=%d wrapper_set_failure=%d\n",
-						polardb_wait_active() ? 1 : 0, wrapper_set_failure ? 1 : 0);
-					if (polardb_wait_active() && wrapper_set_failure &&
+					// The condition is intentionally limited to wrapper, timeout, or
+					// reader connection loss failures; ordinary SQL errors must keep
+					// the normal error flow.
+					if (polardb_wait_active() &&
+						(polardb_failure.wrapper_set_failure ||
+						 polardb_failure.timeout_error ||
+						 polardb_failure.connection_lost) &&
 						polardb_query.wait.wait_started_at_us != 0) {
 						record_wait_latency(polardb_query.wait);  // account the failed wait's elapsed time
 						polardb_query.reset_wait();
