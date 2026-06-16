@@ -17,6 +17,12 @@ extern ProxySQL_Admin *GloAdmin;
 
 static __thread Command_Counter* _thr_commands_counters[PGSQL_QUERY___NONE];
 
+#if POLARDB_PROXY
+static const int PGSQL_QUERY_RULE_TEXT_FIELDS = 36;
+#else
+static const int PGSQL_QUERY_RULE_TEXT_FIELDS = 35;
+#endif // POLARDB_PROXY
+
 static char* commands_counters_desc[PGSQL_QUERY___NONE] = {
 	[PGSQL_QUERY_SELECT] = (char*)"SELECT",
 	[PGSQL_QUERY_INSERT] = (char*)"INSERT",
@@ -174,7 +180,7 @@ static char* commands_counters_desc[PGSQL_QUERY___NONE] = {
 };
 
 PgSQL_Rule_Text::PgSQL_Rule_Text(const PgSQL_Query_Processor_Rule_t* pqr) {
-	num_fields = 35; // this count the number of fields
+	num_fields = PGSQL_QUERY_RULE_TEXT_FIELDS;
 	pta = NULL;
 	pta = (char**)malloc(sizeof(char*) * num_fields);
 	itostr(pta[0], (long long)pqr->rule_id);
@@ -226,12 +232,22 @@ PgSQL_Rule_Text::PgSQL_Rule_Text(const PgSQL_Query_Processor_Rule_t* pqr) {
 	pta[27] = strdup_null(pqr->OK_msg);
 	itostr(pta[28], (long long)pqr->sticky_conn);
 	itostr(pta[29], (long long)pqr->multiplex);
-
+#if POLARDB_PROXY
+	// PolarDB query rules carry replica_eligible between multiplex and log, so
+	// the serialized runtime row keeps the same column order as the admin table.
+	itostr(pta[30], (long long)pqr->replica_eligible);
+	itostr(pta[31], (long long)pqr->log);
+	itostr(pta[32], (long long)pqr->apply);
+	pta[33] = strdup_null(pqr->attributes);
+	pta[34] = strdup_null(pqr->comment); // issue #643
+	itostr(pta[35], (long long)pqr->hits);
+#else
 	itostr(pta[30], (long long)pqr->log);
 	itostr(pta[31], (long long)pqr->apply);
 	pta[32] = strdup_null(pqr->attributes);
 	pta[33] = strdup_null(pqr->comment); // issue #643
 	itostr(pta[34], (long long)pqr->hits);
+#endif // POLARDB_PROXY
 }
 
 PgSQL_Query_Processor::PgSQL_Query_Processor() : 
@@ -324,7 +340,11 @@ PgSQL_Query_Processor_Rule_t* PgSQL_Query_Processor::new_query_rule(int rule_id,
 	const char* proxy_addr, int proxy_port, const char* digest, const char* match_digest, const char* match_pattern, bool negate_match_pattern,
 	const char* re_modifiers, int flagOUT, const char* replace_pattern, int destination_hostgroup, int cache_ttl, int cache_empty_result,
 	int cache_timeout, int reconnect, int timeout, int retries, int delay, int next_query_flagIN, int mirror_flagOUT,
-	int mirror_hostgroup, const char* error_msg, const char* OK_msg, int sticky_conn, int multiplex, int log,
+	int mirror_hostgroup, const char* error_msg, const char* OK_msg, int sticky_conn, int multiplex,
+#if POLARDB_PROXY
+	int replica_eligible,
+#endif // POLARDB_PROXY
+	int log,
 	bool apply, const char* attributes, const char* comment) {
 
 	PgSQL_Query_Processor_Rule_t* newQR = (PgSQL_Query_Processor_Rule_t*)malloc(sizeof(PgSQL_Query_Processor_Rule_t));
@@ -368,6 +388,9 @@ PgSQL_Query_Processor_Rule_t* PgSQL_Query_Processor::new_query_rule(int rule_id,
 	newQR->OK_msg = (OK_msg ? strdup(OK_msg) : NULL);
 	newQR->sticky_conn = sticky_conn;
 	newQR->multiplex = multiplex;
+#if POLARDB_PROXY
+	newQR->replica_eligible = replica_eligible;
+#endif // POLARDB_PROXY
 	newQR->apply = apply;
 	newQR->attributes = (attributes ? strdup(attributes) : NULL);
 	newQR->comment = (comment ? strdup(comment) : NULL); // see issue #643
@@ -503,6 +526,9 @@ PgSQL_Query_Processor_Rule_t* PgSQL_Query_Processor::new_query_rule(const PgSQL_
 	newQR->OK_msg = (pqr->OK_msg ? strdup(pqr->OK_msg) : NULL);
 	newQR->sticky_conn = pqr->sticky_conn;
 	newQR->multiplex = pqr->multiplex;
+#if POLARDB_PROXY
+	newQR->replica_eligible = pqr->replica_eligible;
+#endif // POLARDB_PROXY
 	newQR->apply = pqr->apply;
 	newQR->attributes = (pqr->attributes ? strdup(pqr->attributes) : NULL);
 	newQR->comment = (pqr->comment ? strdup(pqr->comment) : NULL); // see issue #643
@@ -582,7 +608,7 @@ PgSQL_Query_Processor_Rule_t* PgSQL_Query_Processor::new_query_rule(const PgSQL_
 
 SQLite3_result* PgSQL_Query_Processor::get_current_query_rules() {
 	proxy_debug(PROXY_DEBUG_MYSQL_QUERY_PROCESSOR, 4, "Dumping current query rules, using Global version %d\n", version);
-	SQLite3_result* result = new SQLite3_result(35);
+	SQLite3_result* result = new SQLite3_result(PGSQL_QUERY_RULE_TEXT_FIELDS);
 	PgSQL_Query_Processor_Rule_t* qr1;
 	rdlock();
 	result->add_column_definition(SQLITE_TEXT, "rule_id");
@@ -615,6 +641,9 @@ SQLite3_result* PgSQL_Query_Processor::get_current_query_rules() {
 	result->add_column_definition(SQLITE_TEXT, "OK_msg");
 	result->add_column_definition(SQLITE_TEXT, "sticky_conn");
 	result->add_column_definition(SQLITE_TEXT, "multiplex");
+#if POLARDB_PROXY
+	result->add_column_definition(SQLITE_TEXT, "replica_eligible");
+#endif // POLARDB_PROXY
 	result->add_column_definition(SQLITE_TEXT, "log");
 	result->add_column_definition(SQLITE_TEXT, "apply");
 	result->add_column_definition(SQLITE_TEXT, "attributes");

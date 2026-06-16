@@ -1002,6 +1002,11 @@ FlushVariableStats ProxySQL_Admin::flush_pgsql_variables___database_to_runtime(S
 		free(default_client_encoding);
 		GloPTH->commit();
 		GloPTH->wrunlock();
+#if POLARDB_PROXY
+		if (PgHGM) {
+			PgHGM->polardb_warn_config_mismatches();
+		}
+#endif // POLARDB_PROXY
 
 			{
 				// NOTE: 'GloPTH->wrunlock()' should have been called before this point to avoid possible

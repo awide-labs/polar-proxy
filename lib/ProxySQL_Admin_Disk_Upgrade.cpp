@@ -659,5 +659,54 @@ void ProxySQL_Admin::disk_upgrade_pgsql_replication_hostgroups() {
 		);
 	}
 
+#if POLARDB_PROXY
+	// PolarDB LSN upgrade: V3_0_2 -> V3_0_3 (add check_type='polardb',
+	// consistency_mode, max_lag_bytes, lsn_wait_timeout_ms).
+	// Only present in the PolarDB build; the =0 build keeps the V3_0_2 schema.
+	rci = configdb->check_table_structure(
+		const_cast<char*>("pgsql_replication_hostgroups"),
+		const_cast<char*>(ADMIN_SQLITE_TABLE_PGSQL_REPLICATION_HOSTGROUPS_V3_0_2)
+	);
+
+	if (rci) {
+		proxy_warning("Detected version 3.0.2 of table 'pgsql_replication_hostgroups'\n");
+		proxy_warning("ONLINE UPGRADE of table 'pgsql_replication_hostgroups' in progress\n");
+		configdb->execute("DROP TABLE IF EXISTS pgsql_replication_hostgroups_v302");
+		configdb->execute("ALTER TABLE pgsql_replication_hostgroups RENAME TO pgsql_replication_hostgroups_v302");
+		configdb->build_table(
+			const_cast<char*>("pgsql_replication_hostgroups"),
+			const_cast<char*>(ADMIN_SQLITE_TABLE_PGSQL_REPLICATION_HOSTGROUPS),
+			false
+		);
+		configdb->execute(
+			"INSERT INTO pgsql_replication_hostgroups(writer_hostgroup, reader_hostgroup, check_type, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, comment)"
+				" SELECT writer_hostgroup, reader_hostgroup, check_type, 'default', -1, -1, comment FROM pgsql_replication_hostgroups_v302"
+		);
+	}
+
+	// PolarDB RFQ config upgrade: V3_0_3 -> V3_0_4
+	// (add per-replication-hostgroup proxy_protocol with global inheritance).
+	rci = configdb->check_table_structure(
+		const_cast<char*>("pgsql_replication_hostgroups"),
+		const_cast<char*>(ADMIN_SQLITE_TABLE_PGSQL_REPLICATION_HOSTGROUPS_V3_0_3)
+	);
+
+	if (rci) {
+		proxy_warning("Detected version 3.0.3 of table 'pgsql_replication_hostgroups'\n");
+		proxy_warning("ONLINE UPGRADE of table 'pgsql_replication_hostgroups' in progress\n");
+		configdb->execute("DROP TABLE IF EXISTS pgsql_replication_hostgroups_v303");
+		configdb->execute("ALTER TABLE pgsql_replication_hostgroups RENAME TO pgsql_replication_hostgroups_v303");
+		configdb->build_table(
+			const_cast<char*>("pgsql_replication_hostgroups"),
+			const_cast<char*>(ADMIN_SQLITE_TABLE_PGSQL_REPLICATION_HOSTGROUPS),
+			false
+		);
+		configdb->execute(
+			"INSERT INTO pgsql_replication_hostgroups(writer_hostgroup, reader_hostgroup, check_type, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment)"
+				" SELECT writer_hostgroup, reader_hostgroup, check_type, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, 'default', comment FROM pgsql_replication_hostgroups_v303"
+		);
+	}
+#endif // POLARDB_PROXY
+
 	configdb->execute("PRAGMA foreign_keys = ON");
 }

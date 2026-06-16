@@ -1489,8 +1489,15 @@ void update_pgsql_replication_hostgroups(SQLite3_result* resultset) {
 	}
 
 	const char* q =
+#if POLARDB_PROXY
+		"INSERT INTO pgsql_replication_hostgroups "
+		"(writer_hostgroup, reader_hostgroup, check_type, consistency_mode, "
+		"max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment)"
+		" VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
+#else
 		"INSERT INTO pgsql_replication_hostgroups (writer_hostgroup, reader_hostgroup, check_type, comment)"
 		" VALUES (?1, ?2, ?3, ?4)";
+#endif // POLARDB_PROXY
 
 	auto [rc1, statement1_unique] = GloAdmin->admindb->prepare_v2(q);
 	ASSERT_SQLITE_OK(rc1, GloAdmin->admindb);
@@ -1501,7 +1508,15 @@ void update_pgsql_replication_hostgroups(SQLite3_result* resultset) {
 		rc = (*proxy_sqlite3_bind_int64)(statement1, 1, atoll(row->fields[0])); ASSERT_SQLITE_OK(rc, GloAdmin->admindb);
 		rc = (*proxy_sqlite3_bind_int64)(statement1, 2, atoll(row->fields[1])); ASSERT_SQLITE_OK(rc, GloAdmin->admindb);
 		rc = (*proxy_sqlite3_bind_text)(statement1, 3, row->fields[2] ? row->fields[2] : "", -1, SQLITE_TRANSIENT); ASSERT_SQLITE_OK(rc, GloAdmin->admindb);
+#if POLARDB_PROXY
 		rc = (*proxy_sqlite3_bind_text)(statement1, 4, row->fields[3] ? row->fields[3] : "", -1, SQLITE_TRANSIENT); ASSERT_SQLITE_OK(rc, GloAdmin->admindb);
+		rc = (*proxy_sqlite3_bind_int64)(statement1, 5, atoll(row->fields[4])); ASSERT_SQLITE_OK(rc, GloAdmin->admindb);
+		rc = (*proxy_sqlite3_bind_int64)(statement1, 6, atoll(row->fields[5])); ASSERT_SQLITE_OK(rc, GloAdmin->admindb);
+		rc = (*proxy_sqlite3_bind_text)(statement1, 7, row->fields[6] ? row->fields[6] : "", -1, SQLITE_TRANSIENT); ASSERT_SQLITE_OK(rc, GloAdmin->admindb);
+		rc = (*proxy_sqlite3_bind_text)(statement1, 8, row->fields[7] ? row->fields[7] : "", -1, SQLITE_TRANSIENT); ASSERT_SQLITE_OK(rc, GloAdmin->admindb);
+#else
+		rc = (*proxy_sqlite3_bind_text)(statement1, 4, row->fields[3] ? row->fields[3] : "", -1, SQLITE_TRANSIENT); ASSERT_SQLITE_OK(rc, GloAdmin->admindb);
+#endif // POLARDB_PROXY
 
 		SAFE_SQLITE3_STEP2(statement1);
 		rc = (*proxy_sqlite3_clear_bindings)(statement1); ASSERT_SQLITE_OK(rc, GloAdmin->admindb);

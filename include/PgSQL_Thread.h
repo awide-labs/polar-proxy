@@ -41,6 +41,27 @@ constexpr const char* AUTHENTICATION_METHOD_STR[] = {
 #define MY_EPOLL_THREAD_MAXEVENTS 128
 */
 
+#if POLARDB_PROXY
+// PolarDB consistency-mode integer constants used where an int plus -1 sentinel
+// is needed (thread variables, HG policy, admin SQL). The values align with
+// PolarDB_ConsistencyMode.
+constexpr int POLARDB_CONSISTENCY_OFF     = 0;  // No consistency routing
+constexpr int POLARDB_CONSISTENCY_LSN     = 1;  // LSN-based read-your-own-writes (per-session)
+constexpr int POLARDB_CONSISTENCY_PRIMARY = 3;  // Force all reads to the primary
+
+// User-facing PolarDB proxy protocol dialect. Hostgroup config may use -1 to
+// inherit the global pgsql-polardb_proxy_protocol value.
+constexpr int POLARDB_PROXY_PROTOCOL_OFF    = 0;
+constexpr int POLARDB_PROXY_PROTOCOL_LEGACY = 1;
+constexpr int POLARDB_PROXY_PROTOCOL_V15    = 2;
+
+constexpr int POLARDB_RFQ_POLICY_BEST_EFFORT = 1;
+constexpr int POLARDB_RFQ_POLICY_STRICT      = 2;
+
+constexpr int POLARDB_SESSION_LSN_BASELINE_OBSERVED = 1;
+constexpr int POLARDB_SESSION_LSN_BASELINE_PRIMARY  = 2;
+#endif // POLARDB_PROXY
+
 #define ADMIN_HOSTGROUP	(-2)
 #define STATS_HOSTGROUP	(-3)
 #define SQLITE_HOSTGROUP (-4)
@@ -990,6 +1011,23 @@ public:
 		bool autocommit_false_is_transaction;
 		bool verbose_query_error;
 		int max_allowed_packet;
+#if POLARDB_PROXY
+		// PolarDB LSN session-consistency knobs. The mode knobs are word-valued
+		// (validated to off|lsn|primary and best_effort|strict); the
+		// rest are integer/bool.
+		char* polardb_consistency_mode;       // off | lsn | primary
+		int polardb_lag_bytes;                // reader lag-cap (bytes); 0=off
+		int polardb_lag_ms;                   // reserved ms lag cap; T13 accepts only 0, no PgSQL producer yet
+		int polardb_lag_wait_ms;              // polar_xact_split_wait_lsn timeout (ms); 0=wait indefinitely
+		int polardb_lsn_freshness_ms;         // max age of a cached per-server LSN to trust
+		bool polardb_monitor_lsn_updates;     // enable monitor LSN cache updates
+		char* polardb_wait_timeout_mode;      // best_effort | strict
+		char* polardb_proxy_protocol;         // v15 | legacy | off
+		char* polardb_route_rfq_policy;       // strict | best_effort
+		char* polardb_session_lsn_baseline;   // observed | primary
+		char* polardb_proxy_identity_host;    // empty or IP literal
+		int polardb_proxy_identity_port;      // 0..65535
+#endif // POLARDB_PROXY
 		bool automatic_detect_sqli;
 		bool firewall_whitelist_enabled;
 		bool use_tcp_keepalive;

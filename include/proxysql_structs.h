@@ -1134,6 +1134,25 @@ __thread int pgsql_thread___free_connections_pct;
 __thread bool pgsql_thread___kill_backend_connection_when_disconnect;
 __thread int pgsql_thread___max_allowed_packet;
 
+#if POLARDB_PROXY
+/* PolarDB LSN session-consistency knobs. The consistency/wait mode knobs are
+ * stored here as ints (off=0/lsn=1/primary=3,
+ * best_effort=1/strict=2); the admin string<->int mapping lives in
+ * PgSQL_Thread.cpp. */
+__thread int pgsql_thread___polardb_consistency_mode;        // off=0, lsn=1, primary=3
+__thread int pgsql_thread___polardb_lag_bytes;               // reader lag-cap (bytes); 0=off
+__thread int pgsql_thread___polardb_lag_ms;                  // reserved ms lag cap; T13 accepts only 0, no PgSQL producer yet
+__thread int pgsql_thread___polardb_lag_wait_ms;             // polar_xact_split_wait_lsn timeout (ms); 0=wait indefinitely
+__thread int pgsql_thread___polardb_lsn_freshness_ms;        // max age of a cached per-server LSN to trust
+__thread bool pgsql_thread___polardb_monitor_lsn_updates;    // enable monitor LSN cache updates
+__thread int pgsql_thread___polardb_wait_timeout_mode;       // best_effort=1, strict=2
+__thread int pgsql_thread___polardb_proxy_protocol;          // off=0, legacy=1, v15=2
+__thread int pgsql_thread___polardb_route_rfq_policy;        // best_effort=1, strict=2
+__thread int pgsql_thread___polardb_session_lsn_baseline;    // observed=1, primary=2
+__thread char* pgsql_thread___polardb_proxy_identity_host;   // empty or IP literal
+__thread int pgsql_thread___polardb_proxy_identity_port;     // 0..65535
+#endif // POLARDB_PROXY
+
 /* variables used for SSL , from proxy to server (p2s) */
 __thread char* pgsql_thread___ssl_p2s_ca;
 __thread char* pgsql_thread___ssl_p2s_capath;
@@ -1476,6 +1495,21 @@ extern __thread int pgsql_thread___unshun_algorithm;
 extern __thread int pgsql_thread___free_connections_pct;
 extern __thread bool pgsql_thread___kill_backend_connection_when_disconnect;
 extern __thread int pgsql_thread___max_allowed_packet;
+
+#if POLARDB_PROXY
+extern __thread int pgsql_thread___polardb_consistency_mode;
+extern __thread int pgsql_thread___polardb_lag_bytes;
+extern __thread int pgsql_thread___polardb_lag_ms;
+extern __thread int pgsql_thread___polardb_lag_wait_ms;
+extern __thread int pgsql_thread___polardb_lsn_freshness_ms;
+extern __thread bool pgsql_thread___polardb_monitor_lsn_updates;
+extern __thread int pgsql_thread___polardb_wait_timeout_mode;
+extern __thread int pgsql_thread___polardb_proxy_protocol;
+extern __thread int pgsql_thread___polardb_route_rfq_policy;
+extern __thread int pgsql_thread___polardb_session_lsn_baseline;
+extern __thread char* pgsql_thread___polardb_proxy_identity_host;
+extern __thread int pgsql_thread___polardb_proxy_identity_port;
+#endif // POLARDB_PROXY
 
 extern __thread char* pgsql_thread___ssl_p2s_ca;
 extern __thread char* pgsql_thread___ssl_p2s_capath;

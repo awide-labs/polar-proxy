@@ -1732,7 +1732,15 @@ int ProxySQL_Config::Write_PgSQL_Servers_to_configfile(std::string& data) {
 				addField(data, "writer_hostgroup", r->fields[0], "");
 				addField(data, "reader_hostgroup", r->fields[1], "");
 				addField(data, "check_type", r->fields[2]);
+#if POLARDB_PROXY
+				addField(data, "consistency_mode", r->fields[3]);
+				addField(data, "max_lag_bytes", r->fields[4], "");
+				addField(data, "lsn_wait_timeout_ms", r->fields[5], "");
+				addField(data, "proxy_protocol", r->fields[6]);
+				addField(data, "comment", r->fields[7]);
+#else
 				addField(data, "comment", r->fields[3]);
+#endif // POLARDB_PROXY
 
 				data += "\t}";
 				isNext = true;
@@ -1816,13 +1824,23 @@ int ProxySQL_Config::Read_PgSQL_Servers_from_configfile(std::string& error) {
 	if (root.exists("pgsql_replication_hostgroups") == true) {
 		const Setting& pgsql_replication_hostgroups = root["pgsql_replication_hostgroups"];
 		int count = pgsql_replication_hostgroups.getLength();
+#if POLARDB_PROXY
+		char* q = (char*)"INSERT OR REPLACE INTO pgsql_replication_hostgroups (writer_hostgroup, reader_hostgroup, check_type, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment) VALUES (%d, %d, '%s', '%s', %d, %d, '%s', '%s')";
+#else
 		char* q = (char*)"INSERT OR REPLACE INTO pgsql_replication_hostgroups (writer_hostgroup, reader_hostgroup, comment, check_type) VALUES (%d, %d, '%s', '%s')";
+#endif // POLARDB_PROXY
 		for (i = 0; i < count; i++) {
 			const Setting& line = pgsql_replication_hostgroups[i];
 			int writer_hostgroup;
 			int reader_hostgroup;
 			std::string comment = "";
 			std::string check_type = "";
+#if POLARDB_PROXY
+			std::string consistency_mode = "default";
+			std::string proxy_protocol = "default";
+			int max_lag_bytes = -1;
+			int lsn_wait_timeout_ms = -1;
+#endif // POLARDB_PROXY
 			if (line.lookupValue("writer_hostgroup", writer_hostgroup) == false) {
 				proxy_error("Admin: detected a pgsql_replication_hostgroups in config file without a mandatory writer_hostgroup\n");
 				continue;
@@ -1835,6 +1853,28 @@ int ProxySQL_Config::Read_PgSQL_Servers_from_configfile(std::string& error) {
 			char* o1 = strdup(comment.c_str());
 			char* o = escape_string_single_quotes(o1, false);
 			line.lookupValue("check_type", check_type);
+#if POLARDB_PROXY
+			if (strcasecmp(check_type.c_str(), (char*)"read_only") &&
+				strcasecmp(check_type.c_str(), (char*)"polardb")) {
+				check_type = "read_only";
+			}
+			line.lookupValue("consistency_mode", consistency_mode);
+			if (strcasecmp(consistency_mode.c_str(), (char*)"default") &&
+				strcasecmp(consistency_mode.c_str(), (char*)"off") &&
+				strcasecmp(consistency_mode.c_str(), (char*)"lsn") &&
+				strcasecmp(consistency_mode.c_str(), (char*)"primary")) {
+				consistency_mode = "default";
+			}
+			line.lookupValue("max_lag_bytes", max_lag_bytes);
+			line.lookupValue("lsn_wait_timeout_ms", lsn_wait_timeout_ms);
+			line.lookupValue("proxy_protocol", proxy_protocol);
+			if (strcasecmp(proxy_protocol.c_str(), (char*)"default") &&
+				strcasecmp(proxy_protocol.c_str(), (char*)"v15") &&
+				strcasecmp(proxy_protocol.c_str(), (char*)"legacy") &&
+				strcasecmp(proxy_protocol.c_str(), (char*)"off")) {
+				proxy_protocol = "default";
+			}
+#else
 			if (
 				(strcasecmp(check_type.c_str(), (char*)"read_only"))
 				&& (strcasecmp(check_type.c_str(), (char*)"innodb_read_only"))
@@ -1842,16 +1882,32 @@ int ProxySQL_Config::Read_PgSQL_Servers_from_configfile(std::string& error) {
 				) {
 				check_type = "read_only";
 			}
+#endif // POLARDB_PROXY
 			char* t1 = strdup(check_type.c_str());
 			char* t = escape_string_single_quotes(t1, false);
+#if POLARDB_PROXY
+			char* m1 = strdup(consistency_mode.c_str());
+			char* m = escape_string_single_quotes(m1, false);
+			char* p1 = strdup(proxy_protocol.c_str());
+			char* p = escape_string_single_quotes(p1, false);
+			char* query = (char*)malloc(strlen(q) + strlen(o) + strlen(t) + strlen(m) + strlen(p) + 64);
+			sprintf(query, q, writer_hostgroup, reader_hostgroup, t, m, max_lag_bytes, lsn_wait_timeout_ms, p, o);
+#else
 			char* query = (char*)malloc(strlen(q) + strlen(o) + strlen(t) + 32);
 			sprintf(query, q, writer_hostgroup, reader_hostgroup, o, t);
+#endif // POLARDB_PROXY
 			//fprintf(stderr, "%s\n", query);
 			admindb->execute(query);
 			if (o != o1) free(o);
 			free(o1);
 			if (t != t1) free(t);
 			free(t1);
+#if POLARDB_PROXY
+			if (m != m1) free(m);
+			free(m1);
+			if (p != p1) free(p);
+			free(p1);
+#endif // POLARDB_PROXY
 			free(query);
 			rows++;
 		}
@@ -2007,10 +2063,18 @@ int ProxySQL_Config::Write_PgSQL_Query_Rules_to_configfile(std::string& data) {
 				addField(data, "OK_msg", r->fields[27]);
 				addField(data, "sticky_conn", r->fields[28], "");
 				addField(data, "multiplex", r->fields[29], "");
+#if POLARDB_PROXY
+				addField(data, "replica_eligible", r->fields[30], "");
+				addField(data, "log", r->fields[31], "");
+				addField(data, "apply", r->fields[32], "");
+				addField(data, "attributes", r->fields[33]);
+				addField(data, "comment", r->fields[34]);
+#else
 				addField(data, "log", r->fields[30], "");
 				addField(data, "apply", r->fields[31], "");
 				addField(data, "attributes", r->fields[32]);
 				addField(data, "comment", r->fields[33]);
+#endif // POLARDB_PROXY
 
 				data += "\t}";
 				isNext = true;
@@ -2035,7 +2099,11 @@ int ProxySQL_Config::Read_PgSQL_Query_Rules_from_configfile() {
 	int i;
 	int rows = 0;
 	admindb->execute("PRAGMA foreign_keys = OFF");
+#if POLARDB_PROXY
+	char* q = (char*)"INSERT OR REPLACE INTO pgsql_query_rules (rule_id, active, username, database, flagIN, client_addr, proxy_addr, proxy_port, digest, match_digest, match_pattern, negate_match_pattern, re_modifiers, flagOUT, replace_pattern, destination_hostgroup, cache_ttl, cache_empty_result, cache_timeout, reconnect, timeout, retries, delay, next_query_flagIN, mirror_flagOUT, mirror_hostgroup, error_msg, ok_msg, sticky_conn, multiplex, replica_eligible, log, apply, attributes, comment) VALUES (%d, %d, %s, %s, %s, %s, %s, %s, %s, %s, %s, %d, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %d, %s, %d, %s, %s)";
+#else
 	char* q = (char*)"INSERT OR REPLACE INTO pgsql_query_rules (rule_id, active, username, database, flagIN, client_addr, proxy_addr, proxy_port, digest, match_digest, match_pattern, negate_match_pattern, re_modifiers, flagOUT, replace_pattern, destination_hostgroup, cache_ttl, cache_empty_result, cache_timeout, reconnect, timeout, retries, delay, next_query_flagIN, mirror_flagOUT, mirror_hostgroup, error_msg, ok_msg, sticky_conn, multiplex, log, apply, attributes, comment) VALUES (%d, %d, %s, %s, %s, %s, %s, %s, %s, %s, %s, %d, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %d, %s, %s)";
+#endif // POLARDB_PROXY
 	for (i = 0; i < count; i++) {
 		const Setting& rule = pgsql_query_rules[i];
 		int rule_id;
@@ -2092,6 +2160,9 @@ int ProxySQL_Config::Read_PgSQL_Query_Rules_from_configfile() {
 
 		int sticky_conn = -1;
 		int multiplex = -1;
+#if POLARDB_PROXY
+		int replica_eligible = -1;
+#endif // POLARDB_PROXY
 
 		// variable for parsing log
 		int log = -1;
@@ -2148,6 +2219,10 @@ int ProxySQL_Config::Read_PgSQL_Query_Rules_from_configfile() {
 
 		rule.lookupValue("sticky_conn", sticky_conn);
 		rule.lookupValue("multiplex", multiplex);
+#if POLARDB_PROXY
+		rule.lookupValue("replica_eligible", replica_eligible);
+		if (replica_eligible < -1 || replica_eligible > 1) replica_eligible = -1;
+#endif // POLARDB_PROXY
 
 		rule.lookupValue("log", log);
 
@@ -2190,6 +2265,9 @@ int ProxySQL_Config::Read_PgSQL_Query_Rules_from_configfile() {
 			(OK_msg_exists ? strlen(OK_msg.c_str()) : 0) + 4 +
 			strlen(std::to_string(sticky_conn).c_str()) + 4 +
 			strlen(std::to_string(multiplex).c_str()) + 4 +
+#if POLARDB_PROXY
+			strlen(std::to_string(replica_eligible).c_str()) + 4 +
+#endif // POLARDB_PROXY
 			strlen(std::to_string(log).c_str()) + 4 +
 			strlen(std::to_string(apply).c_str()) + 4 +
 			(attributes_exists ? strlen(attributes.c_str()) : 0) + 4 +
@@ -2282,6 +2360,9 @@ int ProxySQL_Config::Read_PgSQL_Query_Rules_from_configfile() {
 			OK_msg.c_str(),
 			(sticky_conn >= 0 ? std::to_string(sticky_conn).c_str() : "NULL"),
 			(multiplex >= 0 ? std::to_string(multiplex).c_str() : "NULL"),
+#if POLARDB_PROXY
+			replica_eligible,
+#endif // POLARDB_PROXY
 			(log >= 0 ? std::to_string(log).c_str() : "NULL"),
 			(apply == 0 ? 0 : 1),
 			attributes.c_str(),

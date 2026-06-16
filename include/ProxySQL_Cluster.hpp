@@ -180,6 +180,7 @@
  * - mirror_hostgroup: Query mirroring destination
  * - error_msg, ok_msg: Custom response messages
  * - sticky_conn, multiplex: Connection pooling behavior
+ * - replica_eligible: PolarDB automatic replica-read eligibility (-1/0/1)
  * - log, apply: Logging and application flags
  * - attributes: Additional rule attributes (JSON)
  * - comment: Administrative comments
@@ -187,7 +188,11 @@
  * @see runtime_pgsql_query_rules
  * @see pull_pgsql_query_rules_from_peer()
  */
+#if POLARDB_PROXY
+#define CLUSTER_QUERY_PGSQL_QUERY_RULES "PROXY_SELECT rule_id, username, database, flagIN, client_addr, proxy_addr, proxy_port, digest, match_digest, match_pattern, negate_match_pattern, re_modifiers, flagOUT, replace_pattern, destination_hostgroup, cache_ttl, cache_empty_result, cache_timeout, reconnect, timeout, retries, delay, next_query_flagIN, mirror_flagOUT, mirror_hostgroup, error_msg, ok_msg, sticky_conn, multiplex, replica_eligible, log, apply, attributes, comment FROM runtime_pgsql_query_rules ORDER BY rule_id"
+#else
 #define CLUSTER_QUERY_PGSQL_QUERY_RULES "PROXY_SELECT rule_id, username, database, flagIN, client_addr, proxy_addr, proxy_port, digest, match_digest, match_pattern, negate_match_pattern, re_modifiers, flagOUT, replace_pattern, destination_hostgroup, cache_ttl, cache_empty_result, cache_timeout, reconnect, timeout, retries, delay, next_query_flagIN, mirror_flagOUT, mirror_hostgroup, error_msg, ok_msg, sticky_conn, multiplex, log, apply, attributes, comment FROM runtime_pgsql_query_rules ORDER BY rule_id"
+#endif // POLARDB_PROXY
 
 /**
  * @brief Query to be intercepted by 'ProxySQL_Admin' for 'runtime_pgsql_query_rules_fast_routing'.
@@ -212,7 +217,11 @@
 
 #define CLUSTER_QUERY_PGSQL_VARIABLES "PROXY_SELECT variable_name, variable_value FROM runtime_pgsql_variables ORDER BY variable_name"
 
+#if POLARDB_PROXY
+#define CLUSTER_QUERY_PGSQL_REPLICATION_HOSTGROUPS "PROXY_SELECT writer_hostgroup, reader_hostgroup, check_type, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment FROM runtime_pgsql_replication_hostgroups ORDER BY writer_hostgroup"
+#else
 #define CLUSTER_QUERY_PGSQL_REPLICATION_HOSTGROUPS "PROXY_SELECT writer_hostgroup, reader_hostgroup, check_type, comment FROM runtime_pgsql_replication_hostgroups ORDER BY writer_hostgroup"
+#endif // POLARDB_PROXY
 #define CLUSTER_QUERY_PGSQL_HOSTGROUP_ATTRIBUTES "PROXY_SELECT hostgroup_id, max_num_online_servers, autocommit, free_connections_pct, init_connect, multiplex, connection_warming, throttle_connections_per_sec, ignore_session_variables, hostgroup_settings, servers_defaults, comment FROM runtime_pgsql_hostgroup_attributes ORDER BY hostgroup_id"
 
 class ProxySQL_Checksum_Value_2: public ProxySQL_Checksum_Value {

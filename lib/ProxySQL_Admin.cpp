@@ -5117,15 +5117,29 @@ void ProxySQL_Admin::save_pgsql_query_rules_from_runtime(bool _runtime) {
 	//char *a=(char *)"INSERT INTO pgsql_query_rules VALUES (\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\")";
 	char* a = NULL;
 	if (_runtime) {
+#if POLARDB_PROXY
+		// PolarDB query rules persist replica_eligible between multiplex and log.
+		a = (char*)"INSERT INTO runtime_pgsql_query_rules (rule_id, active, username, database, flagIN, client_addr, proxy_addr, proxy_port, digest, match_digest, match_pattern, negate_match_pattern, re_modifiers, flagOUT, replace_pattern, destination_hostgroup, cache_ttl, cache_empty_result, cache_timeout, reconnect, timeout, retries, delay, next_query_flagIN, mirror_flagOUT, mirror_hostgroup, error_msg, OK_msg, sticky_conn, multiplex, replica_eligible, log, apply, attributes, comment) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)";
+#else
 		a = (char*)"INSERT INTO runtime_pgsql_query_rules (rule_id, active, username, database, flagIN, client_addr, proxy_addr, proxy_port, digest, match_digest, match_pattern, negate_match_pattern, re_modifiers, flagOUT, replace_pattern, destination_hostgroup, cache_ttl, cache_empty_result, cache_timeout, reconnect, timeout, retries, delay, next_query_flagIN, mirror_flagOUT, mirror_hostgroup, error_msg, OK_msg, sticky_conn, multiplex, log, apply, attributes, comment) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)";
+#endif // POLARDB_PROXY
 	} else {
+#if POLARDB_PROXY
+		a = (char*)"INSERT INTO pgsql_query_rules (rule_id, active, username, database, flagIN, client_addr, proxy_addr, proxy_port, digest, match_digest, match_pattern, negate_match_pattern, re_modifiers, flagOUT, replace_pattern, destination_hostgroup, cache_ttl, cache_empty_result, cache_timeout, reconnect, timeout, retries, delay, next_query_flagIN, mirror_flagOUT, mirror_hostgroup, error_msg, OK_msg, sticky_conn, multiplex, replica_eligible, log, apply, attributes, comment) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)";
+#else
 		a = (char*)"INSERT INTO pgsql_query_rules (rule_id, active, username, database, flagIN, client_addr, proxy_addr, proxy_port, digest, match_digest, match_pattern, negate_match_pattern, re_modifiers, flagOUT, replace_pattern, destination_hostgroup, cache_ttl, cache_empty_result, cache_timeout, reconnect, timeout, retries, delay, next_query_flagIN, mirror_flagOUT, mirror_hostgroup, error_msg, OK_msg, sticky_conn, multiplex, log, apply, attributes, comment) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)";
+#endif // POLARDB_PROXY
 	}
 	for (std::vector<SQLite3_row*>::iterator it = resultset->rows.begin(); it != resultset->rows.end(); ++it) {
 		SQLite3_row* r = *it;
 		int arg_len = 0;
-		char* buffs[34]; // number of fields
-		for (int i = 0; i < 34; i++) {
+#if POLARDB_PROXY
+		static constexpr int qr_store_fields = 35; // includes replica_eligible
+#else
+		static constexpr int qr_store_fields = 34;
+#endif // POLARDB_PROXY
+		char* buffs[qr_store_fields];
+		for (int i = 0; i < qr_store_fields; i++) {
 			if (r->fields[i]) {
 				char* o = escape_string_single_quotes(r->fields[i], false);
 				int l = strlen(o) + 4;
@@ -5176,14 +5190,22 @@ void ProxySQL_Admin::save_pgsql_query_rules_from_runtime(bool _runtime) {
 			buffs[27], // OK_msg
 			(strcmp(r->fields[28], "-1") == 0 ? "NULL" : r->fields[28]), // sticky_conn
 			(strcmp(r->fields[29], "-1") == 0 ? "NULL" : r->fields[29]), // multiplex
+#if POLARDB_PROXY
+			r->fields[30], // replica_eligible (-1 is a real NOT NULL value, not SQL NULL)
+			(strcmp(r->fields[31], "-1") == 0 ? "NULL" : r->fields[31]), // log
+			(strcmp(r->fields[32], "-1") == 0 ? "NULL" : r->fields[32]), // apply
+			buffs[33], // attributes
+			buffs[34]  // comment
+#else
 			(strcmp(r->fields[30], "-1") == 0 ? "NULL" : r->fields[30]), // log
 			(strcmp(r->fields[31], "-1") == 0 ? "NULL" : r->fields[31]), // apply
 			buffs[32], // attributes
 			buffs[33]  // comment
+#endif // POLARDB_PROXY
 		);
 		//fprintf(stderr,"%s\n",query);
 		admindb->execute(query);
-		for (int i = 0; i < 34; i++) {
+		for (int i = 0; i < qr_store_fields; i++) {
 			free(buffs[i]);
 		}
 		free(query);
@@ -7735,6 +7757,49 @@ void ProxySQL_Admin::save_pgsql_servers_runtime_to_database(bool _runtime) {
 	if (resultset) {
 		for (std::vector<SQLite3_row*>::iterator it = resultset->rows.begin(); it != resultset->rows.end(); ++it) {
 			SQLite3_row* r = *it;
+#if POLARDB_PROXY
+			// PolarDB replication-hostgroup rows carry the LSN consistency
+			// policy columns after check_type. Fields:
+			//   0=writer_hostgroup, 1=reader_hostgroup, 2=check_type,
+			//   3=consistency_mode, 4=max_lag_bytes, 5=lsn_wait_timeout_ms,
+			//   6=proxy_protocol, 7=comment
+			char* q = NULL;
+			if (_runtime) {
+				q = (char*)"INSERT INTO runtime_pgsql_replication_hostgroups VALUES(%s,%s,'%s','%s',%s,%s,'%s','%s')";
+			}
+			else {
+				q = (char*)"INSERT INTO pgsql_replication_hostgroups VALUES(%s,%s,'%s','%s',%s,%s,'%s','%s')";
+			}
+			char* check_type = escape_string_single_quotes(r->fields[2], false);
+			char* consistency_mode = escape_string_single_quotes(r->fields[3], false);
+			char* proxy_protocol = escape_string_single_quotes(r->fields[6], false);
+			char* comment = r->fields[7] ? escape_string_single_quotes(r->fields[7], false) : (char*)"";
+			// Size after escaping: a quote-heavy comment can be larger than the
+			// raw field. Track ownership explicitly instead of comparing against
+			// a string literal when deciding which escaped buffers to free.
+			const bool free_check_type = check_type != r->fields[2];
+			const bool free_consistency_mode = consistency_mode != r->fields[3];
+			const bool free_proxy_protocol = proxy_protocol != r->fields[6];
+			const bool free_comment = r->fields[7] && comment != r->fields[7];
+			const int query_len = snprintf(NULL, 0, q,
+				r->fields[0], r->fields[1], check_type, consistency_mode,
+				r->fields[4], r->fields[5], proxy_protocol, comment);
+			if (query_len >= 0) {
+				char* query = (char*)malloc((size_t)query_len + 1);
+				if (query) {
+					snprintf(query, (size_t)query_len + 1, q,
+						r->fields[0], r->fields[1], check_type, consistency_mode,
+						r->fields[4], r->fields[5], proxy_protocol, comment);
+					proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 4, "%s\n", query);
+					admindb->execute(query);
+					free(query);
+				}
+			}
+			if (free_check_type) free(check_type);
+			if (free_consistency_mode) free(consistency_mode);
+			if (free_proxy_protocol) free(proxy_protocol);
+			if (free_comment) free(comment);
+#else
 			int l = 0;
 			if (r->fields[3]) l = strlen(r->fields[3]);
 			char* q = NULL;
@@ -7757,6 +7822,7 @@ void ProxySQL_Admin::save_pgsql_servers_runtime_to_database(bool _runtime) {
 			proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 4, "%s\n", query);
 			admindb->execute(query);
 			free(query);
+#endif // POLARDB_PROXY
 		}
 	}
 	if (resultset) delete resultset;
@@ -8572,7 +8638,12 @@ char* ProxySQL_Admin::load_pgsql_query_rules_to_runtime(SQLite3_result* SQLite3_
 	int affected_rows = 0;
 	if (GloPgQPro == NULL) return (char*)"Global Query Processor not started: command impossible to run";
 	SQLite3_result* resultset = NULL;
+#if POLARDB_PROXY
+	// PolarDB query rules load replica_eligible between multiplex and log.
+	char* query = (char*)"SELECT rule_id, username, database, flagIN, client_addr, proxy_addr, proxy_port, digest, match_digest, match_pattern, negate_match_pattern, re_modifiers, flagOUT, replace_pattern, destination_hostgroup, cache_ttl, cache_empty_result, cache_timeout, reconnect, timeout, retries, delay, next_query_flagIN, mirror_flagOUT, mirror_hostgroup, error_msg, ok_msg, sticky_conn, multiplex, replica_eligible, log, apply, attributes, comment FROM main.pgsql_query_rules WHERE active=1 ORDER BY rule_id";
+#else
 	char* query = (char*)"SELECT rule_id, username, database, flagIN, client_addr, proxy_addr, proxy_port, digest, match_digest, match_pattern, negate_match_pattern, re_modifiers, flagOUT, replace_pattern, destination_hostgroup, cache_ttl, cache_empty_result, cache_timeout, reconnect, timeout, retries, delay, next_query_flagIN, mirror_flagOUT, mirror_hostgroup, error_msg, ok_msg, sticky_conn, multiplex, log, apply, attributes, comment FROM main.pgsql_query_rules WHERE active=1 ORDER BY rule_id";
+#endif // POLARDB_PROXY
 	if (SQLite3_query_rules_resultset == NULL) {
 		admindb->execute_statement(query, &error, &cols, &affected_rows, &resultset);
 	}
@@ -8721,10 +8792,18 @@ char* ProxySQL_Admin::load_pgsql_query_rules_to_runtime(SQLite3_result* SQLite3_
 					r->fields[26], // OK_msg
 					(r->fields[27] == NULL ? -1 : atol(r->fields[27])),	// sticky_conn
 					(r->fields[28] == NULL ? -1 : atol(r->fields[28])),	// multiplex
+#if POLARDB_PROXY
+					(r->fields[29] == NULL ? -1 : atol(r->fields[29])),	// replica_eligible
+					(r->fields[30] == NULL ? -1 : atol(r->fields[30])),	// log
+					(atoi(r->fields[31]) == 1 ? true : false),	// apply
+					r->fields[32], // attributes
+					r->fields[33]  // comment
+#else
 					(r->fields[29] == NULL ? -1 : atol(r->fields[29])),	// log
 					(atoi(r->fields[30]) == 1 ? true : false),
 					r->fields[31], // attributes
 					r->fields[32]  // comment
+#endif // POLARDB_PROXY
 				);
 				GloPgQPro->insert(nqpr, false);
 			}

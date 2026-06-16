@@ -24,6 +24,9 @@ using json = nlohmann::json;
 
 #include "PgSQL_Data_Stream.h"
 #include "PgSQL_Query_Processor.h"
+#if POLARDB_PROXY
+#include "PgSQL_PolarDB.h"
+#endif
 #include "StatCounters.h"
 #include "PgSQL_PreparedStatement.h"
 #include "PgSQL_Logger.hpp"
@@ -51,6 +54,24 @@ extern PgSQL_Threads_Handler* GloPTH;
 extern MySQL_Monitor* GloMyMon;
 extern PgSQL_Monitor* GloPgMon;
 extern PgSQL_Logger* GloPgSQL_Logger;
+
+#if POLARDB_PROXY
+static bool polardb_parse_proxy_identity_port(const char* value, int* port) {
+	if (!value || !*value || !port) return false;
+
+	unsigned int parsed = 0;
+	const unsigned char* p = reinterpret_cast<const unsigned char*>(value);
+	for (; *p; ++p) {
+		if (!std::isdigit(*p)) return false;
+		const unsigned int digit = *p - '0';
+		if (parsed > 6553 || (parsed == 6553 && digit > 5)) return false;
+		parsed = parsed * 10 + digit;
+	}
+
+	*port = static_cast<int>(parsed);
+	return true;
+}
+#endif // POLARDB_PROXY
 
 typedef struct mythr_st_vars {
 	enum PgSQL_Thread_status_variable v_idx;
@@ -367,6 +388,21 @@ static char* pgsql_thread_variables_names[] = {
 */
 	(char*)"monitor_writer_is_also_reader",
 	(char*)"max_allowed_packet",
+#if POLARDB_PROXY
+	// PolarDB session-consistency knobs.
+	(char*)"polardb_consistency_mode",
+	(char*)"polardb_lag_bytes",
+	(char*)"polardb_lag_ms",
+	(char*)"polardb_lag_wait_ms",
+	(char*)"polardb_lsn_freshness_ms",
+	(char*)"polardb_monitor_lsn_updates",
+	(char*)"polardb_wait_timeout_mode",
+	(char*)"polardb_proxy_protocol",
+	(char*)"polardb_route_rfq_policy",
+	(char*)"polardb_session_lsn_baseline",
+	(char*)"polardb_proxy_identity_host",
+	(char*)"polardb_proxy_identity_port",
+#endif // POLARDB_PROXY
 	(char*)"tcp_keepalive_time",
 	(char*)"use_tcp_keepalive",
 	(char*)"automatic_detect_sqli",
@@ -1105,6 +1141,21 @@ PgSQL_Threads_Handler::PgSQL_Threads_Handler() {
 	variables.monitor_wait_timeout = true;
 	variables.monitor_writer_is_also_reader = true;
 	variables.max_allowed_packet = 64 * 1024 * 1024;
+#if POLARDB_PROXY
+	// PolarDB session-consistency knob defaults.
+	variables.polardb_consistency_mode = strdup((char*)"off");   // consistency disabled by default
+	variables.polardb_lag_bytes = 0;                             // 0 = lag-cap (bytes) disabled
+	variables.polardb_lag_ms = 0;                                // reserved: T13 accepts only 0; no PgSQL ms-lag producer yet
+	variables.polardb_lag_wait_ms = 1000;                        // default finite wait timeout
+	variables.polardb_lsn_freshness_ms = 5000;                   // 5s max age for a trusted cached LSN
+	variables.polardb_monitor_lsn_updates = true;                // monitor LSN cache updates enabled
+	variables.polardb_wait_timeout_mode = strdup((char*)"best_effort");
+	variables.polardb_proxy_protocol = strdup((char*)"v15");
+	variables.polardb_route_rfq_policy = strdup((char*)"strict");
+	variables.polardb_session_lsn_baseline = strdup((char*)"observed");
+	variables.polardb_proxy_identity_host = strdup((char*)"");
+	variables.polardb_proxy_identity_port = 0;
+#endif // POLARDB_PROXY
 	variables.automatic_detect_sqli = false;
 	variables.firewall_whitelist_enabled = false;
 	variables.firewall_whitelist_errormsg = strdup((char*)"Firewall blocked this query");
@@ -1325,6 +1376,15 @@ char* PgSQL_Threads_Handler::get_variable_string(char* name) {
 		// NOTE: Disabled until 'pt-heartbeat' supports PostgreSQL is fixed: https://perconadev.atlassian.net/browse/PT-2030
 		// if (!strcmp(name, "monitor_replication_lag_use_percona_heartbeat")) return strdup(variables.monitor_replication_lag_use_percona_heartbeat);
 	}
+#if POLARDB_PROXY
+	// PolarDB word-valued knobs.
+	if (!strcmp(name, "polardb_consistency_mode")) return strdup(variables.polardb_consistency_mode);
+	if (!strcmp(name, "polardb_wait_timeout_mode")) return strdup(variables.polardb_wait_timeout_mode);
+	if (!strcmp(name, "polardb_proxy_protocol")) return strdup(variables.polardb_proxy_protocol);
+	if (!strcmp(name, "polardb_route_rfq_policy")) return strdup(variables.polardb_route_rfq_policy);
+	if (!strcmp(name, "polardb_session_lsn_baseline")) return strdup(variables.polardb_session_lsn_baseline);
+	if (!strcmp(name, "polardb_proxy_identity_host")) return strdup(variables.polardb_proxy_identity_host);
+#endif // POLARDB_PROXY
 	if (!strncmp(name, "ssl_", 4)) {
 		if (!strcmp(name, "ssl_p2s_ca")) {
 			if (variables.ssl_p2s_ca == NULL || strlen(variables.ssl_p2s_ca) == 0) {
@@ -1620,6 +1680,15 @@ char* PgSQL_Threads_Handler::get_variable(char* name) {	// this is the public fu
 		// NOTE: Disabled until 'pt-heartbeat' supports PostgreSQL is fixed: https://perconadev.atlassian.net/browse/PT-2030
 		// if (!strcasecmp(name, "monitor_replication_lag_use_percona_heartbeat")) return strdup(variables.monitor_replication_lag_use_percona_heartbeat);
 	}
+#if POLARDB_PROXY
+	// PolarDB word-valued knobs.
+	if (!strcasecmp(name, "polardb_consistency_mode")) return strdup(variables.polardb_consistency_mode);
+	if (!strcasecmp(name, "polardb_wait_timeout_mode")) return strdup(variables.polardb_wait_timeout_mode);
+	if (!strcasecmp(name, "polardb_proxy_protocol")) return strdup(variables.polardb_proxy_protocol);
+	if (!strcasecmp(name, "polardb_route_rfq_policy")) return strdup(variables.polardb_route_rfq_policy);
+	if (!strcasecmp(name, "polardb_session_lsn_baseline")) return strdup(variables.polardb_session_lsn_baseline);
+	if (!strcasecmp(name, "polardb_proxy_identity_host")) return strdup(variables.polardb_proxy_identity_host);
+#endif // POLARDB_PROXY
 	if (!strcasecmp(name, "threads")) {
 		sprintf(intbuf, "%d", (num_threads ? num_threads : DEFAULT_NUM_THREADS));
 		return strdup(intbuf);
@@ -1651,6 +1720,25 @@ bool PgSQL_Threads_Handler::set_variable(char* name, const char* value) {	// thi
 	// convert name to string, and lowercase
 	std::string nameS = string(name);
 	std::transform(nameS.begin(), nameS.end(), nameS.begin(), [](unsigned char c) { return std::tolower(c); });
+#if POLARDB_PROXY
+	if (nameS == "polardb_proxy_identity_port") {
+		int port = 0;
+		if (polardb_parse_proxy_identity_port(value, &port)) {
+			if (variables.polardb_proxy_identity_host &&
+					variables.polardb_proxy_identity_host[0] != '\0' &&
+					!PolarDB_StartupIdentity{
+						variables.polardb_proxy_identity_host, port}.valid(true)) {
+				proxy_error("Invalid value '%s' for pgsql-polardb_proxy_identity_port: configured pgsql-polardb_proxy_identity_host='%s' requires a non-wildcard IP literal with port 1..65535; clear pgsql-polardb_proxy_identity_host before unsetting the port\n",
+					value, variables.polardb_proxy_identity_host);
+				return false;
+			}
+			variables.polardb_proxy_identity_port = port;
+			return true;
+		}
+		proxy_error("Invalid value '%s' for pgsql-polardb_proxy_identity_port (allowed: integer 0..65535)\n", value);
+		return false;
+	}
+#endif // POLARDB_PROXY
 	{
 		// integer variable ?
 		std::unordered_map<std::string, std::tuple<int*, int, int, bool>>::const_iterator it = VariablesPointers_int.find(nameS);
@@ -1709,6 +1797,66 @@ bool PgSQL_Threads_Handler::set_variable(char* name, const char* value) {	// thi
 			}
 		}
 	}
+
+#if POLARDB_PROXY
+	// PolarDB word-valued knobs are stored as strings and mapped into the
+	// pgsql_thread___ globals during commit_get_global_variables_refresh().
+	if (!strcasecmp(name, "polardb_consistency_mode")) {
+		if (polardb_consistency_mode_from_string(value, -1) >= 0) {
+			free(variables.polardb_consistency_mode);
+			variables.polardb_consistency_mode = strdup(value);
+			return true;
+		}
+		proxy_error("Invalid value '%s' for pgsql-polardb_consistency_mode (allowed: off, lsn, primary)\n", value);
+		return false;
+	}
+	if (!strcasecmp(name, "polardb_wait_timeout_mode")) {
+		if (polardb_wait_mode_from_string(value, -1) >= 0) {
+			free(variables.polardb_wait_timeout_mode);
+			variables.polardb_wait_timeout_mode = strdup(value);
+			return true;
+		}
+		proxy_error("Invalid value '%s' for pgsql-polardb_wait_timeout_mode (allowed: best_effort, strict)\n", value);
+		return false;
+	}
+	if (!strcasecmp(name, "polardb_proxy_protocol")) {
+		if (polardb_proxy_protocol_from_string(value, -1) >= 0) {
+			free(variables.polardb_proxy_protocol);
+			variables.polardb_proxy_protocol = strdup(value);
+			return true;
+		}
+		proxy_error("Invalid value '%s' for pgsql-polardb_proxy_protocol (allowed: v15, legacy, off)\n", value);
+		return false;
+	}
+	if (!strcasecmp(name, "polardb_route_rfq_policy")) {
+		if (polardb_route_rfq_policy_from_string(value, -1) >= 0) {
+			free(variables.polardb_route_rfq_policy);
+			variables.polardb_route_rfq_policy = strdup(value);
+			return true;
+		}
+		proxy_error("Invalid value '%s' for pgsql-polardb_route_rfq_policy (allowed: strict, best_effort)\n", value);
+		return false;
+	}
+	if (!strcasecmp(name, "polardb_session_lsn_baseline")) {
+		if (polardb_session_lsn_baseline_from_string(value, -1) >= 0) {
+			free(variables.polardb_session_lsn_baseline);
+			variables.polardb_session_lsn_baseline = strdup(value);
+			return true;
+		}
+		proxy_error("Invalid value '%s' for pgsql-polardb_session_lsn_baseline (allowed: observed, primary)\n", value);
+		return false;
+	}
+	if (!strcasecmp(name, "polardb_proxy_identity_host")) {
+		if (polardb_identity_config_valid(
+				value, variables.polardb_proxy_identity_port, true)) {
+			free(variables.polardb_proxy_identity_host);
+			variables.polardb_proxy_identity_host = strdup(value);
+			return true;
+		}
+		proxy_error("Invalid value '%s' for pgsql-polardb_proxy_identity_host (allowed: empty string or non-wildcard IP literal; if pgsql-polardb_proxy_identity_port is non-zero the host+port pair must be usable for PolarDB startup identity)\n", value);
+		return false;
+	}
+#endif // POLARDB_PROXY
 
 	// monitor variables
 	if (!strncasecmp(name, "monitor_", 8)) {
@@ -2193,6 +2341,10 @@ char** PgSQL_Threads_Handler::get_variables_list() {
 		VariablesPointers_bool["firewall_whitelist_enabled"] = make_tuple(&variables.firewall_whitelist_enabled, false);
 		VariablesPointers_bool["kill_backend_connection_when_disconnect"] = make_tuple(&variables.kill_backend_connection_when_disconnect, false);
 		VariablesPointers_bool["log_unhealthy_connections"] = make_tuple(&variables.log_unhealthy_connections, false);
+#if POLARDB_PROXY
+		// PolarDB monitor LSN-cache update toggle.
+		VariablesPointers_bool["polardb_monitor_lsn_updates"] = make_tuple(&variables.polardb_monitor_lsn_updates, false);
+#endif // POLARDB_PROXY
 #ifdef PROXYSQLFFTO
 		VariablesPointers_bool["ffto_enabled"] = make_tuple(&variables.ffto_enabled, false);
 #endif
@@ -2350,6 +2502,15 @@ char** PgSQL_Threads_Handler::get_variables_list() {
 		// various
 		VariablesPointers_int["long_query_time"] = make_tuple(&variables.long_query_time, 0, 20 * 24 * 3600 * 1000, false);
 		VariablesPointers_int["max_allowed_packet"] = make_tuple(&variables.max_allowed_packet, 8192, 1024 * 1024 * 1024, false);
+#if POLARDB_PROXY
+		// PolarDB numeric session-consistency knobs. The two word-valued *mode*
+		// knobs are handled by dedicated get/set handlers, not VariablesPointers.
+		VariablesPointers_int["polardb_lag_bytes"] = make_tuple(&variables.polardb_lag_bytes, 0, INT_MAX, false);    // 0 = off
+		VariablesPointers_int["polardb_lag_ms"] = make_tuple(&variables.polardb_lag_ms, 0, 0, false);                // reserved for future PgSQL ms-lag producer; T13 accepts only 0
+		VariablesPointers_int["polardb_lag_wait_ms"] = make_tuple(&variables.polardb_lag_wait_ms, 0, 60000, false);  // 0 = wait indefinitely, max 60s
+		VariablesPointers_int["polardb_lsn_freshness_ms"] = make_tuple(&variables.polardb_lsn_freshness_ms, 100, 60000, false); // 100ms-60s
+		VariablesPointers_int["polardb_proxy_identity_port"] = make_tuple(&variables.polardb_proxy_identity_port, 0, 65535, false); // 0 = unset
+#endif // POLARDB_PROXY
 		VariablesPointers_int["max_connections"] = make_tuple(&variables.max_connections, 1, 1000 * 1000, false);
 		VariablesPointers_int["max_stmts_per_connection"] = make_tuple(&variables.max_stmts_per_connection, 1, 1024, false);
 		VariablesPointers_int["max_stmts_cache"] = make_tuple(&variables.max_stmts_cache, 128, 1024 * 1024, false);
@@ -2744,6 +2905,15 @@ PgSQL_Threads_Handler::~PgSQL_Threads_Handler() {
 	if (variables.monitor_username) { free(variables.monitor_username); variables.monitor_username = NULL; }
 	if (variables.monitor_password) { free(variables.monitor_password); variables.monitor_password = NULL; }
 	if (variables.monitor_dbname) { free(variables.monitor_dbname); variables.monitor_dbname = NULL; }
+#if POLARDB_PROXY
+	// PolarDB word-valued knobs.
+	if (variables.polardb_consistency_mode) { free(variables.polardb_consistency_mode); variables.polardb_consistency_mode = NULL; }
+	if (variables.polardb_wait_timeout_mode) { free(variables.polardb_wait_timeout_mode); variables.polardb_wait_timeout_mode = NULL; }
+	if (variables.polardb_proxy_protocol) { free(variables.polardb_proxy_protocol); variables.polardb_proxy_protocol = NULL; }
+	if (variables.polardb_route_rfq_policy) { free(variables.polardb_route_rfq_policy); variables.polardb_route_rfq_policy = NULL; }
+	if (variables.polardb_session_lsn_baseline) { free(variables.polardb_session_lsn_baseline); variables.polardb_session_lsn_baseline = NULL; }
+	if (variables.polardb_proxy_identity_host) { free(variables.polardb_proxy_identity_host); variables.polardb_proxy_identity_host = NULL; }
+#endif // POLARDB_PROXY
 	if (variables.monitor_replication_lag_use_percona_heartbeat) {
 		free(variables.monitor_replication_lag_use_percona_heartbeat);
 		variables.monitor_replication_lag_use_percona_heartbeat = NULL;
@@ -2898,6 +3068,12 @@ PgSQL_Thread::~PgSQL_Thread() {
 
 	if (pgsql_thread___server_version) { free(pgsql_thread___server_version); pgsql_thread___server_version = NULL; }
 	if (pgsql_thread___server_encoding) { free(pgsql_thread___server_encoding); pgsql_thread___server_encoding = NULL; }
+#if POLARDB_PROXY
+	if (pgsql_thread___polardb_proxy_identity_host) {
+		free(pgsql_thread___polardb_proxy_identity_host);
+		pgsql_thread___polardb_proxy_identity_host = NULL;
+	}
+#endif // POLARDB_PROXY
 
 	for (int i = 0; i < PGSQL_NAME_LAST_LOW_WM; i++) {
 		if (pgsql_thread___default_variables[i]) {
@@ -3993,6 +4169,48 @@ void PgSQL_Thread::refresh_variables() {
 	pgsql_thread___free_connections_pct = GloPTH->get_variable_int((char*)"free_connections_pct");
 	pgsql_thread___kill_backend_connection_when_disconnect = (bool)GloPTH->get_variable_int((char*)"kill_backend_connection_when_disconnect");
 	pgsql_thread___max_allowed_packet = GloPTH->get_variable_int((char*)"max_allowed_packet");
+#if POLARDB_PROXY
+	// PolarDB session-consistency knobs. The integer/bool knobs refresh directly;
+	// the two word-valued *mode* knobs are mapped into the globals consumed by routing.
+	pgsql_thread___polardb_lag_bytes = GloPTH->get_variable_int((char*)"polardb_lag_bytes");
+	pgsql_thread___polardb_lag_ms = GloPTH->get_variable_int((char*)"polardb_lag_ms");
+	pgsql_thread___polardb_lag_wait_ms = GloPTH->get_variable_int((char*)"polardb_lag_wait_ms");
+	pgsql_thread___polardb_lsn_freshness_ms = GloPTH->get_variable_int((char*)"polardb_lsn_freshness_ms");
+	pgsql_thread___polardb_monitor_lsn_updates = (bool)GloPTH->get_variable_int((char*)"polardb_monitor_lsn_updates");
+	{
+		char* cm = GloPTH->get_variable_string((char*)"polardb_consistency_mode");
+		pgsql_thread___polardb_consistency_mode =
+			polardb_consistency_mode_from_string(cm, POLARDB_CONSISTENCY_OFF);
+		if (cm) free(cm);
+	}
+	{
+		char* wm = GloPTH->get_variable_string((char*)"polardb_wait_timeout_mode");
+		pgsql_thread___polardb_wait_timeout_mode =
+			polardb_wait_mode_from_string(
+				wm, static_cast<int>(PolarDB_WaitMode::BEST_EFFORT));
+		if (wm) free(wm);
+	}
+	{
+		char* protocol = GloPTH->get_variable_string((char*)"polardb_proxy_protocol");
+		pgsql_thread___polardb_proxy_protocol =
+			polardb_proxy_protocol_from_string(protocol, POLARDB_PROXY_PROTOCOL_V15);
+		if (protocol) free(protocol);
+	}
+	{
+		char* policy = GloPTH->get_variable_string((char*)"polardb_route_rfq_policy");
+		pgsql_thread___polardb_route_rfq_policy = polardb_route_rfq_policy_from_string(policy);
+		if (policy) free(policy);
+	}
+	{
+		char* baseline = GloPTH->get_variable_string((char*)"polardb_session_lsn_baseline");
+		pgsql_thread___polardb_session_lsn_baseline = polardb_session_lsn_baseline_from_string(baseline);
+		if (baseline) free(baseline);
+	}
+	if (pgsql_thread___polardb_proxy_identity_host) free(pgsql_thread___polardb_proxy_identity_host);
+	pgsql_thread___polardb_proxy_identity_host = GloPTH->get_variable_string((char*)"polardb_proxy_identity_host");
+	pgsql_thread___polardb_proxy_identity_port =
+		GloPTH->get_variable_int((char*)"polardb_proxy_identity_port");
+#endif // POLARDB_PROXY
 	pgsql_thread___set_query_lock_on_hostgroup = GloPTH->get_variable_int((char*)"set_query_lock_on_hostgroup");
 	pgsql_thread___verbose_query_error = (bool)GloPTH->get_variable_int((char*)"verbose_query_error");
 #ifdef IDLE_THREADS
@@ -4228,6 +4446,9 @@ PgSQL_Thread::PgSQL_Thread() {
 	__thread_PgSQL_Thread_Variables_version = 0;
 	pgsql_thread___server_version = NULL;
 	pgsql_thread___server_encoding = NULL;
+#if POLARDB_PROXY
+	pgsql_thread___polardb_proxy_identity_host = NULL;
+#endif // POLARDB_PROXY
 	pgsql_thread___have_ssl = true;
 	//pgsql_thread___default_schema = NULL;
 	pgsql_thread___init_connect = NULL;
