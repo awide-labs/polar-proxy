@@ -647,6 +647,211 @@ public:
 	char* get_current_query(int max_length = -1);
 	bool is_in_transaction() const;
 
+#if POLARDB_PROXY
+	// ---- PolarDB LSN routing pipeline ----
+
+	/**
+	 * @brief Collect all routing inputs for one query into an immutable snapshot.
+	 *
+	 * Reads session, HostGroups_Manager, and thread state into @p route_ctx, which
+	 * polardb_plan() then decides from. One side effect: if the replication group's
+	 * writer scope changed since this session last collected, it first clears the
+	 * session's now-stale LSN targets and latches before copying them in.
+	 */
+	void polardb_collect(PolarDB_Query_RouteCtx& route_ctx, int current_hg, int qpo_replica_eligible, bool qpo_force_primary_hint);
+	/**
+	 * @brief Decide the route for one query from the collected snapshot.
+	 *
+	 * Deterministic and side-effect free apart from read-only HGM snapshots. The
+	 * LSN consistency feature applies to autocommit, simple-query reads only;
+	 * explicit transactions, multi-statement, and extended-protocol queries are
+	 * routed to the writer rather than offloaded with a wait wrapper.
+	 */
+	PolarDB_Query_RoutePlan polardb_plan(const PolarDB_Query_RouteCtx& route_ctx);
+	/** @brief Update counters and emit the rate-limited log for a produced route plan. */
+	void polardb_account_route_plan(const PolarDB_Query_RoutePlan& plan,
+		const PolarDB_Query_RouteCtx& route_ctx);
+	/**
+	 * @brief Apply the route plan's side effects and stage wait state if needed.
+	 *
+	 * Resolves the final target hostgroup. For a replica-with-wait plan it prepares
+	 * the per-query wait state and snapshots the original query text; the wrapped
+	 * query itself is not built here but later, once, by
+	 * finalize_wait_timeout_injection() at ASYNC_IDLE.
+	 */
+	PolarDB_Query_ExecuteResult polardb_execute(const PolarDB_Query_RoutePlan& plan,
+		const PolarDB_Query_RouteCtx& route_ctx, PtrSize_t& pkt);
+	/**
+	 * @brief Detect whether a query rule is doing manual destination-hostgroup routing.
+	 *
+	 * Manual means the rule set a destination hostgroup but did not opt into
+	 * automatic replica routing. In that case the PolarDB planner must not override
+	 * the route; it only stages the writer scope for result attribution. Returns
+	 * true and reports that scope hostgroup via @p scope_hg; the optional outputs
+	 * return the rule's raw destination and replica-eligible values.
+	 */
+	bool polardb_manual_route_scope(int* scope_hg, int* dest_hg = nullptr,
+		int* replica_eligible = nullptr) const;
+	/**
+	 * @brief Record which writer scope this request runs under, for LSN attribution.
+	 *
+	 * Snapshots the writer hostgroup and epoch for @p scope_hg into the per-query
+	 * state. Used on the manual-routing path, which skips collect() but still needs
+	 * the scope so the response path can tell whether an RFQ LSN belongs to the
+	 * current writer timeline. Returns false if @p scope_hg is not a PolarDB
+	 * hostgroup.
+	 */
+	bool polardb_capture_request_writer_scope(int scope_hg);
+	/**
+	 * @brief Apply automatic routing for an extended-protocol (Parse/Bind/Execute)
+	 *        query, without a wait wrapper.
+	 *
+	 * The wait is injected as SQL text, which cannot be safely spliced into an
+	 * extended-protocol stream, so this is routing only. Manual destination rules
+	 * are left untouched. An automatic replica-eligible read may use a reader only
+	 * when the session has no wait target; otherwise it is pinned to the writer.
+	 */
+	void polardb_apply_extended_route();
+	/**
+	 * @brief Attach lag-cap inputs (primary LSN mirror and byte cap) to the reader plan.
+	 *
+	 * No-op when no byte cap is configured. When a cap applies, backend acquisition
+	 * later enforces the per-reader byte lag, so the chosen reader is one within the
+	 * cap.
+	 */
+	void polardb_reader_lag_plan(PolarDB_Query_RoutePlan& plan,
+		const PolarDB_Query_RouteCtx& route_ctx);
+	/**
+	 * @brief Send the in-flight query to the writer instead of a replica.
+	 *
+	 * Clears the staged reader target and wait, sets current_hostgroup to
+	 * @p writer_hg, and acquires a backend there. Used when a consistency-safe
+	 * reader cannot be obtained; the query uses the writer instead of an
+	 * unprotected replica read. Returns false (no change)
+	 * if @p writer_hg is negative.
+	 */
+	bool polardb_redirect_to_writer(int writer_hg, const char* reason);
+	/**
+	 * @brief Update session consistency state from the finished query's result.
+	 *
+	 * Runs on the success path. Reads the WAL LSN the backend appended to its
+	 * ReadyForQuery message (no extra round-trip), advances the session's observed
+	 * and write LSN positions, maintains the missing-LSN latches, and refreshes the
+	 * per-server LSN cache. Writer-epoch-stale RFQs are rejected first.
+	 */
+	void polardb_process_result(PgSQL_Data_Stream* myds, const char* query_digest_text);
+
+	/** @brief Set the per-session consistency mode override (-1 clears it). */
+	void polardb_set_session_override(int mode);
+
+	// ---- PolarDB wait wrapping and notices ----
+
+	/** @brief Whether an LSN wait is prepared for the in-flight query. */
+	inline bool polardb_wait_active() const {
+		return polardb_query.wait.wait_stage == PolarDB_WaitStage::WAITING;
+	}
+	/**
+	 * @brief Return the `SET polar_consistency_mode = '...'` statement for a wait mode.
+	 *
+	 * This is the first SET in the wait wrapper; it tells the replica what to do
+	 * when the wait times out (best_effort returns stale data with a WARNING,
+	 * strict raises an ERROR). The two statements are fixed text, so this returns a
+	 * reference to a long-lived static string. @p wait_mode is the timeout-behavior
+	 * knob, not the routing consistency mode. Do not free or modify the result.
+	 */
+	const std::string& build_polar_consistency_mode_set(PolarDB_WaitMode wait_mode);
+	/**
+	 * @brief Assemble the wrapped wait query (mode + timeout + wait SETs, then the
+	 *        user query) into @p out.
+	 *
+	 * Safety contract: @p out is left empty when there is nothing safe to wrap
+	 * (empty query, no wait, or an LSN target of 0). The caller treats an empty
+	 * buffer as a build failure and must not run the read unwrapped on a replica.
+	 *
+	 * @param prefix The consistency-mode SET statement to place first, from
+	 *               build_polar_consistency_mode_set(). The timeout and wait SETs
+	 *               are appended after it, then the user query.
+	 */
+	void build_wrapped_wait_query(const char* orig_query, size_t orig_len,
+		const PolarDB_Query_WaitState& wait_state, const std::string& prefix, std::string& out);
+	/**
+	 * @brief Build the wrapped wait query and install it into the outgoing packet.
+	 *
+	 * The single point where the wrapper is applied, called once at ASYNC_IDLE
+	 * after the backend connection exists. Idempotent (a second call after success
+	 * is a no-op). If a needed wrapper cannot be built it latches the session to
+	 * the writer and returns FAILED, and the caller must abort the query
+	 * rather than send it unwrapped.
+	 */
+	PolarDB_WrapFinalizeResult finalize_wait_timeout_injection(PgSQL_Connection* conn, PgSQL_Data_Stream* myds);
+
+	/**
+	 * @brief Add the in-flight wait's elapsed time to the latency counter and clear
+	 *        its start timer.
+	 *
+	 * No-op if no wait was active. Zeroing the start timer also disarms timeout
+	 * accounting, so the same backend wait cannot be counted twice. Must run before
+	 * the per-query wait state is reset, or the elapsed time is lost.
+	 */
+	void record_wait_latency(PolarDB_Query_WaitState& state);
+	/**
+	 * @brief Count one proven PolarDB wait timeout and its elapsed latency.
+	 *
+	 * Precondition: the caller has already proven the backend event is a PolarDB
+	 * proxy wait timeout (for example by matching the timeout detail marker).
+	 * Consumes the wait start timer through record_wait_latency(), so a repeated
+	 * observation of the same event does not double-count. Returns false (no count)
+	 * if no wait is active or the timer was already consumed.
+	 */
+	bool polardb_account_wait_timeout(const char* source);
+
+	/**
+	 * @brief Empty and free the captured-notice queue.
+	 *
+	 * Idempotent (safe when the queue was never allocated). Pass
+	 * free_buffers=false only on the flush path, where the packet bytes have been
+	 * handed to the client output array, which then owns them; every other path
+	 * passes true to free the buffers.
+	 */
+	void clear_pending_notices(bool free_buffers = false);
+	/**
+	 * @brief Move queued NoticeResponse packets to the client output array.
+	 *
+	 * Used before normal result forwarding and before the first streamed result
+	 * chunk, so best_effort wait warnings stay ahead of rows.
+	 */
+	void polardb_flush_pending_notices_to_client();
+	/**
+	 * @brief Take ownership of a NoticeResponse packet to forward with the next result.
+	 *
+	 * Allocates the queue lazily on the first captured notice, so a session that
+	 * never hits a wait timeout never allocates it. @p pkt becomes session-owned.
+	 */
+	void enqueue_pending_notice(unsigned char* pkt, unsigned int size);
+	/** @brief Build and enqueue a NoticeResponse packet. */
+	bool polardb_enqueue_notice_packet(const char* severity, const char* sqlstate,
+		const char* primary, const char* detail = nullptr,
+		const char* severity_nonlocalized = nullptr);
+	/** @brief Queue a synthetic client-visible warning for a degraded RFQ route. */
+	void polardb_enqueue_degraded_rfq_notice(const char* reason,
+		int reader_hg, int writer_hg);
+	/** @brief Same, deriving the reason and hostgroups from the route plan/context. */
+	void polardb_enqueue_degraded_rfq_notice(const PolarDB_Query_RoutePlan& plan,
+		const PolarDB_Query_RouteCtx& route_ctx);
+
+	/**
+	 * @brief Clear staged per-query wait/notice state on a RESET-family command.
+	 *
+	 * Handles RESET / RESET ALL / DISCARD ALL / RESET CONNECTION. Clears the
+	 * per-query wait, notices, and wrapper state, and lifts the wait-disabled
+	 * latch. It deliberately does NOT clear the durable session write/observed
+	 * LSNs: a RESET clears session settings, not the fact that the client has
+	 * written, so read-your-writes must survive it. @p reset_override additionally
+	 * clears the per-session consistency-mode override.
+	 */
+	void polardb_clear_staged_wait_state_for_reset(bool reset_override);
+#endif // POLARDB_PROXY
+
 private:
 	int32_t extract_pid_from_param(const PgSQL_Param_Value& param, uint16_t format) const;
 	void send_parameter_error_response(const char* error_message, PGSQL_ERROR_CODES code = PGSQL_ERROR_CODES::ERRCODE_INVALID_TEXT_REPRESENTATION);

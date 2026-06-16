@@ -3678,6 +3678,11 @@ handler_again:
 						// start sending to frontend if pgsql_thread___threshold_resultset_size is reached
 					case 1:
 						if (myconn->query_result && myconn->query_result->get_resultset_size() > (unsigned int)pgsql_thread___threshold_resultset_size) {
+#if POLARDB_PROXY
+							if (!myconn->query_result->is_transfer_started()) {
+								polardb_flush_pending_notices_to_client();
+							}
+#endif // POLARDB_PROXY
 							myconn->query_result->get_resultset(client_myds->PSarrayOUT);
 						} else {
 
@@ -3709,6 +3714,11 @@ handler_again:
 						// start sending to frontend if pgsql_thread___threshold_resultset_size is reached
 					case 3:
 						if (myconn->query_result && myconn->query_result->get_resultset_size() > (unsigned int)pgsql_thread___threshold_resultset_size) {
+#if POLARDB_PROXY
+							if (!myconn->query_result->is_transfer_started()) {
+								polardb_flush_pending_notices_to_client();
+							}
+#endif // POLARDB_PROXY
 							myconn->query_result->get_resultset(client_myds->PSarrayOUT);
 						}
 						break;
@@ -5535,8 +5545,17 @@ void PgSQL_Session::PgSQL_Result_to_PgSQL_wire(PgSQL_Connection* _conn, PgSQL_Da
 		if (_affected_rows != static_cast<unsigned long long>(-1)) {
 			 CurrentQuery.affected_rows = _affected_rows;
 			 CurrentQuery.have_affected_rows = true;
-		}
+	}
 		CurrentQuery.rows_sent = num_rows;
+
+#if POLARDB_PROXY
+		// Prepend any pending notices captured from skipped prepended-SET results
+		// (e.g. a best_effort LSN wait-timeout WARNING). The same helper is also
+		// called before the first streamed chunk, so warnings stay ahead of rows
+		// even when threshold_resultset_size starts early forwarding.
+		polardb_flush_pending_notices_to_client();
+#endif // POLARDB_PROXY
+
 		bool resultset_completed = query_result->get_resultset(client_myds->PSarrayOUT);
 		if (status == PROCESSING_QUERY && _conn->processing_multi_statement == false)
 			assert(resultset_completed); // the resultset should always be completed if PgSQL_Result_to_PgSQL_wire is called
