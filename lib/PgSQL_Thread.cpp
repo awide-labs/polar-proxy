@@ -6148,6 +6148,79 @@ PgSQL_Connection* PgSQL_Thread::get_MyConn_local(unsigned int _hid, PgSQL_Sessio
 	return NULL;
 }
 
+#if POLARDB_PROXY
+PgSQL_Connection* PgSQL_Thread::get_MyConn_local_polardb_reader(
+		unsigned int _hid, PgSQL_Session* sess,
+		const PolarDB_Query_ReaderPlan& reader_plan) {
+	if (sess == NULL) return NULL;
+	if (sess->client_myds == NULL) return NULL;
+	if (sess->client_myds->myconn == NULL) return NULL;
+	if (sess->client_myds->myconn->userinfo == NULL) return NULL;
+	if (!reader_plan.has_consistency_target_lsn()) return NULL;
+
+	const uint64_t now_us = monotonic_time();
+	const int fresh_ms = pgsql_thread___polardb_lsn_freshness_ms > 0
+		? pgsql_thread___polardb_lsn_freshness_ms
+		: POLARDB_LSN_FRESHNESS_MS_DEFAULT;
+	PgSQL_Connection* client_conn = sess->client_myds->myconn;
+	// A thread-local cached reader may have been opened under an older RFQ-capable
+	// startup profile. Re-check the current effective HG/global protocol before
+	// bypassing the shared HGM acquisition path, so a runtime switch to
+	// proxy_protocol=off cannot keep using and wait-bypassing that stale backend.
+	if (!PgHGM || !PgHGM->polardb_hostgroup_requests_rfq_lsn(_hid)) {
+		return NULL;
+	}
+
+	for (unsigned int i = 0; i < cached_connections->len; i++) {
+		PgSQL_Connection* c = (PgSQL_Connection*)cached_connections->index(i);
+		if (!c || !c->parent || !c->parent->myhgc) continue;
+		if (c->parent->myhgc->hid != _hid) continue;
+		if (c->parent->status != MYSQL_SERVER_STATUS_ONLINE) continue;
+		if (!client_conn->has_same_connection_options(c)) continue;
+
+		// LSN-protected reads need a backend whose startup profile requested RFQ
+		// LSNs. Local cached backends created before the PolarDB profile changed
+		// are skipped; shared HGM selection can evict/replace them if needed.
+		if (!c->polardb_startup_profile.has_rfq_lsn()) {
+			PgHGM->status.polardb_rfq_profile_skipped.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+
+		const uint64_t updated_us =
+			c->parent->lsn_updated_at.load(std::memory_order_relaxed);
+		const uint64_t reader_lsn =
+			c->parent->polardb_current_lsn.load(std::memory_order_relaxed);
+		const bool lsn_fresh =
+			polardb_lsn_cache_fresh(updated_us, now_us, (uint32_t)fresh_ms);
+
+		if (!lsn_fresh || !reader_plan.reader_lsn_reaches_consistency_target(reader_lsn))
+			continue;
+		if (reader_plan.lag_cap_enabled() &&
+				!reader_plan.within_byte_cap(reader_lsn))
+			continue;
+		if (c->requires_RESETTING_CONNECTION(client_conn))
+			continue;
+
+		unsigned int not_match = 0;
+		c->number_of_matching_session_variables(client_conn, not_match);
+		if (not_match != 0)
+			continue;
+
+		c = (PgSQL_Connection*)cached_connections->remove_index_fast(i);
+		PgHGM->status.polardb_target_lsn_preferred.fetch_add(
+			1, std::memory_order_relaxed);
+		POLARDB_TRACE(
+			"PolarDB consistency: thread-local RFQ reader hit conn=%p "
+			"hg=%u lsn=%lu consistency_target_lsn=%lu\n",
+			c, _hid, (unsigned long)reader_lsn,
+			(unsigned long)reader_plan.consistency_target_lsn);
+		return c;
+	}
+
+	return NULL;
+}
+#endif // POLARDB_PROXY
+
 void PgSQL_Thread::push_MyConn_local(PgSQL_Connection * c) {
 	// Bounded local cache: cache 1-in-N releases (N = pgsql_threads), push the
 	// rest to the shared HGM pool so peer workers can pick them up.

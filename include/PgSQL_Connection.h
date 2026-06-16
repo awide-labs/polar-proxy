@@ -4,6 +4,11 @@
 #include "proxysql.h"
 #include "cpp.h"
 #include "PgSQL_Error_Helper.h"
+#if POLARDB_PROXY
+#include "PgSQL_PolarDB.h"
+#include <sstream>  // std::ostringstream for PolarDB startup params
+#include <string>
+#endif
 
 #ifndef PROXYJSON
 #define PROXYJSON
@@ -639,6 +644,149 @@ public:
 	bool send_quit;
 	bool reusable;
 	bool processing_multi_statement;
+
+#if POLARDB_PROXY
+	// ---- PolarDB wrapped-wait result filtering ----
+	// A wrapped LSN-wait read prepends N SET statements ahead of the user query
+	// (see PgSQL_PolarDB_Wrap.cpp). The connection layer is the sole owner of SET
+	// consumption: it silently skips the first N results and forwards only the
+	// user's result to the session/client.
+
+	/**
+	 * @brief Per-dispatch query state passed from session to connection layer.
+	 *
+	 * Snapshotted at submit time (async_query ASYNC_IDLE) and consumed by
+	 * query_start(). This decouples the connection layer from session state — it
+	 * only needs to know how many prepended SET results to skip.
+	 */
+	struct PolarDB_Query_DispatchState {
+		uint32_t wrapper_stmts{0};  // wrapper statements whose result sets to consume (0 = none)
+		PolarDB_Query_WrapperKind wrapper_kind{PolarDB_Query_WrapperKind::NONE};
+		void reset() {
+			wrapper_stmts = 0;
+			wrapper_kind = PolarDB_Query_WrapperKind::NONE;
+		}
+	};
+	PolarDB_Query_DispatchState dispatch_state;
+
+	/**
+	 * @brief Per-query, connection-local state for consuming a wrapped query's
+	 *        wrapper result sets.
+	 *
+	 * A consistency read is sent as a wrapped query: the user query preceded by a
+	 * few wrapper statements (the consistency-mode / timeout / wait-LSN SETs). The
+	 * backend returns one result set per statement, so this counts the wrapper
+	 * result sets down and drops them, forwarding only the user query's result.
+	 * For a straight, non-wrapped query it carries no state (was_wrapped == false,
+	 * stmt_pending == 0) and the result path skips it entirely.
+	 *
+	 * How the wrapped consistency read is sent:
+	 *
+	 *     SET polar_consistency_mode = 'best_effort'|'strict';
+	 *     SET polar_proxy_wait_timeout_ms = <resolved_ms>;
+	 *     SET polar_xact_split_wait_lsn = '<target>';
+	 *     <user query>
+	 *
+	 * ProxySQL owns all three values for a wrapped read. The first two SETs are
+	 * always emitted, so a pooled backend connection cannot reuse an old wait mode
+	 * or timeout from a previous client session. <resolved_ms> can be 0; in
+	 * PolarDB that means the wait has no PolarDB wait-timeout limit. It is not an
+	 * absolute "query can never stop" setting: PostgreSQL statement_timeout,
+	 * client cancel, administrator termination, or connection loss can still
+	 * interrupt the backend wait through the normal CHECK_FOR_INTERRUPTS() path.
+	 * If none of those happens and the replica never reaches the target LSN, the
+	 * query waits until replay catches up.
+	 *
+	 * The backend returns one result for each statement in order. This connection
+	 * state stores the number of prepended SET results and PgSQL_Connection.cpp
+	 * consumes exactly those leading results before forwarding the user query
+	 * result. A SET appended after the user query is not supported by this state:
+	 * without a separate trailing-skip counter, that result would be forwarded to
+	 * the client as an extra result.
+	 *
+	 * PolarDB backend facts used here:
+	 *  - procarray.c:GetSnapshotData() calls polar_split_wait_for_lsn() on a
+	 *    replica only when polar_xact_split_wait_lsn is not InvalidXLogRecPtr
+	 *    (procarray.c:2803-2820).
+	 *  - procarray.c:polar_split_wait_for_lsn() loops while current_lsn < target.
+	 *    It reads polar_proxy_wait_timeout_ms in that loop and checks
+	 *    polar_consistency_mode only when a finite timeout is reached. strict
+	 *    raises ERROR; best_effort raises WARNING and returns stale data
+	 *    (procarray.c:2687-2742).
+	 *  - With polar_proxy_wait_timeout_ms=0, the finite-timeout branch is not
+	 *    reached. For the wait itself, best_effort and strict both mean "wait
+	 *    until the target LSN is replayed or the statement is interrupted by
+	 *    PostgreSQL/client/admin timeout/cancel handling."
+	 *  - guc.c defines polar_xact_split_wait_lsn as a transactional PGC_USERSET
+	 *    GUC; its assign hook treats an empty string as InvalidXLogRecPtr
+	 *    (guc.c:6274-6281, guc.c:15837-15848).
+	 *  - ReadyForQuery LSN capture is separate from polar_xact_split_wait_lsn.
+	 *    The backend sends LSN when startup parameter _polar_send_lsn or
+	 *    _polar_proxy_send_lsn sets Port.polar_proxy_send_lsn
+	 *    (postmaster.c:2440-2442, dest.c:314-325).
+	 *
+	 * Result by case (PolarDB15 with proxy support):
+	 *  1. Whether the wrapped read reaches the target, times out (best_effort
+	 *     WARNING), or errors (strict), the backend consumes polar_xact_split_wait_lsn
+	 *     after the first wait, so the wait target never survives on the pooled
+	 *     backend connection. A later straight read sees an Invalid target and never
+	 *     waits, so ProxySQL does not need a second wrapper kind just to clear
+	 *     the wait target.
+	 *  2. A strict finite-timeout ERROR or user-query ERROR additionally aborts the
+	 *     multi-statement batch; PostgreSQL transactional GUC behavior rolls back the
+	 *     wrapper SETs.
+	 * Postponed optimization:
+	 *  - Repeated mode/timeout SETs can be skipped per backend connection later.
+	 *    That state must live on PgSQL_Connection, not on the client session,
+	 *    because backend connections are pooled and reused.
+	 *  - Applied mode/timeout tracking must update only after the whole wrapped
+	 *    query completes successfully. A strict timeout or user-query ERROR rolls
+	 *    back the wrapper SETs, so updating at wrapper-build time would desync the
+	 *    tracked state from the backend connection.
+	 */
+	struct PolarDB_Query_WrapState {
+		bool was_wrapped{false};   // sticky: this query was sent wrapped (survives consumption)
+		bool stmt_failed{false};   // sticky: a wrapper statement failed before the user result
+		uint32_t stmt_total{0};    // wrapper statements in the wrapped query (set once by begin)
+		uint32_t stmt_pending{0};  // wrapper statements whose result set is still to consume
+		PolarDB_Query_WrapperKind wrapper_kind{PolarDB_Query_WrapperKind::NONE};
+
+		bool has_pending() const { return stmt_pending > 0; }  // still consuming wrapper result sets
+		bool consuming_wrapper_set() const { return stmt_pending > 0; }
+		bool wrapper_set_failed() const { return stmt_failed; }
+		bool is_consistency_wait() const {
+			return wrapper_kind == PolarDB_Query_WrapperKind::CONSISTENCY_WAIT;
+		}
+
+		void begin(uint32_t n, PolarDB_Query_WrapperKind kind) {
+			was_wrapped = (n > 0);
+			stmt_failed = false;
+			stmt_total = n;
+			stmt_pending = n;
+			wrapper_kind = (n > 0) ? kind : PolarDB_Query_WrapperKind::NONE;
+		}
+		void mark_wrapper_set_failed() { stmt_failed = true; stmt_pending = 0; }
+		void clear() {
+			was_wrapped = false;
+			stmt_failed = false;
+			stmt_total = 0;
+			stmt_pending = 0;
+			wrapper_kind = PolarDB_Query_WrapperKind::NONE;
+		}
+	};
+	PolarDB_Query_WrapState polardb_query_wrap_state;
+
+	/**
+	 * @brief PolarDB startup profile requested on this backend connection.
+	 *
+	 * It records only what ProxySQL asked for in the startup packet; it is not proof
+	 * the backend returned RFQ payloads. When picking a pooled reader for an
+	 * LSN-targeted read, the connection pool checks has_rfq_lsn() on this profile to
+	 * confirm the backend was asked to append the RFQ LSN.
+	 */
+	PolarDB_StartupProfile polardb_startup_profile;
+#endif // POLARDB_PROXY
+
 	bool multiplex_delayed;
 	bool is_client_connection; // true if this is a client connection, false if it is a server connection
 	bool exit_pipeline_mode; // true if it is safe to exit pipeline mode
@@ -659,6 +807,29 @@ public:
 	int async_exit_status; // exit status of Non blocking API
 	bool unknown_transaction_status;
 
+#if POLARDB_PROXY
+	/**
+	 * @brief Enable PolarDB LSN reporting on a freshly connected backend.
+	 *
+	 * Called once per connection right after a successful connect (cold path).
+	 * Turns on libpq RFQ-LSN parsing only when this connection's recorded startup
+	 * profile requested REQUEST_RFQ_LSN. No-op when there is no live connection.
+	 */
+	void polardb_init_connection_tracking();
+
+	/**
+	 * @brief Read the PolarDB WAL LSN carried by the last ReadyForQuery (RFQ-only).
+	 *
+	 * Reads the LSN libpq cached from the most recent extended ReadyForQuery via
+	 * PQgetLSN()/PQhasLSN(). This is a pure accessor: it never issues a SQL query,
+	 * so it is safe to call on the hot request/result-processing path.
+	 * SQL-based LSN probing lives only in the monitor.
+	 *
+	 * @return LSN value (64-bit), or 0 if the RFQ carried no LSN / no connection.
+	 */
+	uint64_t get_polardb_lsn();
+#endif // POLARDB_PROXY
+
 private:
 	// Set end state for the fetch result to indicate that it originates from a simple query or statement execution.
 	ASYNC_ST fetch_result_end_st = ASYNC_QUERY_END;
@@ -674,6 +845,46 @@ private:
 	static void notice_handler_cb(void* arg, const PGresult* result);
 	static void unhandled_notice_cb(void* arg, const PGresult* result);
 	void init_query_result();
+
+#if POLARDB_PROXY
+	/**
+	 * @brief Resolve the PolarDB startup profile for this backend hostgroup.
+	 *
+	 * @param hid hostgroup id used to resolve the per-hostgroup proxy protocol.
+	 */
+	PolarDB_StartupProfile build_polardb_startup_profile(unsigned int hid) const;
+
+	/**
+	 * @brief Append profile-driven PolarDB startup params to a conninfo.
+	 *
+	 * Emits no parameters when the profile does not request the RFQ LSN (which
+	 * includes proxy_protocol=off). For profiles that request RFQ LSNs, this
+	 * resolves client/listener/fallback identity first and fails the connection
+	 * before PQconnectStart when no valid identity is available.
+	 *
+	 * @param conninfo       conninfo string being built for the connection.
+	 * @param profile        resolved startup profile.
+	 * @param hid            hostgroup id for diagnostics.
+	 * @return true on success, false when the connection should fail early.
+	 */
+	bool append_polardb_startup_params(std::ostringstream& conninfo,
+		const PolarDB_StartupProfile& profile, unsigned int hid);
+
+	/**
+	 * @brief Choose the client endpoint to advertise in the PolarDB startup params.
+	 *
+	 * Tries sources in order and returns the first valid one: the client's
+	 * connection address, the client's raw socket address, the local
+	 * listener/proxy address, then the configured fallback identity. Returns an
+	 * identity with source NONE when none is usable; the caller then fails an
+	 * RFQ-requesting connection before it is opened.
+	 *
+	 * The profile argument is accepted for symmetry with the caller but does not
+	 * affect the chosen identity; identity selection is the same for every profile.
+	 */
+	PolarDB_StartupIdentity resolve_polardb_startup_identity(
+		const PolarDB_StartupProfile& profile) const;
+#endif // POLARDB_PROXY
 
 	/**
 	 * @brief Checks if a substring at a given position in a string matches the format of a formatted PostgreSQL error header.

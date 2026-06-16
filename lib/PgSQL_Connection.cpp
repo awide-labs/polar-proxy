@@ -15,7 +15,112 @@ using json = nlohmann::json;
 #include "PgSQL_Data_Stream.h"
 #include "PgSQL_Query_Processor.h"
 #include "PgSQL_Variables.h"
+#include "PgSQL_Thread.h"
 #include "PgSQL_Extended_Query_Message.h"
+#include "PgSQL_PolarDB.h"
+
+#if POLARDB_PROXY
+// PolarDB_ProxyProtocol is the enum used in the connection code; the same values
+// are also defined as plain integer constants (POLARDB_PROXY_PROTOCOL_*) used by
+// configuration. Keep the two in lock-step so a cast between them is always valid.
+static_assert(POLARDB_PROXY_PROTOCOL_OFF == static_cast<int>(PolarDB_ProxyProtocol::OFF),
+	"PolarDB proxy protocol OFF constant mismatch");
+static_assert(POLARDB_PROXY_PROTOCOL_LEGACY == static_cast<int>(PolarDB_ProxyProtocol::LEGACY),
+	"PolarDB proxy protocol LEGACY constant mismatch");
+static_assert(POLARDB_PROXY_PROTOCOL_V15 == static_cast<int>(PolarDB_ProxyProtocol::V15),
+	"PolarDB proxy protocol V15 constant mismatch");
+
+// Defined in PgSQL_PolarDB_Notices.cpp. Handles the backend's LSN wait-timeout
+// notice. It must run even when this connection has no active result object,
+// because the wrapped wait recycles that object while consuming the prepended
+// SET results (see notice_handler_cb below).
+void polardb_handle_notice(PgSQL_Connection* conn, const PGresult* result);
+
+/// @brief Human-readable name of a proxy protocol value, for log and trace lines.
+static const char* polardb_proxy_protocol_name(PolarDB_ProxyProtocol protocol) {
+	switch (protocol) {
+	case PolarDB_ProxyProtocol::V15:
+		return "v15";
+	case PolarDB_ProxyProtocol::LEGACY:
+		return "legacy";
+	case PolarDB_ProxyProtocol::OFF:
+	default:
+		return "off";
+	}
+}
+
+/// @brief Is this error/notice the PolarDB LSN wait-timeout?
+///
+/// The PolarDB backend tags its wait-timeout with a fixed marker in the
+/// structured DETAIL diagnostic field. We match that field, never the
+/// human-readable message text, so a user query that happens to contain the
+/// same words cannot be mistaken for a wait timeout.
+static bool polardb_is_lsn_wait_timeout_result(const PGresult* result) {
+	const char* detail = result ? PQresultErrorField(result, PG_DIAG_MESSAGE_DETAIL) : nullptr;
+	return detail && strcmp(detail, POLARDB_LSN_WAIT_TIMEOUT_DETAIL) == 0;
+}
+
+/// @brief Account a wrapper-statement error and stop consuming wrapper results.
+///
+/// A consistency read is sent as several SET statements glued in front of the
+/// user query (see PgSQL_PolarDB_Wrap.cpp). If one of those wrapper statements
+/// errors, this decides whether the error is a PolarDB wait-timeout to count,
+/// then marks this connection's wrap-state failed so result consumption stops
+/// and the error flows to the client through the normal path.
+///
+/// @param conn   the backend connection whose wrapped read errored.
+/// @param result the libpq result carrying the error (may be null on some paths).
+/// @param msg    error text, for trace output only.
+static void polardb_account_wrapper_set_error(PgSQL_Connection* conn, const PGresult* result, const char* msg) {
+	POLARDB_TRACE("PolarDB WAIT: account_wrapper_set_error enter conn=%p msg='%s'\n",
+		(void*)conn, msg ? msg : "");
+	// Nothing to account if this query was never sent wrapped.
+	if (!conn || !conn->polardb_query_wrap_state.was_wrapped) {
+		POLARDB_TRACE("PolarDB WAIT: skip account, no conn or not consuming wrapper SET "
+			"conn=%p was_wrapped=%d pending=%u failed=%d\n",
+			(void*)conn,
+			conn && conn->polardb_query_wrap_state.was_wrapped ? 1 : 0,
+			conn ? conn->polardb_query_wrap_state.stmt_pending : 0,
+			conn && conn->polardb_query_wrap_state.wrapper_set_failed() ? 1 : 0);
+		return;
+	}
+
+	// With no live wait there is nothing to charge; still mark the wrap-state
+	// failed so the result loop stops consuming and surfaces the error.
+	PgSQL_Session* sess = conn->myds ? conn->myds->sess : nullptr;
+	if (!sess || !sess->polardb_wait_active()) {
+		POLARDB_TRACE("PolarDB WAIT: mark wrapper failed without accounting "
+			"sess=%p wait_active=%d pending=%u\n",
+			(void*)sess, sess && sess->polardb_wait_active() ? 1 : 0,
+			conn->polardb_query_wrap_state.stmt_pending);
+		conn->polardb_query_wrap_state.mark_wrapper_set_failed();
+		return;
+	}
+
+	const bool is_lsn_timeout = polardb_is_lsn_wait_timeout_result(result);
+	POLARDB_TRACE("PolarDB WAIT: account check sess=%p wait_active=%d "
+		"wait_type=%d wait_started=%lu pending=%u is_lsn_timeout=%d\n",
+		(void*)sess, sess->polardb_wait_active() ? 1 : 0,
+		(int)sess->polardb_query.wait.spec.type,
+		(unsigned long)sess->polardb_query.wait.wait_started_at_us,
+		conn->polardb_query_wrap_state.stmt_pending,
+		is_lsn_timeout ? 1 : 0);
+
+	// In strict mode the timeout can arrive after every wrapper SET result has
+	// already been consumed: the wait is armed by SET polar_xact_split_wait_lsn,
+	// then the backend raises ERROR before running the user SELECT. Count it only
+	// when the structured marker is present AND the wait is still active, so an
+	// ordinary user-query error that happens to resemble a timeout is not counted.
+	if (is_lsn_timeout) {
+		sess->polardb_account_wait_timeout("result-error");
+	}
+
+	if (conn->polardb_query_wrap_state.consuming_wrapper_set()) {
+		conn->polardb_query_wrap_state.mark_wrapper_set_failed();
+		POLARDB_TRACE("PolarDB WAIT: wrapper SET failure marked\n");
+	}
+}
+#endif
 
 extern char * binary_sha1;
 
@@ -287,6 +392,15 @@ void PgSQL_Connection::next_event(PG_ASYNC_ST new_st) {
 
 
 PG_ASYNC_ST PgSQL_Connection::handler(short event) {
+#if POLARDB_PROXY && POLARDB_DEBUG
+	{
+		static std::atomic<int> _h_count{0};
+		int _hc = _h_count.fetch_add(1, std::memory_order_relaxed) + 1;
+		int _conn_id = pgsql_conn ? PQsocket(pgsql_conn) : -1;
+		POLARDB_TRACE("[H%03d.000|C%d] ======== HANDLER ENTRY ======== async_state=%d event=%d\n",
+			_hc, _conn_id, (int)async_state_machine, (int)event);
+	}
+#endif // POLARDB_PROXY && POLARDB_DEBUG
 #if ENABLE_TIMER
 	Timer timer(myds->sess->thread->Timers.Connections_Handlers);
 #endif // ENABLE_TIMER
@@ -302,10 +416,18 @@ PG_ASYNC_ST PgSQL_Connection::handler(short event) {
 		}
 	}
 handler_again:
+#if POLARDB_PROXY && POLARDB_DEBUG
+	POLARDB_TRACE("[H.010] ---- handler_again state=%d event=%d ----\n", (int)async_state_machine, (int)event);
+#endif
 	proxy_debug(PROXY_DEBUG_MYSQL_PROTOCOL, 6, "async_state_machine=%d\n", async_state_machine);
 	switch (async_state_machine) {
 	case ASYNC_CONNECT_START:
 		connect_start();
+#if POLARDB_PROXY
+		if (is_error_present() && pgsql_conn == NULL) {
+			NEXT_IMMEDIATE(ASYNC_CONNECT_FAILED);
+		}
+#endif // POLARDB_PROXY
 		if (async_exit_status) {
 			next_event(ASYNC_CONNECT_CONT);
 		}
@@ -337,7 +459,9 @@ handler_again:
 		}
 		if (is_error_present()) {
 			// always increase the counter
-			proxy_error("Failed to PQconnectStart() on %u:%s:%d , FD (Conn:%d , MyDS:%d) , %s.\n", parent->myhgc->hid, parent->address, parent->port, PQsocket(pgsql_conn), myds->fd, get_error_code_with_message().c_str());
+			const int conn_fd = pgsql_conn ? PQsocket(pgsql_conn) : -1;
+			const int myds_fd = myds ? myds->fd : -1;
+			proxy_error("Failed to PQconnectStart() on %u:%s:%d , FD (Conn:%d , MyDS:%d) , %s.\n", parent->myhgc->hid, parent->address, parent->port, conn_fd, myds_fd, get_error_code_with_message().c_str());
 			NEXT_IMMEDIATE(ASYNC_CONNECT_FAILED);
 		} else {
 			if (PQisnonblocking(pgsql_conn) == false) {
@@ -378,6 +502,11 @@ handler_again:
 		// the next connect for this hostname can skip getaddrinfo even if
 		// the background resolver loop hasn't visited it yet.
 		PgSQL_Monitor::update_dns_cache_from_pgsql_conn(pgsql_conn);
+#if POLARDB_PROXY
+		// Turn on PolarDB WAL-LSN reporting on this backend so a later writer
+		// query can expose its LSN via PQgetLSN() with no extra round-trip.
+		polardb_init_connection_tracking();
+#endif
 		break;
 	case ASYNC_CONNECT_FAILED:
 		//PQfinish(pgsql_conn);//release connection even on error
@@ -402,6 +531,13 @@ handler_again:
 			next_event(ASYNC_QUERY_CONT);
 		} else {
 			if (is_error_present()) {
+#if POLARDB_PROXY
+				POLARDB_TRACE("PolarDB WAIT: ASYNC_QUERY_START early error "
+					"wrapper_pending=%u wait_active=%d msg='%s'\n",
+					polardb_query_wrap_state.stmt_pending,
+					myds && myds->sess && myds->sess->polardb_wait_active() ? 1 : 0,
+					get_error_message().c_str());
+#endif
 				NEXT_IMMEDIATE(ASYNC_QUERY_END);
 			}
 			NEXT_IMMEDIATE(ASYNC_USE_RESULT_START);
@@ -416,6 +552,14 @@ handler_again:
 		} else {
 			if (is_error_present() || 
 				!set_single_row_mode()) {
+#if POLARDB_PROXY
+				POLARDB_TRACE("PolarDB WAIT: ASYNC_QUERY_CONT early end "
+					"is_error=%d wrapper_pending=%u wait_active=%d msg='%s'\n",
+					is_error_present() ? 1 : 0,
+					polardb_query_wrap_state.stmt_pending,
+					myds && myds->sess && myds->sess->polardb_wait_active() ? 1 : 0,
+					get_error_message().c_str());
+#endif
 				NEXT_IMMEDIATE(ASYNC_QUERY_END);
 			}
 			set_fetch_result_end_state(ASYNC_QUERY_END);
@@ -426,6 +570,12 @@ handler_again:
 		fetch_result_start();
 		if (async_exit_status == PG_EVENT_NONE) {
 			if (is_error_present()) {
+#if POLARDB_PROXY
+				// The fetch start already failed, so there is no per-result PGresult
+				// to classify here; pass null and let the helper decide from session
+				// wait state whether a wrapper wait timeout still needs accounting.
+				polardb_account_wrapper_set_error(this, nullptr, get_error_message().c_str());
+#endif
 				NEXT_IMMEDIATE(fetch_result_end_st);
 			}
 			init_query_result();
@@ -456,6 +606,45 @@ handler_again:
 			if (result) {
 
 				const ExecStatusType exec_status_type = PQresultStatus(result.get());
+
+#if POLARDB_PROXY
+				// Consume the wrapper SET results inline. A wrapped LSN-wait read
+				// prepends N SET statements; each completes as PGRES_COMMAND_OK or
+				// PGRES_EMPTY_QUERY. We silently discard those results (do NOT buffer
+				// them to the client) and forward only the (N+1)th result, the user's
+				// query. The connection is the sole owner of SET consumption, so the
+				// session and client only ever see the user result. Wrapped reads are
+				// simple queries, so this only triggers at the simple-query end state.
+				if (polardb_query_wrap_state.has_pending() &&
+					fetch_result_end_st == ASYNC_QUERY_END) {
+					if (exec_status_type == PGRES_COMMAND_OK ||
+						exec_status_type == PGRES_EMPTY_QUERY) {
+						polardb_query_wrap_state.stmt_pending--;
+						POLARDB_TRACE("PolarDB: wrapper result consumed: status=%d pending=%u\n",
+							(int)exec_status_type, polardb_query_wrap_state.stmt_pending);
+						// Discard the SET result and reuse its buffer for the next
+						// result (init_query_result() picks up query_result_reuse).
+						if (query_result) {
+							if (query_result_reuse) delete query_result_reuse;
+							query_result_reuse = query_result;
+							query_result = nullptr;
+						}
+						NEXT_IMMEDIATE(ASYNC_USE_RESULT_START);
+					} else if (exec_status_type == PGRES_FATAL_ERROR ||
+						exec_status_type == PGRES_NONFATAL_ERROR ||
+						exec_status_type == PGRES_BAD_RESPONSE) {
+						// A wrapper statement itself errored (e.g. strict-mode wait timeout
+						// surfaced as ERROR). Strict wait errors are normal PostgreSQL
+						// ErrorResponse packets, not dead-connection rc=-1 failures, so
+						// account them here while we still know the error belongs to a
+						// wrapper SET result. Then stop consuming and let the error flow
+						// to the client through the normal path below.
+						POLARDB_TRACE("PolarDB: wrapper result error: status=%d pending=%u\n",
+							(int)exec_status_type, polardb_query_wrap_state.stmt_pending);
+						polardb_account_wrapper_set_error(this, result.get(), PQresultErrorMessage(result.get()));
+					}
+				}
+#endif // POLARDB_PROXY
 
 				// Multi-statements are supported only in simple queries
 				if (fetch_result_end_st == ASYNC_QUERY_END &&
@@ -562,6 +751,11 @@ handler_again:
 					//if ((query_result->get_result_packet_type() & (PGSQL_QUERY_RESULT_COMMAND | PGSQL_QUERY_RESULT_EMPTY | PGSQL_QUERY_RESULT_ERROR)) == 0) {
 					set_error_from_result(result.get(), PGSQL_ERROR_FIELD_ALL);
 					assert(is_error_present());
+#if POLARDB_PROXY
+					// Catch-all error path for a wrapper read that reached the generic
+					// FATAL/bad-response handling: account a wrapper wait timeout here too.
+					polardb_account_wrapper_set_error(this, result.get(), PQresultErrorMessage(result.get()));
+#endif
 
 					// we will not send FATAL error messages to the client
 					const PGSQL_ERROR_SEVERITY severity = get_error_severity();
@@ -990,6 +1184,21 @@ void PgSQL_Connection::connect_start() {
 	}
 	conninfo << "application_name=proxysql "; // application name
 	//conninfo << "require_auth=" << AUTHENTICATION_METHOD_STR[pgsql_thread___authentication_method]; // authentication method
+#if POLARDB_PROXY
+	// Resolve the startup profile once and record it on the connection. The
+	// actual startup parameters are appended further down (after the options
+	// block is closed); the recorded profile is also read later by
+	// polardb_init_connection_tracking() once the connect succeeds.
+	const unsigned int polardb_hid = parent && parent->myhgc ? parent->myhgc->hid : 0;
+	const bool is_polardb_hg =
+		parent && parent->myhgc && PgHGM->is_polardb_hostgroup(polardb_hid);
+	const bool client_backed = myds && myds->sess && myds->sess->client_myds;
+	polardb_startup_profile = build_polardb_startup_profile(polardb_hid);
+	POLARDB_TRACE("PolarDB CONNINFO: hg=%u is_polardb=%d protocol=%s request_bits=0x%x\n",
+		polardb_hid, is_polardb_hg ? 1 : 0,
+		polardb_proxy_protocol_name(polardb_startup_profile.protocol),
+		polardb_startup_profile.request_bits);
+#endif // POLARDB_PROXY
 	if (parent->use_ssl) {
 		conninfo << "sslmode='require' "; // SSL required
 		std::unique_ptr<PgSQLServers_SslParams> ssl_params {
@@ -1066,8 +1275,37 @@ void PgSQL_Connection::connect_start() {
 			conninfo << separator << myds->sess->untracked_option_parameters;
 		}
 		conninfo << "'";
-		
+
+#if POLARDB_PROXY
+		// Append the PolarDB startup parameters now that the options block above
+		// is closed: they must be top-level conninfo keys, not options entries.
+		// The profile decides whether v15, legacy, or no parameters are emitted.
+		if (is_polardb_hg) {
+			POLARDB_TRACE("PolarDB CONNINFO: client-backed sess=%p is_polardb_enabled=%d session_consistency_mode=%d\n",
+				myds->sess,
+				myds->sess ? (myds->sess->polardb_config.is_polardb_enabled ? 1 : 0) : -1,
+				myds->sess ? myds->sess->polardb_config.session_consistency_mode : -1);
+			if (!append_polardb_startup_params(conninfo, polardb_startup_profile, polardb_hid)) {
+				return;
+			}
+			// Mark the session PolarDB-enabled whenever its backend is in a PolarDB
+			// hostgroup. This flag gates the response-side LSN result processing;
+			// it is only ever turned on, never cleared, for the life of the session.
+			myds->sess->polardb_config.is_polardb_enabled = true;
+		}
+#endif // POLARDB_PROXY
 	}
+
+#if POLARDB_PROXY
+	// Non-client (monitor / internal) connections use the same profile builder.
+	// If RFQ LSN is requested here, configured fallback identity is normally
+	// required because there is no real client address.
+	if (!client_backed && is_polardb_hg) {
+		if (!append_polardb_startup_params(conninfo, polardb_startup_profile, polardb_hid)) {
+			return;
+		}
+	}
+#endif // POLARDB_PROXY
 
 	/*conninfo << "postgres://";
 	 conninfo << userinfo->username << ":" << userinfo->password; // username and password
@@ -1104,6 +1342,165 @@ void PgSQL_Connection::connect_start() {
 	fd = PQsocket(pgsql_conn);
 	async_exit_status = PG_EVENT_WRITE;
 }
+
+#if POLARDB_PROXY
+PolarDB_StartupProfile PgSQL_Connection::build_polardb_startup_profile(unsigned int hid) const {
+	// A non-PolarDB hostgroup never gets PolarDB startup parameters.
+	if (!parent || !parent->myhgc || !PgHGM->is_polardb_hostgroup(hid)) {
+		return PolarDB_StartupProfile::from_protocol(PolarDB_ProxyProtocol::OFF);
+	}
+
+	// Per-hostgroup proxy_protocol wins when set (>= 0); otherwise fall back to the
+	// global pgsql-polardb_proxy_protocol default.
+	PgSQL_HostGroups_Manager::PolarDB_HG_Policy policy = PgHGM->get_polardb_hg_policy(hid);
+	int protocol = policy.proxy_protocol >= 0 ? policy.proxy_protocol : pgsql_thread___polardb_proxy_protocol;
+	return PolarDB_StartupProfile::from_protocol(polardb_proxy_protocol_from_int(protocol));
+}
+
+/// @brief Pick the client identity to advertise in PolarDB startup parameters.
+///
+/// PolarDB uses this host/port to know who the real client is behind the proxy.
+/// Tried in order of preference: the session's recorded client endpoint, the
+/// raw client socket address, the proxy's own listener endpoint, then the
+/// configured fallback (pgsql-polardb_proxy_identity_host/_port). Returns an
+/// identity with source NONE when nothing usable is found; the caller treats
+/// that as a hard failure for any profile that requests an RFQ LSN.
+PolarDB_StartupIdentity PgSQL_Connection::resolve_polardb_startup_identity(
+	const PolarDB_StartupProfile& profile) const {
+	(void)profile;
+	const PgSQL_Data_Stream* client_myds =
+		(myds && myds->sess) ? myds->sess->client_myds : nullptr;
+	if (client_myds) {
+		// First choice: the client endpoint already resolved on the session.
+		PolarDB_StartupIdentity identity{
+			client_myds->addr.addr,
+			client_myds->addr.port,
+			PolarDB_StartupIdentitySource::CLIENT
+		};
+		if (identity.valid(false)) {
+			return identity;
+		}
+		// Second: derive it straight from the raw client socket address.
+		PolarDB_StartupIdentity raw_identity;
+		if (polardb_startup_identity_from_sockaddr(
+				client_myds->client_addr,
+				&raw_identity,
+				PolarDB_StartupIdentitySource::CLIENT)) {
+			return raw_identity;
+		}
+		// Third: the proxy's own listener address. valid(true) additionally
+		// rejects a wildcard (any-address) listener, which would not identify a
+		// real endpoint; the client checks above use valid(false) and tolerate it.
+		identity = PolarDB_StartupIdentity{
+			client_myds->proxy_addr.addr,
+			client_myds->proxy_addr.port,
+			PolarDB_StartupIdentitySource::LISTENER_PROXY
+		};
+		if (identity.valid(true)) {
+			return identity;
+		}
+	}
+
+	// Last resort: the operator-configured fallback identity. This is the only
+	// path available to non-client (monitor / internal) connections.
+	PolarDB_StartupIdentity fallback_identity{
+		pgsql_thread___polardb_proxy_identity_host,
+		pgsql_thread___polardb_proxy_identity_port,
+		PolarDB_StartupIdentitySource::CONFIGURED_FALLBACK
+	};
+	if (fallback_identity.valid(true)) {
+		return fallback_identity;
+	}
+
+	// Nothing usable: default-constructed identity has source NONE.
+	return PolarDB_StartupIdentity{};
+}
+
+// These parameters must be top-level conninfo keys (NOT inside the `options`
+// block) so the PolarDB backend's startup-packet handler sees them. See the
+// declaration in PgSQL_Connection.h for the full contract.
+bool PgSQL_Connection::append_polardb_startup_params(std::ostringstream& conninfo,
+	const PolarDB_StartupProfile& profile, unsigned int hid) {
+	// Profiles that do not ask for an RFQ LSN need no startup parameters at all.
+	if (!profile.has_rfq_lsn()) {
+		POLARDB_TRACE("PolarDB CONNINFO: no RFQ LSN startup request for HG %u protocol=%s\n",
+			hid, polardb_proxy_protocol_name(profile.protocol));
+		return true;
+	}
+
+	// RFQ startup safety: a profile that requests an RFQ LSN but has no client
+	// identity to advertise cannot work, so refuse the connection rather than
+	// connect without the parameters and silently lose read-your-writes.
+	PolarDB_StartupIdentity identity = resolve_polardb_startup_identity(profile);
+	if (identity.source == PolarDB_StartupIdentitySource::NONE) {
+		std::string msg = "PolarDB proxy_protocol=";
+		msg += polardb_proxy_protocol_name(profile.protocol);
+		msg += " requests RFQ LSN but no startup identity is available; ";
+		msg += "use a client-backed connection, listener/proxy address, or configure ";
+		msg += "pgsql-polardb_proxy_identity_host and pgsql-polardb_proxy_identity_port";
+		set_error(PGSQL_ERROR_CODES::ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
+			msg.c_str(), true);
+		proxy_error("Cannot create PolarDB backend connection for HG %u: %s\n",
+			hid, msg.c_str());
+		return false;
+	}
+
+	POLARDB_TRACE("PolarDB CONNINFO: adding startup params to HG %u protocol=%s request_bits=0x%x identity_source=%d identity=%s:%d\n",
+		hid, polardb_proxy_protocol_name(profile.protocol), profile.request_bits,
+		static_cast<int>(identity.source), identity.host.c_str(), identity.port);
+
+	// Two PolarDB startup dialects carry the same information under different
+	// parameter names. _polar_*_send_lsn asks the backend to append its WAL LSN
+	// to every ReadyForQuery message.
+	if (profile.protocol == PolarDB_ProxyProtocol::V15) {
+		conninfo << " _polar_proxy_client_host=" << identity.host;
+		conninfo << " _polar_proxy_client_port=" << identity.port;
+		conninfo << " _polar_proxy_send_lsn=true";
+		return true;
+	}
+
+	if (profile.protocol == PolarDB_ProxyProtocol::LEGACY) {
+		conninfo << " _polar_origin_client_ip=" << identity.host;
+		conninfo << " _polar_origin_client_port=" << identity.port;
+		conninfo << " _polar_send_lsn=true";
+		return true;
+	}
+
+	return true;
+}
+
+// See PgSQL_Connection.h for the @brief. PQsetPolarSendLSN turns on libpq's
+// parsing of the LSN that PolarDB appends to ReadyForQuery, so a later
+// get_polardb_lsn() can read it with no extra round-trip.
+void PgSQL_Connection::polardb_init_connection_tracking() {
+	if (!pgsql_conn || PQstatus(pgsql_conn) != CONNECTION_OK) {
+		return;
+	}
+	// Only enable parsing when this connection's startup actually requested an
+	// RFQ LSN. Requesting is not the same as confirming: this only tells libpq to
+	// parse the payload if the backend later chooses to send it.
+	if (!polardb_startup_profile.has_rfq_lsn()) {
+		return;
+	}
+	PQsetPolarSendLSN(pgsql_conn, 1);
+}
+
+// See PgSQL_Connection.h for the @brief. This is a pure accessor: it reads the
+// LSN libpq already cached from the last ReadyForQuery and issues no SQL, which
+// is what makes it safe on the hot result-processing path.
+uint64_t PgSQL_Connection::get_polardb_lsn() {
+	if (!pgsql_conn || PQstatus(pgsql_conn) != CONNECTION_OK) {
+		return 0;
+	}
+
+	// Returns 0 when the last ReadyForQuery carried no LSN.
+	if (PQhasLSN(pgsql_conn)) {
+		return PQgetLSN(pgsql_conn);
+	}
+
+	return 0;
+}
+#endif // POLARDB_PROXY
 
 void PgSQL_Connection::connect_cont(short event) {
 	PROXY_TRACE();
@@ -1177,6 +1574,28 @@ void PgSQL_Connection::query_start() {
 	PROXY_TRACE();
 	reset_error();
 	processing_multi_statement = false;
+#if POLARDB_PROXY
+	// Begin consuming wrapper result sets from the dispatch state.
+	// async_query() (ASYNC_IDLE) copied the wrapper-statement count into
+	// dispatch_state.wrapper_stmts from the session field that
+	// finalize_wait_timeout_injection() recorded. The handler then counts those
+	// result sets down via stmt_pending, dropping each until only the user
+	// query's result remains.
+	polardb_query_wrap_state.clear();
+	if (dispatch_state.wrapper_stmts > 0) {
+		polardb_query_wrap_state.begin(dispatch_state.wrapper_stmts,
+			dispatch_state.wrapper_kind);
+		POLARDB_TRACE("PolarDB QUERY_START: begin wrapped result, stmt_total=%u kind=%d\n",
+			dispatch_state.wrapper_stmts, (int)dispatch_state.wrapper_kind);
+	}
+	POLARDB_TRACE("PolarDB QUERY_START: wrapper_stmts=%u kind=%d pending=%u "
+		"wait_active=%d query='%s'\n",
+		dispatch_state.wrapper_stmts, (int)dispatch_state.wrapper_kind,
+		polardb_query_wrap_state.stmt_pending,
+		myds && myds->sess && myds->sess->polardb_wait_active() ? 1 : 0,
+		query.ptr ? query.ptr : "");
+	dispatch_state.reset();  // Consumed — prevent stale reuse
+#endif // POLARDB_PROXY
 	async_exit_status = PG_EVENT_NONE;
 	PQsetNoticeReceiver(pgsql_conn, &PgSQL_Connection::notice_handler_cb, this);
 
@@ -1293,6 +1712,18 @@ void PgSQL_Connection::flush(bool is_resync) {
 int PgSQL_Connection::async_connect(short event) {
 	PROXY_TRACE();
 	if (pgsql_conn == NULL && async_state_machine != ASYNC_CONNECT_START) {
+#if POLARDB_PROXY
+		// PolarDB can fail before PQconnectStart() when RFQ startup parameters
+		// are required but no valid startup identity exists. The debug fault
+		// only makes this production path deterministic in tests; the
+		// connection is rejected rather than opened without RFQ LSN support.
+		if (async_state_machine == ASYNC_CONNECT_FAILED) {
+			return -1;
+		}
+		if (async_state_machine == ASYNC_CONNECT_TIMEOUT) {
+			return -2;
+		}
+#endif // POLARDB_PROXY
 		// LCOV_EXCL_START
 		assert(0);
 		// LCOV_EXCL_STOP
@@ -1439,6 +1870,19 @@ int PgSQL_Connection::async_query(short event, const char* stmt, unsigned long l
 		return 0;
 		break;
 	case ASYNC_IDLE:
+#if POLARDB_PROXY
+		// Snapshot the wrapper-statement count from session state at dispatch time
+		// so query_start() consumes dispatch_state and does not re-read the session.
+		// Only simple queries can be wrapped; extended queries never are. Clearing
+		// the session fields here stops a later query from re-skipping these results.
+		dispatch_state.reset();
+		if (!extended_query_info && myds && myds->sess &&
+			myds->sess->polardb_query.dispatch_wrapper_stmts > 0) {
+			dispatch_state.wrapper_stmts = myds->sess->polardb_query.dispatch_wrapper_stmts;
+			dispatch_state.wrapper_kind = myds->sess->polardb_query.dispatch_wrapper_kind;
+			myds->sess->polardb_query.reset_dispatch_wrapper();
+		}
+#endif // POLARDB_PROXY
 		if (myds && myds->sess) {
 			if (myds->sess->active_transactions == 0) {
 				// every time we start a query (no matter if COM_QUERY, STMT_PREPARE or otherwise)
@@ -2247,17 +2691,31 @@ bool PgSQL_Connection::handle_copy_out(const PGresult* result, uint64_t* process
 void PgSQL_Connection::notice_handler_cb(void* arg, const PGresult* result) {
 	assert(arg);
 	PgSQL_Connection* conn = (PgSQL_Connection*)arg;
-	if (conn->query_result == nullptr) {
-		// Notice received without active query_result. This can happen when:
-		// - RESET SESSION is in progress (DISCARD ALL or ROLLBACK)
+	if (!result) return;
+
+	if (conn->query_result != nullptr) {
+		// Generic upstream path: record the notice in the active result so its
+		// NoticeResponse is forwarded inline and its bytes are accounted.
+		const unsigned int bytes_recv = conn->query_result->add_notice(result);
+		conn->update_bytes_recv(bytes_recv);
+	} else {
+		// No active query_result to store into. This can happen when a notice
+		// arrives outside a result boundary, for example during RESET SESSION
+		// (DISCARD ALL / ROLLBACK).
 		proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Notice received without active query_result [State: %d, FD: %d]: %s\n",
 			(int)conn->async_state_machine,
 			conn->get_pg_socket_fd(),
-			(result ? PQresultErrorMessage(result) : "unknown notice"));
-		return;
+			PQresultErrorMessage(result));
 	}
-	const unsigned int bytes_recv = conn->query_result->add_notice(result);
-	conn->update_bytes_recv(bytes_recv);
+
+#if POLARDB_PROXY
+	// Do not return before this block: a wrapped LSN wait can receive its timeout
+	// notice while hidden wrapper SET results are being consumed and query_result
+	// is not available for normal notice forwarding. polardb_handle_notice()
+	// ignores anything that is not an LSN wait-timeout notice during an active
+	// PolarDB wait.
+	polardb_handle_notice(conn, result);
+#endif
 }
 
 void PgSQL_Connection::unhandled_notice_cb(void* arg, const PGresult* result) {
@@ -2613,6 +3071,13 @@ void PgSQL_Connection::reset() {
 		}
 	}
 	dynamic_variables_idx.clear();
+
+#if POLARDB_PROXY
+	// Drop any leftover wrapped-read state so a connection returned to the pool
+	// does not carry a stale wrapper count into the next client session.
+	dispatch_state.reset();
+	polardb_query_wrap_state.clear();
+#endif
 
 	// We need to copy the startup parameters:
 	// For client connections, we copy all startup parameters

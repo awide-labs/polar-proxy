@@ -53,6 +53,14 @@ ifeq ($(PROXYSQLCLICKHOUSE),1)
 	PSQLCH := -DPROXYSQLCLICKHOUSE
 endif
 
+PSQLPOLAR :=
+ifeq ($(POLARDB_PROXY),1)
+	PSQLPOLAR := -DPOLARDB_PROXY
+endif
+ifeq ($(POLARDB_DEBUG),1)
+	PSQLPOLAR += -DPOLARDB_DEBUG=1
+endif
+
 PSQL40 :=
 ifeq ($(PROXYSQL40),1)
 	PSQL40 := -DPROXYSQL40
@@ -83,7 +91,7 @@ endif
 
 
 MYCFLAGS := $(IDIRS) $(OPTZ) $(DEBUG) -Wall -DGITVERSION=\"$(GIT_VERSION)\" $(NOJEM) $(WGCOV) $(WASAN)
-MYCXXFLAGS := $(STDCPP) $(MYCFLAGS) $(PSQLCH) $(PSQL40) $(PSQL31) $(PSQLFFTO) $(PSQLTSDB) $(ENABLE_EPOLL)
+MYCXXFLAGS := $(STDCPP) $(MYCFLAGS) $(PSQLCH) $(PSQLPOLAR) $(PSQL40) $(PSQL31) $(PSQLFFTO) $(PSQLTSDB) $(ENABLE_EPOLL)
 
 default: libproxysql.a
 .PHONY: default
@@ -102,7 +110,7 @@ _OBJ_CXX := ProxySQL_GloVars.oo network.oo debug.oo configfile.oo Query_Cache.oo
 	proxy_protocol_info.oo \
 	proxysql_find_charset.oo ProxySQL_Poll.oo \
 	PgSQL_Protocol.oo PgSQL_Thread.oo PgSQL_Data_Stream.oo PgSQL_Session.oo PgSQL_Variables.oo PgSQL_HostGroups_Manager.oo PgSQL_Connection.oo PgSQL_Backend.oo PgSQL_Logger.oo PgSQL_Authentication.oo PgSQL_Error_Helper.oo \
-	MySQL_Query_Cache.oo PgSQL_Query_Cache.oo PgSQL_Monitor.oo DNS_Cache.oo \
+	MySQL_Query_Cache.oo PgSQL_Query_Cache.oo PgSQL_Monitor.oo PgSQL_PolarDB.oo PgSQL_PolarDB_Flow.oo PgSQL_PolarDB_Consistency.oo PgSQL_PolarDB_Wrap.oo PgSQL_PolarDB_Notices.oo PgSQL_PolarDB_Failure.oo PgSQL_PolarDB_Stubs.oo DNS_Cache.oo \
 	MySQL_Set_Stmt_Parser.oo PgSQL_Set_Stmt_Parser.oo \
 	PgSQL_Variables_Validator.oo PgSQL_ExplicitTxnStateMgr.oo \
 	PgSQL_PreparedStatement.oo PgSQL_Extended_Query_Message.oo \

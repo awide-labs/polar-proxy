@@ -1078,6 +1078,12 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 	PolarDB_HG_Policy get_polardb_hg_policy(unsigned int hostgroup_id);
 
 	/**
+	 * @brief Whether the hostgroup's current effective proxy protocol requests
+	 *        RFQ LSN feedback.
+	 */
+	bool polardb_hostgroup_requests_rfq_lsn(unsigned int hostgroup_id);
+
+	/**
 	 * @brief Warn about loaded PolarDB policy combinations whose effective
 	 * global/HG resolution disables expected RFQ LSN behavior.
 	 */

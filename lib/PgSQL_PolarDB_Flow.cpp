@@ -114,6 +114,56 @@ bool PgSQL_Session::polardb_manual_route_scope(
 	return true;
 }
 
+bool PgSQL_Session::polardb_query_cache_disabled_for_current_rule() const {
+	if (!qpo || qpo->replica_eligible != 1 ||
+			!PgHGM->status.polardb_active.load(std::memory_order_relaxed)) {
+		return false;
+	}
+
+	// Cache lookup happens before collect()/plan(), so no reader plan exists yet.
+	// Use the same cheap inputs the planner will later read, and disable cache
+	// only when this automatic PolarDB route may need writer routing or a replica
+	// wait for the current session.
+	int route_hg = current_hostgroup;
+	if (qpo->destination_hostgroup >= 0 && transaction_persistent_hostgroup == -1) {
+		route_hg = qpo->destination_hostgroup;
+	}
+	if (route_hg < 0) {
+		return false;
+	}
+
+	const auto hg_config = PgHGM->get_polardb_hg_config((unsigned int)route_hg);
+	if (!hg_config.is_polardb_hostgroup) {
+		return false;
+	}
+
+	const int mode = polardb_resolve_consistency_mode(
+		polardb_config.session_consistency_mode,
+		hg_config.policy.consistency_mode,
+		pgsql_thread___polardb_consistency_mode);
+	switch (polardb_consistency_from_int(mode)) {
+	case PolarDB_ConsistencyMode::OFF:
+		return false;
+	case PolarDB_ConsistencyMode::PRIMARY_ONLY:
+		return true;
+	case PolarDB_ConsistencyMode::SESSION_LSN:
+		break;
+	}
+
+	// In LSN mode, cache is safe until the session has an LSN target or a missing
+	// LSN latch. PRIMARY baseline can create a first-read target from the writer
+	// mirror, so it also bypasses cache before the planner runs.
+	if (polardb_session_consistency.target() > 0 ||
+			polardb_session_consistency.write_unknown ||
+			polardb_session_consistency.observed_unknown) {
+		return true;
+	}
+
+	return polardb_session_lsn_baseline_from_int(
+		pgsql_thread___polardb_session_lsn_baseline) ==
+			PolarDB_SessionLsnBaseline::PRIMARY;
+}
+
 /**
  * @brief Record the writer scope this request runs under, for later LSN attribution.
  *

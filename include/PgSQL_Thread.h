@@ -43,6 +43,8 @@ constexpr const char* AUTHENTICATION_METHOD_STR[] = {
 */
 
 #if POLARDB_PROXY
+struct PolarDB_Query_ReaderPlan;
+
 // PolarDB consistency-mode integer constants used where an int plus -1 sentinel
 // is needed (thread variables, HG policy, admin SQL). The values align with
 // PolarDB_ConsistencyMode.
@@ -677,6 +679,21 @@ public:
 	 *
 	 */
 	PgSQL_Connection* get_MyConn_local(unsigned int, PgSQL_Session * sess, char* gtid_uuid, uint64_t gtid_trxid, int max_lag_ms);
+#if POLARDB_PROXY
+	/**
+	 * @brief Try the thread-local cache for a PolarDB target-aware reader.
+	 *
+	 * This is a conservative fast path for LSN-protected reads. It returns a
+	 * cached backend only when the normal local-cache requirements match and the
+	 * backend was created with an RFQ-LSN startup profile. It also requires a
+	 * fresh cached server LSN that already satisfies the reader plan, so taking
+	 * the local cache does not bypass route-smart's caught-up-reader preference
+	 * or byte-lag safety checks. Misses fall through to HostGroups Manager reader
+	 * selection.
+	 */
+	PgSQL_Connection* get_MyConn_local_polardb_reader(unsigned int, PgSQL_Session* sess,
+		const PolarDB_Query_ReaderPlan& reader_plan);
+#endif // POLARDB_PROXY
 
 	/**
 	 * @brief Adds a connection to the thread's local connection cache.

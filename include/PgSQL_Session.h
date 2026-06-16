@@ -12,6 +12,7 @@
 #include "PgSQL_Error_Helper.h"
 #include "PgSQL_Variables.h"
 #include "PgSQL_Variables_Validator.h"
+#include "PgSQL_PolarDB.h"   // PolarDB LSN types (no-op when POLARDB_PROXY=0)
 
 class PgSQL_Query_Result;
 class PgSQL_ExplicitTxnStateMgr;
@@ -472,6 +473,75 @@ public:
 	PgSQL_DateStyle_t current_datestyle = {};
 	uint32_t cancel_secret_key;
 
+#if POLARDB_PROXY
+	// ---- PolarDB LSN session-consistency ----
+	// All PolarDB session state lives here, grouped into small value structs so the
+	// routing, result-processing, and reset paths share one set of fields and one
+	// reset contract instead of scattering loose flags across the session.
+	// Every field is session-confined: only the one thread currently driving this
+	// PgSQL_Session touches it, so none of these fields use locks or atomics.
+
+	/**
+	 * @brief PolarDB per-session configuration.
+	 *
+	 * Optional per-session consistency-mode override. The resolved mode is
+	 * request-local state in PolarDB_Query_RouteCtx, because per-hostgroup or
+	 * global policy can change between queries.
+	 *
+	 * Supported values for the client SET that drives this override:
+	 *   default      clear the session override and inherit per-HG / global config
+	 *   off          disable PolarDB consistency routing for this session
+	 *   lsn/session  use per-session write LSN read-your-writes routing
+	 *   primary      force reads to the primary
+	 */
+	struct PgSQL_PolarDB_Config {
+		// Set true once this session attaches to a backend in a PolarDB-enabled
+		// hostgroup (on fresh connect, or when a pooled connection is reused). It
+		// gates the response-path result processing. Only ever turned on: a session
+		// that has talked to a PolarDB backend keeps capturing LSNs for its life.
+		bool is_polardb_enabled = false;
+		// Per-session consistency-mode override, and the top tier of mode resolution
+		// (session override > hostgroup > global). -1 means "no override", so the
+		// resolved mode falls through to the per-hostgroup and global settings.
+		int session_consistency_mode = -1;
+	} polardb_config;
+
+	// Durable per-session consistency truth: the read-your-writes LSN target
+	// (write and observed positions), the missing-LSN latches, and the writer
+	// hostgroup/epoch scope those values belong to. This lives for the whole
+	// session: the write LSN deliberately survives RESET, because a RESET clears
+	// session settings but does not undo writes the client already made. Only a
+	// new client connection (a fresh session object) starts it at zero.
+	// See doc/polardb-arch/10-SESSION-INTEGRATION.md section 6.4.
+	PolarDB_SessionConsistency polardb_session_consistency;
+
+	// Mutable state for the one query in flight: the reader acquisition plan, the
+	// wait state, the wrapped-query buffer, and the request writer scope. Reset
+	// before each query and at query end, so nothing leaks into the next query.
+	PolarDB_QueryState polardb_query;
+
+	// Safety latch. When set, this session forces the writer instead of sending an
+	// unwrapped read to a replica. It is set when a wait wrapper cannot be built,
+	// which would otherwise break read-your-writes silently. Cleared on RESET.
+	bool polardb_wait_disabled = false;
+
+	// Queue of NoticeResponse packets captured from a wrapped consistency read,
+	// flushed to the client just ahead of the user result so the client sees the
+	// same warning-before-result ordering it would without wrapping (e.g. a
+	// best_effort LSN wait-timeout WARNING, or a synthetic degraded-route WARNING).
+	// This is the only heap-owned PolarDB session field: it is allocated lazily on
+	// the first captured notice and freed by clear_pending_notices(). The flush
+	// path hands the bytes to the client output array and clears without freeing;
+	// every other teardown path frees. See doc/polardb-arch/10-SESSION-INTEGRATION.md
+	// section 6.3.
+	PtrSizeArray* pending_notices = nullptr;
+	// One-shot guard so the per-session "RFQ route degraded" log line is written at
+	// most once while a degradation stays active. The client NoticeResponse and the
+	// counters are still emitted for every degraded route; only the log line is
+	// rate-limited. Re-armed (set back to false) when the degradation clears.
+	bool polardb_rfq_degraded_route_warning_sent = false;
+#endif // POLARDB_PROXY
+
 	// Describe mode state for \d tablename meta command
 	bool describe_mode{ false };
 	char describe_table_name[256]{ 0 };
@@ -722,6 +792,13 @@ public:
 	void polardb_reader_lag_plan(PolarDB_Query_RoutePlan& plan,
 		const PolarDB_Query_RouteCtx& route_ctx);
 	/**
+	 * @brief True when query cache must not serve or store the current query.
+	 *
+	 * Automatic PolarDB consistency reads must pass through routing so the
+	 * session LSN policy can choose the writer or add a replica wait.
+	 */
+	bool polardb_query_cache_disabled_for_current_rule() const;
+	/**
 	 * @brief Send the in-flight query to the writer instead of a replica.
 	 *
 	 * Clears the staged reader target and wait, sets current_hostgroup to
@@ -815,14 +892,14 @@ public:
 	 */
 	void clear_pending_notices(bool free_buffers = false);
 	/**
-	 * @brief Move queued NoticeResponse packets to the client output array.
+	* @brief Move queued NoticeResponse packets to the client output array.
 	 *
 	 * Used before normal result forwarding and before the first streamed result
 	 * chunk, so best_effort wait warnings stay ahead of rows.
-	 */
+	*/
 	void polardb_flush_pending_notices_to_client();
 	/**
-	 * @brief Take ownership of a NoticeResponse packet to forward with the next result.
+	* @brief Take ownership of a NoticeResponse packet to forward with the next result.
 	 *
 	 * Allocates the queue lazily on the first captured notice, so a session that
 	 * never hits a wait timeout never allocates it. @p pkt becomes session-owned.
@@ -853,6 +930,18 @@ public:
 #endif // POLARDB_PROXY
 
 private:
+#if POLARDB_PROXY
+	/**
+	 * @brief Fail closed when the wait wrapper cannot be built or installed.
+	 *
+	 * Counts the abort, logs @p reason, latches polardb_wait_disabled so later
+	 * reads in this session go to the writer until RESET, and clears the half-built
+	 * wrapper and wait state. Always returns PolarDB_WrapFinalizeResult::FAILED; the
+	 * caller must stop before running the query and return a clean error.
+	 */
+	PolarDB_WrapFinalizeResult fail_wait_wrap_finalize(const char* reason);
+#endif // POLARDB_PROXY
+
 	int32_t extract_pid_from_param(const PgSQL_Param_Value& param, uint16_t format) const;
 	void send_parameter_error_response(const char* error_message, PGSQL_ERROR_CODES code = PGSQL_ERROR_CODES::ERRCODE_INVALID_TEXT_REPRESENTATION);
 	bool handle_kill_success(int32_t pid, int tki, const char* digest_text, PgSQL_Connection* mc, PtrSize_t* pkt);

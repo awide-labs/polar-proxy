@@ -4634,7 +4634,6 @@ void PgSQL_HostGroups_Manager::HostGroup_Server_Mapping::remove_HGM(PgSQL_SrvC* 
 // TODO: pgsql-polardb_lag_ms is deferred. The PgSQL path does not currently
 // produce a real millisecond replica-lag value; use LSN byte lag and cache
 // freshness as the supported LSN-only safety controls.
-static constexpr int POLARDB_LSN_FRESHNESS_MS_DEFAULT = 5000;
 
 std::string PgSQL_HostGroups_Manager::polardb_writer_identity_locked(
 		unsigned int writer_hostgroup_id) {
@@ -4827,6 +4826,17 @@ PgSQL_HostGroups_Manager::PolarDB_HG_Config PgSQL_HostGroups_Manager::get_polard
 
 PgSQL_HostGroups_Manager::PolarDB_HG_Policy PgSQL_HostGroups_Manager::get_polardb_hg_policy(unsigned int hostgroup_id) {
 	return get_polardb_hg_config(hostgroup_id).policy;
+}
+
+bool PgSQL_HostGroups_Manager::polardb_hostgroup_requests_rfq_lsn(unsigned int hostgroup_id) {
+	const PolarDB_HG_Config config = get_polardb_hg_config(hostgroup_id);
+	if (!config.is_polardb_hostgroup) {
+		return false;
+	}
+	const int protocol = config.policy.proxy_protocol >= 0 ?
+		config.policy.proxy_protocol : current_global_polardb_proxy_protocol();
+	return PolarDB_StartupProfile::from_protocol(
+		polardb_proxy_protocol_from_int(protocol)).has_rfq_lsn();
 }
 
 void PgSQL_HostGroups_Manager::polardb_warn_config_mismatches() {
