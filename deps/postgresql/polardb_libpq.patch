@@ -1,0 +1,283 @@
+--- src/interfaces/libpq/exports.txt
++++ src/interfaces/libpq/exports.txt
+@@ -187,3 +187,7 @@ PQsetTraceFlags           184
+ PQmblenBounded            185
+ PQsendFlushRequest        186
+ PQconnectionUsedGSSAPI    187
++# PolarDB proxy support - LSN functions
++PQgetLSN                  188
++PQhasLSN                  189
++PQsetPolarSendLSN         190
+--- src/interfaces/libpq/fe-connect.c
++++ src/interfaces/libpq/fe-connect.c
+@@ -361,6 +361,54 @@ static const internalPQconninfoOption PQconninfoOptions[] = {
+ 		"Load-Balance-Hosts", "", 8,	/* sizeof("disable") = 8 */
+ 	offsetof(struct pg_conn, load_balance_hosts)},
+ 
++	/* PolarDB proxy support - direct startup packet parameters */
++	/* PG11 style names - work with both PolarDB 11 and 15 */
++	{"_polar_send_lsn", NULL, NULL, NULL,
++		"PolarDB-Send-LSN", "D", 6,
++	offsetof(struct pg_conn, _polar_send_lsn)},
++
++	{"_polar_origin_client_ip", NULL, NULL, NULL,
++		"PolarDB-Client-IP", "D", 45,
++	offsetof(struct pg_conn, _polar_origin_client_ip)},
++
++	{"_polar_origin_client_port", NULL, NULL, NULL,
++		"PolarDB-Client-Port", "D", 6,
++	offsetof(struct pg_conn, _polar_origin_client_port)},
++
++	/* PG15 aliases.  Old names above remain the compatibility baseline. */
++	{"_polar_proxy_client_host", NULL, NULL, NULL,
++		"PolarDB-Proxy-Client-Host", "D", 45,
++	offsetof(struct pg_conn, _polar_proxy_client_host)},
++
++	{"_polar_proxy_client_port", NULL, NULL, NULL,
++		"PolarDB-Proxy-Client-Port", "D", 6,
++	offsetof(struct pg_conn, _polar_proxy_client_port)},
++
++	{"_polar_proxy_send_lsn", NULL, NULL, NULL,
++		"PolarDB-Proxy-Send-LSN", "D", 6,
++	offsetof(struct pg_conn, _polar_proxy_send_lsn)},
++
++	/* PG15-only metadata */
++	{"_polar_proxy_session_id", NULL, NULL, NULL,
++		"PolarDB-Session-ID", "D", 12,
++	offsetof(struct pg_conn, _polar_proxy_session_id)},
++
++	{"_polar_proxy_cancel_key", NULL, NULL, NULL,
++		"PolarDB-Cancel-Key", "D", 12,
++	offsetof(struct pg_conn, _polar_proxy_cancel_key)},
++
++	{"_polar_proxy_use_ssl", NULL, NULL, NULL,
++		"PolarDB-Use-SSL", "D", 6,
++	offsetof(struct pg_conn, _polar_proxy_use_ssl)},
++
++	{"_polar_proxy_ssl_version", NULL, NULL, NULL,
++		"PolarDB-SSL-Version", "D", 20,
++	offsetof(struct pg_conn, _polar_proxy_ssl_version)},
++
++	{"_polar_proxy_ssl_cipher_name", NULL, NULL, NULL,
++		"PolarDB-SSL-Cipher", "D", 64,
++	offsetof(struct pg_conn, _polar_proxy_ssl_cipher_name)},
++
+ 	/* Terminating entry --- MUST BE LAST */
+ 	{NULL, NULL, NULL, NULL,
+ 	NULL, NULL, 0}
+@@ -1745,6 +1793,20 @@ connectOptions2(PGconn *conn)
+ 			goto oom_error;
+ 	}
+ 
++	/*
++	 * PolarDB proxy options - convert string options to bool flags.
++	 * The bool flags are used by getReadyForQuery() to parse PolarDB's
++	 * extended ReadyForQuery message that includes LSN data.
++	 */
++	/*
++	 * Old PG11-style names are the compatibility baseline.  If both old and
++	 * PG15 alias names are supplied, the old value wins deterministically.
++	 */
++	if (conn->_polar_send_lsn)
++		conn->polar_proxy_send_lsn = (strcmp(conn->_polar_send_lsn, "true") == 0);
++	else if (conn->_polar_proxy_send_lsn)
++		conn->polar_proxy_send_lsn = (strcmp(conn->_polar_proxy_send_lsn, "true") == 0);
++
+ 	/*
+ 	 * Only if we get this far is it appropriate to try to connect. (We need a
+ 	 * state flag, rather than just the boolean result of this function, in
+@@ -4458,6 +4520,21 @@ freePGconn(PGconn *conn)
+ 	free(conn->rowBuf);
+ 	free(conn->target_session_attrs);
+ 	free(conn->load_balance_hosts);
++	/* PolarDB proxy connection string parameters */
++	/* PG11 style */
++	free(conn->_polar_send_lsn);
++	free(conn->_polar_origin_client_ip);
++	free(conn->_polar_origin_client_port);
++	/* PG15 aliases */
++	free(conn->_polar_proxy_client_host);
++	free(conn->_polar_proxy_client_port);
++	free(conn->_polar_proxy_send_lsn);
++	/* PG15-only metadata */
++	free(conn->_polar_proxy_session_id);
++	free(conn->_polar_proxy_cancel_key);
++	free(conn->_polar_proxy_use_ssl);
++	free(conn->_polar_proxy_ssl_version);
++	free(conn->_polar_proxy_ssl_cipher_name);
+ 	termPQExpBuffer(&conn->errorMessage);
+ 	termPQExpBuffer(&conn->workBuffer);
+ 
+@@ -7810,3 +7887,34 @@ PQregisterThreadLock(pgthreadlock_t newhandler)
+ 
+ 	return prev;
+ }
++
++/*
++ * PolarDB LSN API - for read-your-writes consistency
++ */
++
++/* PQgetLSN - get LSN from last ReadyForQuery (returns 0 if not available) */
++uint64_t
++PQgetLSN(const PGconn *conn)
++{
++	if (!conn)
++		return 0;
++	return conn->polar_last_lsn;
++}
++
++/* PQhasLSN - check if LSN is available from last ReadyForQuery */
++int
++PQhasLSN(const PGconn *conn)
++{
++	if (!conn)
++		return 0;
++	return conn->polar_has_lsn ? 1 : 0;
++}
++
++/* PQsetPolarSendLSN - enable/disable polar_proxy_send_lsn flag */
++void
++PQsetPolarSendLSN(PGconn *conn, int enable)
++{
++	if (!conn)
++		return;
++	conn->polar_proxy_send_lsn = (enable != 0);
++}
+--- src/interfaces/libpq/fe-protocol3.c
++++ src/interfaces/libpq/fe-protocol3.c
+@@ -1655,6 +1655,44 @@ getReadyForQuery(PGconn *conn)
+ 			break;
+ 	}
+ 
++	/*
++	 * Compute message end to avoid reading past boundary.
++	 * The length field (at inStart+1, 4 bytes, network order) includes itself
++	 * but not the type byte.  msg_end = inStart + 1 (type) + length_value.
++	 */
++	uint32		raw_len;
++	int			msg_end;
++
++	memcpy(&raw_len, conn->inBuffer + conn->inStart + 1, 4);
++	msg_end = conn->inStart + 1 + (int) pg_ntoh32(raw_len);
++
++#define MSG_REMAINING() (msg_end - conn->inCursor)
++
++	/* PolarDB extension: parse LSN if present */
++	conn->polar_has_lsn = false;
++	if (conn->polar_proxy_send_lsn && MSG_REMAINING() >= 8)
++	{
++		char lsn_buf[8];
++		if (pqGetnchar(lsn_buf, 8, conn) == 0)
++		{
++			uint64 lsn;
++			memcpy(&lsn, lsn_buf, 8);
++			lsn = pg_ntoh64(lsn);
++			conn->polar_last_lsn = lsn;
++			conn->polar_has_lsn = true;
++		}
++	}
++
++	/*
++	 * Skip any remaining bytes we did not parse.  This handles:
++	 *  - the backend appending extra fields the proxy did not request
++	 *  - Future PolarDB protocol extensions
++	 */
++	if (MSG_REMAINING() > 0)
++		conn->inCursor = msg_end;
++
++#undef MSG_REMAINING
++
+ 	return 0;
+ }
+ 
+@@ -2340,6 +2378,35 @@ build_startup_packet(const PGconn *conn, char *packet,
+ 		}
+ 	}
+ 
++	/*
++	 * PolarDB proxy parameters - sent directly (NOT inside options block).
++	 * These are parsed by PolarDB's ProcessStartupPacket() in postmaster.c.
++	 */
++	/* PG11 style names - work with both PolarDB 11 and 15 */
++	if (conn->_polar_send_lsn && conn->_polar_send_lsn[0])
++		ADD_STARTUP_OPTION("_polar_send_lsn", conn->_polar_send_lsn);
++	else if (conn->_polar_proxy_send_lsn && conn->_polar_proxy_send_lsn[0])
++		ADD_STARTUP_OPTION("_polar_proxy_send_lsn", conn->_polar_proxy_send_lsn);
++	if (conn->_polar_origin_client_ip && conn->_polar_origin_client_ip[0])
++		ADD_STARTUP_OPTION("_polar_origin_client_ip", conn->_polar_origin_client_ip);
++	else if (conn->_polar_proxy_client_host && conn->_polar_proxy_client_host[0])
++		ADD_STARTUP_OPTION("_polar_proxy_client_host", conn->_polar_proxy_client_host);
++	if (conn->_polar_origin_client_port && conn->_polar_origin_client_port[0])
++		ADD_STARTUP_OPTION("_polar_origin_client_port", conn->_polar_origin_client_port);
++	else if (conn->_polar_proxy_client_port && conn->_polar_proxy_client_port[0])
++		ADD_STARTUP_OPTION("_polar_proxy_client_port", conn->_polar_proxy_client_port);
++	/* PG15-only metadata */
++	if (conn->_polar_proxy_session_id && conn->_polar_proxy_session_id[0])
++		ADD_STARTUP_OPTION("_polar_proxy_session_id", conn->_polar_proxy_session_id);
++	if (conn->_polar_proxy_cancel_key && conn->_polar_proxy_cancel_key[0])
++		ADD_STARTUP_OPTION("_polar_proxy_cancel_key", conn->_polar_proxy_cancel_key);
++	if (conn->_polar_proxy_use_ssl && conn->_polar_proxy_use_ssl[0])
++		ADD_STARTUP_OPTION("_polar_proxy_use_ssl", conn->_polar_proxy_use_ssl);
++	if (conn->_polar_proxy_ssl_version && conn->_polar_proxy_ssl_version[0])
++		ADD_STARTUP_OPTION("_polar_proxy_ssl_version", conn->_polar_proxy_ssl_version);
++	if (conn->_polar_proxy_ssl_cipher_name && conn->_polar_proxy_ssl_cipher_name[0])
++		ADD_STARTUP_OPTION("_polar_proxy_ssl_cipher_name", conn->_polar_proxy_ssl_cipher_name);
++
+ 	/* Add trailing terminator */
+ 	if (packet)
+ 		packet[packet_len] = '\0';
+--- src/interfaces/libpq/libpq-fe.h
++++ src/interfaces/libpq/libpq-fe.h
+@@ -27,7 +27,7 @@ extern "C"
+  * such as Oid.
+  */
+ #include "postgres_ext.h"
+-
++#include <stdint.h>
+ /*
+  * These symbols may be used in compile-time #ifdef tests for the availability
+  * of newer libpq features.
+@@ -688,6 +688,13 @@ extern const PGresult *PQgetResultFromPGconn(PGconn *conn);
+ /* ProxySQL special handler function */
+ extern int PShandleRowData(PGconn *conn, bool is_first_packet, PSresult* result);
+ 
++/*
++ * PolarDB LSN API - for read-your-writes consistency
++ */
++extern uint64_t PQgetLSN(const PGconn *conn);
++extern int	PQhasLSN(const PGconn *conn);
++extern void PQsetPolarSendLSN(PGconn *conn, int enable);
++
+ /* Send a pipeline sync message without flushing the send buffer */
+ extern int	PQsendPipelineSync(PGconn *conn);
+ 
+--- src/interfaces/libpq/libpq-int.h
++++ src/interfaces/libpq/libpq-int.h
+@@ -493,6 +493,27 @@ struct pg_conn
+ 								 * tried host */
+ 	bool		send_appname;	/* okay to send application_name? */
+ 
++	/* PolarDB proxy support */
++	bool		polar_proxy_send_lsn;	/* request LSN in ReadyForQuery? */
++	uint64		polar_last_lsn;			/* LSN from last ReadyForQuery */
++	bool		polar_has_lsn;			/* was LSN present in last RFQ? */
++
++	/* PolarDB connection string options (passed directly in startup packet) */
++	/* PG11 style names - work with both PolarDB 11 and 15 */
++	char	   *_polar_send_lsn;           /* "true" to request LSN */
++	char	   *_polar_origin_client_ip;   /* Client IP passthrough */
++	char	   *_polar_origin_client_port; /* Client port passthrough */
++	/* PG15 aliases.  If both old and new names are provided, old names win. */
++	char	   *_polar_proxy_client_host;  /* Client host passthrough */
++	char	   *_polar_proxy_client_port;  /* Client port passthrough */
++	char	   *_polar_proxy_send_lsn;     /* "true" to request LSN */
++	/* PG15-only metadata */
++	char	   *_polar_proxy_session_id;   /* Session ID for cancel routing */
++	char	   *_polar_proxy_cancel_key;   /* Cancel key for verification */
++	char	   *_polar_proxy_use_ssl;      /* "true" if client used SSL */
++	char	   *_polar_proxy_ssl_version;  /* SSL version string */
++	char	   *_polar_proxy_ssl_cipher_name; /* SSL cipher name */
++
+ 	/* Miscellaneous stuff */
+ 	int			be_pid;			/* PID of backend --- needed for cancels */
+ 	int			be_key;			/* key of backend --- needed for cancels */

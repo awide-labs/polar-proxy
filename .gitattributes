@@ -1,0 +1,2 @@
+# Vendored PostgreSQL patch files store source diffs; keep embedded whitespace intact.
+deps/postgresql/*.patch -whitespace

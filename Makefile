@@ -144,6 +144,10 @@ DEBUG := $(ALL_DEBUG)
 #export EXTRALINK
 export MAKE
 
+# PolarDB proxy support. Default ON; build with POLARDB_PROXY=0 to compile the
+# PolarDB compilation units to no-op stubs (no behavior change vs upstream).
+POLARDB_PROXY ?= 1
+
 ### detect compiler support for c++17 (required)
 CPLUSPLUS := $(shell ${CC} -std=c++17 -dM -E -x c++ /dev/null 2>/dev/null | grep -F __cplusplus | egrep -o '[0-9]{6}L')
 ifneq ($(CPLUSPLUS),201703L)
@@ -393,31 +397,84 @@ build_src_debug_clickhouse: build_src_debug_default
 
 .PHONY: build_deps_default
 build_deps_default:
-	cd deps && OPTZ="${O2} -ggdb" PROXYSQLCLICKHOUSE=1 PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE}
+	cd deps && OPTZ="${O2} -ggdb" PROXYSQLCLICKHOUSE=1 POLARDB_PROXY=$(POLARDB_PROXY) POLARDB_DEBUG=$(POLARDB_DEBUG) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE}
 
 .PHONY: build_deps_debug_default
 build_deps_debug_default:
-	cd deps && OPTZ="${O0} -ggdb -DDEBUG" PROXYSQLCLICKHOUSE=1 PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) PROXYDEBUG=1 CC=${CC} CXX=${CXX} ${MAKE}
+	cd deps && OPTZ="${O0} -ggdb -DDEBUG" PROXYSQLCLICKHOUSE=1 POLARDB_PROXY=$(POLARDB_PROXY) POLARDB_DEBUG=$(POLARDB_DEBUG) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) PROXYDEBUG=1 CC=${CC} CXX=${CXX} ${MAKE}
 
 .PHONY: build_lib_default
 build_lib_default: build_deps_default
-	cd lib && OPTZ="${O2} -ggdb" PROXYSQLCLICKHOUSE=1 PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE}
+	cd lib && OPTZ="${O2} -ggdb" PROXYSQLCLICKHOUSE=1 POLARDB_PROXY=$(POLARDB_PROXY) POLARDB_DEBUG=$(POLARDB_DEBUG) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE}
 
 .PHONY: build_lib_debug_default
 build_lib_debug_default: build_deps_debug_default
-	cd lib && OPTZ="${O0} -ggdb -DDEBUG" PROXYSQLCLICKHOUSE=1 PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE}
+	cd lib && OPTZ="${O0} -ggdb -DDEBUG" PROXYSQLCLICKHOUSE=1 POLARDB_PROXY=$(POLARDB_PROXY) POLARDB_DEBUG=$(POLARDB_DEBUG) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE}
 
 .PHONY: build_src_default
 build_src_default: build_lib_default
-	cd src && OPTZ="${O2} -ggdb" PROXYSQLCLICKHOUSE=1 PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE}
+	cd src && OPTZ="${O2} -ggdb" PROXYSQLCLICKHOUSE=1 POLARDB_PROXY=$(POLARDB_PROXY) POLARDB_DEBUG=$(POLARDB_DEBUG) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE}
 	$(if $(filter 1,$(PROXYSQL40)),cd plugins/mysqlx && OPTZ="${O2} -ggdb" PROXYSQL40=$(PROXYSQL40) PROXYSQL31=$(PROXYSQL31) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE},@echo "[skip] mysqlx plugin (PROXYSQL40 not set)")
 	$(if $(filter 1,$(PROXYSQL40)),cd plugins/genai && OPTZ="${O2} -ggdb" PROXYSQL40=$(PROXYSQL40) PROXYSQL31=$(PROXYSQL31) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE},@echo "[skip] genai plugin (PROXYSQL40 not set)")
 
 .PHONY: build_src_debug_default
 build_src_debug_default: build_lib_debug_default
-	cd src && OPTZ="${O0} -ggdb -DDEBUG" PROXYSQLCLICKHOUSE=1 PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE}
+	cd src && OPTZ="${O0} -ggdb -DDEBUG" PROXYSQLCLICKHOUSE=1 POLARDB_PROXY=$(POLARDB_PROXY) POLARDB_DEBUG=$(POLARDB_DEBUG) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE}
 	$(if $(filter 1,$(PROXYSQL40)),cd plugins/mysqlx && OPTZ="${O0} -ggdb -DDEBUG" PROXYSQL40=$(PROXYSQL40) PROXYSQL31=$(PROXYSQL31) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE},@echo "[skip] mysqlx plugin (PROXYSQL40 not set)")
 	$(if $(filter 1,$(PROXYSQL40)),cd plugins/genai && OPTZ="${O0} -ggdb -DDEBUG" PROXYSQL40=$(PROXYSQL40) PROXYSQL31=$(PROXYSQL31) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE},@echo "[skip] genai plugin (PROXYSQL40 not set)")
+
+# Rebuild only libpq (e.g. after editing the PolarDB libpq patch) without a full
+# postgres re-extract. Mirrors deps/ libpq-rebuild.
+.PHONY: libpq-rebuild
+libpq-rebuild:
+	+$(MAKE) -C deps libpq-rebuild
+
+# Build the PolarDB binary with the verbose POLARDB_DEBUG trace facility enabled
+# (per-call Handler/RunQuery/RC/WIRE FSM traces, off by default). Clean build so the
+# -DPOLARDB_DEBUG=1 flag is applied to every object. Usage: make polardb-debug
+.PHONY: polardb-debug
+polardb-debug:
+	+$(MAKE) clean
+	+$(MAKE) POLARDB_PROXY=1 POLARDB_DEBUG=1 build_src
+	@echo "=== Built POLARDB_PROXY=1 POLARDB_DEBUG=1 (verbose PolarDB trace enabled) ==="
+
+# Build the PolarDB release binary (POLARDB_PROXY=1, optimized, no trace facility).
+# When switching between POLARDB_PROXY tiers, run a clean build first:
+#   make clean && make polardb
+.PHONY: polardb
+polardb:
+	+$(MAKE) POLARDB_PROXY=1 build_src
+	@echo "=== Built POLARDB_PROXY=1 (PolarDB release tier) ==="
+
+# Verify BOTH tiers with explicit clean builds. Leaves the tree at POLARDB_PROXY=1.
+# Usage: make polardb-check
+.PHONY: polardb-check
+polardb-check:
+	@echo "=== polardb-check [1/3]: POLARDB_PROXY=1 ==="
+	+$(MAKE) clean
+	+$(MAKE) POLARDB_PROXY=1 build_src
+	@echo "=== polardb-check [2/3]: POLARDB_PROXY=0 (stubs) ==="
+	+$(MAKE) clean
+	+$(MAKE) POLARDB_PROXY=0 build_src
+	@echo "=== polardb-check [3/3]: restore POLARDB_PROXY=1 ==="
+	+$(MAKE) clean
+	+$(MAKE) POLARDB_PROXY=1 build_src
+	@echo "=== polardb-check OK: both tiers build; tree left at POLARDB_PROXY=1 ==="
+
+# Re-extract PostgreSQL, apply the full libpq patch stack, rebuild libpq and
+# bundled pgbench, then build the standalone PolarDB test helpers. Configure
+# test/polardb/.env before running the helpers against a live cluster. Usage:
+#   make polardb-libpq
+.PHONY: polardb-libpq
+polardb-libpq:
+	cd deps/postgresql && rm -rf postgres-*/ || true
+	+$(MAKE) -C deps POLARDB_PROXY=1 postgresql
+	+$(MAKE) -C test polardb
+	@echo "=== Rebuilt libpq (PolarDB patch), bundled pgbench, and PolarDB test helpers ==="
+	@echo "    Configure test/polardb/.env, then run:"
+	@echo "      make -C test/polardb help"
+	@echo "      make -C test/polardb run-c-libpq-lsn"
+	@echo "      make -C test/polardb run-c-extended-protocol QUERY='SELECT 1'"
 
 
 ### packaging targets

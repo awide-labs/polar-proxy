@@ -395,14 +395,32 @@ postgresql/postgresql/src/interfaces/libpq/libpq.a:
 	cd postgresql/postgresql && patch -p0 < ../bind_fmt_text.patch
 	cd postgresql/postgresql && patch -p0 < ../pqsendpipelinesync.patch
 	cd postgresql/postgresql && patch -p0 < ../sslkeylogfile.patch
+# PolarDB proxy support: LSN-only libpq patch (read-your-writes consistency).
+# Applied LAST, after sslkeylogfile, so its baseline is the full upstream-patched
+# tree it was regenerated against. The ifeq guard keeps POLARDB_PROXY=0 builds on
+# vanilla libpq.
+ifeq ($(POLARDB_PROXY),1)
+	cd postgresql/postgresql && patch -p0 < ../polardb_libpq.patch
+endif
 ifeq ($(UNAME_S),Darwin)
 	cd postgresql/postgresql && LDFLAGS="-L$$(brew --prefix icu4c)/lib" CPPFLAGS="-I$$(brew --prefix icu4c)/include" PKG_CONFIG_PATH="$$(brew --prefix icu4c)/lib/pkgconfig:$$PKG_CONFIG_PATH" DYLD_LIBRARY_PATH="$(SSL_LDIR):$$DYLD_LIBRARY_PATH" ./configure --with-ssl=openssl --with-includes="$(SSL_IDIR)" --with-libraries="$(SSL_LDIR)" --without-readline --with-icu
 else
 	cd postgresql/postgresql && LD_LIBRARY_PATH="$(SSL_LDIR)" ./configure --with-ssl=openssl --with-includes="$(SSL_IDIR)" --with-libraries="$(SSL_LDIR)" --without-readline
 endif
-	cd postgresql/postgresql/src/interfaces/libpq && CC=${CC} CXX=${CXX} ${MAKE} MAKELEVEL=0
+	+cd postgresql/postgresql/src/interfaces/libpq && CC=${CC} CXX=${CXX} ${MAKE} MAKELEVEL=0
 
-postgresql: postgresql/postgresql/src/interfaces/libpq/libpq.a
+POSTGRESQL_PGBENCH_RPATH := -Wl,-rpath,$(shell pwd)/postgresql/postgresql/src/interfaces/libpq -Wl,-rpath-link,$(shell pwd)/postgresql/postgresql/src/interfaces/libpq
+
+postgresql/postgresql/src/bin/pgbench/pgbench: postgresql/postgresql/src/interfaces/libpq/libpq.a
+	+cd postgresql/postgresql/src/bin/pgbench && CC=${CC} CXX=${CXX} ${MAKE} MAKELEVEL=0 LDFLAGS_EX="$(POSTGRESQL_PGBENCH_RPATH) $${LDFLAGS_EX:-}"
+
+postgresql: postgresql/postgresql/src/interfaces/libpq/libpq.a postgresql/postgresql/src/bin/pgbench/pgbench
+
+.PHONY: libpq-rebuild
+libpq-rebuild:
+	+cd postgresql/postgresql/src/interfaces/libpq && CC=${CC} CXX=${CXX} ${MAKE} MAKELEVEL=0
+	+cd postgresql/postgresql/src/bin/pgbench && CC=${CC} CXX=${CXX} ${MAKE} clean MAKELEVEL=0
+	+cd postgresql/postgresql/src/bin/pgbench && CC=${CC} CXX=${CXX} ${MAKE} MAKELEVEL=0 LDFLAGS_EX="$(POSTGRESQL_PGBENCH_RPATH) $${LDFLAGS_EX:-}"
 
 
 libusual/libusual/.libs/libusual.a:
