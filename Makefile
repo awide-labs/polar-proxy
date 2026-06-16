@@ -438,6 +438,15 @@ polardb-debug:
 	+$(MAKE) POLARDB_PROXY=1 POLARDB_DEBUG=1 build_src
 	@echo "=== Built POLARDB_PROXY=1 POLARDB_DEBUG=1 (verbose PolarDB trace enabled) ==="
 
+# Build the PolarDB debug binary for coverage attribution. This keeps the same
+# POLARDB_DEBUG traces as polardb-debug, but uses the debug build recipes so
+# gcov does not lose small functions to optimized inlining.
+.PHONY: polardb-coverage-debug
+polardb-coverage-debug:
+	+$(MAKE) clean
+	+$(MAKE) POLARDB_PROXY=1 POLARDB_DEBUG=1 build_src_debug
+	@echo "=== Built POLARDB_PROXY=1 POLARDB_DEBUG=1 -O0 (coverage attribution) ==="
+
 # Build the PolarDB release binary (POLARDB_PROXY=1, optimized, no trace facility).
 # When switching between POLARDB_PROXY tiers, run a clean build first:
 #   make clean && make polardb

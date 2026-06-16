@@ -1,0 +1,19 @@
+# Local PolarDB test environment and generated outputs.
+.env
+.runid
+test_output/
+
+# Test build products (kept out of source dirs):
+#   bin/   compiled unit-test and C-helper binaries
+#   build/ object files + gcov intermediates (.gcno/.gcda/.gcov)
+bin/
+build/
+
+# gcov intermediates, wherever the toolchain may drop them.
+*.gcda
+*.gcno
+*.gcov
+
+# Python tool cache.
+__pycache__/
+*.pyc
