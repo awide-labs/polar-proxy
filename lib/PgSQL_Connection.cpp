@@ -3,6 +3,7 @@
 #include <sstream>
 #include <atomic>
 #include <memory>
+#include <cstring>
 
 #include "../deps/json/json.hpp"
 using json = nlohmann::json;
@@ -48,6 +49,26 @@ static const char* polardb_proxy_protocol_name(PolarDB_ProxyProtocol protocol) {
 		return "off";
 	}
 }
+
+#if POLARDB_PROXY && POLARDB_DEBUG
+static bool polardb_debug_startup_identity_fault(char* out, size_t out_size) {
+	if (out && out_size > 0) {
+		out[0] = '\0';
+	}
+	// A non-empty first line names the forced identity path. Clear the file only
+	// after consuming a real request so a blank file is harmless.
+	bool found = false;
+	if (polardb_debug_consume_fault_file(
+			"POLARDB_DEBUG_STARTUP_IDENTITY_FILE", out, out_size)) {
+		found = out[0] != '\0';
+	}
+
+	if (found) {
+		polardb_debug_clear_fault_file("POLARDB_DEBUG_STARTUP_IDENTITY_FILE");
+	}
+	return found;
+}
+#endif // POLARDB_PROXY && POLARDB_DEBUG
 
 /// @brief Is this error/notice the PolarDB LSN wait-timeout?
 ///
@@ -1380,6 +1401,22 @@ PolarDB_StartupProfile PgSQL_Connection::build_polardb_startup_profile(unsigned 
 PolarDB_StartupIdentity PgSQL_Connection::resolve_polardb_startup_identity(
 	const PolarDB_StartupProfile& profile) const {
 	(void)profile;
+#if POLARDB_PROXY && POLARDB_DEBUG
+	char debug_identity_fault[64] = {0};
+	polardb_debug_startup_identity_fault(
+		debug_identity_fault, sizeof(debug_identity_fault));
+	if (strcmp(debug_identity_fault, "none") == 0) {
+		POLARDB_TRACE("PolarDB CONNINFO: debug forced missing startup identity\n");
+		return PolarDB_StartupIdentity{};
+	}
+	const bool debug_use_listener_proxy =
+		strcmp(debug_identity_fault, "listener_proxy") == 0;
+	const bool debug_use_configured_fallback =
+		strcmp(debug_identity_fault, "configured_fallback") == 0;
+#else
+	const bool debug_use_listener_proxy = false;
+	const bool debug_use_configured_fallback = false;
+#endif
 	const PgSQL_Data_Stream* client_myds =
 		(myds && myds->sess) ? myds->sess->client_myds : nullptr;
 	if (client_myds) {
@@ -1389,15 +1426,19 @@ PolarDB_StartupIdentity PgSQL_Connection::resolve_polardb_startup_identity(
 			client_myds->addr.port,
 			PolarDB_StartupIdentitySource::CLIENT
 		};
-		if (identity.valid(false)) {
+		if (!debug_use_listener_proxy &&
+				!debug_use_configured_fallback &&
+				identity.valid(false)) {
 			return identity;
 		}
 		// Second: derive it straight from the raw client socket address.
 		PolarDB_StartupIdentity raw_identity;
-		if (polardb_startup_identity_from_sockaddr(
-				client_myds->client_addr,
-				&raw_identity,
-				PolarDB_StartupIdentitySource::CLIENT)) {
+		if (!debug_use_listener_proxy &&
+				!debug_use_configured_fallback &&
+				polardb_startup_identity_from_sockaddr(
+					client_myds->client_addr,
+					&raw_identity,
+					PolarDB_StartupIdentitySource::CLIENT)) {
 			return raw_identity;
 		}
 		// Third: the proxy's own listener address. valid(true) additionally
@@ -1408,7 +1449,7 @@ PolarDB_StartupIdentity PgSQL_Connection::resolve_polardb_startup_identity(
 			client_myds->proxy_addr.port,
 			PolarDB_StartupIdentitySource::LISTENER_PROXY
 		};
-		if (identity.valid(true)) {
+		if (!debug_use_configured_fallback && identity.valid(true)) {
 			return identity;
 		}
 	}

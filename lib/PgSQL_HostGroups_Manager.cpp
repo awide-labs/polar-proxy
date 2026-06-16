@@ -11,6 +11,7 @@ using json = nlohmann::json;
 #include "PgSQL_PreparedStatement.h"
 #include "PgSQL_Connection.h"
 #include "PgSQL_Data_Stream.h"
+#include "PgSQL_Thread.h"
 
 #include <memory>
 #include <algorithm>
@@ -41,6 +42,25 @@ using json = nlohmann::json;
 #include <type_traits>
 
 using std::function;
+
+#if POLARDB_PROXY && POLARDB_DEBUG
+static bool polardb_debug_reader_acquire_fault(const char* fault_name) {
+	// One shared fault file is probed once per candidate fault name, so the clear
+	// is match-gated: a non-matching probe must leave the file intact for the
+	// matching probe that follows.
+	char buf[64] = {0};
+	bool matched = false;
+	if (polardb_debug_consume_fault_file(
+			"POLARDB_DEBUG_READER_ACQUIRE_FAULT_FILE", buf, sizeof(buf))) {
+		matched = (strcmp(buf, fault_name) == 0);
+	}
+
+	if (matched) {
+		polardb_debug_clear_fault_file("POLARDB_DEBUG_READER_ACQUIRE_FAULT_FILE");
+	}
+	return matched;
+}
+#endif // POLARDB_PROXY && POLARDB_DEBUG
 
 #ifdef TEST_AURORA
 static unsigned long long array_mysrvc_total = 0;
@@ -5298,6 +5318,27 @@ PolarDB_ReaderResult PgSQL_HostGroups_Manager::get_MyConn_polardb_reader(unsigne
 		const bool startup_requests_rfq_lsn =
 			PolarDB_StartupProfile::from_protocol(
 				polardb_proxy_protocol_from_int(protocol)).has_rfq_lsn();
+
+#if POLARDB_PROXY && POLARDB_DEBUG
+		PolarDB_ReaderStatus debug_status = PolarDB_ReaderStatus::ACQUIRED;
+		if (reader_plan.has_consistency_target_lsn()) {
+			if (polardb_debug_reader_acquire_fault("reader_busy")) {
+				debug_status = PolarDB_ReaderStatus::READER_BUSY;
+			} else if (polardb_debug_reader_acquire_fault("reader_lsn_unknown")) {
+				debug_status = PolarDB_ReaderStatus::READER_LSN_UNKNOWN;
+			}
+		}
+		if (debug_status != PolarDB_ReaderStatus::ACQUIRED) {
+			result.status = debug_status;
+			POLARDB_TRACE(
+				"PolarDB route smart: debug forced reader acquisition status=%s "
+				"(reader_hg=%u consistency_target_lsn=%lu)\n",
+				polardb_reader_status_name(result.status), _hid,
+				(unsigned long)reader_plan.consistency_target_lsn);
+			wrunlock();
+			return result;
+		}
+#endif // POLARDB_PROXY && POLARDB_DEBUG
 
 		if (reader_plan.lag_cap_enabled() && reader_plan.primary_lsn == 0) {
 			POLARDB_THREAD_COUNT_ONE(sess ? sess->thread : NULL, lsn_stale_count);
