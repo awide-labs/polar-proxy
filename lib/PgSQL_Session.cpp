@@ -398,6 +398,7 @@ void PgSQL_Session::reset() {
 	// command handlers, not here.
 #if POLARDB_PROXY
 	polardb_query.reset_for_new_query();
+	polardb_clear_transaction_split_state("session_reset", /*want_reuse=*/false);
 	clear_pending_notices(/*free_buffers=*/true);
 #endif // POLARDB_PROXY
 	extended_query_phase = EXTQ_PHASE_IDLE;
@@ -2564,6 +2565,14 @@ __implicit_sync:
 											&manual_scope_hg, &dest_hg, &replica_eligible);
 
 									if (manual_mode) {
+										if (polardb_txn_reader_failure_pin == PolarDB_RoutePin::FORCE_WRITER &&
+												polardb_txn_writer_hg >= 0) {
+											current_hostgroup = polardb_txn_writer_hg;
+											POLARDB_TRACE(
+												"PolarDB PIPELINE: manual route overridden by "
+												"reader-failure writer pin writer_hg=%d\n",
+												polardb_txn_writer_hg);
+										}
 										polardb_capture_request_writer_scope(manual_scope_hg);
 										POLARDB_TRACE(
 											"PolarDB PIPELINE: MANUAL mode (replica_eligible=%d "
@@ -3049,7 +3058,7 @@ bool PgSQL_Session::handler_minus1_HandleErrorCodes(PgSQL_Data_Stream* myds, int
 	case PGSQL_ERROR_CODES::ERRCODE_ADMIN_SHUTDOWN: // Server shutdown in progress. Requested by Admin
 	case PGSQL_ERROR_CODES::ERRCODE_CRASH_SHUTDOWN: // Server shutdown in progress
 	case PGSQL_ERROR_CODES::ERRCODE_CANNOT_CONNECT_NOW: // Server in initialization mode and not ready to handle new connections
-		myconn->parent->connect_error(9999);
+		myconn->parent->connect_error(9999, true);
 		if (myds->query_retries_on_failure > 0) {
 			myds->query_retries_on_failure--;
 			if ((myconn->reusable == true) && myconn->IsActiveTransaction() == false && myconn->MultiplexDisabled() == false &&
@@ -3719,6 +3728,89 @@ handler_again:
 				case PROCESSING_STMT_DESCRIBE:
 				case PROCESSING_STMT_EXECUTE:
 				case PROCESSING_QUERY:
+#if POLARDB_PROXY
+					if (polardb_should_handle_wait_timeout_result(
+							status == PROCESSING_QUERY,
+							polardb_wait_active(),
+							polardb_query.wait.timeout_error,
+							polardb_query.wait.wrapper_finalized,
+							myconn->polardb_query_wrap_state.is_consistency_wait(),
+							myconn->query_result &&
+								myconn->query_result->is_transfer_started())) {
+						myds->query_retries_on_failure = 0;
+						PolarDB_RequestOutcome polardb_outcome =
+							polardb_capture_outcome(active_backend(), /*ok=*/false);
+						polardb_outcome.timeout_error = true;
+						polardb_outcome.timeout_already_accounted =
+							polardb_query.wait.wait_started_at_us == 0;
+						const PolarDB_FailureAction polardb_failure_action =
+							polardb_on_failure(polardb_outcome);
+						POLARDB_TRACE(
+							"PolarDB FAILURE: wait-timeout result handler action=%s "
+							"backend_hg=%d timeout=%d counted=%d\n",
+							polardb_failure_action_name(polardb_failure_action),
+							polardb_outcome.backend_hg,
+							polardb_outcome.timeout_error ? 1 : 0,
+							polardb_outcome.timeout_already_accounted ? 1 : 0);
+						if (polardb_failure_action == PolarDB_FailureAction::RETRY) {
+							NEXT_IMMEDIATE(CONNECTING_SERVER);
+						}
+						if (polardb_failure_action == PolarDB_FailureAction::TERMINATE) {
+							handler_ret = -1;
+							return handler_ret;
+						}
+						if (polardb_failure_action == PolarDB_FailureAction::FORWARD) {
+							RequestEnd(myds, true);
+							goto __exit_DSS__STATE_NOT_INITIALIZED;
+						}
+					}
+					// A strict reader wait timeout is a PostgreSQL ErrorResponse from
+					// the prepended SET, not an rc=-1 connection failure. Route it
+					// through the same reader-failure policy gate used by rc==-1
+					// failures, before PgSQL_Result_to_PgSQL_wire() makes the replica
+					// error client-visible.
+					if (status == PROCESSING_QUERY &&
+						polardb_txn_reader_read_active() &&
+						polardb_txn_split_backend &&
+						polardb_txn_split_backend->server_myds == myds &&
+						myconn->polardb_query_wrap_state.wrapper_set_failed()) {
+						myds->query_retries_on_failure = 0;
+						PolarDB_RequestOutcome polardb_outcome =
+							polardb_capture_outcome(polardb_txn_split_backend,
+								/*ok=*/false);
+						// polardb_account_txn_split_wait_timeout() consumes the split
+						// wait timer only after a structured LSN-timeout marker. Use
+						// that consumed timer to classify wrapper-result failures whose
+						// backend error text is not stable across server versions.
+						polardb_outcome.timeout_already_accounted =
+							polardb_txn_split_active &&
+							polardb_txn_split_wait_start_us == 0;
+						polardb_outcome.timeout_error =
+							polardb_outcome.timeout_error ||
+							polardb_outcome.timeout_already_accounted;
+						polardb_outcome.wrapper_set_failure = true;
+						const PolarDB_FailureAction polardb_failure_action =
+							polardb_on_failure(polardb_outcome);
+						POLARDB_TRACE(
+							"PolarDB FAILURE: wrapper-result handler action=%s "
+							"backend_hg=%d timeout=%d counted=%d\n",
+							polardb_failure_action_name(polardb_failure_action),
+							polardb_outcome.backend_hg,
+							polardb_outcome.timeout_error ? 1 : 0,
+							polardb_outcome.timeout_already_accounted ? 1 : 0);
+						if (polardb_failure_action == PolarDB_FailureAction::RETRY) {
+							NEXT_IMMEDIATE(CONNECTING_SERVER);
+						}
+						if (polardb_failure_action == PolarDB_FailureAction::TERMINATE) {
+							handler_ret = -1;
+							return handler_ret;
+						}
+						if (polardb_failure_action == PolarDB_FailureAction::FORWARD) {
+							RequestEnd(myds, true);
+							goto __exit_DSS__STATE_NOT_INITIALIZED;
+						}
+					}
+#endif // POLARDB_PROXY
 					PgSQL_Result_to_PgSQL_wire(myconn, myconn->myds);
 
 					handle_transaction_state();
@@ -3812,118 +3904,83 @@ handler_again:
 				if (rc == -1) {
 					// the query failed
 #if POLARDB_PROXY
-					const bool polardb_failed_split_read = polardb_txn_split_active;
 					const PolarDB_RequestOutcome polardb_outcome =
 						polardb_capture_outcome(active_backend(), /*ok=*/false);
 					const PolarDB_FailureAction polardb_failure_action =
 						polardb_on_failure(polardb_outcome);
-					if (polardb_failed_split_read) {
-						myds->query_retries_on_failure = 0;
-						if (polardb_retry_txn_split_read_on_primary(
-								"replica split wait failed before user result")) {
-							NEXT_IMMEDIATE(CONNECTING_SERVER);
-						}
-						polardb_abort_txn_split_read("replica split read failed");
-					}
-					// The general RETRY/FORWARD/TERMINATE reader-failure policy is
-					// still future work. Today the only active in-transaction split
-					// failure path is the narrow primary retry above.
-					assert(polardb_failure_action == PolarDB_FailureAction::PASSTHROUGH);
-					(void)polardb_failure_action;
-
-					// Capture the failed wait-wrapped replica read before any
-					// normal error handling mutates the replica data stream. The
-					// captured query can be retried once on the primary only if no
-					// user result reached the client; otherwise we keep the normal
-					// error path.
-					const PolarDB_WaitReadFailure polardb_failure =
-						polardb_capture_wait_read_failure(myds);
 					POLARDB_TRACE(
-						"PolarDB WAIT: rc=-1 wait_active=%d wait_read=%d wrapper_set_failure=%d "
-						"timeout_error=%d connection_lost=%d result_started=%d "
-						"wrapper_finalized=%d original_query_saved=%d can_return_to_pool=%d "
-						"retry_writer_hg=%d\n",
-						polardb_wait_active() ? 1 : 0,
-						polardb_failure.wait_read ? 1 : 0,
-						polardb_failure.wrapper_set_failure ? 1 : 0,
-						polardb_failure.timeout_error ? 1 : 0,
-						polardb_failure.connection_lost ? 1 : 0,
-						polardb_failure.result_started ? 1 : 0,
-						polardb_query.wait.wrapper_finalized ? 1 : 0,
-						polardb_failure.original_query.empty() ? 0 : 1,
-						polardb_failure.can_return_to_pool ? 1 : 0,
-						polardb_failure.fallback_writer_hg);
-					if (polardb_failure.wait_read && polardb_failure.connection_lost) {
-						POLARDB_THREAD_COUNT_ONE(thread, wait_error_connection_lost);
-					}
-					if (polardb_handle_failed_wait_read(polardb_failure)) {
+						"PolarDB FAILURE: rc=-1 handler action=%s backend_hg=%d "
+						"connected=%d reusable=%d result_started=%d\n",
+						polardb_failure_action_name(polardb_failure_action),
+						polardb_outcome.backend_hg,
+						polardb_outcome.connected ? 1 : 0,
+						polardb_outcome.reusable ? 1 : 0,
+						polardb_outcome.result_started ? 1 : 0);
+					if (polardb_failure_action == PolarDB_FailureAction::RETRY) {
+						myds->query_retries_on_failure = 0;
 						NEXT_IMMEDIATE(CONNECTING_SERVER);
 					}
-
-					// If the failed query was the prepended wrapper SET path and
-					// retry was not possible, tear down staged PolarDB wait state
-					// before falling through to ProxySQL's existing error handling.
-					// Timeout accounting is deliberately not done here: only
-					// marker-confirmed PolarDB timeout events are charged by
-					// polardb_account_wait_timeout() in the notice/result paths.
-					// The condition is intentionally limited to wrapper, timeout, or
-					// reader connection loss failures; ordinary SQL errors must keep
-					// the normal error flow.
-					if (polardb_wait_active() &&
-						(polardb_failure.wrapper_set_failure ||
-						 polardb_failure.timeout_error ||
-						 polardb_failure.connection_lost) &&
-						polardb_query.wait.wait_started_at_us != 0) {
-						record_wait_latency(polardb_query.wait);  // account the failed wait's elapsed time
-						polardb_query.reset_wait();
-						clear_pending_notices(/*free_buffers=*/true);
-					}
-#endif // POLARDB_PROXY
-					//bool is_error_present = myconn->is_error_present(); // false means failure is due to server being in OFFLINE state
-					PgHGM->p_update_pgsql_error_counter(p_pgsql_error_type::pgsql, myconn->parent->myhgc->hid, myconn->parent->address, myconn->parent->port, 9999); // TOFIX
-					//CurrentQuery.mysql_stmt = NULL; // immediately reset mysql_stmt
-					int rc1 = handler_ProcessingQueryError_CheckBackendConnectionStatus(myds);
-					if (rc1 == -1) {
+					if (polardb_failure_action == PolarDB_FailureAction::TERMINATE) {
 						handler_ret = -1;
 						return handler_ret;
 					}
-					else {
-						if (rc1 == 1)
-							NEXT_IMMEDIATE(CONNECTING_SERVER);
+					if (polardb_failure_action == PolarDB_FailureAction::FORWARD) {
+						myds->query_retries_on_failure = 0;
+						RequestEnd(myds, true);
 					}
-					if (myconn->is_connection_in_reusable_state() == false) {
-						if (handler_minus1_ClientLibraryError(myds)) {
-							NEXT_IMMEDIATE(CONNECTING_SERVER);
-						} else if (tx_poisoned) {
-							// Backend died mid-transaction and preserve_client_on_broken_backend_in_tx
-							// is on: the client already received the synthesized ERROR 25P02 +
-							// ReadyForQuery('E'). Keep the session open so the client can issue
-							// ROLLBACK; wrap up this query and fall through to the end of the
-							// processing loop.
-							RequestEnd(myds, true);
-						} else {
+					const bool polardb_run_generic_error_path =
+						polardb_failure_action == PolarDB_FailureAction::PASSTHROUGH;
+#endif // POLARDB_PROXY
+#if POLARDB_PROXY
+					if (polardb_run_generic_error_path)
+#endif // POLARDB_PROXY
+					{
+						//bool is_error_present = myconn->is_error_present(); // false means failure is due to server being in OFFLINE state
+						PgHGM->p_update_pgsql_error_counter(p_pgsql_error_type::pgsql, myconn->parent->myhgc->hid, myconn->parent->address, myconn->parent->port, 9999); // TOFIX
+						//CurrentQuery.mysql_stmt = NULL; // immediately reset mysql_stmt
+						int rc1 = handler_ProcessingQueryError_CheckBackendConnectionStatus(myds);
+						if (rc1 == -1) {
 							handler_ret = -1;
 							return handler_ret;
 						}
-					} else {
-						handler_minus1_LogErrorDuringQuery(myconn);
-						if (handler_minus1_HandleErrorCodes(myds, handler_ret)) {
-							if (handler_ret == 0)
+						else {
+							if (rc1 == 1)
 								NEXT_IMMEDIATE(CONNECTING_SERVER);
-							return handler_ret;
 						}
-						if (tx_poisoned) {
-							// HandleErrorCodes destroyed the backend and already
-							// synthesized ERROR 25P02 + ReadyForQuery('E') onto
-							// the client OUT queue via handler_minus1_PoisonTransaction.
-							// Skip the default GenerateErrorMessage (we don't want
-							// to forward the backend's 57P01 error) and skip
-							// HandleBackendConnection (backend already destroyed).
-							RequestEnd(myds, true);
+						if (myconn->is_connection_in_reusable_state() == false) {
+							if (handler_minus1_ClientLibraryError(myds)) {
+								NEXT_IMMEDIATE(CONNECTING_SERVER);
+							} else if (tx_poisoned) {
+								// Backend died mid-transaction and preserve_client_on_broken_backend_in_tx
+								// is on: the client already received the synthesized ERROR 25P02 +
+								// ReadyForQuery('E'). Keep the session open so the client can issue
+								// ROLLBACK; wrap up this query and fall through to the end of the
+								// processing loop.
+								RequestEnd(myds, true);
+							} else {
+								handler_ret = -1;
+								return handler_ret;
+							}
 						} else {
-							handler_minus1_GenerateErrorMessage(myds, wrong_pass);
-							RequestEnd(myds, true);
-							handler_minus1_HandleBackendConnection(myds);
+							handler_minus1_LogErrorDuringQuery(myconn);
+							if (handler_minus1_HandleErrorCodes(myds, handler_ret)) {
+								if (handler_ret == 0)
+									NEXT_IMMEDIATE(CONNECTING_SERVER);
+								return handler_ret;
+							}
+							if (tx_poisoned) {
+								// HandleErrorCodes destroyed the backend and already
+								// synthesized ERROR 25P02 + ReadyForQuery('E') onto
+								// the client OUT queue via handler_minus1_PoisonTransaction.
+								// Skip the default GenerateErrorMessage (we don't want
+								// to forward the backend's 57P01 error) and skip
+								// HandleBackendConnection (backend already destroyed).
+								RequestEnd(myds, true);
+							} else {
+								handler_minus1_GenerateErrorMessage(myds, wrong_pass);
+								RequestEnd(myds, true);
+								handler_minus1_HandleBackendConnection(myds);
+							}
 						}
 					}
 				} else {
@@ -5661,6 +5718,22 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_Q
 	if (handle_command_query_kill(pkt)) {
 		return true;
 	}
+
+#if POLARDB_PROXY
+	// A split-reader failure pins the rest of the transaction to the writer.
+	// This check is intentionally before query-cache lookup and the qpo
+	// destination override: a pinned transaction must not serve from cache or be
+	// routed to a replica by a manual rule.
+	if (polardb_txn_reader_failure_pin == PolarDB_RoutePin::FORCE_WRITER &&
+			polardb_txn_writer_hg >= 0) {
+		current_hostgroup = polardb_txn_writer_hg;
+		POLARDB_TRACE(
+			"PolarDB QPO: reader-failure writer pin overrides query routing "
+			"writer_hg=%d\n",
+			polardb_txn_writer_hg);
+		return false;
+	}
+#endif // POLARDB_PROXY
 
 	// Query cache handling
 	if (qpo->cache_ttl > 0 && stmt_type == PGSQL_EXTENDED_QUERY_TYPE_NOT_SET

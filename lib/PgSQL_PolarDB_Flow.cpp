@@ -339,6 +339,17 @@ void PgSQL_Session::polardb_collect(PolarDB_Query_RouteCtx& route_ctx,
 	route_ctx.transaction_split.did_split = polardb_transaction_split.did_split;
 	route_ctx.transaction_split_xids = polardb_transaction_split.xids;
 	route_ctx.txn_split_enabled = policy.txn_split_enabled;
+	route_ctx.txn_force_writer_after_reader_failure =
+		polardb_txn_reader_failure_pin == PolarDB_RoutePin::FORCE_WRITER;
+	route_ctx.txn_writer_hg = polardb_txn_writer_hg;
+	if (route_ctx.txn_force_writer_after_reader_failure) {
+		POLARDB_TRACE(
+			"PolarDB COLLECT: reader-failure writer pin active writer_hg=%d "
+			"stage=%d blocked=%d\n",
+			route_ctx.txn_writer_hg,
+			(int)route_ctx.transaction_split.stage,
+			route_ctx.transaction_split.blocked ? 1 : 0);
+	}
 
 	// Query eligibility (from query rules)
 	route_ctx.replica_eligible = (qpo_replica_eligible == 1);
@@ -521,6 +532,18 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(const PolarDB_Query_RouteCtx
 		return plan;
 	}
 
+	if (route_ctx.txn_force_writer_after_reader_failure &&
+			route_ctx.txn_writer_hg >= 0) {
+		plan = PolarDB_Query_RoutePlan::force_primary(
+			route_ctx.txn_writer_hg,
+			PolarDB_Query_RoutePlan::RouteActionReason::READER_FAILURE_FORCE_WRITER);
+		POLARDB_TRACE(
+			"PolarDB PLAN: prior split-reader failure pinned transaction "
+			"to writer=%d\n",
+			route_ctx.txn_writer_hg);
+		return plan;
+	}
+
 	// --- Level 0: routing hint override (/* route=primary */) ---
 	// Placed after the eligibility fast-paths (a non-eligible read is already
 	// writer-bound) and before the mode decisions, so an explicit per-query hint pins a
@@ -577,6 +600,8 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(const PolarDB_Query_RouteCtx
 				route_ctx.txn_split_enabled,
 				route_ctx.transaction_split,
 				route_ctx.transaction_split_xids,
+				route_ctx.session.write_unknown,
+				route_ctx.session.observed_unknown,
 				route_ctx.is_multi_statement,
 				route_ctx.is_extended_protocol,
 				route_ctx.is_txn_split_safe_read,
@@ -987,6 +1012,14 @@ void PgSQL_Session::polardb_apply_extended_route()
 	bool manual_mode = polardb_manual_route_scope(
 		&manual_scope_hg, &dest_hg, &replica_eligible);
 	if (manual_mode) {
+		if (polardb_txn_reader_failure_pin == PolarDB_RoutePin::FORCE_WRITER &&
+				polardb_txn_writer_hg >= 0) {
+			current_hostgroup = polardb_txn_writer_hg;
+			POLARDB_TRACE(
+				"PolarDB EXTENDED: manual route overridden by "
+				"reader-failure writer pin writer_hg=%d\n",
+				polardb_txn_writer_hg);
+		}
 		polardb_capture_request_writer_scope(manual_scope_hg);
 		POLARDB_TRACE(
 			"PolarDB EXTENDED: manual destination_hostgroup=%d scope_hg=%d, "
@@ -1209,6 +1242,24 @@ void PgSQL_Session::polardb_process_result(PgSQL_Data_Stream* myds, const char* 
 			return;
 		}
 		attach_request_epoch_to_session_lsn();
+
+		const bool missing_rfq_from_primary =
+			polardb_positioned_rfq_from_primary(
+				backend_is_polar_hg,
+				backend_hg,
+				backend_writer_hg);
+		if (missing_rfq_from_primary && myds && myds->myconn) {
+			// Missing-LSN RFQ still carries transaction status and split flags.
+			// Feed that through the same observer as positioned RFQ so idle
+			// transaction close clears split state and reader-failure writer pins.
+			// The session write_unknown/observed_unknown sticky flags below remain the
+			// routing source of truth for the missing LSN itself.
+			polardb_observe_transaction_split(
+				myds->myconn,
+				0,
+				split_observation_enabled,
+				/*primary_source=*/true);
+		}
 
 		// RFQ carried no LSN. On a PolarDB backend with _polar_send_lsn this should
 		// not happen for a writer query. If it does, preserve attribution: missing

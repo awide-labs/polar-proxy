@@ -6,6 +6,7 @@
 #include <functional>
 #include <vector>
 #include <variant>
+#include <string_view>
 #include "proxysql.h"
 #include "Base_Session.h"
 #include "cpp.h"
@@ -546,8 +547,18 @@ public:
 	bool polardb_txn_local_state_changed = false;
 	std::string polardb_txn_split_wrapped_query;
 	PtrSize_t polardb_txn_split_original_pkt{0, nullptr};
+	PolarDB_WaitSpec polardb_txn_split_wait_spec;
 	unsigned long long polardb_txn_split_read_start_us = 0;
 	unsigned long long polardb_txn_split_wait_start_us = 0;
+	// Transaction-scoped route pin set after a split-reader failure. FORCE_WRITER
+	// keeps the remainder of the transaction on the writer even on paths that
+	// bypass the normal planner, such as manual route rules and query-cache
+	// lookup. SHUN_READER keeps split eligible but excludes one failed endpoint.
+	PolarDB_RoutePin polardb_txn_reader_failure_pin = PolarDB_RoutePin::NONE;
+	int polardb_txn_writer_hg = -1;
+	int polardb_txn_shunned_reader_hg = -1;
+	std::string polardb_txn_shunned_reader_address;
+	int polardb_txn_shunned_reader_port = -1;
 
 	// Mutable state for the one query in flight: the reader acquisition plan, the
 	// wait state, the wrapped-query buffer, and the request writer scope. Reset
@@ -1037,32 +1048,114 @@ private:
 	void polardb_record_txn_split_latency();
 	/** @brief Snapshot the failed backend before normal rc==-1 handling mutates it. */
 	PolarDB_RequestOutcome polardb_capture_outcome(PgSQL_Backend* backend, bool ok);
-	/** @brief Stage-1 failure hook; currently returns PASSTHROUGH only. */
+	/** @brief Handle a PolarDB rc==-1 replica-reader failure before generic retries. */
 	PolarDB_FailureAction polardb_on_failure(const PolarDB_RequestOutcome& outcome);
 
 	/**
-	 * @brief Captured state for one failed wait-wrapped replica read.
+	 * @brief Captured state for one failed PolarDB replica read.
 	 *
-	 * This snapshot is collected before normal error handling mutates the
-	 * replica data stream. Retry code uses it to decide whether one autocommit
-	 * wait-wrapped read can run again on the primary after a strict wait timeout
-	 * or a lost replica connection. It does not cover ordinary SQL errors,
-	 * transaction retry, or split reads.
+	 * Built before the generic error path can release/destroy the backend or
+	 * reset request-local state. Transaction split moves the original wire packet
+	 * into retry_pkt; wait-read keeps retry_query instead because the installed
+	 * packet contains internal wrapper SET statements and must be discarded.
 	 */
-	struct PolarDB_WaitReadFailure {
-		PgSQL_Data_Stream* failed_myds = NULL;
+	struct PolarDB_ReaderFailure {
+		bool split_read = false;
 		bool wait_read = false;
+		bool timeout = false;
+		bool reusable = false;
 		bool result_started = false;
+		bool connected = false;
+		bool has_backend_error = false;
+		bool timeout_already_accounted = false;
 		bool wrapper_set_failure = false;
-		bool timeout_error = false;
-		bool connection_lost = false;
 		bool can_return_to_pool = false;
 		int reader_hg = -1;
 		std::string reader_address;
 		int reader_port = 0;
 		int fallback_writer_hg = -1;
-		std::string original_query;
+		PgSQL_Backend* reader_backend = nullptr;
+		PgSQL_Data_Stream* failed_myds = nullptr;
+		PtrSize_t retry_pkt{0, nullptr};
+		PolarDB_Query_ReaderPlan reader_plan;
+		PolarDB_WaitSpec wait_spec;
+		std::string txn_xids;
+		std::string retry_query;
+		PGSQL_ERROR_CODES backend_error_code =
+			PGSQL_ERROR_CODES::ERRCODE_CONNECTION_FAILURE;
+		std::string backend_error_message;
 	};
+
+	/** @brief Policy decision for a captured replica-reader failure. */
+	struct PolarDB_ReaderFailureDecision {
+		PolarDB_ReaderFailureKind kind =
+			PolarDB_ReaderFailureKind::REUSABLE_ERROR;
+		PolarDB_ReaderAction action = PolarDB_ReaderAction::FORWARD;
+		PolarDB_RetryTarget retry_target = PolarDB_RetryTarget::WRITER;
+		PolarDB_RoutePin route_pin = PolarDB_RoutePin::NONE;
+	};
+
+	/** @brief Build the private reader-failure view from a captured outcome. */
+	PolarDB_ReaderFailure polardb_reader_failure_view(
+		const PolarDB_RequestOutcome& outcome);
+	/** @brief Resolve writer state and, for LIVE, return its backend. */
+	PolarDB_WriterState polardb_resolve_writer_state(
+		const PolarDB_ReaderFailure& failure, int& writer_hg,
+		PgSQL_Backend*& writer_backend);
+	/** @brief Find a connected writer backend in a known active transaction. */
+	bool polardb_find_live_writer(int& writer_hg,
+		PgSQL_Backend*& writer_backend, PgSQL_Backend* exclude_reader);
+	/** @brief Writer hostgroup used when the writer backend has not started yet. */
+	int polardb_writer_hgid();
+	/** @brief Classify a reader failure before applying operator policy knobs. */
+	PolarDB_ReaderFailureKind polardb_reader_failure_kind_for(
+		const PolarDB_ReaderFailure& failure);
+	/** @brief Pick retry/forward/terminate policy for this failure class. */
+	PolarDB_ReaderFailureDecision polardb_reader_decision_for(
+		const PolarDB_ReaderFailure& failure);
+	/** @brief Apply a transaction-scoped route pin selected by failure policy. */
+	void polardb_apply_reader_failure_route_pin(
+		PolarDB_RoutePin pin, int writer_hg,
+		const PolarDB_ReaderFailure* failure = nullptr);
+	/** @brief Redispatch the original client query on an existing live writer. */
+	bool polardb_try_redispatch_to_writer(PolarDB_ReaderFailure& failure,
+		int writer_hg, PgSQL_Backend* writer_backend);
+	/** @brief Redispatch the original client query on another split reader. */
+	bool polardb_try_redispatch_to_other_reader(PolarDB_ReaderFailure& failure);
+	/** @brief Reset CurrentQuery to read from the packet dispatched next. */
+	void polardb_reset_current_query_from_packet(const PtrSize_t& pkt);
+	/** @brief Move a retry packet to the writer stream and make that writer active. */
+	bool polardb_move_retry_packet_to_writer(PgSQL_Backend* writer_backend,
+		int writer_hg, PtrSize_t& retry_pkt);
+	/** @brief Return or destroy a backend stream after caller-specific cleanup. */
+	void polardb_return_or_destroy_backend_stream(PgSQL_Data_Stream* myds,
+		bool return_to_pool);
+	/** @brief Release a failed wait-wrapped reader stream after cleanup. */
+	void polardb_release_wait_reader(PgSQL_Data_Stream* failed_myds,
+		bool can_return_to_pool);
+	/** @brief Build the XID + strict LSN wait wrapper for transaction split. */
+	bool polardb_build_txn_split_wrapped_query(const PtrSize_t& pkt,
+		const PolarDB_WaitSpec& wait_spec, std::string_view txn_xids,
+		std::string& wrapped_query);
+	/** @brief Forward captured reader error and keep the transaction on writer. */
+	PolarDB_FailureAction polardb_forward_and_continue(
+		PolarDB_ReaderFailure& failure);
+	/** @brief Emit ErrorResponse plus ReadyForQuery with explicit txn status. */
+	void polardb_forward_reader_error(const PolarDB_ReaderFailure& failure,
+		char rfq);
+	/** @brief Close the session after releasing the failed reader. */
+	PolarDB_FailureAction polardb_terminate_reader(
+		PolarDB_ReaderFailure& failure);
+	/** @brief Split-read state teardown for handled reader failure. */
+	void polardb_finish_reader_failure_split_op(PolarDB_ReaderFailure& failure);
+	/** @brief Error accounting and dead-reader marking for handled failures. */
+	void polardb_record_reader_failure_status(
+		const PolarDB_ReaderFailure& failure);
+	/** @brief Release or destroy a failed reader backend after results are dropped. */
+	void polardb_release_reader_backend(PgSQL_Backend* reader_backend,
+		bool want_reuse);
+	/** @brief Free failure.retry_pkt if it was not installed into a stream. */
+	void polardb_free_retry_pkt_if_owned(PolarDB_ReaderFailure& failure);
 
 	/**
 	 * @brief Stop safely when the wait wrapper cannot be built or installed.
@@ -1074,15 +1167,17 @@ private:
 	 */
 	PolarDB_WrapFinalizeResult fail_wait_wrap_finalize(const char* reason);
 	/** @brief Capture retry-relevant details from a failed wait-wrapped replica read. */
-	PolarDB_WaitReadFailure polardb_capture_wait_read_failure(PgSQL_Data_Stream* failed_myds);
+	PolarDB_ReaderFailure polardb_capture_wait_read_failure(PgSQL_Data_Stream* failed_myds);
 	/**
 	 * @brief Handle a failed wait-wrapped read without redispatching wrapper SETs.
 	 *
-	 * A safe pre-result replica failure is redirected to the primary as the
-	 * original SQL. Otherwise the wrapper packet is removed and the normal
-	 * error path returns a clean client error.
+	 * The common reader-failure policy decides retry/forward/terminate. This
+	 * adapter owns wait-wrapper cleanup and primary retry; FORWARD deliberately
+	 * falls back to ProxySQL's normal error path after the wrapper is removed.
 	 */
-	bool polardb_handle_failed_wait_read(const PolarDB_WaitReadFailure& failure);
+	PolarDB_FailureAction polardb_handle_failed_wait_read(
+		const PolarDB_ReaderFailure& failure,
+		const PolarDB_ReaderFailureDecision& decision);
 	/** @brief Build a PostgreSQL simple-query packet owned by the caller. */
 	void build_simple_query_packet(const std::string& sql, PtrSize_t& out);
 #endif // POLARDB_PROXY

@@ -1150,6 +1150,9 @@ __thread int pgsql_thread___polardb_wait_timeout_mode;       // best_effort=1, s
 __thread int pgsql_thread___polardb_proxy_protocol;          // off=0, legacy=1, v15=2
 __thread int pgsql_thread___polardb_route_rfq_policy;        // best_effort=1, strict=2
 __thread int pgsql_thread___polardb_session_lsn_baseline;    // observed=1, primary=2
+__thread int pgsql_thread___polardb_reader_death_action;     // retry=0, forward=1, terminate=2
+__thread int pgsql_thread___polardb_reader_timeout_action;   // retry=0, forward=1, terminate=2
+__thread int pgsql_thread___polardb_reader_error_action;     // retry=0, forward=1, terminate=2
 __thread int pgsql_thread___polardb_split_warmup_identity;   // strict=0, client_ip=1, auth_profile=2
 __thread char* pgsql_thread___polardb_proxy_identity_host;   // empty or IP literal
 __thread int pgsql_thread___polardb_proxy_identity_port;     // 0..65535
@@ -1510,6 +1513,9 @@ extern __thread int pgsql_thread___polardb_wait_timeout_mode;
 extern __thread int pgsql_thread___polardb_proxy_protocol;
 extern __thread int pgsql_thread___polardb_route_rfq_policy;
 extern __thread int pgsql_thread___polardb_session_lsn_baseline;
+extern __thread int pgsql_thread___polardb_reader_death_action;
+extern __thread int pgsql_thread___polardb_reader_timeout_action;
+extern __thread int pgsql_thread___polardb_reader_error_action;
 extern __thread int pgsql_thread___polardb_split_warmup_identity;
 extern __thread char* pgsql_thread___polardb_proxy_identity_host;
 extern __thread int pgsql_thread___polardb_proxy_identity_port;

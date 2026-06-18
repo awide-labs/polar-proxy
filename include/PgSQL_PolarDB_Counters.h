@@ -127,10 +127,43 @@
 		"Transaction-split reads completed on a replica") \
 	T(split_reads_fallback, "PolarDB_Split_Reads_Fallback", \
 		"proxysql_polardb_split_reads_fallback_total", \
-		"Transaction-split reads that fell back to the primary") \
+		"Transaction-split reads never dispatched to a replica and run on the primary") \
+	T(split_fallback_reader_unavailable, "PolarDB_Split_Fallback_Reader_Unavailable", \
+		"proxysql_polardb_split_fallback_reader_unavailable_total", \
+		"Transaction-split reader acquisition fell back because no reader was online or usable") \
+	T(split_fallback_reader_busy, "PolarDB_Split_Fallback_Reader_Busy", \
+		"proxysql_polardb_split_fallback_reader_busy_total", \
+		"Transaction-split reader acquisition fell back because readers were at capacity or had no pooled match") \
+	T(split_fallback_rfq_unavailable, "PolarDB_Split_Fallback_RFQ_Unavailable", \
+		"proxysql_polardb_split_fallback_rfq_unavailable_total", \
+		"Transaction-split reader acquisition fell back because no RFQ-LSN-capable reader backend was available") \
+	T(split_fallback_primary_lsn_unknown, "PolarDB_Split_Fallback_Primary_LSN_Unknown", \
+		"proxysql_polardb_split_fallback_primary_lsn_unknown_total", \
+		"Transaction-split reader acquisition fell back because lag-cap policy had no primary LSN sample") \
+	T(split_fallback_reader_lsn_unknown, "PolarDB_Split_Fallback_Reader_LSN_Unknown", \
+		"proxysql_polardb_split_fallback_reader_lsn_unknown_total", \
+		"Transaction-split reader acquisition fell back because lag-cap policy had no reader LSN sample") \
+	T(split_fallback_reader_lsn_stale, "PolarDB_Split_Fallback_Reader_LSN_Stale", \
+		"proxysql_polardb_split_fallback_reader_lsn_stale_total", \
+		"Transaction-split reader acquisition fell back because the reader LSN sample was stale") \
+	T(split_fallback_reader_lag_exceeded, "PolarDB_Split_Fallback_Reader_Lag_Exceeded", \
+		"proxysql_polardb_split_fallback_reader_lag_exceeded_total", \
+		"Transaction-split reader acquisition fell back because byte lag exceeded max_lag_bytes") \
+	T(split_reads_retried, "PolarDB_Split_Reads_Retried", \
+		"proxysql_polardb_split_reads_retried_total", \
+		"Transaction-split reader failures redispatched on the writer") \
+	T(split_reads_retried_on_reader, "PolarDB_Split_Reads_Retried_On_Reader", \
+		"proxysql_polardb_split_reads_retried_on_reader_total", \
+		"Transaction-split reader failures redispatched on another replica") \
+	T(split_reads_forwarded, "PolarDB_Split_Reads_Forwarded", \
+		"proxysql_polardb_split_reads_forwarded_total", \
+		"Transaction-split reader failures forwarded to the client while keeping the transaction on the writer") \
 	T(split_reads_error, "PolarDB_Split_Reads_Error", \
 		"proxysql_polardb_split_reads_error_total", \
 		"Transaction-split reads that ended in an error path") \
+	T(reader_terminations, "PolarDB_Reader_Terminations", \
+		"proxysql_polardb_reader_terminations_total", \
+		"Replica-reader failures that closed the client session") \
 	T(split_rejected_multistatement, "PolarDB_Split_Rejected_Multistatement", \
 		"proxysql_polardb_split_rejected_multistatement_total", \
 		"Transaction-split candidates rejected because the query has multiple statements") \

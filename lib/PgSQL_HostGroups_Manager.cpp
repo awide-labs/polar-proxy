@@ -5063,8 +5063,6 @@ static std::string polardb_split_warmup_key(
 	key.push_back('\x1f');
 	key.append(req.username);
 	key.push_back('\x1f');
-	key.append(req.password);
-	key.push_back('\x1f');
 	key.append(req.dbname);
 	key.push_back('\x1f');
 	key.append(polardb_split_warmup_identity_name(req.identity_match));
@@ -5133,7 +5131,12 @@ void PgSQL_HostGroups_Manager::request_split_warmup(
 	bool wake_threads = false;
 	{
 		std::lock_guard<std::mutex> guard(split_warmup_mutex_);
-		if (split_warmup_inflight_.find(request_key) !=
+		// Dedup against both queued and active work. The request key excludes the
+		// password; user/db plus the configured identity match mode select the
+		// reusable backend profile.
+		if (split_warmup_queued_.find(request_key) !=
+				split_warmup_queued_.end() ||
+				split_warmup_inflight_.find(request_key) !=
 				split_warmup_inflight_.end()) {
 			status.polardb_warmup_pending.store(
 				split_warmup_queue_.size(), std::memory_order_relaxed);
@@ -5145,6 +5148,11 @@ void PgSQL_HostGroups_Manager::request_split_warmup(
 				split_warmup_queue_.size(), std::memory_order_relaxed);
 			return;
 		}
+		// Only the first request after an empty queue wakes worker threads. More
+		// queued work is drained by the woken loop and by normal maintenance, so
+		// repeated BEGIN/read misses do not create a pipe-write storm.
+		wake_threads = split_warmup_queue_.empty();
+		split_warmup_queued_.insert(request_key);
 		split_warmup_queue_.push(std::move(request));
 		status.polardb_warmup_pending.store(
 			split_warmup_queue_.size(), std::memory_order_relaxed);
@@ -5257,9 +5265,39 @@ void PgSQL_HostGroups_Manager::warm_split_pools() {
 	std::vector<PgSQL_SplitWarmupRequest> requests;
 	{
 		std::lock_guard<std::mutex> guard(split_warmup_mutex_);
-		while (!split_warmup_queue_.empty()) {
-			requests.push_back(std::move(split_warmup_queue_.front()));
+		if (!pgsql_thread___polardb_lazy_warmup_split) {
+			const size_t dropped = split_warmup_queue_.size();
+			while (!split_warmup_queue_.empty()) {
+				split_warmup_queue_.pop();
+			}
+			split_warmup_queued_.clear();
+			split_warmup_inflight_.clear();
+			status.polardb_warmup_pending.store(0, std::memory_order_relaxed);
+			if (dropped > 0) {
+				POLARDB_TRACE(
+					"PolarDB WARMUP: split lazy warmup disabled; "
+					"dropped %zu queued requests\n",
+					dropped);
+			}
+			return;
+		}
+		size_t drained = 0;
+		while (!split_warmup_queue_.empty() &&
+				drained < SPLIT_WARMUP_DRAIN_LIMIT) {
+			PgSQL_SplitWarmupRequest request =
+				std::move(split_warmup_queue_.front());
 			split_warmup_queue_.pop();
+			split_warmup_queued_.erase(polardb_split_warmup_key(request));
+			requests.push_back(std::move(request));
+			++drained;
+		}
+		status.polardb_warmup_pending.store(
+			split_warmup_queue_.size(), std::memory_order_relaxed);
+		if (!split_warmup_queue_.empty()) {
+			POLARDB_TRACE(
+				"PolarDB WARMUP: deferred %zu queued split warmup requests "
+				"after draining %zu this pass\n",
+				split_warmup_queue_.size(), drained);
 		}
 	}
 	if (requests.empty()) {
@@ -5426,8 +5464,9 @@ void PgSQL_HostGroups_Manager::warm_split_pools() {
 			if (target) {
 				PgHGM->p_update_pgsql_error_counter(
 					p_pgsql_error_type::pgsql, target->myhgc->hid,
-					target->address, target->port, 9999);
-				target->connect_error(9999);
+					target->address, target->port,
+					POLARDB_REPLICA_FAILURE_ERROR_CODE);
+				target->connect_error(POLARDB_REPLICA_FAILURE_ERROR_CODE, false);
 			}
 			delete conn;
 			wrunlock();
@@ -5827,7 +5866,8 @@ static PolarDB_ReaderResult polardb_try_weighted_rfq_candidates(
 }
 
 PolarDB_ReaderResult PgSQL_HostGroups_Manager::get_MyConn_polardb_reader(unsigned int _hid, PgSQL_Session* sess,
-	const PolarDB_Query_ReaderPlan& reader_plan, bool only_pooled) {
+	const PolarDB_Query_ReaderPlan& reader_plan, bool only_pooled,
+	const char* exclude_address, int exclude_port) {
 	const uint64_t consistency_target_lsn = reader_plan.consistency_target_lsn;
 	// A consistency target narrows preference to readers whose fresh cached LSN
 	// already reaches that target. It never rejects the original replica set
@@ -5919,6 +5959,17 @@ PolarDB_ReaderResult PgSQL_HostGroups_Manager::get_MyConn_polardb_reader(unsigne
 		for (unsigned int j = 0; j < num_servers; j++) {
 			PgSQL_SrvC* mysrvc = myhgc->mysrvs->idx(j);
 			if (!mysrvc) continue;
+
+			if (exclude_address && exclude_address[0] && exclude_port >= 0 &&
+					mysrvc->address &&
+					strcmp(mysrvc->address, exclude_address) == 0 &&
+					(int)mysrvc->port == exclude_port) {
+				POLARDB_TRACE(
+					"PolarDB route smart: excluded reader %s:%d "
+					"(reader_hg=%u)\n",
+					mysrvc->address, (int)mysrvc->port, _hid);
+				continue;
+			}
 
 			// Filter 1: must be ONLINE.
 			if (mysrvc->status != MYSQL_SERVER_STATUS_ONLINE)

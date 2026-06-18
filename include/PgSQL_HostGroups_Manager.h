@@ -303,7 +303,7 @@ class PgSQL_SrvC {	// MySQL Server Container
 		char* _comment
 	);
 	~PgSQL_SrvC();
-	void connect_error(int, bool get_mutex=true);
+	void connect_error(int, bool get_mutex);
 	void shun_and_killall();
 #if POLARDB_PROXY
 	bool polardb_advance_lsn(uint64_t lsn, uint64_t observed_at_us);
@@ -832,8 +832,19 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 		std::atomic<unsigned long long> polardb_txn_committed_no_split{0};    // split-readable txn committed without a split read
 		std::atomic<unsigned long long> polardb_split_reads_total{0};         // split reads attempted
 		std::atomic<unsigned long long> polardb_split_reads_success{0};       // split reads completed on replica
-		std::atomic<unsigned long long> polardb_split_reads_fallback{0};      // split reads fell back to primary
+		std::atomic<unsigned long long> polardb_split_reads_fallback{0};      // split reads never dispatched to replica and ran on primary
+		std::atomic<unsigned long long> polardb_split_fallback_reader_unavailable{0}; // split fallback: no usable reader server
+		std::atomic<unsigned long long> polardb_split_fallback_reader_busy{0}; // split fallback: readers had no available pooled match
+		std::atomic<unsigned long long> polardb_split_fallback_rfq_unavailable{0}; // split fallback: no RFQ-LSN-capable reader backend
+		std::atomic<unsigned long long> polardb_split_fallback_primary_lsn_unknown{0}; // split fallback: lag cap had no primary LSN sample
+		std::atomic<unsigned long long> polardb_split_fallback_reader_lsn_unknown{0}; // split fallback: lag cap had no reader LSN sample
+		std::atomic<unsigned long long> polardb_split_fallback_reader_lsn_stale{0}; // split fallback: reader LSN sample was stale
+		std::atomic<unsigned long long> polardb_split_fallback_reader_lag_exceeded{0}; // split fallback: byte lag exceeded max_lag_bytes
+		std::atomic<unsigned long long> polardb_split_reads_retried{0};       // split reader failures redispatched on writer
+		std::atomic<unsigned long long> polardb_split_reads_retried_on_reader{0}; // split reader failures redispatched on another replica
+		std::atomic<unsigned long long> polardb_split_reads_forwarded{0};     // split reader failures forwarded while txn stays on writer
 		std::atomic<unsigned long long> polardb_split_reads_error{0};         // split reads ended through an error path
+		std::atomic<unsigned long long> polardb_reader_terminations{0};       // reader failures that closed the client session
 		std::atomic<unsigned long long> polardb_split_rejected_multistatement{0}; // split candidates rejected as multi-statement
 		std::atomic<unsigned long long> polardb_split_rejected_not_select{0}; // split candidates rejected by non-SELECT shape
 		std::atomic<unsigned long long> polardb_split_rejected_for_update{0}; // split candidates rejected by locking SELECT shape
@@ -1222,10 +1233,13 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 	 * @param sess          Session requesting the connection.
 	 * @param reader_plan  Required target and per-reader lag-cap filters.
 	 * @param only_pooled   If true, return only already-pooled connections.
+	 * @param exclude_address Optional backend address to skip.
+	 * @param exclude_port  Backend port to skip with @p exclude_address.
 	 * @return Connection plus the precise acquisition outcome.
 	 */
 	PolarDB_ReaderResult get_MyConn_polardb_reader(unsigned int hid, PgSQL_Session* sess,
-		const PolarDB_Query_ReaderPlan& reader_plan, bool only_pooled);
+		const PolarDB_Query_ReaderPlan& reader_plan, bool only_pooled,
+		const char* exclude_address = nullptr, int exclude_port = -1);
 
 	/**
 	 * @brief Queue one lazy transaction-split pool warmup request.
@@ -1268,6 +1282,7 @@ private:
 	std::shared_ptr<const PolarDB_TopologySnapshot> polardb_topology_snapshot_;
 	std::atomic<uint64_t> polardb_topology_generation_{0};
 	std::queue<PgSQL_SplitWarmupRequest> split_warmup_queue_;
+	std::unordered_set<std::string> split_warmup_queued_;
 	std::unordered_set<std::string> split_warmup_inflight_;
 	std::mutex split_warmup_mutex_;
 #endif // POLARDB_PROXY

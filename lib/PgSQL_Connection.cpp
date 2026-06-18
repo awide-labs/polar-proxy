@@ -561,7 +561,7 @@ handler_again:
 		//PQfinish(pgsql_conn);//release connection even on error
 		//pgsql_conn = NULL;
 		PgHGM->p_update_pgsql_error_counter(p_pgsql_error_type::pgsql, parent->myhgc->hid, parent->address, parent->port, 9999 /* TODO: fix this mysql_errno(pgsql) */);
-		parent->connect_error(9999 /* TODO: fix this mysql_errno(pgsql)*/);
+		parent->connect_error(9999 /* TODO: fix this mysql_errno(pgsql)*/, true);
 		break;
 	case ASYNC_CONNECT_TIMEOUT:
 		// to fix
@@ -569,7 +569,7 @@ handler_again:
 		//pgsql_conn = NULL;
 		proxy_error("Connect timeout on %s:%d : exceeded by %lluus\n", parent->address, parent->port, myds->sess->thread->curtime - myds->wait_until);
 		PgHGM->p_update_pgsql_error_counter(p_pgsql_error_type::pgsql, parent->myhgc->hid, parent->address, parent->port, 9999/* TODO: fix this mysql_errno(pgsql)*/);
-		parent->connect_error(9999 /* TODO: fix this mysql_errno(pgsql)*/);
+		parent->connect_error(9999 /* TODO: fix this mysql_errno(pgsql)*/, true);
 		break;
 	case ASYNC_QUERY_START:
 		query_start();

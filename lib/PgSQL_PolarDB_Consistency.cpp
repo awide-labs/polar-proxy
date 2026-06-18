@@ -73,9 +73,126 @@ int PgSQL_Session::polardb_effective_txn_split_warmup_mode() const {
 	return static_cast<int>(PolarDB_TxnSplitWarmupMode::DEMAND);
 }
 
-// Observes transaction-split RFQ metadata only after Flow.cpp accepted the LSN
-// for the current writer scope. This is state collection; the later planner and
-// executor decide whether one in-transaction read may borrow a replica backend.
+void PgSQL_Session::polardb_apply_user_attributes(const char* attributes) {
+	bool read_committed = true;
+	if (attributes && attributes[0]) {
+		try {
+			nlohmann::json parsed = nlohmann::json::parse(attributes);
+			auto default_isolation =
+				parsed.find("default-transaction_isolation");
+			if (default_isolation != parsed.end()) {
+				const std::string value = default_isolation->get<std::string>();
+				read_committed = polardb_value_is_read_committed(value.c_str());
+			}
+		} catch (...) {
+			// Authentication normally validates attributes before a session sees
+			// them. If a malformed value still reaches this point, keep
+			// pre-write transaction reads on the primary.
+			read_committed = false;
+		}
+	}
+	polardb_config.txn_reader_wait_default_read_committed = read_committed;
+	POLARDB_TRACE(
+		"PolarDB USER: default_transaction_isolation_read_committed=%d\n",
+		read_committed ? 1 : 0);
+}
+
+void PgSQL_Session::polardb_apply_backend_isolation_status(
+		PgSQL_Connection* conn, const char* reason) {
+	if (!conn) {
+		return;
+	}
+
+	const char* default_isolation =
+		conn->get_pg_parameter_status("default_transaction_isolation");
+	if (default_isolation && default_isolation[0]) {
+		const bool read_committed =
+			polardb_value_is_read_committed(default_isolation);
+		if (!polardb_config.txn_reader_wait_backend_default_seen ||
+				polardb_config.txn_reader_wait_default_read_committed !=
+					read_committed) {
+			POLARDB_TRACE(
+				"PolarDB TXN_WAIT: backend default_transaction_isolation "
+				"read_committed=%d reason=%s\n",
+				read_committed ? 1 : 0,
+				reason ? reason : "unknown");
+		}
+		polardb_config.txn_reader_wait_backend_default_seen = true;
+		polardb_config.txn_reader_wait_default_read_committed = read_committed;
+	}
+
+	const char* current_isolation =
+		conn->get_pg_parameter_status("transaction_isolation");
+	if (!current_isolation || !current_isolation[0]) {
+		return;
+	}
+
+	// A current-isolation report can be stale outside an active transaction on
+	// older backend patches. Use it only as a fail-closed blocker while the
+	// backend says a transaction is open; the default-isolation report above is
+	// the source that enables pre-write reader waits.
+	const PGTransactionStatusType tx_status = conn->get_pg_transaction_status();
+	if ((tx_status == PQTRANS_INTRANS || tx_status == PQTRANS_INERROR) &&
+			!polardb_value_is_read_committed(current_isolation)) {
+		polardb_note_txn_non_read_committed("backend_transaction_isolation");
+	}
+}
+
+void PgSQL_Session::polardb_note_txn_non_read_committed(const char* reason) {
+	if (!polardb_txn_non_read_committed) {
+		POLARDB_TRACE(
+			"PolarDB TXN_WAIT: pre-write reader waits blocked by isolation "
+			"reason=%s\n",
+			reason ? reason : "unknown");
+	}
+	polardb_txn_non_read_committed = true;
+}
+
+void PgSQL_Session::polardb_note_txn_local_state_change(const char* reason) {
+	if (!polardb_txn_local_state_changed) {
+		POLARDB_TRACE(
+			"PolarDB TXN_WAIT: pre-write reader waits blocked by transaction "
+			"local state reason=%s\n",
+			reason ? reason : "unknown");
+	}
+	polardb_txn_local_state_changed = true;
+}
+
+bool PgSQL_Session::polardb_txn_reader_wait_isolation_read_committed() {
+	if (polardb_txn_non_read_committed) {
+		return false;
+	}
+	return polardb_config.txn_reader_wait_default_read_committed;
+}
+
+// Clears durable transaction-split state and any borrowed split backend. The
+// active split-read path restores mybe before calling this; this routine owns
+// only the persistent transaction-split state, route pin, and borrowed backend slot.
+void PgSQL_Session::polardb_clear_transaction_split_state(
+	const char* reason, bool want_reuse) {
+	if (polardb_transaction_split.active() ||
+			polardb_transaction_split.has_backend_evidence() ||
+			polardb_txn_reader_failure_pin != PolarDB_RoutePin::NONE) {
+		POLARDB_TRACE(
+			"PolarDB TXN_SPLIT: clear state reason=%s\n",
+			reason ? reason : "unspecified");
+	}
+	polardb_release_txn_split_backend(want_reuse);
+	polardb_transaction_split.reset();
+	polardb_txn_reader_failure_pin = PolarDB_RoutePin::NONE;
+	polardb_txn_writer_hg = -1;
+	polardb_txn_shunned_reader_hg = -1;
+	polardb_txn_shunned_reader_address.clear();
+	polardb_txn_shunned_reader_port = -1;
+	polardb_txn_non_read_committed = false;
+	polardb_txn_local_state_changed = false;
+}
+
+// Observes transaction-split RFQ metadata after Flow.cpp has validated the
+// writer scope. Positioned RFQ passes its primary LSN; missing-LSN RFQ passes 0
+// only to process transaction status/split flags and to clear writer pins on
+// transaction close. Session write_unknown/observed_unknown sticky flags remain the
+// routing source of truth when the LSN itself is missing.
 void PgSQL_Session::polardb_observe_transaction_split(PgSQL_Connection* conn,
 	uint64_t primary_lsn, bool split_enabled, bool primary_source) {
 	if (!primary_source || !conn) {
@@ -83,14 +200,7 @@ void PgSQL_Session::polardb_observe_transaction_split(PgSQL_Connection* conn,
 	}
 
 	if (!split_enabled) {
-		if (polardb_transaction_split.active() ||
-				polardb_transaction_split.has_backend_evidence()) {
-			POLARDB_TRACE(
-				"PolarDB TXN_SPLIT: cleared observed RFQ state because "
-				"txn_split_enabled=0\n");
-		}
-		polardb_release_txn_split_backend(/*want_reuse=*/true);
-		polardb_transaction_split.reset();
+		polardb_clear_transaction_split_state("observation_disabled", true);
 		return;
 	}
 
@@ -101,8 +211,7 @@ void PgSQL_Session::polardb_observe_transaction_split(PgSQL_Connection* conn,
 		} else if (polardb_transaction_split.was_splittable) {
 			POLARDB_THREAD_COUNT_ONE(thread, txn_committed_no_split);
 		}
-		polardb_release_txn_split_backend(/*want_reuse=*/true);
-		polardb_transaction_split.reset();
+		polardb_clear_transaction_split_state("primary_idle", true);
 		return;
 	}
 

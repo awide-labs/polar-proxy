@@ -414,6 +414,9 @@ static char* pgsql_thread_variables_names[] = {
 	(char*)"polardb_proxy_protocol",
 	(char*)"polardb_route_rfq_policy",
 	(char*)"polardb_session_lsn_baseline",
+	(char*)"polardb_reader_death_action",
+	(char*)"polardb_reader_timeout_action",
+	(char*)"polardb_reader_error_action",
 	(char*)"polardb_split_warmup_identity",
 	(char*)"polardb_proxy_identity_host",
 	(char*)"polardb_proxy_identity_port",
@@ -1169,6 +1172,9 @@ PgSQL_Threads_Handler::PgSQL_Threads_Handler() {
 	variables.polardb_proxy_protocol = strdup((char*)"v15");
 	variables.polardb_route_rfq_policy = strdup((char*)"strict");
 	variables.polardb_session_lsn_baseline = strdup((char*)"observed");
+	variables.polardb_reader_death_action = strdup((char*)"retry");
+	variables.polardb_reader_timeout_action = strdup((char*)"retry");
+	variables.polardb_reader_error_action = strdup((char*)"forward");
 	variables.polardb_split_warmup_identity = strdup((char*)"strict");
 	variables.polardb_proxy_identity_host = strdup((char*)"");
 	variables.polardb_proxy_identity_port = 0;
@@ -1400,6 +1406,9 @@ char* PgSQL_Threads_Handler::get_variable_string(char* name) {
 	if (!strcmp(name, "polardb_proxy_protocol")) return strdup(variables.polardb_proxy_protocol);
 	if (!strcmp(name, "polardb_route_rfq_policy")) return strdup(variables.polardb_route_rfq_policy);
 	if (!strcmp(name, "polardb_session_lsn_baseline")) return strdup(variables.polardb_session_lsn_baseline);
+	if (!strcmp(name, "polardb_reader_death_action")) return strdup(variables.polardb_reader_death_action);
+	if (!strcmp(name, "polardb_reader_timeout_action")) return strdup(variables.polardb_reader_timeout_action);
+	if (!strcmp(name, "polardb_reader_error_action")) return strdup(variables.polardb_reader_error_action);
 	if (!strcmp(name, "polardb_split_warmup_identity")) return strdup(variables.polardb_split_warmup_identity);
 	if (!strcmp(name, "polardb_proxy_identity_host")) return strdup(variables.polardb_proxy_identity_host);
 #endif // POLARDB_PROXY
@@ -1705,6 +1714,9 @@ char* PgSQL_Threads_Handler::get_variable(char* name) {	// this is the public fu
 	if (!strcasecmp(name, "polardb_proxy_protocol")) return strdup(variables.polardb_proxy_protocol);
 	if (!strcasecmp(name, "polardb_route_rfq_policy")) return strdup(variables.polardb_route_rfq_policy);
 	if (!strcasecmp(name, "polardb_session_lsn_baseline")) return strdup(variables.polardb_session_lsn_baseline);
+	if (!strcasecmp(name, "polardb_reader_death_action")) return strdup(variables.polardb_reader_death_action);
+	if (!strcasecmp(name, "polardb_reader_timeout_action")) return strdup(variables.polardb_reader_timeout_action);
+	if (!strcasecmp(name, "polardb_reader_error_action")) return strdup(variables.polardb_reader_error_action);
 	if (!strcasecmp(name, "polardb_split_warmup_identity")) return strdup(variables.polardb_split_warmup_identity);
 	if (!strcasecmp(name, "polardb_proxy_identity_host")) return strdup(variables.polardb_proxy_identity_host);
 #endif // POLARDB_PROXY
@@ -1863,6 +1875,33 @@ bool PgSQL_Threads_Handler::set_variable(char* name, const char* value) {	// thi
 			return true;
 		}
 		proxy_error("Invalid value '%s' for pgsql-polardb_session_lsn_baseline (allowed: observed, primary)\n", value);
+		return false;
+	}
+	if (!strcasecmp(name, "polardb_reader_death_action")) {
+		if (polardb_reader_action_from_string(value, -1) >= 0) {
+			free(variables.polardb_reader_death_action);
+			variables.polardb_reader_death_action = strdup(value);
+			return true;
+		}
+		proxy_error("Invalid value '%s' for pgsql-polardb_reader_death_action (allowed: retry, forward, terminate)\n", value);
+		return false;
+	}
+	if (!strcasecmp(name, "polardb_reader_timeout_action")) {
+		if (polardb_reader_action_from_string(value, -1) >= 0) {
+			free(variables.polardb_reader_timeout_action);
+			variables.polardb_reader_timeout_action = strdup(value);
+			return true;
+		}
+		proxy_error("Invalid value '%s' for pgsql-polardb_reader_timeout_action (allowed: retry, forward, terminate)\n", value);
+		return false;
+	}
+	if (!strcasecmp(name, "polardb_reader_error_action")) {
+		if (polardb_reader_action_from_string(value, -1) >= 0) {
+			free(variables.polardb_reader_error_action);
+			variables.polardb_reader_error_action = strdup(value);
+			return true;
+		}
+		proxy_error("Invalid value '%s' for pgsql-polardb_reader_error_action (allowed: retry, forward, terminate)\n", value);
 		return false;
 	}
 	if (!strcasecmp(name, "polardb_split_warmup_identity")) {
@@ -2941,6 +2980,9 @@ PgSQL_Threads_Handler::~PgSQL_Threads_Handler() {
 	if (variables.polardb_proxy_protocol) { free(variables.polardb_proxy_protocol); variables.polardb_proxy_protocol = NULL; }
 	if (variables.polardb_route_rfq_policy) { free(variables.polardb_route_rfq_policy); variables.polardb_route_rfq_policy = NULL; }
 	if (variables.polardb_session_lsn_baseline) { free(variables.polardb_session_lsn_baseline); variables.polardb_session_lsn_baseline = NULL; }
+	if (variables.polardb_reader_death_action) { free(variables.polardb_reader_death_action); variables.polardb_reader_death_action = NULL; }
+	if (variables.polardb_reader_timeout_action) { free(variables.polardb_reader_timeout_action); variables.polardb_reader_timeout_action = NULL; }
+	if (variables.polardb_reader_error_action) { free(variables.polardb_reader_error_action); variables.polardb_reader_error_action = NULL; }
 	if (variables.polardb_split_warmup_identity) { free(variables.polardb_split_warmup_identity); variables.polardb_split_warmup_identity = NULL; }
 	if (variables.polardb_proxy_identity_host) { free(variables.polardb_proxy_identity_host); variables.polardb_proxy_identity_host = NULL; }
 #endif // POLARDB_PROXY
@@ -4244,6 +4286,24 @@ void PgSQL_Thread::refresh_variables() {
 		char* baseline = GloPTH->get_variable_string((char*)"polardb_session_lsn_baseline");
 		pgsql_thread___polardb_session_lsn_baseline = polardb_session_lsn_baseline_from_string(baseline);
 		if (baseline) free(baseline);
+	}
+	{
+		char* action = GloPTH->get_variable_string((char*)"polardb_reader_death_action");
+		pgsql_thread___polardb_reader_death_action = polardb_reader_action_from_string(
+			action, static_cast<int>(PolarDB_ReaderAction::RETRY));
+		if (action) free(action);
+	}
+	{
+		char* action = GloPTH->get_variable_string((char*)"polardb_reader_timeout_action");
+		pgsql_thread___polardb_reader_timeout_action = polardb_reader_action_from_string(
+			action, static_cast<int>(PolarDB_ReaderAction::RETRY));
+		if (action) free(action);
+	}
+	{
+		char* action = GloPTH->get_variable_string((char*)"polardb_reader_error_action");
+		pgsql_thread___polardb_reader_error_action = polardb_reader_action_from_string(
+			action, static_cast<int>(PolarDB_ReaderAction::FORWARD));
+		if (action) free(action);
 	}
 	{
 		char* identity = GloPTH->get_variable_string((char*)"polardb_split_warmup_identity");

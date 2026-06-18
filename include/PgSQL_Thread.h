@@ -1102,6 +1102,9 @@ public:
 		char* polardb_proxy_protocol;         // v15 | legacy | off
 		char* polardb_route_rfq_policy;       // strict | best_effort
 		char* polardb_session_lsn_baseline;   // observed | primary
+		char* polardb_reader_death_action;    // retry | forward | terminate
+		char* polardb_reader_timeout_action;  // retry | forward | terminate
+		char* polardb_reader_error_action;    // retry | forward | terminate
 		char* polardb_split_warmup_identity;  // strict | client_ip | auth_profile
 		char* polardb_proxy_identity_host;    // empty or IP literal
 		int polardb_proxy_identity_port;      // 0..65535

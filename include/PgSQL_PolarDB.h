@@ -27,6 +27,8 @@
 #define __CLASS_PGSQL_POLARDB_H
 
 class PgSQL_Connection;
+class PgSQL_Backend;
+class PgSQL_Data_Stream;
 class PgSQL_SrvC;
 
 // ===========================================================================
@@ -134,6 +136,7 @@ class PgSQL_SrvC;
 // matching human-readable WARNING/ERROR text.
 static constexpr const char* POLARDB_LSN_WAIT_TIMEOUT_DETAIL =
     "polar_proxy_lsn_wait_timeout";
+static constexpr unsigned int POLARDB_REPLICA_FAILURE_ERROR_CODE = 9999;
 
 // =============================================================================
 // PolarDB DEBUG fault-injection catalog (test hooks; release builds compile out)
@@ -182,6 +185,15 @@ static constexpr const char* POLARDB_LSN_WAIT_TIMEOUT_DETAIL =
 //             Line == one of: "fallback_unknown" | "result_started" |
 //             "writer_busy" -> force that wait-retry fault (FILE path of
 //             polardb_debug_once_enabled in PgSQL_PolarDB_Failure.cpp).
+//
+//         POLARDB_DEBUG_SPLIT_FAILURE_FAULT_FILE
+//             Line == one of: "death" | "sql_error" | "result_started" |
+//             "no_retry_packet" | "writer_busy" | "writer_lost" |
+//             "writer_not_started" -> force that transaction-split
+//             reader-failure branch. "death_twice" injects two reader deaths
+//             in one statement to verify the reader-retry budget falls back to
+//             the writer instead of oscillating between replicas.
+//             (PgSQL_PolarDB_Failure.cpp: polardb_debug_split_failure_fault_is)
 //
 //         POLARDB_DEBUG_READER_ACQUIRE_FAULT_FILE
 //             Line == "reader_busy" | "reader_lsn_unknown" -> force that reader
@@ -1994,6 +2006,10 @@ struct PolarDB_Query_RouteCtx {
     bool txn_reader_wait_isolation_read_committed = true; // pre-write reader waits require READ COMMITTED
     bool txn_reader_wait_local_state_clean = true; // false after in-txn SET/SET LOCAL
     bool force_primary_hint = false;       // /* route=primary */ first-comment hint (plan L0)
+    // Transaction-scoped pin set after a split-reader failure. Checked by the
+    // normal planner plus manual/qpo paths that may bypass planning.
+    bool txn_force_writer_after_reader_failure = false;
+    int txn_writer_hg = -1;
 };
 
 /**
@@ -2141,6 +2157,8 @@ struct PolarDB_Query_RoutePlan {
         SPLIT_BLOCKED,         // split: a prior split read failed in this transaction
         SPLIT_NOT_SELECT,      // split: only top-level SELECT is eligible
         SPLIT_LOCKING_READ,    // split: locking SELECT must stay on the primary
+        SPLIT_WRITE_LSN_UNKNOWN,    // split: a prior write RFQ missed its LSN target
+        SPLIT_OBSERVED_LSN_UNKNOWN, // split: a tracked read RFQ missed its LSN
         NO_TXN_LSN,            // split: no transaction-scoped LSN wait target is available
         INVARIANT_VIOLATION,   // split: defensive fallback for impossible state
         HG_SPLIT_DISABLED,     // split: replication-hostgroup policy disables transaction split
@@ -2227,6 +2245,8 @@ static inline PolarDB_Query_RoutePlan::RouteActionReason polardb_txn_split_rejec
     bool txn_split_enabled,
     const PolarDB_TransactionSplitState& transaction_split,
     std::string_view transaction_split_xids,
+    bool write_lsn_unknown,
+    bool observed_lsn_unknown,
     bool is_multi_statement,
     bool is_extended_protocol,
     bool is_txn_split_safe_read,
@@ -2238,6 +2258,8 @@ static inline PolarDB_Query_RoutePlan::RouteActionReason polardb_txn_split_rejec
     if (is_extended_protocol) return RAR::EXTENDED_PROTOCOL;
     if (is_txn_split_locking_read) return RAR::SPLIT_LOCKING_READ;
     if (!is_txn_split_safe_read) return RAR::SPLIT_NOT_SELECT;
+    if (write_lsn_unknown) return RAR::SPLIT_WRITE_LSN_UNKNOWN;
+    if (observed_lsn_unknown) return RAR::SPLIT_OBSERVED_LSN_UNKNOWN;
     if (transaction_split.blocked) return RAR::SPLIT_BLOCKED;
     if (transaction_split.wal_pending) return RAR::WAL_PENDING;
     if (transaction_split.stage != PolarDB_TransactionSplitStage::TXN_SPLITTABLE) {
@@ -2282,6 +2304,10 @@ static inline const char* polardb_route_action_reason_name(
         return "split_not_select";
     case RAR::SPLIT_LOCKING_READ:
         return "split_locking_read";
+    case RAR::SPLIT_WRITE_LSN_UNKNOWN:
+        return "split_write_lsn_unknown";
+    case RAR::SPLIT_OBSERVED_LSN_UNKNOWN:
+        return "split_observed_lsn_unknown";
     case RAR::NO_TXN_LSN:
         return "no_txn_lsn";
     case RAR::INVARIANT_VIOLATION:
@@ -2307,11 +2333,13 @@ struct PolarDB_RequestOutcome {
     bool reusable = false;
     bool connected = false;
     bool timeout_error = false;
+    bool timeout_already_accounted = false;
     bool wrapper_set_failure = false;
 
     int backend_hg = -1;
     std::string backend_address;
     int backend_port = 0;
+    int backend_error_code = -1;
     std::string error_message;
 
     PgSQL_Backend* backend = nullptr;          // non-owning; valid only during rc==-1 handling
@@ -2321,15 +2349,13 @@ struct PolarDB_RequestOutcome {
 /**
  * @brief Action returned by the PolarDB rc==-1 failure stage.
  *
- * This first extraction stage always returns PASSTHROUGH. The enum is reserved
- * now so transaction split and full reader-failure recovery add behavior without
- * inventing a second failure path.
+ * The rc==-1 handler consumes these before ProxySQL's generic retry/error path.
  */
 enum class PolarDB_FailureAction : uint8_t {
     PASSTHROUGH = 0,   // Keep existing ProxySQL rc==-1 handling
-    RETRY,             // Future: redispatch the original query on the writer
-    FORWARD,           // Future: forward reader error and keep txn alive
-    TERMINATE,         // Future: close the session
+    RETRY,             // Redispatch the original query on the writer
+    FORWARD,           // Forward reader error and keep txn alive on writer
+    TERMINATE,         // Close the session
 };
 
 static inline const char* polardb_failure_action_name(
@@ -2343,6 +2369,114 @@ static inline const char* polardb_failure_action_name(
         return "forward";
     case PolarDB_FailureAction::TERMINATE:
         return "terminate";
+    }
+    return "unknown";
+}
+
+/**
+ * @brief Operator policy for a handled replica-reader failure.
+ *
+ * The failure class picks which configured knob applies: non-reusable/dead
+ * reader, strict wait timeout, or reusable SQL error. RETRY means "try a safe
+ * redispatch target"; the target resolver chooses writer vs another reader
+ * from the failure kind and query shape.
+ */
+enum class PolarDB_ReaderAction : uint8_t {
+    RETRY = 0,
+    FORWARD = 1,
+    TERMINATE = 2
+};
+
+/// @brief Reader failure category used before applying operator policy knobs.
+enum class PolarDB_ReaderFailureKind : uint8_t {
+    CONNECTION_LOST = 0,
+    WAIT_TIMEOUT = 1,
+    REUSABLE_ERROR = 2
+};
+
+/// @brief Destination selected when a reader-failure policy chooses RETRY.
+enum class PolarDB_RetryTarget : uint8_t {
+    WRITER = 0,
+    OTHER_READER = 1
+};
+
+/// @brief Transaction-scoped route pin installed after handled reader failures.
+enum class PolarDB_RoutePin : uint8_t {
+    NONE = 0,
+    FORCE_WRITER = 1,
+    SHUN_READER = 2
+};
+
+/// @brief State of the writer transaction when a replica-reader failure is seen.
+enum class PolarDB_WriterState : uint8_t {
+    LIVE = 0,        // A connected writer backend is already inside the txn
+    NOT_STARTED,    // BEGIN exists client-side, but no writer backend exists yet
+    LOST = 2         // Writer evidence existed but no live writer can be found
+};
+
+static inline int polardb_reader_action_from_string(
+    const char* value,
+    int default_value) {
+    if (!value) {
+        return default_value;
+    }
+    if (strcasecmp(value, "retry") == 0) {
+        return static_cast<int>(PolarDB_ReaderAction::RETRY);
+    }
+    if (strcasecmp(value, "forward") == 0) {
+        return static_cast<int>(PolarDB_ReaderAction::FORWARD);
+    }
+    if (strcasecmp(value, "terminate") == 0) {
+        return static_cast<int>(PolarDB_ReaderAction::TERMINATE);
+    }
+    return default_value;
+}
+
+static inline const char* polardb_reader_action_name(
+        PolarDB_ReaderAction action) {
+    switch (action) {
+    case PolarDB_ReaderAction::RETRY:
+        return "retry";
+    case PolarDB_ReaderAction::FORWARD:
+        return "forward";
+    case PolarDB_ReaderAction::TERMINATE:
+        return "terminate";
+    }
+    return "unknown";
+}
+
+static inline const char* polardb_reader_failure_kind_name(
+        PolarDB_ReaderFailureKind kind) {
+    switch (kind) {
+    case PolarDB_ReaderFailureKind::CONNECTION_LOST:
+        return "connection_lost";
+    case PolarDB_ReaderFailureKind::WAIT_TIMEOUT:
+        return "wait_timeout";
+    case PolarDB_ReaderFailureKind::REUSABLE_ERROR:
+        return "reusable_error";
+    }
+    return "unknown";
+}
+
+static inline const char* polardb_retry_target_name(
+        PolarDB_RetryTarget target) {
+    switch (target) {
+    case PolarDB_RetryTarget::WRITER:
+        return "writer";
+    case PolarDB_RetryTarget::OTHER_READER:
+        return "other_reader";
+    }
+    return "unknown";
+}
+
+static inline const char* polardb_route_pin_name(PolarDB_RoutePin pin) {
+    switch (pin) {
+    case PolarDB_RoutePin::NONE:
+        return "none";
+    case PolarDB_RoutePin::FORCE_WRITER:
+        return "force_writer";
+    case PolarDB_RoutePin::SHUN_READER:
+        return "shun_reader";
     }
     return "unknown";
 }
