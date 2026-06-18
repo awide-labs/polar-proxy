@@ -10,6 +10,8 @@
 #include <thread>
 #include <iostream>
 #include <mutex>
+#include <queue>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -119,6 +121,45 @@ class PgSQL_SrvC;
 class PgSQL_SrvList;
 class PgSQL_HGC;
 class PgSQL_Connection;
+
+#if POLARDB_PROXY
+/**
+ * @brief Demand signal for lazy transaction-split replica-pool warmup.
+ *
+ * Split reads require an already-pooled replica connection. When the pool is
+ * empty, the session queues this key and the HGM maintenance pass opens a
+ * connected backend before publishing it into the free list. The request carries
+ * the real startup client context captured from the session that requested
+ * warmup. SSL and proxy session/cancel fields are reserved for future startup
+ * keys; identity matching is active now.
+ */
+struct PgSQL_SplitWarmupRequest {
+	unsigned int hostgroup_id = 0;
+	std::string username;
+	std::string password;
+	std::string dbname;
+	PolarDB_StartupClientContext startup_client;
+	int identity_match = static_cast<int>(PolarDB_SplitWarmupIdentity::STRICT);
+	unsigned long long requested_at_us = 0;
+
+	PgSQL_SplitWarmupRequest() = default;
+	PgSQL_SplitWarmupRequest(
+		unsigned int hg,
+		const char* user,
+		const char* pass,
+		const char* db,
+		const PolarDB_StartupClientContext& client_context,
+		int match_mode,
+		unsigned long long now_us)
+		: hostgroup_id(hg)
+		, username(user ? user : "")
+		, password(pass ? pass : "")
+		, dbname(db ? db : "")
+		, startup_client(client_context)
+		, identity_match(match_mode)
+		, requested_at_us(now_us) {}
+};
+#endif // POLARDB_PROXY
 
 // Forward declaration for WebUI monitoring metrics collector
 namespace ProxySQL {
@@ -320,7 +361,7 @@ class PgSQL_HGC: public BaseHGC<PgSQL_HGC> {
 		unsigned int writer_hostgroup{0};  // corresponding writer HG (if this is reader)
 		int max_lag_bytes{0};              // max LSN lag in bytes (lag-cap safety; 0 = off)
 		std::string check_type;            // e.g. "polardb", "read_only"
-		bool txn_split_enabled{false};     // persisted switch; no routing effect yet
+		bool txn_split_enabled{false};     // enable RFQ XID evidence and split reads
 		std::string consistency_mode;      // consistency mode string (off/lsn/primary)
 		int consistency_mode_enum{-1};     // parsed enum value; -1 = use global default
 		int lsn_wait_timeout_ms{0};        // polar_xact_split_wait_lsn timeout in ms
@@ -782,6 +823,47 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 		std::atomic<unsigned long long> polardb_wait_error_timeout{0};       // wait-timeout notices accounted
 		std::atomic<unsigned long long> polardb_wait_error_lsn_wait_timeout{0}; // LSN wait-timeout notices accounted
 		std::atomic<unsigned long long> polardb_wait_error_connection_lost{0}; // wait-wrapped reader lost its backend connection
+		std::atomic<unsigned long long> polardb_queries_in_splittable_txn{0}; // queries planned while txn split evidence is usable
+		std::atomic<unsigned long long> polardb_queries_split_eligible{0};    // in-txn reads that passed split checks
+		std::atomic<unsigned long long> polardb_xids_received{0};             // primary RFQs with transaction XIDs
+		std::atomic<unsigned long long> polardb_txn_became_splittable{0};     // txn entered split-readable state
+		std::atomic<unsigned long long> polardb_txn_lost_splittable{0};       // txn lost split-readable state
+		std::atomic<unsigned long long> polardb_txn_committed_with_split{0};  // txn committed after a split read
+		std::atomic<unsigned long long> polardb_txn_committed_no_split{0};    // split-readable txn committed without a split read
+		std::atomic<unsigned long long> polardb_split_reads_total{0};         // split reads attempted
+		std::atomic<unsigned long long> polardb_split_reads_success{0};       // split reads completed on replica
+		std::atomic<unsigned long long> polardb_split_reads_fallback{0};      // split reads fell back to primary
+		std::atomic<unsigned long long> polardb_split_reads_error{0};         // split reads ended through an error path
+		std::atomic<unsigned long long> polardb_split_rejected_multistatement{0}; // split candidates rejected as multi-statement
+		std::atomic<unsigned long long> polardb_split_rejected_not_select{0}; // split candidates rejected by non-SELECT shape
+		std::atomic<unsigned long long> polardb_split_rejected_for_update{0}; // split candidates rejected by locking SELECT shape
+		std::atomic<unsigned long long> polardb_split_rejected_write_lsn_unknown{0}; // split candidates blocked by missing write LSN
+		std::atomic<unsigned long long> polardb_split_rejected_observed_lsn_unknown{0}; // split candidates blocked by missing observed LSN
+		std::atomic<unsigned long long> polardb_split_wal_pending{0};         // primary RFQ still has pending WAL
+		std::atomic<unsigned long long> polardb_split_invariant_violations{0}; // unexpected transaction-split state
+		std::atomic<unsigned long long> polardb_split_blocked_reads{0};       // transaction already blocked from further split reads
+		std::atomic<unsigned long long> polardb_split_no_backend{0};          // no split replica backend available
+		std::atomic<unsigned long long> polardb_split_send_failed{0};         // split wrapped query send failed
+		std::atomic<unsigned long long> polardb_split_pool_hit{0};            // acquired an existing pooled split connection
+		std::atomic<unsigned long long> polardb_split_pool_empty{0};          // no pooled split connection existed
+		std::atomic<unsigned long long> polardb_split_pool_contention{0};     // no usable pooled split connection was available
+		std::atomic<unsigned long long> polardb_split_conn_reused{0};         // reused already attached split backend
+		std::atomic<unsigned long long> polardb_split_conn_cleanup_success{0}; // split backend returned to pool
+		std::atomic<unsigned long long> polardb_split_conn_cleanup_failed{0}; // split backend destroyed instead of pooled
+		std::atomic<unsigned long long> polardb_split_lsn_wait_count{0};      // split LSN wait wrappers prepared
+		std::atomic<unsigned long long> polardb_split_lsn_wait_sum_us{0};     // split LSN wait latency total
+		std::atomic<unsigned long long> polardb_split_error_connection_lost{0}; // split replica connection loss
+		std::atomic<unsigned long long> polardb_split_error_query_failed{0};  // split user-query failure
+		std::atomic<unsigned long long> polardb_split_error_timeout{0};       // split timeout total
+		std::atomic<unsigned long long> polardb_split_error_lsn_wait_timeout{0}; // split LSN timeout subset
+		std::atomic<unsigned long long> polardb_split_latency_sum_us{0};      // split read latency total
+		std::atomic<unsigned long long> polardb_split_latency_count{0};       // split read latency samples
+		std::atomic<unsigned long long> polardb_split_warmup_requested{0};    // lazy warmup requests queued
+		std::atomic<unsigned long long> polardb_split_warmup_created{0};      // lazy warmup connections created
+		std::atomic<unsigned long long> polardb_split_warmup_failed{0};       // lazy warmup requests failed
+		std::atomic<unsigned long long> polardb_split_warmup_sum_us{0};       // request-to-pool warmup latency total
+		std::atomic<unsigned long long> polardb_split_warmup_count{0};        // request-to-pool warmup samples
+		std::atomic<unsigned long long> polardb_warmup_pending{0};            // queued lazy warmup requests
 
 		// Fast gate read on every routing decision; true while any PolarDB
 		// hostgroup is configured. Set from the published snapshot on each commit.
@@ -1051,7 +1133,7 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 	 * -1 = not configured (inherit global), 0 = explicitly disabled, >0 = explicit value.
 	*/
 	struct PolarDB_HG_Policy {
-		bool txn_split_enabled{false};  // request/observe RFQ XID data; planner may name split route
+		bool txn_split_enabled{false};  // request/observe RFQ XID data and allow split reads
 		int consistency_mode{-1};
 		int lsn_wait_timeout_ms{-1};
 		int max_lag_bytes{-1};
@@ -1144,6 +1226,27 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 	 */
 	PolarDB_ReaderResult get_MyConn_polardb_reader(unsigned int hid, PgSQL_Session* sess,
 		const PolarDB_Query_ReaderPlan& reader_plan, bool only_pooled);
+
+	/**
+	 * @brief Queue one lazy transaction-split pool warmup request.
+	 *
+	 * Pure producer: it only records the demand key (reader HG, user, database,
+	 * proxy listener identity) and returns. It never opens a socket and never
+	 * takes the HGM write lock.
+	 */
+	void request_split_warmup(unsigned int reader_hostgroup_id,
+		const char* username, const char* password, const char* dbname,
+		const PolarDB_StartupClientContext& startup_client);
+
+	/**
+	 * @brief Drain queued split warmup requests into connected pool entries.
+	 *
+	 * Called from the HGM maintenance pass while the caller already holds the
+	 * HGM write lock. Each successful request publishes only a fully connected
+	 * backend, so pooled-only split reads never run a connect handshake in the
+	 * transaction path.
+	 */
+	void warm_split_pools();
 #endif // POLARDB_PROXY
 
 private:
@@ -1164,6 +1267,8 @@ private:
 	std::unordered_set<unsigned int> polardb_hostgroups_;  // all HGs in the PolarDB config
 	std::shared_ptr<const PolarDB_TopologySnapshot> polardb_topology_snapshot_;
 	std::atomic<uint64_t> polardb_topology_generation_{0};
+	std::queue<PgSQL_SplitWarmupRequest> split_warmup_queue_;
+	std::mutex split_warmup_mutex_;
 #endif // POLARDB_PROXY
 };
 

@@ -19,6 +19,8 @@ using json = nlohmann::json;
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
+#include <poll.h>
 #include <string>
 #include <vector>
 
@@ -3134,6 +3136,9 @@ void PgSQL_HostGroups_Manager::drop_all_idle_connections() {
 
 		}
 	}
+#if POLARDB_PROXY
+	warm_split_pools();
+#endif
 }
 
 /*
@@ -5018,6 +5023,347 @@ uint64_t PgSQL_HostGroups_Manager::get_polardb_primary_lsn(unsigned int writer_h
 	return it->second.primary_lsn->load(std::memory_order_relaxed);
 }
 
+static bool polardb_session_startup_client_context(
+		PgSQL_Session* sess, PolarDB_StartupClientContext* startup_client) {
+	if (startup_client) {
+		*startup_client = PolarDB_StartupClientContext{};
+	}
+	if (!sess || !sess->client_myds || !startup_client) {
+		return false;
+	}
+
+	PgSQL_Data_Stream* client_myds = sess->client_myds;
+	PolarDB_StartupIdentity identity{
+		client_myds->addr.addr,
+		client_myds->addr.port,
+		PolarDB_StartupIdentitySource::CLIENT};
+	if (identity.valid(false)) {
+		startup_client->identity = std::move(identity);
+		return true;
+	}
+
+	if (polardb_startup_identity_from_sockaddr(
+			client_myds->client_addr,
+			&identity,
+			PolarDB_StartupIdentitySource::CLIENT)) {
+		startup_client->identity = std::move(identity);
+		return true;
+	}
+
+	return false;
+}
+
+void PgSQL_HostGroups_Manager::request_split_warmup(
+		unsigned int reader_hostgroup_id,
+		const char* username,
+		const char* password,
+		const char* dbname,
+		const PolarDB_StartupClientContext& startup_client) {
+	if (!pgsql_thread___polardb_lazy_warmup_split) {
+		POLARDB_TRACE(
+			"PolarDB WARMUP: split lazy warmup disabled; skip request "
+			"reader_hg=%u user=%s db=%s\n",
+			reader_hostgroup_id, username ? username : "",
+			dbname ? dbname : "");
+		return;
+	}
+	if (!status.polardb_active.load(std::memory_order_relaxed) ||
+			reader_hostgroup_id == 0 || !username || username[0] == '\0' ||
+			!startup_client.identity_valid_for_startup(false)) {
+		status.polardb_split_warmup_failed.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+
+	const unsigned long long now_us = monotonic_time();
+	{
+		std::lock_guard<std::mutex> guard(split_warmup_mutex_);
+		if (split_warmup_queue_.size() >= SPLIT_WARMUP_QUEUE_LIMIT) {
+			status.polardb_split_warmup_failed.fetch_add(1, std::memory_order_relaxed);
+			status.polardb_warmup_pending.store(
+				split_warmup_queue_.size(), std::memory_order_relaxed);
+			return;
+		}
+		split_warmup_queue_.emplace(
+			reader_hostgroup_id, username, password, dbname,
+			startup_client, now_us);
+		status.polardb_warmup_pending.store(
+			split_warmup_queue_.size(), std::memory_order_relaxed);
+	}
+	status.polardb_split_warmup_requested.fetch_add(1, std::memory_order_relaxed);
+	POLARDB_TRACE(
+		"PolarDB WARMUP: queued split pool request reader_hg=%u user=%s db=%s "
+		"startup_client=%s:%d identity_match=%s\n",
+		reader_hostgroup_id, username, dbname ? dbname : "",
+		startup_client.identity.host.c_str(), startup_client.identity.port,
+		polardb_split_warmup_identity_name(identity_match));
+	if (wake_threads && GloPTH) {
+		// Wake once when the queue transitions from empty to non-empty. Duplicate
+		// transaction requests dedup above, so high transaction rates do not turn
+		// into one signal per BEGIN.
+		GloPTH->signal_all_threads(0);
+	}
+}
+
+static bool polardb_connect_split_warmup_connection(PgSQL_Connection* conn) {
+	if (!conn) return false;
+
+	const int configured_timeout_ms =
+		pgsql_thread___connect_timeout_server_max > 0
+			? pgsql_thread___connect_timeout_server_max
+			: pgsql_thread___connect_timeout_server;
+	const int timeout_ms = configured_timeout_ms > 0 ? configured_timeout_ms : 10000;
+	const unsigned long long deadline_us =
+		monotonic_time() + (unsigned long long)timeout_ms * 1000ULL;
+
+	conn->connect_start();
+	if (conn->is_error_present() || conn->get_pg_connection() == nullptr) {
+		return false;
+	}
+
+	while (conn->async_exit_status != PG_EVENT_NONE) {
+		short events = 0;
+		if (conn->async_exit_status & PG_EVENT_READ) events |= POLLIN;
+		if (conn->async_exit_status & PG_EVENT_WRITE) events |= POLLOUT;
+
+		const int fd = conn->fd;
+		if (fd < 0 || events == 0) {
+			conn->set_error(
+				PGSQL_ERROR_CODES::ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
+				"PolarDB split warmup connection has no pollable backend socket",
+				true);
+			return false;
+		}
+
+		const unsigned long long now_us = monotonic_time();
+		if (now_us >= deadline_us) {
+			conn->set_error(
+				PGSQL_ERROR_CODES::ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
+				"PolarDB split warmup connection timed out",
+				true);
+			return false;
+		}
+
+		const int poll_timeout_ms =
+			(int)((deadline_us - now_us + 999ULL) / 1000ULL);
+		struct pollfd pfd;
+		pfd.fd = fd;
+		pfd.events = events;
+		pfd.revents = 0;
+
+		int rc = poll(&pfd, 1, poll_timeout_ms);
+		if (rc < 0) {
+			if (errno == EINTR) continue;
+			conn->set_error(
+				PGSQL_ERROR_CODES::ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
+				strerror(errno),
+				true);
+			return false;
+		}
+		if (rc == 0) {
+			conn->set_error(
+				PGSQL_ERROR_CODES::ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
+				"PolarDB split warmup connection timed out",
+				true);
+			return false;
+		}
+
+		conn->connect_cont(pfd.revents);
+		if (conn->is_error_present()) {
+			return false;
+		}
+	}
+
+	if (!conn->is_connected()) {
+		conn->set_error(
+			PGSQL_ERROR_CODES::ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
+			"PolarDB split warmup connection did not reach CONNECTION_OK",
+			true);
+		return false;
+	}
+
+	conn->async_state_machine = ASYNC_IDLE;
+	conn->fd = conn->get_pg_socket_fd();
+	conn->creation_time = monotonic_time();
+	conn->last_time_used = 0;
+	conn->reusable = true;
+	conn->init_startup_parameters_from_server();
+	conn->polardb_init_connection_tracking();
+	__sync_fetch_and_add(&PgHGM->status.server_connections_connected, 1);
+	__sync_fetch_and_add(&conn->parent->connect_OK, 1);
+	return true;
+}
+
+void PgSQL_HostGroups_Manager::warm_split_pools() {
+	std::vector<PgSQL_SplitWarmupRequest> requests;
+	{
+		std::lock_guard<std::mutex> guard(split_warmup_mutex_);
+		while (!split_warmup_queue_.empty()) {
+			requests.push_back(std::move(split_warmup_queue_.front()));
+			split_warmup_queue_.pop();
+		}
+	}
+	if (requests.empty()) {
+		return;
+	}
+
+	auto make_key = [](const PgSQL_SplitWarmupRequest& req) {
+		std::string key = std::to_string(req.hostgroup_id);
+		key.push_back('\x1f');
+		key.append(req.username);
+		key.push_back('\x1f');
+		key.append(req.password);
+		key.push_back('\x1f');
+		key.append(req.dbname);
+		key.push_back('\x1f');
+		key.append(req.startup_client.identity.host);
+		key.push_back('\x1f');
+		key.append(std::to_string(req.startup_client.identity.port));
+		key.push_back('\x1f');
+		key.append(std::to_string(
+			static_cast<int>(req.startup_client.identity.source)));
+		key.push_back('\x1f');
+		key.append(req.startup_client.frontend_ssl ? "ssl" : "nossl");
+		key.push_back('\x1f');
+		key.append(req.startup_client.ssl_version);
+		key.push_back('\x1f');
+		key.append(req.startup_client.ssl_cipher);
+		key.push_back('\x1f');
+		key.append(req.startup_client.has_proxy_session ? "sid" : "nosid");
+		key.push_back('\x1f');
+		key.append(std::to_string(req.startup_client.proxy_session_id));
+		key.push_back('\x1f');
+		key.append(std::to_string(req.startup_client.proxy_cancel_key));
+		return key;
+	};
+
+	std::unordered_set<std::string> seen;
+	for (const PgSQL_SplitWarmupRequest& req : requests) {
+		if (req.hostgroup_id == 0 || req.username.empty() ||
+				!req.startup_client.identity_valid_for_startup(false)) {
+			status.polardb_split_warmup_failed.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+
+		const std::string req_key = make_key(req);
+		if (!seen.insert(req_key).second) {
+			continue;
+		}
+
+		PgSQL_HGC* myhgc = MyHGC_lookup(req.hostgroup_id);
+		if (!myhgc) {
+			status.polardb_split_warmup_failed.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+
+		bool already_free = false;
+		for (unsigned int i = 0; i < myhgc->mysrvs->cnt() && !already_free; i++) {
+			PgSQL_SrvC* mysrvc = myhgc->mysrvs->idx(i);
+			if (!mysrvc || mysrvc->status != MYSQL_SERVER_STATUS_ONLINE ||
+					!mysrvc->ConnectionsFree) {
+				continue;
+			}
+			for (unsigned int j = 0; j < mysrvc->ConnectionsFree->conns_length(); j++) {
+				PgSQL_Connection* candidate = mysrvc->ConnectionsFree->index(j);
+				if (!candidate || !candidate->userinfo ||
+						!candidate->userinfo->username || !candidate->userinfo->dbname) {
+					continue;
+				}
+				if (strcmp(candidate->userinfo->username, req.username.c_str()) == 0 &&
+						strcmp(candidate->userinfo->dbname, req.dbname.c_str()) == 0 &&
+						polardb_startup_client_compatible_for_warmup(
+							candidate->polardb_startup_client,
+							req.startup_client,
+							req.identity_match)) {
+					already_free = true;
+					break;
+				}
+			}
+		}
+		if (already_free) {
+			continue;
+		}
+
+		PgSQL_SrvC* target = nullptr;
+		for (unsigned int i = 0; i < myhgc->mysrvs->cnt(); i++) {
+			PgSQL_SrvC* mysrvc = myhgc->mysrvs->idx(i);
+			if (!mysrvc || mysrvc->status != MYSQL_SERVER_STATUS_ONLINE ||
+					mysrvc->weight <= 0 || !pgsql_srv_latency_allowed(mysrvc)) {
+				continue;
+			}
+			if (mysrvc->max_connections <= 0) {
+				continue;
+			}
+			const unsigned int total =
+				mysrvc->ConnectionsUsed->conns_length() +
+				mysrvc->ConnectionsFree->conns_length();
+			if (total >= static_cast<unsigned int>(mysrvc->max_connections)) {
+				continue;
+			}
+			if (pgsql_connection_creation_throttled_locked(mysrvc)) {
+				continue;
+			}
+			target = mysrvc;
+			break;
+		}
+
+		if (!target) {
+			status.polardb_split_warmup_failed.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+
+		PgSQL_Connection* conn = pgsql_create_backend_connection_locked(target);
+		if (!conn || !conn->userinfo) {
+			delete conn;
+			status.polardb_split_warmup_failed.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		conn->userinfo->set(
+			const_cast<char*>(req.username.c_str()),
+			const_cast<char*>(req.password.c_str()),
+			const_cast<char*>(req.dbname.c_str()),
+			nullptr);
+#if POLARDB_PROXY
+		// Split warmup is opened outside client dispatch, but it is still owned by
+		// the client identity that requested it. Force that identity through the
+		// normal conninfo builder; SSL/session-id placeholders remain default
+		// until those startup keys are wired.
+		conn->polardb_use_proxy_startup_identity = false;
+		conn->polardb_forced_startup_identity = req.startup_client.identity;
+#endif // POLARDB_PROXY
+		if (!polardb_connect_split_warmup_connection(conn)) {
+			proxy_error("PolarDB split warmup: connection failed to %s:%u "
+				"for HG %u user=%s db=%s: %s\n",
+				target->address, target->port, req.hostgroup_id,
+				req.username.c_str(), req.dbname.c_str(),
+				conn->get_error_message().c_str());
+			PgHGM->p_update_pgsql_error_counter(
+				p_pgsql_error_type::pgsql, target->myhgc->hid,
+				target->address, target->port, 9999);
+			target->connect_error(9999);
+			delete conn;
+			status.polardb_split_warmup_failed.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		target->ConnectionsFree->add(conn);
+		status.polardb_split_warmup_created.fetch_add(1, std::memory_order_relaxed);
+		__sync_fetch_and_add(&status.server_connections_created, 1);
+		const unsigned long long elapsed_us =
+			req.requested_at_us > 0 ? monotonic_time() - req.requested_at_us : 0;
+		status.polardb_split_warmup_sum_us.fetch_add(
+			elapsed_us, std::memory_order_relaxed);
+		status.polardb_split_warmup_count.fetch_add(
+			1, std::memory_order_relaxed);
+		POLARDB_TRACE(
+			"PolarDB WARMUP: added connected split pool connection "
+			"reader_hg=%u server=%s:%u user=%s db=%s startup_client=%s:%d "
+			"elapsed_us=%llu\n",
+			req.hostgroup_id, target->address, target->port,
+			req.username.c_str(), req.dbname.c_str(),
+			req.startup_client.identity.host.c_str(),
+			req.startup_client.identity.port);
+	}
+}
+
 /**
  * @brief Get a connection to one reader server, honoring the RFQ-LSN profile.
  *
@@ -5063,14 +5409,14 @@ static PgSQL_Connection* polardb_get_rfq_profile_compatible_conn(
 		return nullptr;
 	}
 
-	// Scan the free list for a connection that can carry an RFQ-LSN read. A
-	// not-yet-connected entry counts as usable: it will negotiate the right
-	// profile when it actually connects. Among RFQ-capable entries, use the same
-	// reuse preference as the regular PostgreSQL pool path: same connection
-	// options first, then avoid RESET, then prefer the entry with more matching
-	// session variables/schema. This keeps the PolarDB RFQ filter from turning
-	// pooled acquisition into "first compatible entry wins" and causing
-	// avoidable reset/variable-sync work before the query.
+	// Scan the free list for a connection that can carry an RFQ-LSN read.
+	// Pooled-only split reads require a connection that is already connected:
+	// they cannot pause a transaction to run a backend connect handshake. When
+	// creation is allowed, a not-yet-connected entry remains usable because the
+	// normal session connect path will negotiate the RFQ profile before dispatch.
+	// Among RFQ-capable entries, use the same reuse preference as the regular
+	// PostgreSQL pool path: same connection options first, then avoid RESET, then
+	// prefer the entry with more matching session variables/schema.
 	bool skipped_incompatible = false;
 	const unsigned int initial_free = mysrvc->ConnectionsFree->conns_length();
 	PgSQL_Connection* client_conn =
@@ -5078,6 +5424,15 @@ static PgSQL_Connection* polardb_get_rfq_profile_compatible_conn(
 		 sess->client_myds->myconn->userinfo)
 			? sess->client_myds->myconn
 			: nullptr;
+	PolarDB_StartupClientContext required_startup_client;
+	const bool has_required_startup_client =
+		polardb_session_startup_client_context(sess, &required_startup_client);
+	if (only_pooled && (!client_conn || !has_required_startup_client)) {
+		if (status) {
+			*status = PolarDB_ReaderStatus::RFQ_UNAVAILABLE;
+		}
+		return nullptr;
+	}
 	bool found_compatible = false;
 	unsigned int best_idx = 0;
 	unsigned int best_quality = 0;
@@ -5087,9 +5442,17 @@ static PgSQL_Connection* polardb_get_rfq_profile_compatible_conn(
 		if (!candidate) {
 			continue;
 		}
-		if (candidate &&
-				(candidate->get_pg_connection() == nullptr ||
-				 candidate->polardb_startup_profile.has_rfq_lsn())) {
+		const bool disconnected = candidate->get_pg_connection() == nullptr;
+		const bool rfq_profile_compatible =
+			candidate->polardb_startup_profile.has_rfq_lsn() &&
+			(!only_pooled || candidate->polardb_startup_profile.has_rfq_xid());
+		if (disconnected && only_pooled) {
+			proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5,
+				"PolarDB route smart: skipped disconnected pooled connection %p from %s:%d for pooled-only split read\n",
+				candidate, mysrvc->address, mysrvc->port);
+			continue;
+		}
+		if (disconnected || rfq_profile_compatible) {
 			if (!client_conn) {
 				if (status) {
 					*status = PolarDB_ReaderStatus::ACQUIRED;
@@ -5100,6 +5463,19 @@ static PgSQL_Connection* polardb_get_rfq_profile_compatible_conn(
 			unsigned int quality = 0;
 			unsigned int matching_session_vars = 0;
 			if (candidate->has_same_connection_options(client_conn)) {
+				if (!disconnected) {
+					if (!has_required_startup_client ||
+							!polardb_startup_client_compatible_for_warmup(
+								candidate->polardb_startup_client,
+								required_startup_client,
+								pgsql_thread___polardb_split_warmup_identity)) {
+						skipped_incompatible = true;
+						proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5,
+							"PolarDB route smart: skipped pooled connection %p from %s:%d because startup client identity differs\n",
+							candidate, mysrvc->address, mysrvc->port);
+						continue;
+					}
+				}
 				quality = 1;
 				if (!candidate->requires_RESETTING_CONNECTION(client_conn)) {
 					quality = 2;
@@ -5114,6 +5490,12 @@ static PgSQL_Connection* polardb_get_rfq_profile_compatible_conn(
 						return mysrvc->ConnectionsFree->remove(i);
 					}
 				}
+			} else {
+				skipped_incompatible = true;
+				proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5,
+					"PolarDB route smart: skipped pooled connection %p from %s:%d because user or database differs\n",
+					candidate, mysrvc->address, mysrvc->port);
+				continue;
 			}
 
 			const bool better =

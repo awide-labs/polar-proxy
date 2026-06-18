@@ -363,6 +363,12 @@ void PgSQL_Session::reset() {
 	default_hostgroup = -1;
 	locked_on_hostgroup = -1;
 	locked_on_hostgroup_and_all_variables_set = false;
+#if POLARDB_PROXY
+	if (polardb_txn_split_backend || polardb_txn_split_active) {
+		polardb_reset_txn_split_read();
+		polardb_release_txn_split_backend(/*want_reuse=*/false);
+	}
+#endif // POLARDB_PROXY
 	if (mybes) {
 		reset_all_backends();
 		delete mybes;
@@ -386,11 +392,11 @@ void PgSQL_Session::reset() {
 	if (transaction_state_manager) {
 		transaction_state_manager->reset_state();
 	}
-#if POLARDB_PROXY
 	// Free any per-query PolarDB wait/notice state on session reset so a recycled
 	// session never carries a stale wait or leaks a captured NoticeResponse.
 	// Clearing the per-session consistency override happens in the RESET/DISCARD
 	// command handlers, not here.
+#if POLARDB_PROXY
 	polardb_query.reset_for_new_query();
 	clear_pending_notices(/*free_buffers=*/true);
 #endif // POLARDB_PROXY
@@ -2585,7 +2591,13 @@ __implicit_sync:
 									}
 								}
 #endif // POLARDB_PROXY
-								mybe = find_or_create_backend(current_hostgroup);
+#if POLARDB_PROXY
+								if (!polardb_txn_reader_read_active()) {
+#endif // POLARDB_PROXY
+									mybe = find_or_create_backend(current_hostgroup);
+#if POLARDB_PROXY
+								}
+#endif // POLARDB_PROXY
 								status = PROCESSING_QUERY;
 								// set query retries
 								mybe->server_myds->query_retries_on_failure = pgsql_thread___query_retries_on_failure;
@@ -2613,7 +2625,13 @@ __implicit_sync:
 								proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Received query to be processed...\n");
 								mybe->server_myds->killed_at = 0;
 								mybe->server_myds->kill_type = 0;
-								mybe->server_myds->pgsql_real_query.init(&pkt);
+#if POLARDB_PROXY
+								if (!polardb_txn_reader_read_active()) {
+#endif // POLARDB_PROXY
+									mybe->server_myds->pgsql_real_query.init(&pkt);
+#if POLARDB_PROXY
+								}
+#endif // POLARDB_PROXY
 								mybe->server_myds->statuses.questions++;
 								client_myds->setDSS_STATE_QUERY_SENT_NET();
 							}
@@ -3716,9 +3734,39 @@ handler_again:
 				}
 
 				enum session_status old_status = status;
+#if POLARDB_PROXY
+					const bool polardb_split_completed =
+						polardb_txn_split_active &&
+						polardb_txn_split_backend &&
+						polardb_txn_split_backend->server_myds == myds;
+					const bool polardb_txn_wait_completed =
+						polardb_txn_wait_read_active &&
+						polardb_txn_split_backend &&
+						polardb_txn_split_backend->server_myds == myds;
+					const bool polardb_txn_reader_completed =
+						polardb_split_completed || polardb_txn_wait_completed;
+					const bool polardb_split_wrapper_failed =
+						polardb_split_completed &&
+						myconn->polardb_query_wrap_state.wrapper_set_failed();
+#endif // POLARDB_PROXY
 
 				RequestEnd(myds, false);
-				finishQuery(myds, myconn, has_pending_messages);
+				finishQuery(myds, myconn,
+					has_pending_messages
+#if POLARDB_PROXY
+					|| polardb_split_completed
+#endif // POLARDB_PROXY
+				);
+
+#if POLARDB_PROXY
+				if (polardb_split_completed) {
+					if (polardb_split_wrapper_failed) {
+						polardb_abort_txn_split_read("wrapper statement failed");
+					} else {
+						polardb_complete_txn_split_read();
+					}
+				}
+#endif // POLARDB_PROXY
 
 				if (processing_extended_query) {
 					if (!has_pending_messages) {
@@ -3742,6 +3790,25 @@ handler_again:
 				if (rc == -1) {
 					// the query failed
 #if POLARDB_PROXY
+					const bool polardb_failed_split_read = polardb_txn_split_active;
+					const PolarDB_RequestOutcome polardb_outcome =
+						polardb_capture_outcome(active_backend(), /*ok=*/false);
+					const PolarDB_FailureAction polardb_failure_action =
+						polardb_on_failure(polardb_outcome);
+					if (polardb_failed_split_read) {
+						myds->query_retries_on_failure = 0;
+						if (polardb_retry_txn_split_read_on_primary(
+								"replica split wait failed before user result")) {
+							NEXT_IMMEDIATE(CONNECTING_SERVER);
+						}
+						polardb_abort_txn_split_read("replica split read failed");
+					}
+					// The general RETRY/FORWARD/TERMINATE reader-failure policy is
+					// still future work. Today the only active in-transaction split
+					// failure path is the narrow primary retry above.
+					assert(polardb_failure_action == PolarDB_FailureAction::PASSTHROUGH);
+					(void)polardb_failure_action;
+
 					// Capture the failed wait-wrapped replica read before any
 					// normal error handling mutates the replica data stream. The
 					// captured query can be retried once on the primary only if no

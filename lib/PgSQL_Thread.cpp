@@ -4653,9 +4653,8 @@ void PgSQL_Thread::listener_handle_new_connection(PgSQL_Data_Stream * myds, unsi
 }
 
 #if POLARDB_PROXY
-// Append the PolarDB session-consistency counters to the global status result.
-// This build exports LSN and wait-wrap counters; split-read counters are not part
-// of the session-consistency surface.
+// Append PolarDB counters to the global status result. The counter list is the
+// single export table for the LSN consistency and transaction-split surfaces.
 static void polardb_export_stats(PgSQL_Threads_Handler* handler, SQLite3_result* result, char** pta, char* buf) {
 	auto thread_counter = [handler](
 		PolarDB_ThreadStatusVariable idx,

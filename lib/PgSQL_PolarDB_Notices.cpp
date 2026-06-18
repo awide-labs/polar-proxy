@@ -238,35 +238,40 @@ void polardb_handle_notice(PgSQL_Connection* conn, const PGresult* result) {
 	// Prove that an in-flight consistency wrapper is active before accounting.
 	// The best_effort timeout WARNING is emitted while the user's SELECT obtains
 	// its snapshot, after the leading SET results may already be consumed. Do not
-	// require stmt_pending > 0 here; wait_active plus wrapper_kind is the signal
-	// that the notice belongs to the current PolarDB consistency wait.
+	// require stmt_pending > 0 here; an active PolarDB wait plus wrapper_kind is
+	// the signal that the notice belongs to the current hidden wrapper. Transaction
+	// split has its own wrapper kind but uses the same wait-timeout backend marker.
 	PgSQL_Session* sess = (conn->myds ? conn->myds->sess : nullptr);
 	if (!sess) {
 		return;
 	}
 
 	const bool wait_active =
-		(sess->polardb_query.wait.wait_stage == PolarDB_WaitStage::WAITING);
-	const bool consistency_wait =
-		conn->polardb_query_wrap_state.is_consistency_wait();
-	POLARDB_TRACE("PolarDB WAIT: notice handler wait_active=%d consistency_wait=%d "
+		(sess->polardb_query.wait.wait_stage == PolarDB_WaitStage::WAITING) ||
+		sess->polardb_txn_split_read_active();
+	const bool polar_wait_wrapper =
+		conn->polardb_query_wrap_state.is_polar_wait_wrapper();
+	POLARDB_TRACE("PolarDB WAIT: notice handler wait_active=%d polar_wait_wrapper=%d "
 		"pending=%u sess=%p conn=%p\n",
 		wait_active ? 1 : 0,
-		consistency_wait ? 1 : 0,
+		polar_wait_wrapper ? 1 : 0,
 		conn->polardb_query_wrap_state.stmt_pending,
 		(void*)sess, (void*)conn);
-	if (!wait_active || !consistency_wait) {
-		// Timeout-looking notice outside the current consistency wait: do NOT
+	if (!wait_active || !polar_wait_wrapper) {
+		// Timeout-looking notice outside the current PolarDB wait wrapper: do NOT
 		// count it and do NOT forward it ourselves. notice_handler_cb() already
 		// ran its generic store before calling us (or had no result to store into).
 		return;
 	}
 
-	// Current consistency wait confirmed. A best_effort wait surfaces a timeout
-	// as WARNING/NOTICE rather than ERROR. Accounting is centralized so repeated
-	// observations of the same backend event cannot double-count counters or
-	// latency.
-	sess->polardb_account_wait_timeout("notice");
+	// Current PolarDB wait confirmed. A best_effort wait surfaces a timeout as
+	// WARNING/NOTICE rather than ERROR. Split reads use the same backend marker
+	// but have their own counters, so account against the active wrapper family.
+	if (sess->polardb_txn_split_read_active()) {
+		sess->polardb_account_txn_split_wait_timeout("notice");
+	} else {
+		sess->polardb_account_wait_timeout("notice");
+	}
 
 	/*
 	 * Notice forwarding ownership:

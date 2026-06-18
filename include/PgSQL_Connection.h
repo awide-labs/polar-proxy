@@ -671,9 +671,11 @@ public:
 	struct PolarDB_Query_DispatchState {
 		uint32_t wrapper_stmts{0};  // wrapper statements whose result sets to consume (0 = none)
 		PolarDB_Query_WrapperKind wrapper_kind{PolarDB_Query_WrapperKind::NONE};
+		bool txn_split_xids_reset{false};  // first wrapper SET clears stale split XIDs
 		void reset() {
 			wrapper_stmts = 0;
 			wrapper_kind = PolarDB_Query_WrapperKind::NONE;
+			txn_split_xids_reset = false;
 		}
 	};
 	PolarDB_Query_DispatchState dispatch_state;
@@ -759,31 +761,63 @@ public:
 		uint32_t stmt_total{0};    // wrapper statements in the wrapped query (set once by begin)
 		uint32_t stmt_pending{0};  // wrapper statements whose result set is still to consume
 		PolarDB_Query_WrapperKind wrapper_kind{PolarDB_Query_WrapperKind::NONE};
+		bool txn_split_xids_reset_pending{false}; // true only for the first wrapper SET
 
 		bool has_pending() const { return stmt_pending > 0; }  // still consuming wrapper result sets
 		bool consuming_wrapper_set() const { return stmt_pending > 0; }
+		bool consuming_txn_split_xids_reset() const {
+			return txn_split_xids_reset_pending && stmt_pending == stmt_total;
+		}
 		bool wrapper_set_failed() const { return stmt_failed; }
 		bool is_consistency_wait() const {
 			return wrapper_kind == PolarDB_Query_WrapperKind::CONSISTENCY_WAIT;
 		}
+		bool is_txn_split_wait() const {
+			return wrapper_kind == PolarDB_Query_WrapperKind::TXN_SPLIT_WAIT;
+		}
+		bool is_txn_split_xids_reset() const {
+			return wrapper_kind == PolarDB_Query_WrapperKind::TXN_SPLIT_XIDS_RESET;
+		}
+		bool is_polar_wait_wrapper() const {
+			return is_consistency_wait() || is_txn_split_wait();
+		}
 
-		void begin(uint32_t n, PolarDB_Query_WrapperKind kind) {
+		void begin(uint32_t n, PolarDB_Query_WrapperKind kind,
+				bool txn_xids_reset = false) {
 			was_wrapped = (n > 0);
 			stmt_failed = false;
 			stmt_total = n;
 			stmt_pending = n;
 			wrapper_kind = (n > 0) ? kind : PolarDB_Query_WrapperKind::NONE;
+			txn_split_xids_reset_pending = (n > 0) && txn_xids_reset;
 		}
-		void mark_wrapper_set_failed() { stmt_failed = true; stmt_pending = 0; }
+		void mark_wrapper_set_failed() {
+			stmt_failed = true;
+			stmt_pending = 0;
+			txn_split_xids_reset_pending = false;
+		}
 		void clear() {
 			was_wrapped = false;
 			stmt_failed = false;
 			stmt_total = 0;
 			stmt_pending = 0;
 			wrapper_kind = PolarDB_Query_WrapperKind::NONE;
+			txn_split_xids_reset_pending = false;
 		}
 	};
 	PolarDB_Query_WrapState polardb_query_wrap_state;
+
+	/**
+	 * @brief Backend connection may retain polar_xact_split_xids after split use.
+	 *
+	 * Transaction-split readers are pooled physical backend connections. Once a
+	 * split read sends `SET polar_xact_split_xids = ...`, the next non-split read
+	 * on that same connection must first send `SET polar_xact_split_xids = ''` so
+	 * the backend never applies the old split-XID context to an unrelated query.
+	 */
+	bool polardb_txn_split_xids_dirty{false};
+	bool polardb_txn_split_xids_reset_consumed{false};
+	std::string polardb_txn_split_xids_reset_query_buf;
 
 	/**
 	 * @brief PolarDB startup profile requested on this backend connection.
@@ -794,6 +828,35 @@ public:
 	 * confirm the backend was asked to append the RFQ LSN.
 	 */
 	PolarDB_StartupProfile polardb_startup_profile;
+
+	/**
+	 * @brief Prefer ProxySQL's own endpoint for PolarDB startup identity.
+	 *
+	 * Used only by non-client/internal connections that deliberately should not
+	 * advertise a frontend socket. Split warmup must not use this mode: warmed
+	 * replica connections are reusable only for the same real startup client
+	 * identity that was captured by the session that requested warmup.
+	 */
+	bool polardb_use_proxy_startup_identity;
+
+	/**
+	 * @brief Explicit endpoint to advertise in PolarDB startup params.
+	 *
+	 * Used when the caller has already resolved the startup client identity but
+	 * the connection is opened outside that client dispatch path. Split warmup
+	 * uses this to send the original client identity, not the ProxySQL listener.
+	 */
+	PolarDB_StartupIdentity polardb_forced_startup_identity;
+
+	/**
+	 * @brief Startup-client metadata actually used by this backend.
+	 *
+	 * The identity is populated when PolarDB startup keys are appended. SSL and
+	 * proxy session/cancel fields are reserved placeholders until those backend
+	 * startup keys are wired. Pool reuse compares this object so later fields are
+	 * not forgotten when they become active.
+	 */
+	PolarDB_StartupClientContext polardb_startup_client;
 #endif // POLARDB_PROXY
 
 	bool multiplex_delayed;

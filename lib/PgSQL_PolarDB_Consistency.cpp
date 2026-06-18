@@ -23,6 +23,10 @@
 #include "proxysql.h"
 #include "cpp.h"
 
+#include <atomic>
+#include <cctype>
+#include <string>
+
 extern PgSQL_HostGroups_Manager* PgHGM;
 
 #if POLARDB_PROXY
@@ -51,8 +55,8 @@ void PgSQL_Session::polardb_set_session_override(int mode) {
 }
 
 // Observes transaction-split RFQ metadata only after Flow.cpp accepted the LSN
-// for the current writer scope. This is state collection, not route execution:
-// no backend is borrowed and in-transaction reads still use the primary.
+// for the current writer scope. This is state collection; the later planner and
+// executor decide whether one in-transaction read may borrow a replica backend.
 void PgSQL_Session::polardb_observe_transaction_split(PgSQL_Connection* conn,
 	uint64_t primary_lsn, bool split_enabled, bool primary_source) {
 	if (!primary_source || !conn) {
@@ -66,18 +70,45 @@ void PgSQL_Session::polardb_observe_transaction_split(PgSQL_Connection* conn,
 				"PolarDB TXN_SPLIT: cleared observed RFQ state because "
 				"txn_split_enabled=0\n");
 		}
+		polardb_release_txn_split_backend(/*want_reuse=*/true);
 		polardb_transaction_split.reset();
 		return;
 	}
 
 	const char transaction_status = conn->get_transaction_status_char();
+	if (transaction_status == 'I') {
+		if (polardb_transaction_split.did_split) {
+			POLARDB_THREAD_COUNT_ONE(thread, txn_committed_with_split);
+		} else if (polardb_transaction_split.was_splittable) {
+			POLARDB_THREAD_COUNT_ONE(thread, txn_committed_no_split);
+		}
+		polardb_release_txn_split_backend(/*want_reuse=*/true);
+		polardb_transaction_split.reset();
+		return;
+	}
+
 	const char* xids = conn->get_polardb_txn_xids();
 	const bool splittable = conn->is_polardb_txn_splittable();
 	const bool wal_pending = conn->is_polardb_txn_wal_pending();
 	const PolarDB_TransactionSplitStage old_stage = polardb_transaction_split.stage;
+	const bool old_was_split_readable =
+		old_stage == PolarDB_TransactionSplitStage::TXN_SPLITTABLE;
 
 	polardb_transaction_split.observe_primary_rfq(
 		transaction_status, xids, splittable, wal_pending, primary_lsn, split_enabled);
+
+	if (xids && xids[0]) {
+		POLARDB_THREAD_COUNT_ONE(thread, xids_received);
+	}
+	if (old_stage != PolarDB_TransactionSplitStage::TXN_SPLITTABLE &&
+			polardb_transaction_split.stage ==
+				PolarDB_TransactionSplitStage::TXN_SPLITTABLE) {
+		POLARDB_THREAD_COUNT_ONE(thread, txn_became_splittable);
+	} else if (old_was_split_readable &&
+			polardb_transaction_split.stage !=
+				PolarDB_TransactionSplitStage::TXN_SPLITTABLE) {
+		POLARDB_THREAD_COUNT_ONE(thread, txn_lost_splittable);
+	}
 
 	if (old_stage != polardb_transaction_split.stage || xids || splittable || wal_pending) {
 		POLARDB_TRACE(

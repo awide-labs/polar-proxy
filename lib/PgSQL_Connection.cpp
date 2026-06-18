@@ -106,11 +106,17 @@ static void polardb_account_wrapper_set_error(PgSQL_Connection* conn, const PGre
 		return;
 	}
 
-	// With no live wait there is nothing to charge; still mark the wrap-state
-	// failed so the result loop stops consuming and surfaces the error.
+	// Ordinary consistency waits keep session wait state active until result
+	// handling completes. Transaction split stores its wait target on the split
+	// backend wrapper instead, so polardb_wait_active() is false even when the
+	// backend returns the same structured LSN-timeout marker. Count that marker
+	// against split counters while still using the generic wrapper-failed flag to
+	// stop SET consumption.
 	PgSQL_Session* sess = conn->myds ? conn->myds->sess : nullptr;
 	const bool wait_active = sess && sess->polardb_wait_active();
-	const bool is_lsn_timeout = wait_active && polardb_is_lsn_wait_timeout_result(result);
+	const bool txn_split_wait = conn->polardb_query_wrap_state.is_txn_split_wait();
+	const bool is_lsn_timeout =
+		(wait_active || txn_split_wait) && polardb_is_lsn_wait_timeout_result(result);
 	const PolarDB_WrapperErrorAccounting accounting =
 		polardb_wrapper_error_accounting(
 			conn->polardb_query_wrap_state.was_wrapped,
@@ -118,9 +124,14 @@ static void polardb_account_wrapper_set_error(PgSQL_Connection* conn, const PGre
 			is_lsn_timeout,
 			conn->polardb_query_wrap_state.consuming_wrapper_set());
 	if (!wait_active) {
-		POLARDB_TRACE("PolarDB WAIT: mark wrapper failed without accounting "
-			"sess=%p wait_active=%d pending=%u\n",
+		if (txn_split_wait && is_lsn_timeout && sess) {
+			sess->polardb_account_txn_split_wait_timeout("result-error");
+		}
+		POLARDB_TRACE("PolarDB WAIT: mark wrapper failed outside consistency wait "
+			"sess=%p wait_active=%d txn_split_wait=%d lsn_timeout=%d pending=%u\n",
 			(void*)sess, wait_active ? 1 : 0,
+			txn_split_wait ? 1 : 0,
+			is_lsn_timeout ? 1 : 0,
 			conn->polardb_query_wrap_state.stmt_pending);
 		if (accounting.mark_wrapper_failed) {
 			conn->polardb_query_wrap_state.mark_wrapper_set_failed();
@@ -330,6 +341,11 @@ PgSQL_Connection::PgSQL_Connection(bool is_client_conn) {
 	is_copy_out = false;
 	exit_pipeline_mode = false;
 	resync_failed = false;
+#if POLARDB_PROXY
+	polardb_use_proxy_startup_identity = false;
+	polardb_forced_startup_identity = PolarDB_StartupIdentity{};
+	polardb_startup_client = PolarDB_StartupClientContext{};
+#endif // POLARDB_PROXY
 	reset_error();
 	memset(&connected_host_details, 0, sizeof(connected_host_details));
 }
@@ -652,7 +668,16 @@ handler_again:
 					fetch_result_end_st == ASYNC_QUERY_END) {
 					if (exec_status_type == PGRES_COMMAND_OK ||
 						exec_status_type == PGRES_EMPTY_QUERY) {
+						const bool consumed_xids_reset =
+							polardb_query_wrap_state.consuming_txn_split_xids_reset();
 						polardb_query_wrap_state.stmt_pending--;
+						if (consumed_xids_reset) {
+							// Clear the dirty flag later, when the whole reset-wrapped
+							// query completes without error. Until then the physical
+							// backend must still be treated as needing cleanup.
+							polardb_txn_split_xids_reset_consumed = true;
+							polardb_query_wrap_state.txn_split_xids_reset_pending = false;
+						}
 						POLARDB_TRACE("PolarDB: wrapper result consumed: status=%d pending=%u\n",
 							(int)exec_status_type, polardb_query_wrap_state.stmt_pending);
 						// Discard the SET result and reuse its buffer for the next
@@ -672,6 +697,13 @@ handler_again:
 						// account them here while we still know the error belongs to a
 						// wrapper SET result. Then stop consuming and let the error flow
 						// to the client through the normal path below.
+						if (polardb_query_wrap_state.consuming_txn_split_xids_reset()) {
+							reusable = false;
+							polardb_txn_split_xids_reset_consumed = false;
+							POLARDB_TRACE(
+								"PolarDB TXN_SPLIT: xids reset SET failed conn=%p\n",
+								(void*)this);
+						}
 						POLARDB_TRACE("PolarDB: wrapper result error: status=%d pending=%u\n",
 							(int)exec_status_type, polardb_query_wrap_state.stmt_pending);
 						polardb_account_wrapper_set_error(this, result.get(), PQresultErrorMessage(result.get()));
@@ -1387,12 +1419,8 @@ PolarDB_StartupProfile PgSQL_Connection::build_polardb_startup_profile(unsigned 
 	// global pgsql-polardb_proxy_protocol default.
 	PgSQL_HostGroups_Manager::PolarDB_HG_Policy policy = PgHGM->get_polardb_hg_policy(hid);
 	int protocol = policy.proxy_protocol >= 0 ? policy.proxy_protocol : pgsql_thread___polardb_proxy_protocol;
-	PolarDB_StartupProfile profile =
-		PolarDB_StartupProfile::from_protocol(polardb_proxy_protocol_from_int(protocol));
-	if (policy.txn_split_enabled) {
-		profile.request_rfq_xid();
-	}
-	return profile;
+	return PolarDB_StartupProfile::from_protocol(
+		polardb_proxy_protocol_from_int(protocol));
 }
 
 /// @brief Pick the client identity to advertise in PolarDB startup parameters.
@@ -1422,34 +1450,53 @@ PolarDB_StartupIdentity PgSQL_Connection::resolve_polardb_startup_identity(
 	const bool debug_use_listener_proxy = false;
 	const bool debug_use_configured_fallback = false;
 #endif
+	if (polardb_forced_startup_identity.source !=
+			PolarDB_StartupIdentitySource::NONE) {
+		const bool reject_wildcard =
+			polardb_forced_startup_identity.source !=
+			PolarDB_StartupIdentitySource::CLIENT;
+		if (polardb_forced_startup_identity.valid(reject_wildcard)) {
+			return polardb_forced_startup_identity;
+		}
+		POLARDB_TRACE("PolarDB CONNINFO: forced startup identity is invalid "
+			"source=%d host=%s port=%d\n",
+			static_cast<int>(polardb_forced_startup_identity.source),
+			polardb_forced_startup_identity.host.c_str(),
+			polardb_forced_startup_identity.port);
+		return PolarDB_StartupIdentity{};
+	}
+
 	const PgSQL_Data_Stream* client_myds =
 		(myds && myds->sess) ? myds->sess->client_myds : nullptr;
 	if (client_myds) {
-		// First choice: the client endpoint already resolved on the session.
-		PolarDB_StartupIdentity identity{
-			client_myds->addr.addr,
-			client_myds->addr.port,
-			PolarDB_StartupIdentitySource::CLIENT
-		};
-		if (!debug_use_listener_proxy &&
-				!debug_use_configured_fallback &&
-				identity.valid(false)) {
-			return identity;
+		if (!polardb_use_proxy_startup_identity) {
+			// First choice: the client endpoint already resolved on the session.
+			PolarDB_StartupIdentity identity{
+				client_myds->addr.addr,
+				client_myds->addr.port,
+				PolarDB_StartupIdentitySource::CLIENT
+			};
+			if (!debug_use_listener_proxy &&
+					!debug_use_configured_fallback &&
+					identity.valid(false)) {
+				return identity;
+			}
+			// Second: derive it straight from the raw client socket address.
+			PolarDB_StartupIdentity raw_identity;
+			if (!debug_use_listener_proxy &&
+					!debug_use_configured_fallback &&
+					polardb_startup_identity_from_sockaddr(
+						client_myds->client_addr,
+						&raw_identity,
+						PolarDB_StartupIdentitySource::CLIENT)) {
+				return raw_identity;
+			}
 		}
-		// Second: derive it straight from the raw client socket address.
-		PolarDB_StartupIdentity raw_identity;
-		if (!debug_use_listener_proxy &&
-				!debug_use_configured_fallback &&
-				polardb_startup_identity_from_sockaddr(
-					client_myds->client_addr,
-					&raw_identity,
-					PolarDB_StartupIdentitySource::CLIENT)) {
-			return raw_identity;
-		}
-		// Third: the proxy's own listener address. valid(true) additionally
+		// ProxySQL's own listener address. valid(true) additionally
 		// rejects a wildcard (any-address) listener, which would not identify a
-		// real endpoint; the client checks above use valid(false) and tolerate it.
-		identity = PolarDB_StartupIdentity{
+		// real endpoint; ordinary client checks above use valid(false) and
+		// tolerate it because they represent the actual client socket.
+		PolarDB_StartupIdentity identity{
 			client_myds->proxy_addr.addr,
 			client_myds->proxy_addr.port,
 			PolarDB_StartupIdentitySource::LISTENER_PROXY
@@ -1479,6 +1526,7 @@ PolarDB_StartupIdentity PgSQL_Connection::resolve_polardb_startup_identity(
 // declaration in PgSQL_Connection.h for the full contract.
 bool PgSQL_Connection::append_polardb_startup_params(std::ostringstream& conninfo,
 	const PolarDB_StartupProfile& profile, unsigned int hid) {
+	polardb_startup_client = PolarDB_StartupClientContext{};
 	// Profiles that do not ask for RFQ payloads need no startup parameters at all.
 	if (!profile.emits_startup_params()) {
 		POLARDB_TRACE("PolarDB CONNINFO: no RFQ startup request for HG %u protocol=%s\n",
@@ -1502,6 +1550,7 @@ bool PgSQL_Connection::append_polardb_startup_params(std::ostringstream& conninf
 			hid, msg.c_str());
 		return false;
 	}
+	polardb_startup_client.identity = identity;
 
 	POLARDB_TRACE("PolarDB CONNINFO: adding startup params to HG %u protocol=%s request_bits=0x%x identity_source=%d identity=%s:%d\n",
 		hid, polardb_proxy_protocol_name(profile.protocol), profile.request_bits,
@@ -1509,7 +1558,10 @@ bool PgSQL_Connection::append_polardb_startup_params(std::ostringstream& conninf
 
 	// Two PolarDB startup dialects carry the same information under different
 	// parameter names. _polar_*_send_lsn asks for WAL LSN; _polar_*_send_xact
-	// asks for transaction split evidence (XIDs and split markers).
+	// asks for transaction split evidence (XIDs and split markers). XID RFQ is
+	// negotiated on every non-OFF PolarDB connection because the startup profile
+	// is fixed for the lifetime of a pooled backend; txn_split_enabled decides
+	// later whether routing uses it.
 	if (profile.protocol == PolarDB_ProxyProtocol::V15) {
 		conninfo << " _polar_proxy_client_host=" << identity.host;
 		conninfo << " _polar_proxy_client_port=" << identity.port;
@@ -1676,14 +1728,17 @@ void PgSQL_Connection::query_start() {
 	polardb_query_wrap_state.clear();
 	if (dispatch_state.wrapper_stmts > 0) {
 		polardb_query_wrap_state.begin(dispatch_state.wrapper_stmts,
-			dispatch_state.wrapper_kind);
-		POLARDB_TRACE("PolarDB QUERY_START: begin wrapped result, stmt_total=%u kind=%d\n",
-			dispatch_state.wrapper_stmts, (int)dispatch_state.wrapper_kind);
+			dispatch_state.wrapper_kind, dispatch_state.txn_split_xids_reset);
+		POLARDB_TRACE("PolarDB QUERY_START: begin wrapped result, "
+			"stmt_total=%u kind=%d reset_xids=%d\n",
+			dispatch_state.wrapper_stmts, (int)dispatch_state.wrapper_kind,
+			dispatch_state.txn_split_xids_reset ? 1 : 0);
 	}
-	POLARDB_TRACE("PolarDB QUERY_START: wrapper_stmts=%u kind=%d pending=%u "
+	POLARDB_TRACE("PolarDB QUERY_START: wrapper_stmts=%u kind=%d pending=%u reset_xids=%d "
 		"wait_active=%d query='%s'\n",
 		dispatch_state.wrapper_stmts, (int)dispatch_state.wrapper_kind,
 		polardb_query_wrap_state.stmt_pending,
+		dispatch_state.txn_split_xids_reset ? 1 : 0,
 		myds && myds->sess && myds->sess->polardb_wait_active() ? 1 : 0,
 		query.ptr ? query.ptr : "");
 	dispatch_state.reset();  // Consumed — prevent stale reuse
@@ -1897,6 +1952,22 @@ void PgSQL_Connection::async_free_result() {
 		query.ptr = NULL;
 		query.length = 0;
 	}
+#if POLARDB_PROXY
+	if (polardb_txn_split_xids_reset_consumed) {
+		if (!is_error_present()) {
+			polardb_txn_split_xids_dirty = false;
+			POLARDB_TRACE("PolarDB TXN_SPLIT: xids reset committed on conn=%p\n",
+				(void*)this);
+		} else {
+			POLARDB_TRACE(
+				"PolarDB TXN_SPLIT: keep xids dirty after reset-wrapped query error "
+				"conn=%p msg='%s'\n",
+				(void*)this, get_error_message().c_str());
+		}
+		polardb_txn_split_xids_reset_consumed = false;
+	}
+	polardb_txn_split_xids_reset_query_buf.clear();
+#endif // POLARDB_PROXY
 	if (userinfo) {
 		// if userinfo is NULL , the connection is being destroyed
 		// because it is reset on destructor ( ~PgSQL_Connection() )
@@ -1962,6 +2033,7 @@ int PgSQL_Connection::async_query(short event, const char* stmt, unsigned long l
 		return 0;
 		break;
 	case ASYNC_IDLE:
+	{
 #if POLARDB_PROXY
 		// Snapshot the wrapper-statement count from session state at dispatch time
 		// so query_start() consumes dispatch_state and does not re-read the session.
@@ -1973,6 +2045,44 @@ int PgSQL_Connection::async_query(short event, const char* stmt, unsigned long l
 			dispatch_state.wrapper_stmts = myds->sess->polardb_query.dispatch_wrapper_stmts;
 			dispatch_state.wrapper_kind = myds->sess->polardb_query.dispatch_wrapper_kind;
 			myds->sess->polardb_query.reset_dispatch_wrapper();
+		}
+		const char* dispatch_stmt = stmt;
+		unsigned long dispatch_length = length;
+		if (!extended_query_info && polardb_txn_split_xids_dirty &&
+				dispatch_state.wrapper_kind != PolarDB_Query_WrapperKind::TXN_SPLIT_WAIT) {
+			// A pooled reader that previously ran transaction split can carry the
+			// backend-local split-XID context. Clear it in the same leading-SET
+			// wrapper path used by LSN waits, before any unrelated user query runs.
+			polardb_txn_split_xids_reset_query_buf.assign(
+				"SET polar_xact_split_xids = ''; ");
+			if (stmt && length > 0) {
+				polardb_txn_split_xids_reset_query_buf.append(stmt, length);
+			}
+			dispatch_stmt = polardb_txn_split_xids_reset_query_buf.c_str();
+			dispatch_length =
+				(unsigned long)polardb_txn_split_xids_reset_query_buf.size();
+			dispatch_state.wrapper_stmts +=
+				POLARDB_TXN_SPLIT_RESET_WRAPPER_SET_COUNT;
+			dispatch_state.txn_split_xids_reset = true;
+			if (dispatch_state.wrapper_kind == PolarDB_Query_WrapperKind::NONE) {
+				dispatch_state.wrapper_kind =
+					PolarDB_Query_WrapperKind::TXN_SPLIT_XIDS_RESET;
+			}
+			POLARDB_TRACE(
+				"PolarDB TXN_SPLIT: prepended xids reset conn=%p "
+				"wrapper_stmts=%u kind=%d\n",
+				(void*)this, dispatch_state.wrapper_stmts,
+				(int)dispatch_state.wrapper_kind);
+		} else if (!extended_query_info) {
+			polardb_txn_split_xids_reset_query_buf.clear();
+		} else if (polardb_txn_split_xids_dirty) {
+			// Extended protocol cannot be SQL-text wrapped here. Keep the dirty
+			// marker and avoid returning this backend as clean if the query path
+			// proceeds despite the outstanding reset requirement.
+			reusable = false;
+			POLARDB_TRACE(
+				"PolarDB TXN_SPLIT: dirty xids on extended query conn=%p\n",
+				(void*)this);
 		}
 #endif // POLARDB_PROXY
 		if (myds && myds->sess) {
@@ -1996,7 +2106,12 @@ int PgSQL_Connection::async_query(short event, const char* stmt, unsigned long l
 				assert(0); // should never reach here
 			}
 		}
+#if POLARDB_PROXY
+		set_query(dispatch_stmt, dispatch_length, backend_stmt_name, extended_query_info);
+#else
 		set_query(stmt, length, backend_stmt_name, extended_query_info);
+#endif // POLARDB_PROXY
+	}
 	default:
 		handler(event);
 		break;
@@ -3165,11 +3280,15 @@ void PgSQL_Connection::reset() {
 	dynamic_variables_idx.clear();
 
 #if POLARDB_PROXY
-	// Drop any leftover wrapped-read state so a connection returned to the pool
-	// does not carry a stale wrapper count into the next client session.
+	// Server connections reach reset() after async_reset_session() succeeds, so
+	// backend-local split-XID state is clean again. Wrapper bookkeeping is local
+	// to this PgSQL_Connection and must not survive that reset boundary.
 	dispatch_state.reset();
 	polardb_query_wrap_state.clear();
-#endif
+	polardb_txn_split_xids_dirty = false;
+	polardb_txn_split_xids_reset_consumed = false;
+	polardb_txn_split_xids_reset_query_buf.clear();
+#endif // POLARDB_PROXY
 
 	// We need to copy the startup parameters:
 	// For client connections, we copy all startup parameters
@@ -3516,6 +3635,33 @@ void PgSQL_Connection::copy_startup_parameters_to_pgsql_variables(bool copy_only
 		}
 	}
 }
+
+#if POLARDB_PROXY
+void PgSQL_Connection::init_startup_parameters_from_server() {
+	if (!pgsql_conn) return;
+
+	static const char* param_names[] = {
+		"client_encoding",
+		"DateStyle",
+		"IntervalStyle",
+		"standard_conforming_strings",
+		"TimeZone",
+	};
+
+	for (int i = 0; i < PGSQL_NAME_LAST_LOW_WM; i++) {
+		const char* value = PQparameterStatus(pgsql_conn, param_names[i]);
+		if (!value) {
+			value = pgsql_tracked_variables[i].default_value;
+		}
+		free(startup_parameters[i]);
+		startup_parameters[i] = strdup(value);
+		startup_parameters_hash[i] = SpookyHash::Hash32(value, strlen(value), 0);
+		free(variables[i].value);
+		variables[i].value = strdup(value);
+		var_hash[i] = startup_parameters_hash[i];
+	}
+}
+#endif // POLARDB_PROXY
 
 void PgSQL_Connection::init_query_result() {
 	if (!query_result_reuse) {

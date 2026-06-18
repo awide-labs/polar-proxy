@@ -97,7 +97,130 @@
 		"LSN wait-timeout events accounted") \
 	T(wait_error_connection_lost, "PolarDB_Wait_Error_Connection_Lost", \
 		"proxysql_polardb_wait_error_connection_lost_total", \
-		"Wait-wrapped reads whose reader lost its backend connection")
+		"Wait-wrapped reads whose reader lost its backend connection") \
+	T(queries_in_splittable_txn, "PolarDB_Queries_In_Splittable_Txn", \
+		"proxysql_polardb_queries_in_splittable_txn_total", \
+		"Queries planned while the current transaction had split-readable primary RFQ evidence") \
+	T(queries_split_eligible, "PolarDB_Queries_Split_Eligible", \
+		"proxysql_polardb_queries_split_eligible_total", \
+		"In-transaction reads that passed the transaction-split planner checks") \
+	T(xids_received, "PolarDB_XIDs_Received", \
+		"proxysql_polardb_xids_received_total", \
+		"Primary RFQs that reported transaction XIDs") \
+	T(txn_became_splittable, "PolarDB_Txn_Became_Splittable", \
+		"proxysql_polardb_txn_became_splittable_total", \
+		"Transactions that became eligible for split reads") \
+	T(txn_lost_splittable, "PolarDB_Txn_Lost_Splittable", \
+		"proxysql_polardb_txn_lost_splittable_total", \
+		"Transactions that lost split-readable state before commit") \
+	T(txn_committed_with_split, "PolarDB_Txn_Committed_With_Split", \
+		"proxysql_polardb_txn_committed_with_split_total", \
+		"Transactions that committed after at least one split read") \
+	T(txn_committed_no_split, "PolarDB_Txn_Committed_No_Split", \
+		"proxysql_polardb_txn_committed_no_split_total", \
+		"Split-readable transactions that committed without a split read") \
+	T(split_reads_total, "PolarDB_Split_Reads_Total", \
+		"proxysql_polardb_split_reads_total", \
+		"Transaction-split read attempts") \
+	T(split_reads_success, "PolarDB_Split_Reads_Success", \
+		"proxysql_polardb_split_reads_success_total", \
+		"Transaction-split reads completed on a replica") \
+	T(split_reads_fallback, "PolarDB_Split_Reads_Fallback", \
+		"proxysql_polardb_split_reads_fallback_total", \
+		"Transaction-split reads that fell back to the primary") \
+	T(split_reads_error, "PolarDB_Split_Reads_Error", \
+		"proxysql_polardb_split_reads_error_total", \
+		"Transaction-split reads that ended in an error path") \
+	T(split_rejected_multistatement, "PolarDB_Split_Rejected_Multistatement", \
+		"proxysql_polardb_split_rejected_multistatement_total", \
+		"Transaction-split candidates rejected because the query has multiple statements") \
+	T(split_rejected_not_select, "PolarDB_Split_Rejected_Not_Select", \
+		"proxysql_polardb_split_rejected_not_select_total", \
+		"Transaction-split candidates rejected because the statement shape is not a split-safe SELECT") \
+	T(split_rejected_for_update, "PolarDB_Split_Rejected_For_Update", \
+		"proxysql_polardb_split_rejected_for_update_total", \
+		"Transaction-split candidates rejected because the SELECT takes write locks") \
+	T(split_rejected_write_lsn_unknown, "PolarDB_Split_Rejected_Write_LSN_Unknown", \
+		"proxysql_polardb_split_rejected_write_lsn_unknown_total", \
+		"Transaction-split candidates rejected because a prior write RFQ had no LSN") \
+	T(split_rejected_observed_lsn_unknown, "PolarDB_Split_Rejected_Observed_LSN_Unknown", \
+		"proxysql_polardb_split_rejected_observed_lsn_unknown_total", \
+		"Transaction-split candidates rejected because a prior tracked read RFQ had no LSN") \
+	T(split_wal_pending, "PolarDB_Split_WAL_Pending", \
+		"proxysql_polardb_split_wal_pending_total", \
+		"Transaction-split candidates rejected because primary RFQ reported WAL pending") \
+	T(split_invariant_violations, "PolarDB_Split_Invariant_Violations", \
+		"proxysql_polardb_split_invariant_violations_total", \
+		"Unexpected transaction-split state-machine violations") \
+	T(split_blocked_reads, "PolarDB_Split_Blocked_Reads", \
+		"proxysql_polardb_split_blocked_reads_total", \
+		"Transaction-split reads rejected because this transaction was blocked after a split fault") \
+	T(split_no_backend, "PolarDB_Split_No_Backend", \
+		"proxysql_polardb_split_no_backend_total", \
+		"Transaction-split reads that could not get a replica backend") \
+	T(split_send_failed, "PolarDB_Split_Send_Failed", \
+		"proxysql_polardb_split_send_failed_total", \
+		"Transaction-split reads whose wrapped query could not be sent") \
+	T(split_pool_hit, "PolarDB_Split_Pool_Hit", \
+		"proxysql_polardb_split_pool_hit_total", \
+		"Transaction-split reads that acquired an existing pooled replica connection") \
+	T(split_pool_empty, "PolarDB_Split_Pool_Empty", \
+		"proxysql_polardb_split_pool_empty_total", \
+		"Transaction-split reads that found no pooled replica connection") \
+	T(split_pool_contention, "PolarDB_Split_Pool_Contention", \
+		"proxysql_polardb_split_pool_contention_total", \
+		"Transaction-split reads that could not use a pooled replica connection because the pool had no available match") \
+	T(split_conn_reused, "PolarDB_Split_Conn_Reused", \
+		"proxysql_polardb_split_conn_reused_total", \
+		"Transaction-split reads that reused an already attached split backend connection") \
+	T(split_conn_cleanup_success, "PolarDB_Split_Conn_Cleanup_Success", \
+		"proxysql_polardb_split_conn_cleanup_success_total", \
+		"Transaction-split replica connections returned cleanly to the pool") \
+	T(split_conn_cleanup_failed, "PolarDB_Split_Conn_Cleanup_Failed", \
+		"proxysql_polardb_split_conn_cleanup_failed_total", \
+		"Transaction-split replica connections destroyed instead of returned to the pool") \
+	T(split_lsn_wait_count, "PolarDB_Split_LSN_Wait_Count", \
+		"proxysql_polardb_split_lsn_wait_count_total", \
+		"LSN wait wrappers prepared for transaction-split reads") \
+	T(split_lsn_wait_sum_us, "PolarDB_Split_LSN_Wait_Sum_Us", \
+		"proxysql_polardb_split_lsn_wait_microseconds_total", \
+		"Total transaction-split LSN wait time, in microseconds") \
+	T(split_error_connection_lost, "PolarDB_Split_Error_Connection_Lost", \
+		"proxysql_polardb_split_error_connection_lost_total", \
+		"Transaction-split reads whose replica connection was lost") \
+	T(split_error_query_failed, "PolarDB_Split_Error_Query_Failed", \
+		"proxysql_polardb_split_error_query_failed_total", \
+		"Transaction-split reads whose user query failed on the replica") \
+	T(split_error_timeout, "PolarDB_Split_Error_Timeout", \
+		"proxysql_polardb_split_error_timeout_total", \
+		"Transaction-split wait timeout events accounted") \
+	T(split_error_lsn_wait_timeout, "PolarDB_Split_Error_LSN_Wait_Timeout", \
+		"proxysql_polardb_split_error_lsn_wait_timeout_total", \
+		"Transaction-split LSN wait-timeout events accounted") \
+	T(split_latency_sum_us, "PolarDB_Split_Latency_Sum_Us", \
+		"proxysql_polardb_split_latency_microseconds_total", \
+		"Total transaction-split read latency, in microseconds") \
+	T(split_latency_count, "PolarDB_Split_Latency_Count", \
+		"proxysql_polardb_split_latency_count_total", \
+		"Transaction-split read latency samples") \
+	G(split_warmup_requested, "PolarDB_Split_Warmup_Requested", \
+		"proxysql_polardb_split_warmup_requested_total", \
+		"Lazy split pool warmup requests queued after a pool-empty split attempt") \
+	G(split_warmup_created, "PolarDB_Split_Warmup_Created", \
+		"proxysql_polardb_split_warmup_created_total", \
+		"Lazy split pool warmup connections added to replica pools") \
+	G(split_warmup_failed, "PolarDB_Split_Warmup_Failed", \
+		"proxysql_polardb_split_warmup_failed_total", \
+		"Lazy split pool warmup requests that could not create a connection") \
+	G(split_warmup_sum_us, "PolarDB_Split_Warmup_Sum_Us", \
+		"proxysql_polardb_split_warmup_microseconds_total", \
+		"Total time from lazy split warmup request to pooled connection, in microseconds") \
+	G(split_warmup_count, "PolarDB_Split_Warmup_Count", \
+		"proxysql_polardb_split_warmup_count_total", \
+		"Lazy split warmup latency samples") \
+	G(warmup_pending, "PolarDB_Warmup_Pending", \
+		"proxysql_polardb_warmup_pending", \
+		"Current number of queued lazy split pool warmup requests")
 
 #define POLARDB_COUNTER_LIST_SKIP(name, display_name, prom_name, help)
 

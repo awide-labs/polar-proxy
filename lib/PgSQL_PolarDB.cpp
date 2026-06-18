@@ -48,6 +48,16 @@ static bool polardb_has_token(const char* query, const char* token) {
     return false;
 }
 
+static const char* polardb_skip_leading_space(const char* query) {
+    if (!query) {
+        return nullptr;
+    }
+    while (*query && polardb_ascii_space(*query)) {
+        query++;
+    }
+    return query;
+}
+
 /**
  * @brief Parse full PolarDB health check result (node_type + availability + LSN).
  *
@@ -81,9 +91,7 @@ bool PolarDB_Protocol::is_write_query(const char* query) {
 
     // The digest can keep leading whitespace, so advance to the first keyword
     // before matching prefixes.
-    while (*query && polardb_ascii_space(*query)) {
-        query++;
-    }
+    query = polardb_skip_leading_space(query);
 
     // Only these prefixes are treated as reads. Anything else (including WITH,
     // whose CTE body may modify data) falls through to the write branch below so
