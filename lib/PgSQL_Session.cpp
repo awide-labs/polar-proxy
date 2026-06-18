@@ -2575,6 +2575,28 @@ __implicit_sync:
 										polardb_collect(polardb_route_ctx, current_hostgroup, replica_eligible,
 											qpo ? qpo->force_primary_hint : false);
 										if (polardb_route_ctx.is_polar_hg) {
+											const int warmup_mode =
+												polardb_effective_txn_split_warmup_mode();
+											const bool begin_warmup =
+												warmup_mode == static_cast<int>(
+													PolarDB_TxnSplitWarmupMode::BEGIN) ||
+												warmup_mode == static_cast<int>(
+													PolarDB_TxnSplitWarmupMode::BOTH);
+											// BEGIN-time warmup is only a pool-preparation request:
+											// it needs a PolarDB LSN/split-enabled hostgroup and a
+											// reader HG, but the later split planner still requires
+											// primary RFQ XIDs and LSN evidence before offloading a read.
+											if (begin_warmup &&
+													CurrentQuery.PgQueryCmd == PGSQL_QUERY_BEGIN &&
+													polardb_route_ctx.txn_split_enabled &&
+													polardb_route_ctx.reader_hg >= 0 &&
+													polardb_route_ctx.effective_consistency_mode >= 0 &&
+													polardb_consistency_from_int(
+														polardb_route_ctx.effective_consistency_mode) ==
+														PolarDB_ConsistencyMode::SESSION_LSN) {
+												polardb_request_txn_split_warmup(
+													polardb_route_ctx.reader_hg, "begin");
+											}
 											PolarDB_Query_RoutePlan plan = polardb_plan(polardb_route_ctx);
 											polardb_account_route_plan(plan, polardb_route_ctx);
 											if (plan.action != PolarDB_Query_RoutePlan::RouteAction::PASSTHROUGH) {
@@ -4760,11 +4782,36 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 		return true;
 	};
 
-	auto reject_polardb_consistency_mode_value = [&]() -> bool {
+	auto parse_polardb_txn_split_warmup_mode_value = [](
+			std::string value, int* mode) -> bool {
+		PgSQL_Set_Stmt_Parser::unquote_if_quoted(value);
+		const int parsed = polardb_txn_split_warmup_mode_from_string(
+			value.c_str(), -2);
+		if (parsed == -2) {
+			return false;
+		}
+		*mode = parsed;
+		return true;
+	};
+
+	auto reject_polardb_internal_set = [&](const std::string& pvar) -> bool {
 		client_myds->DSS = STATE_QUERY_SENT_NET;
 		bool send_ready_packet = is_extended_query_ready_for_query();
+		std::string msg = "invalid value for proxysql." + pvar;
 		client_myds->myprot.generate_error_packet(true, send_ready_packet,
-			"invalid value for proxysql.polardb_consistency_mode",
+			msg.c_str(),
+			PGSQL_ERROR_CODES::ERRCODE_INVALID_PARAMETER_VALUE, false, true);
+		RequestEnd(NULL, true);
+		return true;
+	};
+
+	auto reject_unrecognized_polardb_internal_set =
+		[&](const std::string& pvar) -> bool {
+		client_myds->DSS = STATE_QUERY_SENT_NET;
+		bool send_ready_packet = is_extended_query_ready_for_query();
+		std::string errmsg = "unrecognized proxysql parameter: proxysql." + pvar;
+		client_myds->myprot.generate_error_packet(true, send_ready_packet,
+			errmsg.c_str(),
 			PGSQL_ERROR_CODES::ERRCODE_INVALID_PARAMETER_VALUE, false, true);
 		RequestEnd(NULL, true);
 		return true;
@@ -4784,20 +4831,37 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 		return true;
 	};
 
-	// This ProxySQL-owned dotted variable is consumed locally as one PG SET.
+	auto handle_polardb_internal_set =
+		[&](const std::string& pvar, const std::string& value) -> bool {
+		if (strcasecmp(pvar.c_str(), "polardb_consistency_mode") == 0) {
+			int mode = -1;
+			if (!parse_polardb_consistency_mode_value(value, &mode)) {
+				return reject_polardb_internal_set(pvar);
+			}
+			polardb_set_session_override(mode);
+			return finish_polardb_internal_set();
+		}
+		if (strcasecmp(pvar.c_str(), "polardb_txn_split_warmup") == 0) {
+			int mode = -1;
+			if (!parse_polardb_txn_split_warmup_mode_value(value, &mode)) {
+				return reject_polardb_internal_set(pvar);
+			}
+			polardb_set_txn_split_warmup_mode(mode);
+			return finish_polardb_internal_set();
+		}
+		return reject_unrecognized_polardb_internal_set(pvar);
+	};
+
+	// ProxySQL-owned dotted variables are consumed locally as one PG SET.
 	// PostgreSQL has no MySQL-style `SET a=..., b=...`; comma tails are value
 	// lists for the same variable, so there is no later-assignment partial
 	// apply case to stage here.
+	std::string polar_var_name;
 	std::string polar_mode_value;
 	if (RE2::FullMatch(nq,
-		"(?i)\\s*SET\\s+proxysql\\.polardb_consistency_mode\\s*(?:=|TO)\\s*([^\\s;]+)\\s*",
-		&polar_mode_value)) {
-		int mode = -1;
-		if (!parse_polardb_consistency_mode_value(polar_mode_value, &mode)) {
-			return reject_polardb_consistency_mode_value();
-		}
-		polardb_set_session_override(mode);
-		return finish_polardb_internal_set();
+		"(?i)\\s*SET\\s+proxysql\\.([a-zA-Z0-9_]+)\\s*(?:=|TO)\\s*([^\\s;]+)\\s*",
+		&polar_var_name, &polar_mode_value)) {
+		return handle_polardb_internal_set(polar_var_name, polar_mode_value);
 	}
 #endif // POLARDB_PROXY
 	if (
@@ -5074,6 +5138,23 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 
 			if (strcasecmp(pvar.c_str(), "polardb_consistency_mode") == 0) {
 				polardb_clear_staged_wait_state_for_reset(/*reset_override=*/true);
+				polardb_set_session_override(-1);
+				client_myds->DSS = STATE_QUERY_SENT_NET;
+				bool send_ready_packet = is_extended_query_ready_for_query();
+				unsigned int nTrx = NumActiveTransactions();
+				const char txn_state = (nTrx ? 'T' : 'I');
+				client_myds->myprot.generate_ok_packet(true, send_ready_packet, NULL, 0, dig, txn_state, NULL, {});
+
+				if (mirror == false) {
+					RequestEnd(NULL, false);
+				} else {
+					client_myds->DSS = STATE_SLEEP;
+					status = WAITING_CLIENT_DATA;
+				}
+				return true;
+			} else if (strcasecmp(pvar.c_str(), "polardb_txn_split_warmup") == 0) {
+				polardb_clear_staged_wait_state_for_reset(/*reset_override=*/false);
+				polardb_set_txn_split_warmup_mode(-1);
 				client_myds->DSS = STATE_QUERY_SENT_NET;
 				bool send_ready_packet = is_extended_query_ready_for_query();
 				unsigned int nTrx = NumActiveTransactions();

@@ -1097,10 +1097,12 @@ public:
 		int polardb_lag_wait_ms;              // polar_xact_split_wait_lsn timeout (ms); 0=wait indefinitely
 		int polardb_lsn_freshness_ms;         // max age of a cached per-server LSN to trust
 		bool polardb_monitor_lsn_updates;     // enable monitor LSN cache updates
+		bool polardb_lazy_warmup_split;       // demand-warm connected split-reader pool entries
 		char* polardb_wait_timeout_mode;      // best_effort | strict
 		char* polardb_proxy_protocol;         // v15 | legacy | off
 		char* polardb_route_rfq_policy;       // strict | best_effort
 		char* polardb_session_lsn_baseline;   // observed | primary
+		char* polardb_split_warmup_identity;  // strict | client_ip | auth_profile
 		char* polardb_proxy_identity_host;    // empty or IP literal
 		int polardb_proxy_identity_port;      // 0..65535
 #endif // POLARDB_PROXY

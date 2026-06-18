@@ -1241,10 +1241,10 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 	/**
 	 * @brief Drain queued split warmup requests into connected pool entries.
 	 *
-	 * Called from the HGM maintenance pass while the caller already holds the
-	 * HGM write lock. Each successful request publishes only a fully connected
-	 * backend, so pooled-only split reads never run a connect handshake in the
-	 * transaction path.
+	 * Called from the HGM maintenance pass. It reserves capacity under the HGM
+	 * write lock, opens the backend socket without holding that lock, then
+	 * re-locks briefly to publish the fully connected backend. Pooled-only split
+	 * reads never run a connect handshake in the transaction path.
 	 */
 	void warm_split_pools();
 #endif // POLARDB_PROXY
@@ -1268,6 +1268,7 @@ private:
 	std::shared_ptr<const PolarDB_TopologySnapshot> polardb_topology_snapshot_;
 	std::atomic<uint64_t> polardb_topology_generation_{0};
 	std::queue<PgSQL_SplitWarmupRequest> split_warmup_queue_;
+	std::unordered_set<std::string> split_warmup_inflight_;
 	std::mutex split_warmup_mutex_;
 #endif // POLARDB_PROXY
 };

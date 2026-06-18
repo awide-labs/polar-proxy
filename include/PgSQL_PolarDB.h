@@ -841,6 +841,126 @@ static inline int polardb_consistency_mode_from_string(
     return default_value;
 }
 
+/**
+ * @brief Session policy for when transaction-split reader warmup is requested.
+ *
+ * Split execution never opens a socket on the query path: it only borrows an
+ * already-pooled compatible reader. This mode controls when the session asks the
+ * HGM maintenance pass to create that pooled reader in the background.
+ */
+enum class PolarDB_TxnSplitWarmupMode : uint8_t {
+    OFF = 0,     // Never queue warmup from this session
+    DEMAND = 1,  // Queue after a split-readable transaction read misses the pool
+    BEGIN = 2,   // Queue at BEGIN / START TRANSACTION only
+    BOTH = 3     // Queue at BEGIN and also after a later pool miss
+};
+
+/**
+ * @brief How split warmup matches pooled reader startup identity.
+ *
+ * strict keeps the backend-visible client host/port exact. The looser modes are
+ * opt-in throughput modes for deployments that do not depend on per-client
+ * backend-visible identity. SSL/session-id metadata always forces strict
+ * matching because those fields describe one frontend connection.
+ */
+enum class PolarDB_SplitWarmupIdentity : uint8_t {
+    STRICT = 0,       // user/db + exact startup identity
+    CLIENT_IP = 1,    // user/db + client IP/source, ignore client port
+    AUTH_PROFILE = 2  // user/db only, unless strict metadata is present
+};
+
+static inline int polardb_split_warmup_identity_from_string(
+    const char* value,
+    int default_value) {
+    if (!value || value[0] == '\0' || strcasecmp(value, "default") == 0) {
+        return default_value;
+    }
+    if (strcasecmp(value, "strict") == 0) {
+        return static_cast<int>(PolarDB_SplitWarmupIdentity::STRICT);
+    }
+    if (strcasecmp(value, "client_ip") == 0 ||
+            strcasecmp(value, "client-ip") == 0) {
+        return static_cast<int>(PolarDB_SplitWarmupIdentity::CLIENT_IP);
+    }
+    if (strcasecmp(value, "auth_profile") == 0 ||
+            strcasecmp(value, "auth-profile") == 0) {
+        return static_cast<int>(PolarDB_SplitWarmupIdentity::AUTH_PROFILE);
+    }
+    return default_value;
+}
+
+static inline const char* polardb_split_warmup_identity_name(int mode) {
+    switch (mode) {
+    case static_cast<int>(PolarDB_SplitWarmupIdentity::STRICT):
+        return "strict";
+    case static_cast<int>(PolarDB_SplitWarmupIdentity::CLIENT_IP):
+        return "client_ip";
+    case static_cast<int>(PolarDB_SplitWarmupIdentity::AUTH_PROFILE):
+        return "auth_profile";
+    default:
+        return "strict";
+    }
+}
+
+static inline bool polardb_startup_client_compatible_for_warmup(
+        const PolarDB_StartupClientContext& pooled,
+        const PolarDB_StartupClientContext& requested,
+        int mode) {
+    // SSL and proxy session-id fields identify one frontend connection, not a
+    // reusable auth profile. When either side has them, loose warmup modes are
+    // deliberately ignored.
+    if (pooled.has_strict_metadata() || requested.has_strict_metadata()) {
+        return pooled.compatible_for_reuse_strict(requested);
+    }
+    switch (mode) {
+    case static_cast<int>(PolarDB_SplitWarmupIdentity::AUTH_PROFILE):
+        return true;
+    case static_cast<int>(PolarDB_SplitWarmupIdentity::CLIENT_IP):
+        return pooled.identity.source == requested.identity.source &&
+            pooled.identity.host == requested.identity.host;
+    case static_cast<int>(PolarDB_SplitWarmupIdentity::STRICT):
+    default:
+        return pooled.compatible_for_reuse_strict(requested);
+    }
+}
+
+static inline int polardb_txn_split_warmup_mode_from_string(
+    const char* value,
+    int default_value) {
+    if (!value || value[0] == '\0' || strcasecmp(value, "default") == 0) {
+        return default_value;
+    }
+    if (strcasecmp(value, "off") == 0) {
+        return static_cast<int>(PolarDB_TxnSplitWarmupMode::OFF);
+    }
+    if (strcasecmp(value, "demand") == 0 || strcasecmp(value, "lazy") == 0) {
+        return static_cast<int>(PolarDB_TxnSplitWarmupMode::DEMAND);
+    }
+    if (strcasecmp(value, "begin") == 0 ||
+            strcasecmp(value, "transaction_begin") == 0) {
+        return static_cast<int>(PolarDB_TxnSplitWarmupMode::BEGIN);
+    }
+    if (strcasecmp(value, "both") == 0) {
+        return static_cast<int>(PolarDB_TxnSplitWarmupMode::BOTH);
+    }
+    return default_value;
+}
+
+static inline const char* polardb_txn_split_warmup_mode_name(int mode) {
+    switch (mode) {
+    case static_cast<int>(PolarDB_TxnSplitWarmupMode::OFF):
+        return "off";
+    case static_cast<int>(PolarDB_TxnSplitWarmupMode::DEMAND):
+        return "demand";
+    case static_cast<int>(PolarDB_TxnSplitWarmupMode::BEGIN):
+        return "begin";
+    case static_cast<int>(PolarDB_TxnSplitWarmupMode::BOTH):
+        return "both";
+    default:
+        return "default";
+    }
+}
+
 /// @brief Map a config string ("off"/"legacy"/"v15") to the proxy-protocol int.
 /// Null, empty, "default", or any unknown value returns @p default_value.
 static inline int polardb_proxy_protocol_from_string(

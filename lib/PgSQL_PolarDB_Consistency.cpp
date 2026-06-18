@@ -54,6 +54,25 @@ void PgSQL_Session::polardb_set_session_override(int mode) {
 	POLARDB_TRACE("PolarDB SET: session_consistency_mode=%d\n", mode);
 }
 
+// Stores the per-session transaction-split warmup timing override. -1 means
+// "use the built-in default", currently demand warmup for compatibility with
+// the original lazy behavior.
+void PgSQL_Session::polardb_set_txn_split_warmup_mode(int mode) {
+	polardb_config.txn_split_warmup_mode = mode;
+	POLARDB_TRACE(
+		"PolarDB SET: txn_split_warmup_mode=%s (%d)\n",
+		polardb_txn_split_warmup_mode_name(mode), mode);
+}
+
+// Returns the active warmup timing policy. Keeping the default here lets the
+// parser store only a session override and keeps call sites branch-free.
+int PgSQL_Session::polardb_effective_txn_split_warmup_mode() const {
+	if (polardb_config.txn_split_warmup_mode >= 0) {
+		return polardb_config.txn_split_warmup_mode;
+	}
+	return static_cast<int>(PolarDB_TxnSplitWarmupMode::DEMAND);
+}
+
 // Observes transaction-split RFQ metadata only after Flow.cpp accepted the LSN
 // for the current writer scope. This is state collection; the later planner and
 // executor decide whether one in-transaction read may borrow a replica backend.

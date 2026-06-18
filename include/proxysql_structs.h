@@ -1145,10 +1145,12 @@ __thread int pgsql_thread___polardb_lag_ms;                  // reserved ms lag 
 __thread int pgsql_thread___polardb_lag_wait_ms;             // polar_xact_split_wait_lsn timeout (ms); 0=wait indefinitely
 __thread int pgsql_thread___polardb_lsn_freshness_ms;        // max age of a cached per-server LSN to trust
 __thread bool pgsql_thread___polardb_monitor_lsn_updates;    // enable monitor LSN cache updates
+__thread bool pgsql_thread___polardb_lazy_warmup_split;      // demand-warm connected split-reader pool entries
 __thread int pgsql_thread___polardb_wait_timeout_mode;       // best_effort=1, strict=2
 __thread int pgsql_thread___polardb_proxy_protocol;          // off=0, legacy=1, v15=2
 __thread int pgsql_thread___polardb_route_rfq_policy;        // best_effort=1, strict=2
 __thread int pgsql_thread___polardb_session_lsn_baseline;    // observed=1, primary=2
+__thread int pgsql_thread___polardb_split_warmup_identity;   // strict=0, client_ip=1, auth_profile=2
 __thread char* pgsql_thread___polardb_proxy_identity_host;   // empty or IP literal
 __thread int pgsql_thread___polardb_proxy_identity_port;     // 0..65535
 #endif // POLARDB_PROXY
@@ -1503,10 +1505,12 @@ extern __thread int pgsql_thread___polardb_lag_ms;
 extern __thread int pgsql_thread___polardb_lag_wait_ms;
 extern __thread int pgsql_thread___polardb_lsn_freshness_ms;
 extern __thread bool pgsql_thread___polardb_monitor_lsn_updates;
+extern __thread bool pgsql_thread___polardb_lazy_warmup_split;
 extern __thread int pgsql_thread___polardb_wait_timeout_mode;
 extern __thread int pgsql_thread___polardb_proxy_protocol;
 extern __thread int pgsql_thread___polardb_route_rfq_policy;
 extern __thread int pgsql_thread___polardb_session_lsn_baseline;
+extern __thread int pgsql_thread___polardb_split_warmup_identity;
 extern __thread char* pgsql_thread___polardb_proxy_identity_host;
 extern __thread int pgsql_thread___polardb_proxy_identity_port;
 #endif // POLARDB_PROXY

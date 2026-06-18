@@ -493,6 +493,13 @@ public:
 	 *   off          disable PolarDB consistency routing for this session
 	 *   lsn/session  use per-session write LSN read-your-writes routing
 	 *   primary      force reads to the primary
+	 *
+	 * Supported values for SET proxysql.polardb_txn_split_warmup:
+	 *   default  use the built-in default (demand)
+	 *   off      never request split reader warmup from this session
+	 *   demand   request warmup after a split read misses the reader pool
+	 *   begin    request warmup at BEGIN / START TRANSACTION only
+	 *   both     request at BEGIN and after a later split-read pool miss
 	 */
 	struct PgSQL_PolarDB_Config {
 		// Set true once this session attaches to a backend in a PolarDB-enabled
@@ -504,6 +511,9 @@ public:
 		// (session override > hostgroup > global). -1 means "no override", so the
 		// resolved mode falls through to the per-hostgroup and global settings.
 		int session_consistency_mode = -1;
+		// Per-session transaction-split warmup timing override. -1 means use the
+		// built-in default (demand warmup, matching the original lazy behavior).
+		int txn_split_warmup_mode = -1;
 	} polardb_config;
 
 	// Durable per-session consistency truth: the read-your-writes LSN target
@@ -864,6 +874,12 @@ public:
 
 	/** @brief Set the per-session consistency mode override (-1 clears it). */
 	void polardb_set_session_override(int mode);
+	/** @brief Set the per-session transaction-split warmup mode override. */
+	void polardb_set_txn_split_warmup_mode(int mode);
+	/** @brief Return the active transaction-split warmup mode for this session. */
+	int polardb_effective_txn_split_warmup_mode() const;
+	/** @brief Queue transaction-split reader warmup for this session, if possible. */
+	void polardb_request_txn_split_warmup(int reader_hg, const char* reason);
 
 	// ---- PolarDB wait wrapping and notices ----
 
