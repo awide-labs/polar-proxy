@@ -1978,8 +1978,9 @@ void PgSQL_HostGroups_Manager::generate_pgsql_replication_hostgroups_table() {
 	// Besides mirroring the table into mydb, populate the PolarDB topology cache
 	// (writer<->reader pairing) and the per-writer-HGC repl_config consumed by
 	// the routing pipeline. The incoming resultset carries the PolarDB columns:
-	//   0=writer_hostgroup, 1=reader_hostgroup, 2=check_type, 3=consistency_mode,
-	//   4=max_lag_bytes, 5=lsn_wait_timeout_ms, 6=proxy_protocol, 7=comment
+	//   0=writer_hostgroup, 1=reader_hostgroup, 2=check_type,
+	//   3=txn_split_enabled, 4=consistency_mode, 5=max_lag_bytes,
+	//   6=lsn_wait_timeout_ms, 7=proxy_protocol, 8=comment
 
 	// Mark all HGCs as not configured (same pattern as hostgroup_attributes).
 	for (unsigned int i = 0; i < MyHostGroups->len; i++) {
@@ -2006,10 +2007,11 @@ void PgSQL_HostGroups_Manager::generate_pgsql_replication_hostgroups_table() {
 		int writer_hg = atoi(r->fields[0]);
 		int reader_hg = atoi(r->fields[1]);
 		const char* check_type = r->fields[2];
-		const char* consistency_mode = r->fields[3];
-		int max_lag_bytes = atoi(r->fields[4]);
-		int lsn_wait_timeout_ms = atoi(r->fields[5]);
-		const char* proxy_protocol = r->fields[6];
+		const bool txn_split_enabled = atoi(r->fields[3]) != 0;
+		const char* consistency_mode = r->fields[4];
+		int max_lag_bytes = atoi(r->fields[5]);
+		int lsn_wait_timeout_ms = atoi(r->fields[6]);
+		const char* proxy_protocol = r->fields[7];
 		const bool is_polardb_check = (strcasecmp(check_type, "polardb") == 0);
 		const int parsed_consistency_mode =
 			polardb_consistency_mode_from_string(consistency_mode, -1);
@@ -2033,6 +2035,7 @@ void PgSQL_HostGroups_Manager::generate_pgsql_replication_hostgroups_table() {
 			writer_hgc->repl_config.reader_hostgroup = reader_hg;
 			writer_hgc->repl_config.writer_hostgroup = writer_hg;
 			writer_hgc->repl_config.check_type = check_type;
+			writer_hgc->repl_config.txn_split_enabled = txn_split_enabled;
 			writer_hgc->repl_config.consistency_mode = consistency_mode;
 			writer_hgc->repl_config.consistency_mode_enum = parsed_consistency_mode;
 			writer_hgc->repl_config.max_lag_bytes = max_lag_bytes;
@@ -2049,6 +2052,7 @@ void PgSQL_HostGroups_Manager::generate_pgsql_replication_hostgroups_table() {
 			hg_config.is_polardb_hostgroup = true;
 			hg_config.writer_hostgroup = writer_hg;
 			hg_config.reader_hostgroup = reader_hg;
+			hg_config.policy.txn_split_enabled = txn_split_enabled;
 			hg_config.policy.consistency_mode = parsed_consistency_mode;
 			hg_config.policy.max_lag_bytes = max_lag_bytes;
 			hg_config.policy.lsn_wait_timeout_ms = lsn_wait_timeout_ms;
@@ -2061,21 +2065,23 @@ void PgSQL_HostGroups_Manager::generate_pgsql_replication_hostgroups_table() {
 			next_polardb_snapshot->by_hostgroup[(unsigned int)reader_hg] = hg_config;
 		}
 
-		char *comment_escaped=escape_string_single_quotes(r->fields[7],false);
+		char *comment_escaped=escape_string_single_quotes(r->fields[8],false);
 		int comment_length=strlen(comment_escaped);
 		char *query=(char *)malloc(512+comment_length);
-		sprintf(query,"INSERT INTO pgsql_replication_hostgroups VALUES(%s,%s,'%s','%s',%s,%s,'%s','%s')",
+		sprintf(query,"INSERT INTO pgsql_replication_hostgroups VALUES(%s,%s,'%s',%s,'%s',%s,%s,'%s','%s')",
 			r->fields[0], r->fields[1], r->fields[2], r->fields[3],
-			r->fields[4], r->fields[5], r->fields[6], comment_escaped);
-		if (comment_escaped!=r->fields[7]) {
+			r->fields[4], r->fields[5], r->fields[6], r->fields[7],
+			comment_escaped);
+		if (comment_escaped!=r->fields[8]) {
 			free(comment_escaped);
 		}
 		mydb->execute(query);
 		if (pgsql_thread___hostgroup_manager_verbose) {
 			fprintf(stderr,"writer_hostgroup: %s , reader_hostgroup: %s, check_type: %s, "
-				"consistency_mode: %s, max_lag_bytes: %s, lsn_wait_timeout_ms: %s, proxy_protocol: %s, comment: %s\n",
+				"txn_split_enabled: %s, consistency_mode: %s, max_lag_bytes: %s, lsn_wait_timeout_ms: %s, proxy_protocol: %s, comment: %s\n",
 				r->fields[0], r->fields[1], r->fields[2], r->fields[3],
-				r->fields[4], r->fields[5], r->fields[6], r->fields[7]);
+				r->fields[4], r->fields[5], r->fields[6], r->fields[7],
+				r->fields[8]);
 		}
 		free(query);
 	}
@@ -2164,7 +2170,7 @@ SQLite3_result * PgSQL_HostGroups_Manager::dump_table_pgsql(const string& name) 
 #if POLARDB_PROXY
 		// Dump the PolarDB routing columns alongside the upstream
 		// writer/reader/check_type/comment.
-		query=(char *)"SELECT writer_hostgroup, reader_hostgroup, check_type, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment FROM pgsql_replication_hostgroups";
+		query=(char *)"SELECT writer_hostgroup, reader_hostgroup, check_type, txn_split_enabled, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment FROM pgsql_replication_hostgroups";
 #else
 		query=(char *)"SELECT writer_hostgroup, reader_hostgroup, check_type, comment FROM pgsql_replication_hostgroups";
 #endif

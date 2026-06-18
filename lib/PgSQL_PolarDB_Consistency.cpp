@@ -18,6 +18,7 @@
  */
 
 #include "PgSQL_Session.h"
+#include "PgSQL_Connection.h"
 #include "PgSQL_PolarDB.h"
 #include "proxysql.h"
 #include "cpp.h"
@@ -47,6 +48,50 @@ uint32_t polardb_resolve_wait_timeout_ms(int hg_timeout_ms) {
 void PgSQL_Session::polardb_set_session_override(int mode) {
 	polardb_config.session_consistency_mode = mode;
 	POLARDB_TRACE("PolarDB SET: session_consistency_mode=%d\n", mode);
+}
+
+// Observes transaction-split RFQ metadata only after Flow.cpp accepted the LSN
+// for the current writer scope. This is state collection, not route execution:
+// no backend is borrowed and in-transaction reads still use the primary.
+void PgSQL_Session::polardb_observe_transaction_split(PgSQL_Connection* conn,
+	uint64_t primary_lsn, bool split_enabled, bool primary_source) {
+	if (!primary_source || !conn) {
+		return;
+	}
+
+	if (!split_enabled) {
+		if (polardb_transaction_split.active() ||
+				polardb_transaction_split.has_backend_evidence()) {
+			POLARDB_TRACE(
+				"PolarDB TXN_SPLIT: cleared observed RFQ state because "
+				"txn_split_enabled=0\n");
+		}
+		polardb_transaction_split.reset();
+		return;
+	}
+
+	const char transaction_status = conn->get_transaction_status_char();
+	const char* xids = conn->get_polardb_txn_xids();
+	const bool splittable = conn->is_polardb_txn_splittable();
+	const bool wal_pending = conn->is_polardb_txn_wal_pending();
+	const PolarDB_TransactionSplitStage old_stage = polardb_transaction_split.stage;
+
+	polardb_transaction_split.observe_primary_rfq(
+		transaction_status, xids, splittable, wal_pending, primary_lsn, split_enabled);
+
+	if (old_stage != polardb_transaction_split.stage || xids || splittable || wal_pending) {
+		POLARDB_TRACE(
+			"PolarDB TXN_SPLIT: observed primary RFQ status=%c split_enabled=%d "
+			"stage=%d->%d lsn=%lu xids='%s' splittable=%d wal_pending=%d\n",
+			transaction_status,
+			split_enabled ? 1 : 0,
+			static_cast<int>(old_stage),
+			static_cast<int>(polardb_transaction_split.stage),
+			(unsigned long)primary_lsn,
+			xids ? xids : "",
+			splittable ? 1 : 0,
+			wal_pending ? 1 : 0);
+	}
 }
 
 #endif // POLARDB_PROXY

@@ -515,6 +515,10 @@ public:
 	// See doc/polardb-arch/10-SESSION-INTEGRATION.md section 6.4.
 	PolarDB_SessionConsistency polardb_session_consistency;
 
+	// Observed transaction-split RFQ state. The planner can read it, but
+	// in-transaction reads still stay on the primary until split dispatch lands.
+	PolarDB_TransactionSplitState polardb_transaction_split;
+
 	// Mutable state for the one query in flight: the reader acquisition plan, the
 	// wait state, the wrapped-query buffer, and the request writer scope. Reset
 	// before each query and at query end, so nothing leaks into the next query.
@@ -817,6 +821,23 @@ public:
 	 * per-server LSN cache. Writer-epoch-stale RFQs are rejected first.
 	 */
 	void polardb_process_result(PgSQL_Data_Stream* myds, const char* query_digest_text);
+
+	/**
+	 * @brief Observe transaction-split RFQ metadata from an accepted primary result.
+	 *
+	 * Reads the transaction-status byte, XID list, splittable flag, and WAL-pending
+	 * flag that libpq cached from ReadyForQuery. This updates only
+	 * polardb_transaction_split; routing is decided later by the planner.
+	 */
+	void polardb_observe_transaction_split(PgSQL_Connection* conn,
+		uint64_t primary_lsn, bool split_enabled, bool primary_source);
+	/**
+	 * @brief Release any borrowed split backend and clear transaction-split state.
+	 *
+	 * Used when split observation is disabled, a transaction closes, or the
+	 * writer scope changes. The reason is trace-only.
+	 */
+	void polardb_clear_transaction_split_state(const char* reason, bool want_reuse);
 
 	/** @brief Set the per-session consistency mode override (-1 clears it). */
 	void polardb_set_session_override(int mode);

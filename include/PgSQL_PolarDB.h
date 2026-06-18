@@ -415,9 +415,10 @@ static inline PolarDB_SessionLsnBaseline polardb_session_lsn_baseline_from_int(i
 }
 
 // Bits that say which extra payloads ProxySQL asks the PolarDB backend to append
-// to ReadyForQuery in the startup handshake. Only REQUEST_RFQ_LSN is requested
-// today. The CSN and XID bits name slots that are not used yet; they do not mean
-// the backend will send those payloads.
+// to ReadyForQuery in the startup handshake. LSN is requested for consistency
+// routing. XID is requested when transaction-split observation is enabled for a
+// PolarDB hostgroup. CSN remains reserved for a later feature. Request bits state
+// intent only: the backend may still omit a payload from an individual RFQ.
 constexpr uint32_t REQUEST_RFQ_LSN = 1u << 0;
 constexpr uint32_t REQUEST_RFQ_CSN = 1u << 1;
 constexpr uint32_t REQUEST_RFQ_XID = 1u << 2;
@@ -494,6 +495,18 @@ struct PolarDB_StartupProfile {
     /// @brief True if this profile asked the backend to append the RFQ LSN.
     bool has_rfq_lsn() const {
         return requests(REQUEST_RFQ_LSN);
+    }
+
+    /// @brief Add the transaction XID RFQ request to a non-OFF profile.
+    void request_rfq_xid() {
+        if (protocol != PolarDB_ProxyProtocol::OFF) {
+            request_bits |= REQUEST_RFQ_XID;
+        }
+    }
+
+    /// @brief True if this profile asked the backend to append transaction XIDs.
+    bool has_rfq_xid() const {
+        return requests(REQUEST_RFQ_XID);
     }
 
     /// @brief True if this profile causes any PolarDB startup keys to be sent.
@@ -1040,6 +1053,96 @@ struct PolarDB_SessionConsistency {
 };
 
 /**
+ * @brief Transaction-split lifecycle stage for a client transaction.
+ *
+ * This records RFQ transaction evidence and the session-side state machine shape.
+ * The planner can recognize split-readable state, but reads inside an explicit
+ * transaction still use the primary until split dispatch is added.
+ */
+enum class PolarDB_TransactionSplitStage : uint8_t {
+    NONE = 0,                   // No split-capable transaction is being tracked
+    TXN_ON_PRIMARY = 1,         // Transaction is open on the primary
+    TXN_SPLITTABLE = 2,         // Backend RFQ says replica reads may be considered
+    TXN_SPLIT_READ_ACTIVE = 3   // Reserved: a split read is active on a replica
+};
+
+/**
+ * @brief Session-scoped transaction-split state.
+ *
+ * Stores RFQ transaction evidence separately from the existing RYW LSN state.
+ * Result processing updates it after an accepted primary RFQ. The planner reads
+ * it to recognize split-readable transactions; execution still uses the primary
+ * until split dispatch is added.
+ */
+struct PolarDB_TransactionSplitState {
+    PolarDB_TransactionSplitStage stage = PolarDB_TransactionSplitStage::NONE;
+    std::string xids;          // RFQ transaction ID list for future replica import
+    uint64_t primary_lsn = 0;  // LSN observed for this transaction's primary side
+    bool splittable = false;   // RFQ says the transaction can consider split reads
+    bool wal_pending = false;  // RFQ says WAL is pending; do not split
+    bool blocked = false;      // A prior split fault blocks further split attempts
+
+    bool active() const {
+        return stage != PolarDB_TransactionSplitStage::NONE;
+    }
+
+    bool has_backend_evidence() const {
+        return !xids.empty() || primary_lsn != 0 || splittable || wal_pending;
+    }
+
+    void observe_primary_rfq(char transaction_status,
+        const char* rfq_xids,
+        bool rfq_splittable,
+        bool rfq_wal_pending,
+        uint64_t rfq_primary_lsn,
+        bool split_enabled) {
+        if (!split_enabled) {
+            reset();
+            return;
+        }
+
+        if (transaction_status == 'I') {
+            reset();
+            return;
+        }
+        if (transaction_status != 'T' && transaction_status != 'E') {
+            return;
+        }
+
+        if (stage == PolarDB_TransactionSplitStage::NONE) {
+            stage = PolarDB_TransactionSplitStage::TXN_ON_PRIMARY;
+        }
+        if (rfq_primary_lsn > primary_lsn) {
+            primary_lsn = rfq_primary_lsn;
+        }
+        if (rfq_xids && rfq_xids[0]) {
+            xids = rfq_xids;
+        }
+        splittable = rfq_splittable;
+        wal_pending = rfq_wal_pending;
+
+        if (blocked || transaction_status == 'E') {
+            stage = PolarDB_TransactionSplitStage::TXN_ON_PRIMARY;
+            return;
+        }
+        if (splittable && !wal_pending && !xids.empty()) {
+            stage = PolarDB_TransactionSplitStage::TXN_SPLITTABLE;
+        } else if (stage == PolarDB_TransactionSplitStage::TXN_SPLITTABLE) {
+            stage = PolarDB_TransactionSplitStage::TXN_ON_PRIMARY;
+        }
+    }
+
+    void reset() {
+        stage = PolarDB_TransactionSplitStage::NONE;
+        xids.clear();
+        primary_lsn = 0;
+        splittable = false;
+        wal_pending = false;
+        blocked = false;
+    }
+};
+
+/**
  * @brief Immutable wait payload for one routed query (Spec: payload only).
  *
  * Routing is decided by PolarDB_Query_RoutePlan. This object describes only the
@@ -1564,7 +1667,11 @@ bool parse_polardb_full_health_check(const char* node_type_str, const char* is_a
 /// never persisted across async boundaries.
 struct PolarDB_Query_RouteCtx {
     PolarDB_WriterScope writer_scope;         // replication-group writer identity
-    PolarDB_SessionConsistency session;       // session LSN/latch snapshot
+    PolarDB_SessionConsistency session;       // session LSN/sticky-flag snapshot
+    // Observed primary RFQ split state. XIDs are carried separately as a view so
+    // collect->plan does not copy the transaction XID string on every query.
+    PolarDB_TransactionSplitState transaction_split;
+    std::string_view transaction_split_xids;
 
     // --- 32-bit fields ---
     uint32_t wait_timeout_ms = POLARDB_DEFAULT_WAIT_TIMEOUT_MS; // resolved wait timeout (HG or global)
@@ -1581,6 +1688,7 @@ struct PolarDB_Query_RouteCtx {
     bool is_multi_statement = false;       // semicolon scan (hard safety guard)
     bool is_extended_protocol = false;     // Parse/Bind/Execute: regular ProxySQL routing only; no PolarDB wait wrapper
     bool in_transaction = false;           // session is inside an explicit transaction
+    bool txn_split_enabled = false;        // HG policy: request/observe split RFQ and allow planning
     bool force_primary_hint = false;       // /* route=primary */ first-comment hint (plan L0)
 };
 
@@ -1710,6 +1818,7 @@ struct PolarDB_Query_RoutePlan {
         PASSTHROUGH = 0,       // No PolarDB override, use the default/target HG
         REPLICA_WITH_WAIT,     // Route to a replica and prepend SET polar_xact_split_wait_lsn
         FORCE_PRIMARY,         // Override to primary (consistency or safety reason)
+        REPLICA_TXN_SPLIT,     // Planned in-transaction replica read; execution dispatch is added later
     };
 
     /// @brief Why a replica route was rejected (recorded on a FORCE_PRIMARY plan).
@@ -1728,6 +1837,7 @@ struct PolarDB_Query_RoutePlan {
     // --- wait/reader fields ---
     PolarDB_WaitSpec wait_spec;
     PolarDB_Query_ReaderPlan reader;      // per-query reader acquisition plan
+    std::string_view txn_xids;            // split-read XIDs; backed by session state during plan/execute
 
     // --- 32-bit fields ---
     int target_hg = -1;                    // final hostgroup (-1 = caller keeps current)
@@ -1744,6 +1854,21 @@ struct PolarDB_Query_RoutePlan {
         plan.action = RouteAction::FORCE_PRIMARY;
         plan.target_hg = writer_hg;
         plan.action_reason = reason;
+        return plan;
+    }
+
+    /// @brief Build a planned transaction-split replica read.
+    static PolarDB_Query_RoutePlan replica_txn_split(int reader_hg,
+        int writer_hg,
+        const PolarDB_WaitSpec& wait_spec,
+        std::string_view txn_xids) {
+        PolarDB_Query_RoutePlan plan;
+        plan.action = RouteAction::REPLICA_TXN_SPLIT;
+        plan.target_hg = reader_hg;
+        plan.wait_spec = wait_spec;
+        plan.txn_xids = txn_xids;
+        plan.reader.consistency_target_lsn = wait_spec.target;
+        plan.reader.fallback_writer_hg = writer_hg;
         return plan;
     }
 
@@ -1778,6 +1903,35 @@ struct PolarDB_Query_RoutePlan {
         return plan;
     }
 };
+
+/**
+ * @brief Explain why the current transaction cannot be planned as a split read.
+ *
+ * NONE means the observed transaction state has enough RFQ evidence for the
+ * planner to name a split-read route. The executor may still decline it until
+ * split dispatch is wired.
+ */
+static inline PolarDB_Query_RoutePlan::RouteActionReason polardb_txn_split_rejection_reason(
+    bool txn_split_enabled,
+    const PolarDB_TransactionSplitState& transaction_split,
+    std::string_view transaction_split_xids,
+    bool is_multi_statement,
+    bool is_extended_protocol) {
+    using RAR = PolarDB_Query_RoutePlan::RouteActionReason;
+
+    if (!txn_split_enabled) return RAR::HG_SPLIT_DISABLED;
+    if (is_multi_statement) return RAR::MULTI_STATEMENT;
+    if (is_extended_protocol) return RAR::EXTENDED_PROTOCOL;
+    if (transaction_split.blocked) return RAR::SPLIT_BLOCKED;
+    if (transaction_split.wal_pending) return RAR::WAL_PENDING;
+    if (transaction_split.stage != PolarDB_TransactionSplitStage::TXN_SPLITTABLE) {
+        return RAR::IN_TRANSACTION;
+    }
+    if (transaction_split_xids.empty()) return RAR::INVARIANT_VIOLATION;
+    if (transaction_split.primary_lsn == 0) return RAR::NO_TXN_LSN;
+
+    return RAR::NONE;
+}
 
 /// @brief Short stable name for a route-action reason, for logs and traces.
 static inline const char* polardb_route_action_reason_name(

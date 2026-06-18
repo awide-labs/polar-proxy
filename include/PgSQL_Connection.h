@@ -646,6 +646,15 @@ public:
 	bool processing_multi_statement;
 
 #if POLARDB_PROXY
+	/**
+	 * @brief Initialize critical startup parameters from backend ParameterStatus.
+	 *
+	 * Warmup connections are opened without a client session, so they do not run
+	 * the client-variable copy path in connect_start(). Before entering the pool,
+	 * they still need the same critical baseline that reset/reuse code expects.
+	 */
+	void init_startup_parameters_from_server();
+
 	// ---- PolarDB wrapped-wait result filtering ----
 	// A wrapped LSN-wait read prepends N SET statements ahead of the user query
 	// (see PgSQL_PolarDB_Wrap.cpp). The connection layer is the sole owner of SET
@@ -809,11 +818,11 @@ public:
 
 #if POLARDB_PROXY
 	/**
-	 * @brief Enable PolarDB LSN reporting on a freshly connected backend.
+	 * @brief Enable requested PolarDB RFQ parsing on a freshly connected backend.
 	 *
 	 * Called once per connection right after a successful connect (cold path).
-	 * Turns on libpq RFQ-LSN parsing only when this connection's recorded startup
-	 * profile requested REQUEST_RFQ_LSN. No-op when there is no live connection.
+	 * Turns on libpq parsing only for payloads this connection requested in its
+	 * startup profile. No-op when there is no live connection.
 	 */
 	void polardb_init_connection_tracking();
 
@@ -828,6 +837,31 @@ public:
 	 * @return LSN value (64-bit), or 0 if the RFQ carried no LSN / no connection.
 	 */
 	uint64_t get_polardb_lsn();
+
+	/**
+	 * @brief Read the transaction XID list carried by the last ReadyForQuery.
+	 *
+	 * Pure RFQ accessor over libpq's cached payload. It never issues SQL and is
+	 * meaningful only for connections whose startup profile requested
+	 * REQUEST_RFQ_XID.
+	 *
+	 * @return comma-separated XID list, or nullptr when unavailable.
+	 */
+	const char* get_polardb_txn_xids();
+
+	/**
+	 * @brief True when the last RFQ says the transaction is safe to split.
+	 *
+	 * Pure RFQ accessor over libpq's cached `x` marker; no SQL is issued.
+	 */
+	bool is_polardb_txn_splittable();
+
+	/**
+	 * @brief True when the last RFQ says WAL is still pending for split reads.
+	 *
+	 * Pure RFQ accessor over libpq's cached `w` marker; no SQL is issued.
+	 */
+	bool is_polardb_txn_wal_pending();
 #endif // POLARDB_PROXY
 
 private:
@@ -857,10 +891,10 @@ private:
 	/**
 	 * @brief Append profile-driven PolarDB startup params to a conninfo.
 	 *
-	 * Emits no parameters when the profile does not request the RFQ LSN (which
-	 * includes proxy_protocol=off). For profiles that request RFQ LSNs, this
-	 * resolves client/listener/fallback identity first and fails the connection
-	 * before PQconnectStart when no valid identity is available.
+	 * Emits no parameters when the profile requests no RFQ payloads (which includes
+	 * proxy_protocol=off). For RFQ-requesting profiles, this resolves
+	 * client/listener/fallback identity first and fails the connection before
+	 * PQconnectStart when no valid identity is available.
 	 *
 	 * @param conninfo       conninfo string being built for the connection.
 	 * @param profile        resolved startup profile.

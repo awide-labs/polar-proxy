@@ -4667,6 +4667,14 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 		nq.pop_back();
 	}
 #if POLARDB_PROXY
+	if (is_in_transaction()) {
+		// Only SET inside an explicit transaction is backend-local state.
+		// active_transactions is also true while a standalone SET is being
+		// executed, so using it here would block later pre-write reader waits
+		// for the whole session.
+		polardb_note_txn_local_state_change("in_transaction_set");
+	}
+
 	auto parse_polardb_consistency_mode_value = [](std::string value, int* mode) -> bool {
 		PgSQL_Set_Stmt_Parser::unquote_if_quoted(value);
 

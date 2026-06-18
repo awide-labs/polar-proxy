@@ -1387,7 +1387,12 @@ PolarDB_StartupProfile PgSQL_Connection::build_polardb_startup_profile(unsigned 
 	// global pgsql-polardb_proxy_protocol default.
 	PgSQL_HostGroups_Manager::PolarDB_HG_Policy policy = PgHGM->get_polardb_hg_policy(hid);
 	int protocol = policy.proxy_protocol >= 0 ? policy.proxy_protocol : pgsql_thread___polardb_proxy_protocol;
-	return PolarDB_StartupProfile::from_protocol(polardb_proxy_protocol_from_int(protocol));
+	PolarDB_StartupProfile profile =
+		PolarDB_StartupProfile::from_protocol(polardb_proxy_protocol_from_int(protocol));
+	if (policy.txn_split_enabled) {
+		profile.request_rfq_xid();
+	}
+	return profile;
 }
 
 /// @brief Pick the client identity to advertise in PolarDB startup parameters.
@@ -1474,21 +1479,21 @@ PolarDB_StartupIdentity PgSQL_Connection::resolve_polardb_startup_identity(
 // declaration in PgSQL_Connection.h for the full contract.
 bool PgSQL_Connection::append_polardb_startup_params(std::ostringstream& conninfo,
 	const PolarDB_StartupProfile& profile, unsigned int hid) {
-	// Profiles that do not ask for an RFQ LSN need no startup parameters at all.
-	if (!profile.has_rfq_lsn()) {
-		POLARDB_TRACE("PolarDB CONNINFO: no RFQ LSN startup request for HG %u protocol=%s\n",
+	// Profiles that do not ask for RFQ payloads need no startup parameters at all.
+	if (!profile.emits_startup_params()) {
+		POLARDB_TRACE("PolarDB CONNINFO: no RFQ startup request for HG %u protocol=%s\n",
 			hid, polardb_proxy_protocol_name(profile.protocol));
 		return true;
 	}
 
-	// RFQ startup safety: a profile that requests an RFQ LSN but has no client
+	// RFQ startup safety: a profile that requests RFQ payloads but has no client
 	// identity to advertise cannot work, so refuse the connection rather than
 	// connect without the parameters and silently lose read-your-writes.
 	PolarDB_StartupIdentity identity = resolve_polardb_startup_identity(profile);
 	if (identity.source == PolarDB_StartupIdentitySource::NONE) {
 		std::string msg = "PolarDB proxy_protocol=";
 		msg += polardb_proxy_protocol_name(profile.protocol);
-		msg += " requests RFQ LSN but no startup identity is available; ";
+		msg += " requests RFQ payloads but no startup identity is available; ";
 		msg += "use a client-backed connection, listener/proxy address, or configure ";
 		msg += "pgsql-polardb_proxy_identity_host and pgsql-polardb_proxy_identity_port";
 		set_error(PGSQL_ERROR_CODES::ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
@@ -1503,39 +1508,48 @@ bool PgSQL_Connection::append_polardb_startup_params(std::ostringstream& conninf
 		static_cast<int>(identity.source), identity.host.c_str(), identity.port);
 
 	// Two PolarDB startup dialects carry the same information under different
-	// parameter names. _polar_*_send_lsn asks the backend to append its WAL LSN
-	// to every ReadyForQuery message.
+	// parameter names. _polar_*_send_lsn asks for WAL LSN; _polar_*_send_xact
+	// asks for transaction split evidence (XIDs and split markers).
 	if (profile.protocol == PolarDB_ProxyProtocol::V15) {
 		conninfo << " _polar_proxy_client_host=" << identity.host;
 		conninfo << " _polar_proxy_client_port=" << identity.port;
-		conninfo << " _polar_proxy_send_lsn=true";
+		if (profile.has_rfq_lsn()) {
+			conninfo << " _polar_proxy_send_lsn=true";
+		}
+		if (profile.has_rfq_xid()) {
+			conninfo << " _polar_proxy_send_xact=true";
+		}
 		return true;
 	}
 
 	if (profile.protocol == PolarDB_ProxyProtocol::LEGACY) {
 		conninfo << " _polar_origin_client_ip=" << identity.host;
 		conninfo << " _polar_origin_client_port=" << identity.port;
-		conninfo << " _polar_send_lsn=true";
+		if (profile.has_rfq_lsn()) {
+			conninfo << " _polar_send_lsn=true";
+		}
+		if (profile.has_rfq_xid()) {
+			conninfo << " _polar_send_xact=true";
+		}
 		return true;
 	}
 
 	return true;
 }
 
-// See PgSQL_Connection.h for the @brief. PQsetPolarSendLSN turns on libpq's
-// parsing of the LSN that PolarDB appends to ReadyForQuery, so a later
-// get_polardb_lsn() can read it with no extra round-trip.
+// See PgSQL_Connection.h for the @brief. PQsetPolarSend* turns on libpq parsing
+// for payloads this connection requested at startup, so later hot-path accessors
+// can read cached RFQ state with no extra round-trip.
 void PgSQL_Connection::polardb_init_connection_tracking() {
 	if (!pgsql_conn || PQstatus(pgsql_conn) != CONNECTION_OK) {
 		return;
 	}
-	// Only enable parsing when this connection's startup actually requested an
-	// RFQ LSN. Requesting is not the same as confirming: this only tells libpq to
-	// parse the payload if the backend later chooses to send it.
-	if (!polardb_startup_profile.has_rfq_lsn()) {
-		return;
+	if (polardb_startup_profile.has_rfq_lsn()) {
+		PQsetPolarSendLSN(pgsql_conn, 1);
 	}
-	PQsetPolarSendLSN(pgsql_conn, 1);
+	if (polardb_startup_profile.has_rfq_xid()) {
+		PQsetPolarSendXact(pgsql_conn, 1);
+	}
 }
 
 // See PgSQL_Connection.h for the @brief. This is a pure accessor: it reads the
@@ -1552,6 +1566,31 @@ uint64_t PgSQL_Connection::get_polardb_lsn() {
 	}
 
 	return 0;
+}
+
+// See PgSQL_Connection.h for the @brief. This is a pure RFQ accessor: libpq
+// already cached the payload from the last ReadyForQuery.
+const char* PgSQL_Connection::get_polardb_txn_xids() {
+	if (!pgsql_conn || PQstatus(pgsql_conn) != CONNECTION_OK) {
+		return nullptr;
+	}
+	return PQgetXactSplitXids(pgsql_conn);
+}
+
+// See PgSQL_Connection.h for the @brief.
+bool PgSQL_Connection::is_polardb_txn_splittable() {
+	if (!pgsql_conn || PQstatus(pgsql_conn) != CONNECTION_OK) {
+		return false;
+	}
+	return PQisXactSplittable(pgsql_conn) != 0;
+}
+
+// See PgSQL_Connection.h for the @brief.
+bool PgSQL_Connection::is_polardb_txn_wal_pending() {
+	if (!pgsql_conn || PQstatus(pgsql_conn) != CONNECTION_OK) {
+		return false;
+	}
+	return PQisXactWalPending(pgsql_conn) != 0;
 }
 #endif // POLARDB_PROXY
 

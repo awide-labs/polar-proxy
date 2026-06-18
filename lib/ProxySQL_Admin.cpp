@@ -7761,35 +7761,37 @@ void ProxySQL_Admin::save_pgsql_servers_runtime_to_database(bool _runtime) {
 			// PolarDB replication-hostgroup rows carry the LSN consistency
 			// policy columns after check_type. Fields:
 			//   0=writer_hostgroup, 1=reader_hostgroup, 2=check_type,
-			//   3=consistency_mode, 4=max_lag_bytes, 5=lsn_wait_timeout_ms,
-			//   6=proxy_protocol, 7=comment
+			//   3=txn_split_enabled, 4=consistency_mode, 5=max_lag_bytes,
+			//   6=lsn_wait_timeout_ms, 7=proxy_protocol, 8=comment
 			char* q = NULL;
 			if (_runtime) {
-				q = (char*)"INSERT INTO runtime_pgsql_replication_hostgroups VALUES(%s,%s,'%s','%s',%s,%s,'%s','%s')";
+				q = (char*)"INSERT INTO runtime_pgsql_replication_hostgroups VALUES(%s,%s,'%s',%s,'%s',%s,%s,'%s','%s')";
 			}
 			else {
-				q = (char*)"INSERT INTO pgsql_replication_hostgroups VALUES(%s,%s,'%s','%s',%s,%s,'%s','%s')";
+				q = (char*)"INSERT INTO pgsql_replication_hostgroups VALUES(%s,%s,'%s',%s,'%s',%s,%s,'%s','%s')";
 			}
 			char* check_type = escape_string_single_quotes(r->fields[2], false);
-			char* consistency_mode = escape_string_single_quotes(r->fields[3], false);
-			char* proxy_protocol = escape_string_single_quotes(r->fields[6], false);
-			char* comment = r->fields[7] ? escape_string_single_quotes(r->fields[7], false) : (char*)"";
+			char* consistency_mode = escape_string_single_quotes(r->fields[4], false);
+			char* proxy_protocol = escape_string_single_quotes(r->fields[7], false);
+			char* comment = r->fields[8] ? escape_string_single_quotes(r->fields[8], false) : (char*)"";
 			// Size after escaping: a quote-heavy comment can be larger than the
 			// raw field. Track ownership explicitly instead of comparing against
 			// a string literal when deciding which escaped buffers to free.
 			const bool free_check_type = check_type != r->fields[2];
-			const bool free_consistency_mode = consistency_mode != r->fields[3];
-			const bool free_proxy_protocol = proxy_protocol != r->fields[6];
-			const bool free_comment = r->fields[7] && comment != r->fields[7];
+			const bool free_consistency_mode = consistency_mode != r->fields[4];
+			const bool free_proxy_protocol = proxy_protocol != r->fields[7];
+			const bool free_comment = r->fields[8] && comment != r->fields[8];
 			const int query_len = snprintf(NULL, 0, q,
-				r->fields[0], r->fields[1], check_type, consistency_mode,
-				r->fields[4], r->fields[5], proxy_protocol, comment);
+				r->fields[0], r->fields[1], check_type, r->fields[3],
+				consistency_mode, r->fields[5], r->fields[6],
+				proxy_protocol, comment);
 			if (query_len >= 0) {
 				char* query = (char*)malloc((size_t)query_len + 1);
 				if (query) {
 					snprintf(query, (size_t)query_len + 1, q,
-						r->fields[0], r->fields[1], check_type, consistency_mode,
-						r->fields[4], r->fields[5], proxy_protocol, comment);
+						r->fields[0], r->fields[1], check_type, r->fields[3],
+						consistency_mode, r->fields[5], r->fields[6],
+						proxy_protocol, comment);
 					proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 4, "%s\n", query);
 					admindb->execute(query);
 					free(query);

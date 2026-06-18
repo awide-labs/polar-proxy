@@ -329,6 +329,16 @@ void PgSQL_Session::polardb_collect(PolarDB_Query_RouteCtx& route_ctx,
 		polardb_scope_session_lsn(this, route_ctx.writer_scope, "COLLECT");
 	}
 	route_ctx.session = polardb_session_consistency;
+	route_ctx.transaction_split.stage = polardb_transaction_split.stage;
+	route_ctx.transaction_split.primary_lsn = polardb_transaction_split.primary_lsn;
+	route_ctx.transaction_split.splittable = polardb_transaction_split.splittable;
+	route_ctx.transaction_split.wal_pending = polardb_transaction_split.wal_pending;
+	route_ctx.transaction_split.blocked = polardb_transaction_split.blocked;
+	route_ctx.transaction_split.was_splittable =
+		polardb_transaction_split.was_splittable;
+	route_ctx.transaction_split.did_split = polardb_transaction_split.did_split;
+	route_ctx.transaction_split_xids = polardb_transaction_split.xids;
+	route_ctx.txn_split_enabled = policy.txn_split_enabled;
 
 	// Query eligibility (from query rules)
 	route_ctx.replica_eligible = (qpo_replica_eligible == 1);
@@ -350,10 +360,13 @@ void PgSQL_Session::polardb_collect(PolarDB_Query_RouteCtx& route_ctx,
 	// prepended to a simple-query packet; extended protocol cannot be wrapped.
 	route_ctx.is_extended_protocol = (extended_query_phase != EXTQ_PHASE_IDLE);
 
-	// Transaction state. The read-your-writes wait covers autocommit reads only,
-	// so any read inside an explicit transaction is routed to the writer. The
-	// backend reports an open/aborted transaction ('T'/'E') via active_transactions.
-	route_ctx.in_transaction = (active_transactions > 0);
+	// Transaction state. `active_transactions` is a transient backend-query flag:
+	// PgSQL_Connection sets it at the start of every query, including autocommit
+	// SELECTs. Transaction split must only use the XID wrapper inside an explicit
+	// client transaction tracked from BEGIN/START TRANSACTION through COMMIT or
+	// ROLLBACK; otherwise autocommit reads can be misclassified and the backend
+	// rejects `polar_xact_split_xids` with "without begin".
+	route_ctx.in_transaction = is_in_transaction();
 
 	// Per-query routing hint parsed from the query's first comment
 	// (a leading SQL comment "/* route=primary */"); plan turns it into a force-writer route.
@@ -369,7 +382,9 @@ void PgSQL_Session::polardb_collect(PolarDB_Query_RouteCtx& route_ctx,
 			"replica_eligible=%d multi_stmt=%d extended=%d in_txn=%d "
 			"write_lsn=%lu observed_lsn=%lu write_lsn_unknown=%d "
 			"observed_lsn_unknown=%d timeout_ms=%u timeout_mode=%d "
-			"rfq_policy=%d lsn_baseline=%d writer_hg=%d writer_epoch=%lu Q='%.*s'\n",
+			"rfq_policy=%d lsn_baseline=%d txn_split_enabled=%d "
+			"txn_stage=%d txn_lsn=%lu txn_xids_len=%zu txn_wal_pending=%d "
+			"writer_hg=%d writer_epoch=%lu Q='%.*s'\n",
 			current_hg, route_ctx.writer_scope.hg, route_ctx.reader_hg,
 			route_ctx.effective_consistency_mode,
 			route_ctx.replica_eligible, route_ctx.is_multi_statement, route_ctx.is_extended_protocol,
@@ -379,6 +394,13 @@ void PgSQL_Session::polardb_collect(PolarDB_Query_RouteCtx& route_ctx,
 			route_ctx.session.observed_unknown ? 1 : 0,
 			route_ctx.wait_timeout_ms, route_ctx.wait_timeout_mode,
 			route_ctx.route_rfq_policy, route_ctx.session_lsn_baseline,
+			route_ctx.txn_split_enabled ? 1 : 0,
+			(int)route_ctx.transaction_split.stage,
+			(unsigned long)route_ctx.transaction_split.primary_lsn,
+			route_ctx.transaction_split_xids.size(),
+			route_ctx.transaction_split.wal_pending ? 1 : 0,
+			route_ctx.txn_reader_wait_isolation_read_committed ? 1 : 0,
+			route_ctx.txn_reader_wait_local_state_clean ? 1 : 0,
 			route_ctx.writer_scope.hg, (unsigned long)route_ctx.writer_scope.epoch,
 			query_len, query_text);
 	}
@@ -521,7 +543,58 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(const PolarDB_Query_RouteCtx
 		return plan;
 	}
 
-	// Autocommit-only rule: explicit transactions and unsafe query shapes stay on the writer.
+	PolarDB_WaitMode wait_mode =
+		(route_ctx.wait_timeout_mode == (int)PolarDB_WaitMode::STRICT)
+		? PolarDB_WaitMode::STRICT : PolarDB_WaitMode::BEST_EFFORT;
+
+	// Transaction split planning is LSN-only and simple-query only. This stage
+	// names a split-readable route when primary RFQ evidence is complete; execute
+	// still keeps it on the primary until the split-dispatch patch is added.
+	if (route_ctx.in_transaction) {
+		PolarDB_Query_RoutePlan::RouteActionReason split_reason =
+			polardb_txn_split_rejection_reason(
+				route_ctx.txn_split_enabled,
+				route_ctx.transaction_split,
+				route_ctx.transaction_split_xids,
+				route_ctx.is_multi_statement,
+				route_ctx.is_extended_protocol);
+		if (split_reason != PolarDB_Query_RoutePlan::RouteActionReason::NONE) {
+			plan = PolarDB_Query_RoutePlan::force_primary(
+				route_ctx.writer_scope.hg, split_reason);
+			POLARDB_TRACE(
+				"PolarDB PLAN: transaction read not split-readable reason=%s "
+				"-> FORCE_PRIMARY primary_hg=%d\n",
+				polardb_route_action_reason_name(split_reason),
+				route_ctx.writer_scope.hg);
+			return plan;
+		}
+
+		if (!allow_transaction_wait_read) {
+			PolarDB_WaitSpec split_wait;
+			split_wait.type = PolarDB_WaitType::LSN;
+			split_wait.target = route_ctx.transaction_split.primary_lsn;
+			split_wait.timeout_ms = route_ctx.wait_timeout_ms;
+			split_wait.mode = wait_mode;
+
+		plan = PolarDB_Query_RoutePlan::replica_txn_split(
+			route_ctx.reader_hg,
+			route_ctx.writer_scope.hg,
+			split_wait,
+			route_ctx.transaction_split_xids);
+		plan.reader.route_rfq_policy = route_ctx.route_rfq_policy;
+		plan.reader.allow_best_effort_degrade = false;
+		polardb_reader_lag_plan(plan, route_ctx);
+		POLARDB_TRACE(
+			"PolarDB PLAN: REPLICA_TXN_SPLIT planned reader=%d wait_target=%lu "
+			"xids_len=%zu timeout_ms=%u\n",
+			route_ctx.reader_hg,
+			(unsigned long)plan.wait_spec.target,
+			plan.txn_xids.size(),
+			plan.wait_spec.timeout_ms);
+		return plan;
+	}
+
+	// Remaining hard guards: unsafe query shapes stay on the primary.
 	auto required_reason =
 		polardb_writer_required_reason(route_ctx.in_transaction, route_ctx.is_multi_statement);
 	if (required_reason != PolarDB_Query_RoutePlan::RouteActionReason::NONE) {
@@ -593,10 +666,6 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(const PolarDB_Query_RouteCtx
 			route_ctx.route_rfq_policy, (int)plan.action, plan.target_hg);
 		return plan;
 	}
-	PolarDB_WaitMode wait_mode =
-		(route_ctx.wait_timeout_mode == (int)PolarDB_WaitMode::STRICT)
-		? PolarDB_WaitMode::STRICT : PolarDB_WaitMode::BEST_EFFORT;
-
 	PolarDB_Query_WaitPlan wait_plan = PolarDB_Query_WaitPlan::build_consistency(
 		mode, session_lsn, route_ctx.wait_timeout_ms, wait_mode, /*prefer_replica=*/true);
 
@@ -728,6 +797,15 @@ PolarDB_Query_ExecuteResult PgSQL_Session::polardb_execute(
 		POLARDB_TRACE(
 			"PolarDB EXECUTE: FORCE_PRIMARY writer=%d reason=%d\n",
 			route_ctx.writer_scope.hg, (int)plan.action_reason);
+		return result;
+	}
+
+	if (plan.action == PolarDB_Query_RoutePlan::RouteAction::REPLICA_TXN_SPLIT) {
+		result.final_target_hg = route_ctx.writer_scope.hg;
+		POLARDB_TRACE(
+			"PolarDB EXECUTE: REPLICA_TXN_SPLIT planned but split dispatch is "
+			"not wired yet, using primary_hg=%d\n",
+			route_ctx.writer_scope.hg);
 		return result;
 	}
 
@@ -987,6 +1065,11 @@ void PgSQL_Session::polardb_process_result(PgSQL_Data_Stream* myds, const char* 
 			polardb_session_consistency.write_unknown = false;
 			polardb_session_consistency.observed_unknown = false;
 			polardb_rfq_degraded_route_warning_sent = false;
+			polardb_observe_transaction_split(
+				myds->myconn,
+				lsn,
+				split_observation_enabled,
+				positioned_rfq_from_primary);
 		}
 		if (is_write) {
 			// Advance the session's own-write component; the wait target is

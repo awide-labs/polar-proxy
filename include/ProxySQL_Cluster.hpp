@@ -218,7 +218,7 @@
 #define CLUSTER_QUERY_PGSQL_VARIABLES "PROXY_SELECT variable_name, variable_value FROM runtime_pgsql_variables ORDER BY variable_name"
 
 #if POLARDB_PROXY
-#define CLUSTER_QUERY_PGSQL_REPLICATION_HOSTGROUPS "PROXY_SELECT writer_hostgroup, reader_hostgroup, check_type, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment FROM runtime_pgsql_replication_hostgroups ORDER BY writer_hostgroup"
+#define CLUSTER_QUERY_PGSQL_REPLICATION_HOSTGROUPS "PROXY_SELECT writer_hostgroup, reader_hostgroup, check_type, txn_split_enabled, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment FROM runtime_pgsql_replication_hostgroups ORDER BY writer_hostgroup"
 #else
 #define CLUSTER_QUERY_PGSQL_REPLICATION_HOSTGROUPS "PROXY_SELECT writer_hostgroup, reader_hostgroup, check_type, comment FROM runtime_pgsql_replication_hostgroups ORDER BY writer_hostgroup"
 #endif // POLARDB_PROXY

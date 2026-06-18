@@ -54,8 +54,8 @@
 #if POLARDB_PROXY
 // HGM-internal mirror of pgsql_replication_hostgroups for PolarDB topology and
 // LSN consistency policy. Must stay in sync with
-// ADMIN_SQLITE_TABLE_PGSQL_REPLICATION_HOSTGROUPS_V3_0_4.
-#define MYHGM_PgSQL_REPLICATION_HOSTGROUPS "CREATE TABLE pgsql_replication_hostgroups (writer_hostgroup INT CHECK (writer_hostgroup>=0) NOT NULL PRIMARY KEY , reader_hostgroup INT NOT NULL CHECK (reader_hostgroup<>writer_hostgroup AND reader_hostgroup>=0) , check_type VARCHAR CHECK (LOWER(check_type) IN ('read_only', 'polardb')) NOT NULL DEFAULT 'read_only' , consistency_mode VARCHAR CHECK (LOWER(consistency_mode) IN ('default', 'off', 'lsn', 'primary')) NOT NULL DEFAULT 'default' , max_lag_bytes INT NOT NULL DEFAULT -1 , lsn_wait_timeout_ms INT NOT NULL DEFAULT -1 , proxy_protocol VARCHAR CHECK (LOWER(proxy_protocol) IN ('default', 'v15', 'legacy', 'off')) NOT NULL DEFAULT 'default' , comment VARCHAR NOT NULL DEFAULT '' , UNIQUE (reader_hostgroup))"
+// ADMIN_SQLITE_TABLE_PGSQL_REPLICATION_HOSTGROUPS_V3_0_5.
+#define MYHGM_PgSQL_REPLICATION_HOSTGROUPS "CREATE TABLE pgsql_replication_hostgroups (writer_hostgroup INT CHECK (writer_hostgroup>=0) NOT NULL PRIMARY KEY , reader_hostgroup INT NOT NULL CHECK (reader_hostgroup<>writer_hostgroup AND reader_hostgroup>=0) , check_type VARCHAR CHECK (LOWER(check_type) IN ('read_only', 'polardb')) NOT NULL DEFAULT 'read_only' , txn_split_enabled INT CHECK (txn_split_enabled IN (0, 1) AND (txn_split_enabled = 0 OR LOWER(check_type) = 'polardb')) NOT NULL DEFAULT 0 , consistency_mode VARCHAR CHECK (LOWER(consistency_mode) IN ('default', 'off', 'lsn', 'primary')) NOT NULL DEFAULT 'default' , max_lag_bytes INT NOT NULL DEFAULT -1 , lsn_wait_timeout_ms INT NOT NULL DEFAULT -1 , proxy_protocol VARCHAR CHECK (LOWER(proxy_protocol) IN ('default', 'v15', 'legacy', 'off')) NOT NULL DEFAULT 'default' , comment VARCHAR NOT NULL DEFAULT '' , UNIQUE (reader_hostgroup))"
 #else
 #define MYHGM_PgSQL_REPLICATION_HOSTGROUPS "CREATE TABLE pgsql_replication_hostgroups (writer_hostgroup INT CHECK (writer_hostgroup>=0) NOT NULL PRIMARY KEY , reader_hostgroup INT NOT NULL CHECK (reader_hostgroup<>writer_hostgroup AND reader_hostgroup>=0) , check_type VARCHAR CHECK (LOWER(check_type) IN ('read_only')) NOT NULL DEFAULT 'read_only' , comment VARCHAR NOT NULL DEFAULT '' , UNIQUE (reader_hostgroup))"
 #endif // POLARDB_PROXY
@@ -320,6 +320,7 @@ class PgSQL_HGC: public BaseHGC<PgSQL_HGC> {
 		unsigned int writer_hostgroup{0};  // corresponding writer HG (if this is reader)
 		int max_lag_bytes{0};              // max LSN lag in bytes (lag-cap safety; 0 = off)
 		std::string check_type;            // e.g. "polardb", "read_only"
+		bool txn_split_enabled{false};     // persisted switch; no routing effect yet
 		std::string consistency_mode;      // consistency mode string (off/lsn/primary)
 		int consistency_mode_enum{-1};     // parsed enum value; -1 = use global default
 		int lsn_wait_timeout_ms{0};        // polar_xact_split_wait_lsn timeout in ms
@@ -1048,8 +1049,9 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 	/**
 	 * @brief Resolved PolarDB policy for a hostgroup (tri-state values).
 	 * -1 = not configured (inherit global), 0 = explicitly disabled, >0 = explicit value.
-	 */
+	*/
 	struct PolarDB_HG_Policy {
+		bool txn_split_enabled{false};  // request/observe RFQ XID data; planner may name split route
 		int consistency_mode{-1};
 		int lsn_wait_timeout_ms{-1};
 		int max_lag_bytes{-1};

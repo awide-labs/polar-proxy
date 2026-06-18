@@ -1733,11 +1733,12 @@ int ProxySQL_Config::Write_PgSQL_Servers_to_configfile(std::string& data) {
 				addField(data, "reader_hostgroup", r->fields[1], "");
 				addField(data, "check_type", r->fields[2]);
 #if POLARDB_PROXY
-				addField(data, "consistency_mode", r->fields[3]);
-				addField(data, "max_lag_bytes", r->fields[4], "");
-				addField(data, "lsn_wait_timeout_ms", r->fields[5], "");
-				addField(data, "proxy_protocol", r->fields[6]);
-				addField(data, "comment", r->fields[7]);
+				addField(data, "txn_split_enabled", r->fields[3], "");
+				addField(data, "consistency_mode", r->fields[4]);
+				addField(data, "max_lag_bytes", r->fields[5], "");
+				addField(data, "lsn_wait_timeout_ms", r->fields[6], "");
+				addField(data, "proxy_protocol", r->fields[7]);
+				addField(data, "comment", r->fields[8]);
 #else
 				addField(data, "comment", r->fields[3]);
 #endif // POLARDB_PROXY
@@ -1825,7 +1826,7 @@ int ProxySQL_Config::Read_PgSQL_Servers_from_configfile(std::string& error) {
 		const Setting& pgsql_replication_hostgroups = root["pgsql_replication_hostgroups"];
 		int count = pgsql_replication_hostgroups.getLength();
 #if POLARDB_PROXY
-		char* q = (char*)"INSERT OR REPLACE INTO pgsql_replication_hostgroups (writer_hostgroup, reader_hostgroup, check_type, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment) VALUES (%d, %d, '%s', '%s', %d, %d, '%s', '%s')";
+		char* q = (char*)"INSERT OR REPLACE INTO pgsql_replication_hostgroups (writer_hostgroup, reader_hostgroup, check_type, txn_split_enabled, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment) VALUES (%d, %d, '%s', %d, '%s', %d, %d, '%s', '%s')";
 #else
 		char* q = (char*)"INSERT OR REPLACE INTO pgsql_replication_hostgroups (writer_hostgroup, reader_hostgroup, comment, check_type) VALUES (%d, %d, '%s', '%s')";
 #endif // POLARDB_PROXY
@@ -1838,6 +1839,7 @@ int ProxySQL_Config::Read_PgSQL_Servers_from_configfile(std::string& error) {
 #if POLARDB_PROXY
 			std::string consistency_mode = "default";
 			std::string proxy_protocol = "default";
+			int txn_split_enabled = 0;
 			int max_lag_bytes = -1;
 			int lsn_wait_timeout_ms = -1;
 #endif // POLARDB_PROXY
@@ -1857,6 +1859,13 @@ int ProxySQL_Config::Read_PgSQL_Servers_from_configfile(std::string& error) {
 			if (strcasecmp(check_type.c_str(), (char*)"read_only") &&
 				strcasecmp(check_type.c_str(), (char*)"polardb")) {
 				check_type = "read_only";
+			}
+			line.lookupValue("txn_split_enabled", txn_split_enabled);
+			if (txn_split_enabled != 0 && strcasecmp(check_type.c_str(), (char*)"polardb")) {
+				txn_split_enabled = 0;
+			}
+			if (txn_split_enabled != 0 && txn_split_enabled != 1) {
+				txn_split_enabled = 0;
 			}
 			line.lookupValue("consistency_mode", consistency_mode);
 			if (strcasecmp(consistency_mode.c_str(), (char*)"default") &&
@@ -1890,8 +1899,8 @@ int ProxySQL_Config::Read_PgSQL_Servers_from_configfile(std::string& error) {
 			char* m = escape_string_single_quotes(m1, false);
 			char* p1 = strdup(proxy_protocol.c_str());
 			char* p = escape_string_single_quotes(p1, false);
-			char* query = (char*)malloc(strlen(q) + strlen(o) + strlen(t) + strlen(m) + strlen(p) + 64);
-			sprintf(query, q, writer_hostgroup, reader_hostgroup, t, m, max_lag_bytes, lsn_wait_timeout_ms, p, o);
+			char* query = (char*)malloc(strlen(q) + strlen(o) + strlen(t) + strlen(m) + strlen(p) + 80);
+			sprintf(query, q, writer_hostgroup, reader_hostgroup, t, txn_split_enabled, m, max_lag_bytes, lsn_wait_timeout_ms, p, o);
 #else
 			char* query = (char*)malloc(strlen(q) + strlen(o) + strlen(t) + 32);
 			sprintf(query, q, writer_hostgroup, reader_hostgroup, o, t);
