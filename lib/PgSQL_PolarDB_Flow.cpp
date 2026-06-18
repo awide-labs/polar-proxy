@@ -34,6 +34,7 @@
 
 #include <cctype>
 #include <cstring>
+#include <string>
 
 extern PgSQL_HostGroups_Manager* PgHGM;
 
@@ -56,15 +57,17 @@ static bool polardb_snapshot_writer_for_hg(
 		return false;
 	}
 
-	auto hg_config = PgHGM->get_polardb_hg_config((unsigned int)hostgroup_id);
-	if (!hg_config.is_polardb_hostgroup || !hg_config.writer_epoch) {
+	const auto* hg_config =
+		PgHGM->find_polardb_hg_config((unsigned int)hostgroup_id);
+	if (!hg_config || !hg_config->is_polardb_hostgroup ||
+			!hg_config->writer_epoch) {
 		return false;
 	}
 
-	writer_scope->hg = hg_config.writer_hostgroup;
+	writer_scope->hg = hg_config->writer_hostgroup;
 	// Acquire load: pairs with the failover writer-epoch bump so we never read a
 	// torn or stale epoch alongside the hostgroup it scopes.
-	writer_scope->epoch = hg_config.writer_epoch->load(std::memory_order_acquire);
+	writer_scope->epoch = hg_config->writer_epoch->load(std::memory_order_acquire);
 	return true;
 }
 
@@ -132,14 +135,15 @@ bool PgSQL_Session::polardb_query_cache_disabled_for_current_rule() const {
 		return false;
 	}
 
-	const auto hg_config = PgHGM->get_polardb_hg_config((unsigned int)route_hg);
-	if (!hg_config.is_polardb_hostgroup) {
+	const auto* hg_config =
+		PgHGM->find_polardb_hg_config((unsigned int)route_hg);
+	if (!hg_config || !hg_config->is_polardb_hostgroup) {
 		return false;
 	}
 
 	const int mode = polardb_resolve_consistency_mode(
 		polardb_config.session_consistency_mode,
-		hg_config.policy.consistency_mode,
+		hg_config->policy.consistency_mode,
 		pgsql_thread___polardb_consistency_mode);
 	switch (polardb_consistency_from_int(mode)) {
 	case PolarDB_ConsistencyMode::OFF:
@@ -151,7 +155,7 @@ bool PgSQL_Session::polardb_query_cache_disabled_for_current_rule() const {
 	}
 
 	// In LSN mode, cache is safe until the session has an LSN target or a missing
-	// LSN latch. PRIMARY baseline can create a first-read target from the writer
+	// LSN sticky flag. PRIMARY baseline can create a first-read target from the writer
 	// mirror, so it also bypasses cache before the planner runs.
 	if (polardb_session_consistency.target() > 0 ||
 			polardb_session_consistency.write_unknown ||
@@ -162,6 +166,50 @@ bool PgSQL_Session::polardb_query_cache_disabled_for_current_rule() const {
 	return polardb_session_lsn_baseline_from_int(
 		pgsql_thread___polardb_session_lsn_baseline) ==
 			PolarDB_SessionLsnBaseline::PRIMARY;
+}
+
+static std::string polardb_normalize_query_words(
+		const char* query, size_t len) {
+	if (!query || len == 0) {
+		return {};
+	}
+
+	// Normalize only letters and digits so the simple scan covers PostgreSQL
+	// spellings with spaces, underscores, or punctuation, for example
+	// REPEATABLE READ and repeatable_read.
+	std::string normalized;
+	normalized.reserve(len);
+	for (size_t i = 0; i < len; ++i) {
+		const unsigned char ch = (unsigned char)query[i];
+		if (std::isalnum(ch)) {
+			normalized.push_back((char)std::tolower(ch));
+		}
+	}
+	return normalized;
+}
+
+static bool polardb_normalized_mentions_non_read_committed(
+		const std::string& normalized) {
+	return normalized.find("repeatableread") != std::string::npos ||
+		normalized.find("serializable") != std::string::npos;
+}
+
+static bool polardb_normalized_mentions_read_committed(
+		const std::string& normalized) {
+	return normalized.find("readcommitted") != std::string::npos;
+}
+
+static bool polardb_normalized_sets_session_isolation_default(
+		const std::string& normalized) {
+	return normalized.find("sessioncharacteristics") != std::string::npos ||
+		normalized.find("sessiontransactionisolationlevel") != std::string::npos ||
+		normalized.find("defaulttransactionisolation") != std::string::npos;
+}
+
+static bool polardb_query_mentions_non_read_committed(
+		const char* query, size_t len) {
+	return polardb_normalized_mentions_non_read_committed(
+		polardb_normalize_query_words(query, len));
 }
 
 /**
@@ -191,7 +239,7 @@ bool PgSQL_Session::polardb_capture_request_writer_scope(int scope_hg) {
 /**
  * @brief Bind the session's LSN state to a writer scope, discarding stale state.
  *
- * The session's write_lsn / observed_lsn / missing-LSN latches are only meaningful
+ * The session's write_lsn / observed_lsn / missing-LSN sticky flags are only meaningful
  * for one writer hostgroup and epoch. If the current request runs under a different
  * writer scope, the old LSN values name a position on another replication group or
  * an old timeline (for example after a failover bumped the writer epoch). Waiting
@@ -228,6 +276,10 @@ static void polardb_scope_session_lsn(
 		!scope_attached && had_lsn_state;
 
 	if (scope_mismatch || unscoped_state) {
+		const bool has_split_scope_state =
+			sess->polardb_transaction_split.active() ||
+			sess->polardb_transaction_split.has_backend_evidence() ||
+			sess->polardb_txn_reader_failure_pin != PolarDB_RoutePin::NONE;
 		POLARDB_TRACE(
 			"PolarDB %s: scope session LSN state to writer_hg=%d "
 			"writer_epoch=%lu (previous_valid=%d previous_hg=%d "
@@ -244,7 +296,7 @@ static void polardb_scope_session_lsn(
 			sess->polardb_session_consistency.write_unknown ? 1 : 0,
 			sess->polardb_session_consistency.observed_unknown ? 1 : 0);
 		if (had_lsn_state) {
-			// Drop write/observed LSNs and both missing-LSN latches; they belong
+			// Drop write/observed LSNs and both missing-LSN sticky flags; they belong
 			// to the old scope. Also clear the one-shot degraded-route warning so a
 			// fresh degradation under the new scope is reported again. Count only
 			// when state was actually discarded (not on the first bind).
@@ -252,6 +304,11 @@ static void polardb_scope_session_lsn(
 			sess->polardb_rfq_degraded_route_warning_sent = false;
 			PgHGM->status.polardb_session_target_epoch_reset.fetch_add(
 				1, std::memory_order_relaxed);
+		}
+		if (has_split_scope_state) {
+			sess->polardb_clear_transaction_split_state(
+				scope_mismatch ? "writer_scope_change" : "writer_scope_bind",
+				/*want_reuse=*/true);
 		}
 	}
 
@@ -271,7 +328,7 @@ static void polardb_scope_session_lsn(
  *
  * Side effect (the one mutation in this stage): if the replication group's writer
  * scope changed since this session last collected a PolarDB context, it first
- * clears the session's LSN targets and missing-LSN latches, then copies them into
+ * clears the session's LSN targets and missing-LSN sticky flags, then copies them into
  * @p route_ctx. Those old targets name a position on another replication group or
  * an old writer timeline and must not be waited on. See polardb_scope_session_lsn().
  *
@@ -287,8 +344,8 @@ void PgSQL_Session::polardb_collect(PolarDB_Query_RouteCtx& route_ctx,
 {
 	route_ctx = PolarDB_Query_RouteCtx{};  // zero-init all fields
 
-	auto hg_config = PgHGM->get_polardb_hg_config(current_hg);
-	route_ctx.is_polar_hg = hg_config.is_polardb_hostgroup;
+	const auto* hg_config = PgHGM->find_polardb_hg_config(current_hg);
+	route_ctx.is_polar_hg = hg_config && hg_config->is_polardb_hostgroup;
 	if (!route_ctx.is_polar_hg) {
 		POLARDB_TRACE(
 			"PolarDB COLLECT: hg=%d is_polar=false, skip\n", current_hg);
@@ -296,12 +353,13 @@ void PgSQL_Session::polardb_collect(PolarDB_Query_RouteCtx& route_ctx,
 	}
 
 	// Hostgroup topology
-	auto policy = hg_config.policy;
-	route_ctx.writer_scope.hg = hg_config.writer_hostgroup;
+	const auto& policy = hg_config->policy;
+	route_ctx.writer_scope.hg = hg_config->writer_hostgroup;
 	if (route_ctx.writer_scope.hg < 0) route_ctx.writer_scope.hg = current_hg;  // already the writer HG
-	route_ctx.reader_hg = hg_config.reader_hostgroup;
-	if (hg_config.writer_epoch) {
-		route_ctx.writer_scope.epoch = hg_config.writer_epoch->load(std::memory_order_acquire);
+	route_ctx.reader_hg = hg_config->reader_hostgroup;
+	if (hg_config->writer_epoch) {
+		route_ctx.writer_scope.epoch =
+			hg_config->writer_epoch->load(std::memory_order_acquire);
 		polardb_query.request_writer_scope = route_ctx.writer_scope;
 	}
 
@@ -323,7 +381,7 @@ void PgSQL_Session::polardb_collect(PolarDB_Query_RouteCtx& route_ctx,
 
 	// Session LSN positions. SESSION_LSN waits on max(write_lsn, observed_lsn).
 	// Re-bind the session LSN state to the current writer scope first, so a scope
-	// change clears both components and both missing-LSN latches before we snapshot
+	// change clears both components and both missing-LSN sticky flags before we snapshot
 	// them. The snapshot taken into route_ctx is then valid for this writer.
 	if (polardb_query.request_writer_scope.valid()) {
 		polardb_scope_session_lsn(this, route_ctx.writer_scope, "COLLECT");
@@ -390,6 +448,53 @@ void PgSQL_Session::polardb_collect(PolarDB_Query_RouteCtx& route_ctx,
 	// ROLLBACK; otherwise autocommit reads can be misclassified and the backend
 	// rejects `polar_xact_split_xids` with "without begin".
 	route_ctx.in_transaction = is_in_transaction();
+
+	const bool track_txn_reader_wait_safety =
+		lsn_mode && route_ctx.txn_split_enabled && route_ctx.reader_hg >= 0;
+	if (track_txn_reader_wait_safety && CurrentQuery.QueryPointer) {
+		const char* query = (const char*)CurrentQuery.QueryPointer;
+		const size_t query_len = CurrentQuery.QueryLength;
+		if (CurrentQuery.PgQueryCmd == PGSQL_QUERY_BEGIN &&
+				polardb_query_mentions_non_read_committed(query, query_len)) {
+			polardb_note_txn_non_read_committed("begin_isolation");
+		}
+		if (CurrentQuery.PgQueryCmd == PGSQL_QUERY_SET) {
+			const std::string normalized =
+				polardb_normalize_query_words(query, query_len);
+			const bool mentions_non_read_committed =
+				polardb_normalized_mentions_non_read_committed(normalized);
+			const bool mentions_read_committed =
+				polardb_normalized_mentions_read_committed(normalized);
+			if (polardb_normalized_sets_session_isolation_default(normalized)) {
+				// PostgreSQL isolation is not part of PgSQL's tracked-variable
+				// table. For PolarDB pre-write reader waits, keep a compact
+				// session-level gate from the operator attribute and explicit
+				// session/default isolation SET statements. DEFAULT/unknown fails
+				// closed to the primary.
+				const bool read_committed =
+					mentions_read_committed && !mentions_non_read_committed;
+				polardb_config.txn_reader_wait_default_read_committed =
+					read_committed;
+				POLARDB_TRACE(
+					"PolarDB TXN_WAIT: session isolation default "
+					"read_committed=%d\n",
+					read_committed ? 1 : 0);
+			}
+			if (mentions_non_read_committed) {
+				polardb_note_txn_non_read_committed("set_transaction_isolation");
+			}
+			if (route_ctx.in_transaction) {
+				// SET LOCAL and transaction-scoped SET change backend-local state on
+				// the primary transaction connection. Until replay of that state is
+				// modeled, pre-write reader waits must stay on the primary.
+				polardb_note_txn_local_state_change("in_transaction_set");
+			}
+		}
+	}
+	route_ctx.txn_reader_wait_isolation_read_committed =
+		polardb_txn_reader_wait_isolation_read_committed();
+	route_ctx.txn_reader_wait_local_state_clean =
+		!polardb_txn_local_state_changed;
 
 	// Per-query routing hint parsed from the query's first comment
 	// (a leading SQL comment "/* route=primary */"); plan turns it into a force-writer route.
@@ -484,15 +589,17 @@ void PgSQL_Session::polardb_reader_lag_plan(
  * Decision tree (mode = resolved consistency mode, OFF / LSN / PRIMARY only):
  *   1. Fast paths: non-PolarDB HG, no reader HG, not replica-eligible.
  *   2. Mode decisions: PRIMARY -> force writer; OFF -> passthrough (no reroute).
- *   3. Core rule: explicit txn / multi-statement -> writer (the LSN feature is
- *      autocommit + simple-query only).
+ *   3. Core rule: unsafe explicit txn / multi-statement -> writer. Before the
+ *      first transaction write, a READ COMMITTED safe SELECT may use the normal
+ *      reader wait path; after XIDs exist, transaction split handles eligible
+ *      reads.
  *      Extended protocol normally keeps regular ProxySQL qpo routing and does
  *      not enter this planner; if it does, the defensive branch below fails
  *      closed to the writer instead of producing a wait wrapper.
  *   4. Consistency subdecision: build a query consistency snapshot and ask
  *      PolarDB_Query_WaitPlan::build_consistency() for the wait payload. The final
  *      route still belongs to this function.
- *   5. Unknown-LSN rules: missing write or observed RFQ latches are handled
+ *   5. Unknown-LSN rules: missing write or observed RFQ sticky flags are handled
  *      before building a wait target, according to the RFQ route policy.
  *   6. Session target rule: protected reads wait on the session consistency
  *      target, with the configured baseline providing an initial
@@ -706,7 +813,9 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(const PolarDB_Query_RouteCtx
 
 	// Remaining hard guards: unsafe query shapes stay on the primary.
 	auto required_reason =
-		polardb_writer_required_reason(route_ctx.in_transaction, route_ctx.is_multi_statement);
+		polardb_writer_required_reason(
+			route_ctx.in_transaction && !allow_transaction_wait_read,
+			route_ctx.is_multi_statement);
 	if (required_reason != PolarDB_Query_RoutePlan::RouteActionReason::NONE) {
 		plan = PolarDB_Query_RoutePlan::force_primary(
 			route_ctx.writer_scope.hg, required_reason);
@@ -717,7 +826,7 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(const PolarDB_Query_RouteCtx
 	}
 
 	// A prior RFQ finished without an LSN while write or observed session state
-	// needed to be latched. In LSN mode, ProxySQL cannot build the exact wait
+	// needed to be marked unknown. In LSN mode, ProxySQL cannot build the exact wait
 	// target for later automatic reads. Do not guess from monitor/global LSN:
 	// apply the RFQ route policy only after hard query-shape guards have had a
 	// chance to force the writer.
@@ -800,9 +909,12 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(const PolarDB_Query_RouteCtx
 		// also safe for extended protocol: no wrapper is needed.
 		plan.action = PolarDB_Query_RoutePlan::RouteAction::PASSTHROUGH;
 		plan.target_hg = route_ctx.reader_hg;
+		plan.txn_wait_read = allow_transaction_wait_read;
 		POLARDB_TRACE(
-			"PolarDB PLAN: no consistency wait needed (session_lsn=%lu) -> reader=%d\n",
-			(unsigned long)session_lsn, route_ctx.reader_hg);
+			"PolarDB PLAN: no consistency wait needed (session_lsn=%lu) -> "
+			"reader=%d txn_wait_read=%d\n",
+			(unsigned long)session_lsn, route_ctx.reader_hg,
+			allow_transaction_wait_read ? 1 : 0);
 		return plan;
 	}
 
@@ -828,6 +940,7 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(const PolarDB_Query_RouteCtx
 	plan.action          = PolarDB_Query_RoutePlan::RouteAction::REPLICA_WITH_WAIT;
 	plan.target_hg       = route_ctx.reader_hg;
 	plan.wait_spec            = wait_plan.spec;
+	plan.txn_wait_read = allow_transaction_wait_read;
 	plan.reader.consistency_target_lsn = wait_plan.spec.target;
 	plan.reader.fallback_writer_hg = route_ctx.writer_scope.hg;
 	plan.reader.route_rfq_policy = route_ctx.route_rfq_policy;
@@ -852,7 +965,7 @@ void PgSQL_Session::polardb_account_route_plan(
 	if (plan.degraded_rfq_route) {
 		POLARDB_THREAD_COUNT_ONE(thread, rfq_best_effort_degraded_routes);
 		// The per-query client notice is always enqueued, but the operator log
-		// warning is fired at most once per run of degraded routes: the latch
+		// warning is fired at most once per run of degraded routes: the sticky flag
 		// suppresses repeats until a non-degraded route clears it below. This keeps
 		// a sustained degradation from flooding the log.
 		polardb_enqueue_degraded_rfq_notice(plan, route_ctx);
@@ -898,6 +1011,31 @@ PolarDB_Query_ExecuteResult PgSQL_Session::polardb_execute(
 	// Reset per-query wait state. The reader target is reset before the pipeline
 	// (Session.cpp), so it is clean on entry here.
 	polardb_query.reset_wait();
+
+	if (plan.txn_wait_read) {
+		if (polardb_wait_disabled) {
+			result.final_target_hg = route_ctx.writer_scope.hg;
+			POLARDB_TRACE(
+				"PolarDB EXECUTE: transaction wait read disabled, using primary_hg=%d\n",
+				route_ctx.writer_scope.hg);
+			return result;
+		}
+		if (polardb_prepare_txn_wait_read(plan, route_ctx, pkt)) {
+			result.final_target_hg = plan.target_hg;
+			POLARDB_TRACE(
+				"PolarDB EXECUTE: transaction wait read prepared reader_hg=%d "
+				"primary_hg=%d target_lsn=%lu\n",
+				plan.target_hg, route_ctx.writer_scope.hg,
+				(unsigned long)plan.wait_spec.target);
+			return result;
+		}
+		result.final_target_hg = route_ctx.writer_scope.hg;
+		POLARDB_TRACE(
+			"PolarDB EXECUTE: transaction wait read prepare declined; "
+			"using primary_hg=%d\n",
+			route_ctx.writer_scope.hg);
+		return result;
+	}
 
 	if (plan.action == PolarDB_Query_RoutePlan::RouteAction::PASSTHROUGH) {
 		POLARDB_TRACE(
@@ -995,7 +1133,7 @@ PolarDB_Query_ExecuteResult PgSQL_Session::polardb_execute(
  * Parse/Bind/Execute streams. Manual destination_hostgroup rules are left
  * untouched; automatic replica_eligible=1 reads may use a reader only when the
  * session has no wait target. If the session has a write/observed target, or a
- * missing-LSN latch is set, the planner returns FORCE_PRIMARY and this helper
+ * missing-LSN sticky flag is set, the planner returns FORCE_PRIMARY and this helper
  * pins the extended read to the writer.
  */
 void PgSQL_Session::polardb_apply_extended_route()
@@ -1099,8 +1237,8 @@ void PgSQL_Session::polardb_apply_extended_route()
  *     server-RFQ counter move only after the group+epoch-aware cache update
  *     accepts the RFQ as current request data.
  *
- * The result-processing stage only updates the session LSN latches and
- * per-server LSN cache.
+ * The result-processing stage only updates session LSN state and the per-server
+ * LSN cache.
  *
  * @param myds              Backend data stream that produced the result.
  * @param query_digest_text Digest text of the query (write classification).
@@ -1121,24 +1259,43 @@ void PgSQL_Session::polardb_process_result(PgSQL_Data_Stream* myds, const char* 
 	int backend_writer_hg = -1;
 	int backend_consistency_mode = -1;
 	uint64_t backend_writer_epoch = 0;
-	PgSQL_HostGroups_Manager::PolarDB_HG_Config backend_config;
+	const PgSQL_HostGroups_Manager::PolarDB_HG_Config* backend_config = nullptr;
 	if (backend_srv && backend_srv->myhgc) {
 		backend_hg = (int)backend_srv->myhgc->hid;
-		backend_config = PgHGM->get_polardb_hg_config((unsigned int)backend_hg);
-		backend_is_polar_hg = backend_config.is_polardb_hostgroup;
-		backend_writer_hg = backend_config.writer_hostgroup;
-		backend_consistency_mode = backend_config.policy.consistency_mode;
-		if (backend_config.writer_epoch) {
+		backend_config =
+			PgHGM->find_polardb_hg_config((unsigned int)backend_hg);
+		backend_is_polar_hg =
+			backend_config && backend_config->is_polardb_hostgroup;
+		backend_writer_hg = backend_config ?
+			backend_config->writer_hostgroup : -1;
+		backend_consistency_mode = backend_config ?
+			backend_config->policy.consistency_mode : -1;
+		if (backend_config && backend_config->writer_epoch) {
 			backend_writer_epoch =
-				backend_config.writer_epoch->load(std::memory_order_acquire);
+				backend_config->writer_epoch->load(std::memory_order_acquire);
 		}
 	}
 	bool is_write = PolarDB_Protocol::is_write_query(query_digest_text);
+	const int effective_consistency_mode = polardb_resolve_consistency_mode(
+		polardb_config.session_consistency_mode,
+		backend_consistency_mode,
+		pgsql_thread___polardb_consistency_mode);
+	const bool lsn_consistency_mode =
+		effective_consistency_mode >= 0 &&
+		polardb_consistency_from_int(effective_consistency_mode) ==
+			PolarDB_ConsistencyMode::SESSION_LSN;
+	// Split RFQ observation is only operationally meaningful in LSN mode. In
+	// mode=primary/off, planning cannot dispatch split reads, so the observer is
+	// called with split disabled to clear stale state without inflating
+	// transaction-split state counters.
+	const bool split_observation_enabled =
+		backend_config && backend_config->policy.txn_split_enabled &&
+		lsn_consistency_mode;
 	auto attach_request_epoch_to_session_lsn = [&]() {
 		// Automatic routes were already scoped in collect(). Manual
 		// destination-hostgroup routes skip collect but still capture a request
 		// writer epoch, so result processing must attach that scope before it
-		// mutates session LSN targets or missing-LSN latches.
+		// mutates session LSN targets or missing-LSN sticky flags.
 		if (polardb_query.request_writer_scope.valid() &&
 				!polardb_session_consistency.writer_scope.matches(
 					polardb_query.request_writer_scope)) {
@@ -1151,11 +1308,11 @@ void PgSQL_Session::polardb_process_result(PgSQL_Data_Stream* myds, const char* 
 
 	auto polardb_process_positioned_rfq = [&]() -> bool {
 		bool rfq_accepted = false;
-		if (backend_srv && backend_hg >= 0) {
+		if (backend_srv && backend_hg >= 0 && backend_config) {
 			rfq_accepted = PgHGM->polardb_update_server_lsn(
 				backend_srv,
 				(unsigned int)backend_hg,
-				backend_config,
+				*backend_config,
 				lsn,
 				polardb_query.request_writer_scope);
 		}
@@ -1170,7 +1327,8 @@ void PgSQL_Session::polardb_process_result(PgSQL_Data_Stream* myds, const char* 
 				polardb_query.request_writer_scope.valid() ? 1 : 0,
 				backend_hg, backend_writer_hg,
 				(unsigned long)backend_writer_epoch,
-				backend_config.writer_epoch ? 1 : 0, (unsigned long)lsn,
+				backend_config && backend_config->writer_epoch ? 1 : 0,
+				(unsigned long)lsn,
 				is_write ? 1 : 0, (void*)myds->myconn->parent);
 			return false;
 		}
@@ -1195,7 +1353,7 @@ void PgSQL_Session::polardb_process_result(PgSQL_Data_Stream* myds, const char* 
 		if (positioned_rfq_from_primary) {
 			if (polardb_session_consistency.write_unknown || polardb_session_consistency.observed_unknown) {
 				POLARDB_TRACE(
-					"PolarDB PROCESS_RESULT: primary RFQ LSN restored missing-LSN latches "
+					"PolarDB PROCESS_RESULT: primary RFQ LSN restored missing-LSN sticky flags "
 					"(backend_hg=%d writer_hg=%d)\n",
 					backend_hg, backend_writer_hg);
 			}
@@ -1224,11 +1382,11 @@ void PgSQL_Session::polardb_process_result(PgSQL_Data_Stream* myds, const char* 
 	};
 
 	auto polardb_process_missing_rfq = [&]() {
-		if (!backend_config.writer_epoch ||
+		if (!backend_config || !backend_config->writer_epoch ||
 			!polardb_query.request_writer_scope.matches(
 				PolarDB_WriterScope{backend_writer_hg, backend_writer_epoch})) {
 			POLARDB_TRACE(
-				"PolarDB PROCESS_RESULT: skip missing-LSN latch due to writer "
+				"PolarDB PROCESS_RESULT: skip missing-LSN sticky flag due to writer "
 				"group/epoch request_hg=%d request_epoch=%lu request_valid=%d "
 				"current_hg=%d current_epoch=%lu current_valid=%d "
 				"backend_hg=%d is_write=%d\n",
@@ -1237,7 +1395,7 @@ void PgSQL_Session::polardb_process_result(PgSQL_Data_Stream* myds, const char* 
 				polardb_query.request_writer_scope.valid() ? 1 : 0,
 				backend_writer_hg,
 				(unsigned long)backend_writer_epoch,
-				backend_config.writer_epoch ? 1 : 0,
+				backend_config && backend_config->writer_epoch ? 1 : 0,
 				backend_hg, is_write ? 1 : 0);
 			return;
 		}
@@ -1263,8 +1421,8 @@ void PgSQL_Session::polardb_process_result(PgSQL_Data_Stream* myds, const char* 
 
 		// RFQ carried no LSN. On a PolarDB backend with _polar_send_lsn this should
 		// not happen for a writer query. If it does, preserve attribution: missing
-		// write LSN latches write_unknown; missing tracked read LSN latches
-		// observed_unknown. Do not poison mode=off sessions.
+		// write LSN sets write_unknown; missing tracked read LSN sets
+		// observed_unknown. Do not change mode=off sessions.
 		if (is_write) {
 			const bool first_unknown_write = !polardb_session_consistency.write_unknown;
 			polardb_session_consistency.write_unknown = true;
@@ -1277,13 +1435,8 @@ void PgSQL_Session::polardb_process_result(PgSQL_Data_Stream* myds, const char* 
 					this, query_digest_text ? query_digest_text : "(null)");
 			}
 		} else {
-			const int effective_mode = polardb_resolve_consistency_mode(
-				polardb_config.session_consistency_mode,
-				backend_consistency_mode,
-				pgsql_thread___polardb_consistency_mode);
 			if (backend_is_polar_hg &&
-				effective_mode >= 0 &&
-				polardb_consistency_from_int(effective_mode) == PolarDB_ConsistencyMode::SESSION_LSN) {
+				lsn_consistency_mode) {
 				const bool first_unknown_observed = !polardb_session_consistency.observed_unknown;
 				polardb_session_consistency.observed_unknown = true;
 				POLARDB_THREAD_COUNT_ONE(thread, read_missing_lsn);
@@ -1291,7 +1444,7 @@ void PgSQL_Session::polardb_process_result(PgSQL_Data_Stream* myds, const char* 
 					proxy_warning(
 						"PolarDB PROCESS_RESULT: read query completed without RFQ LSN while SESSION_LSN "
 						"tracking is active; automatic LSN-mode reads in this session will use "
-						"writer while the observed-LSN gap remains latched (sess=%p digest='%.60s')\n",
+						"writer while the observed-LSN gap remains marked unknown (sess=%p digest='%.60s')\n",
 						this, query_digest_text ? query_digest_text : "(null)");
 				}
 			}

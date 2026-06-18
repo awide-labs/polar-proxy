@@ -791,7 +791,7 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 		std::atomic<unsigned long long> polardb_tl_cache_bypassed_for_target{0}; // thread-local cache bypasses for consistency-target RFQ-LSN reads
 		std::atomic<unsigned long long> polardb_target_lsn_preferred{0};     // reader choice narrowed to fresh cached LSN >= target
 		std::atomic<unsigned long long> polardb_target_lsn_fallback_wait{0}; // no target-reached reader acquired; wrapper remains correctness gate
-		std::atomic<unsigned long long> polardb_session_target_epoch_reset{0}; // session LSN targets/latches cleared after writer group/epoch change
+		std::atomic<unsigned long long> polardb_session_target_epoch_reset{0}; // session LSN targets/sticky flags cleared after writer group/epoch change
 
 		// Wait wrapping / RYW routing counters.
 		//
@@ -1167,7 +1167,13 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 
 	/**
 	 * @brief Read PolarDB topology and policy from the generation snapshot.
+	 *
+	 * The pointer form is for hot paths that only need to inspect the immutable
+	 * snapshot entry during the current call. It avoids copying the shared atomic
+	 * cells embedded in PolarDB_HG_Config. The pointer remains valid until this
+	 * thread refreshes its cached topology snapshot.
 	 */
+	const PolarDB_HG_Config* find_polardb_hg_config(unsigned int hostgroup_id);
 	PolarDB_HG_Config get_polardb_hg_config(unsigned int hostgroup_id);
 
 	PolarDB_HG_Policy get_polardb_hg_policy(unsigned int hostgroup_id);
@@ -1268,7 +1274,8 @@ private:
 	uint64_t get_pgsql_servers_checksum(SQLite3_result* runtime_pgsql_servers = nullptr);
 	uint64_t get_pgsql_servers_v2_checksum(SQLite3_result* incoming_pgsql_servers_v2 = nullptr);
 #if POLARDB_PROXY
-	std::shared_ptr<const PolarDB_TopologySnapshot> get_polardb_topology_snapshot_cached() const;
+	const std::shared_ptr<const PolarDB_TopologySnapshot>&
+		get_polardb_topology_snapshot_cached() const;
 	std::string polardb_writer_identity_locked(unsigned int writer_hostgroup_id);
 	void polardb_reset_lsn_cache_for_hostgroup_locked(unsigned int hostgroup_id);
 	void polardb_refresh_writer_epoch_locked(unsigned int writer_hostgroup_id, const char* reason);

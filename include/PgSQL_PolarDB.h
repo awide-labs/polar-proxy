@@ -54,12 +54,12 @@ class PgSQL_SrvC;
 //      "PolarDB LSN CACHE ..."       per-server LSN cache ENTER/EXIT
 //      "PolarDB WAIT ..."       wait-timeout NOTICE capture/forward
 //
-// 2) POLARDB_DEBUG numbered FSM/request traces -- OPT-IN (off by default). Build a
+// 2) POLARDB_DEBUG numbered state-machine/request traces -- OPT-IN (off by default). Build a
 //    full-trace binary with `make polardb-debug` (== POLARDB_PROXY=1 POLARDB_DEBUG=1),
 //    or compile with -DPOLARDB_DEBUG=1. Each tag carries a per-call counter for
 //    correlating one request through the dispatch state machine:
 //      [H...]  PgSQL_Connection::handler()       ENTRY + handler_again STATE on every
-//                                                async-state transition (full FSM flow)
+//                                                async-state transition (full state flow)
 //      [RQ...] PgSQL_Session::RunQuery()         ENTRY + query ptr/len + async_query call/return
 //      [SH...] PgSQL_Session::handler()          ENTRY
 //      [S...]  session RC handling               rc disposition after RunQuery
@@ -85,7 +85,7 @@ class PgSQL_SrvC;
 // build and to nothing otherwise (its args are discarded, so it costs nothing in
 // a release build). `make polardb-debug` (POLARDB_PROXY=1 POLARDB_DEBUG=1, or
 // -DPOLARDB_DEBUG=1) yields an optimized binary that carries the full
-// request-flow + FSM tracing below.
+// request-flow + state-machine tracing below.
 #if POLARDB_PROXY && POLARDB_DEBUG
 #define POLARDB_TRACE(fmt, ...) proxy_info(fmt, ##__VA_ARGS__)
 #else
@@ -150,7 +150,7 @@ static constexpr unsigned int POLARDB_REPLICA_FAILURE_ERROR_CODE = 9999;
 //
 // Two mechanisms are used:
 //
-//   (A) Atomic env-latch one-shots — read an environment variable once and fire
+//   (A) Atomic environment one-shots — read an environment variable once and fire
 //       exactly once per process via std::atomic<bool> CAS. Set BEFORE ProxySQL
 //       starts. These do NOT use the file helper.
 //
@@ -1118,7 +1118,7 @@ struct PolarDB_HealthCheck {
  * The caller supplies values from the PolarDB topology snapshot for the backend
  * hostgroup that produced the result. An LSN seen from a replica still advances
  * the session's observed LSN, but only an LSN seen from the writer is allowed to
- * clear the "missing LSN" latches (see PolarDB_SessionConsistency).
+ * clear the "missing LSN" sticky flags (see PolarDB_SessionConsistency).
  */
 static inline bool polardb_positioned_rfq_from_primary(
     bool is_polardb_hostgroup,
@@ -1170,7 +1170,7 @@ struct PolarDB_WriterScope {
  * reads wait on max(write_lsn, observed_lsn), so a later read never goes behind
  * either its own writes or a fresher replica result it already observed.
  *
- * Missing-LSN latches are event-attributed: a write result without RFQ LSN sets
+ * Missing-LSN sticky flags are event-attributed: a write result without RFQ LSN sets
  * write_unknown, while a tracked read without RFQ LSN sets observed_unknown.
  * They share policy handling but keep operator diagnostics distinct.
  */
@@ -2067,7 +2067,7 @@ struct PolarDB_Query_ReaderPlan {
 /**
  * @brief Per-query PolarDB routing/wait state.
  *
- * These fields are consumed across session FSM stages: planning records the
+ * These fields are consumed across session state-machine stages: planning records the
  * reader/wait intent, backend acquisition consumes the reader target, wrapping
  * consumes the wait state, and the connection layer copies dispatch-wrapper
  * metadata. The reset methods intentionally clear different subsets; do not
@@ -2078,6 +2078,7 @@ struct PolarDB_QueryState {
     PolarDB_Query_ReaderPlan reader_plan;
     PolarDB_Query_WaitState wait;
     std::string wrapped_query_buf;
+    uint8_t reader_retry_attempts = 0;
     uint32_t dispatch_wrapper_stmts = 0;
     PolarDB_Query_WrapperKind dispatch_wrapper_kind =
         PolarDB_Query_WrapperKind::NONE;
@@ -2100,6 +2101,7 @@ struct PolarDB_QueryState {
         request_writer_scope.reset();
         reset_wait();
         wrapped_query_buf.clear();
+        reader_retry_attempts = 0;
         reset_dispatch_wrapper();
     }
 };
@@ -2176,6 +2178,7 @@ struct PolarDB_Query_RoutePlan {
     RouteAction action = RouteAction::PASSTHROUGH;
     RouteActionReason action_reason = RouteActionReason::NONE;
     bool degraded_rfq_route = false;       // best-effort route without enforceable RFQ target
+    bool txn_wait_read = false;            // pre-write in-transaction read using a temporary reader backend
 
     /// @brief Build a plan that forces the read to the writer hostgroup.
     static PolarDB_Query_RoutePlan force_primary(int writer_hg,

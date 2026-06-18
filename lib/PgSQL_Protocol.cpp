@@ -920,6 +920,9 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 		//(*myds)->sess->default_schema = default_schema; // just the pointer is passed
 		if ((*myds)->sess->user_attributes) free((*myds)->sess->user_attributes);
 		(*myds)->sess->user_attributes = attributes; // just the pointer is passed
+#if POLARDB_PROXY
+		(*myds)->sess->polardb_apply_user_attributes(attributes);
+#endif // POLARDB_PROXY
 		//(*myds)->sess->schema_locked = schema_locked;
 		(*myds)->sess->transaction_persistent = transaction_persistent;
 		(*myds)->sess->session_fast_forward = SESSION_FORWARD_TYPE_NONE; // default

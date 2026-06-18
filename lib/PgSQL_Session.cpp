@@ -394,7 +394,7 @@ void PgSQL_Session::reset() {
 	}
 	// Free any per-query PolarDB wait/notice state on session reset so a recycled
 	// session never carries a stale wait or leaks a captured NoticeResponse.
-	// Clearing the per-session consistency override happens in the RESET/DISCARD
+	// Clearing per-session PolarDB overrides happens in the RESET/DISCARD
 	// command handlers, not here.
 #if POLARDB_PROXY
 	polardb_query.reset_for_new_query();
@@ -2608,7 +2608,8 @@ __implicit_sync:
 											}
 											PolarDB_Query_RoutePlan plan = polardb_plan(polardb_route_ctx);
 											polardb_account_route_plan(plan, polardb_route_ctx);
-											if (plan.action != PolarDB_Query_RoutePlan::RouteAction::PASSTHROUGH) {
+											if (plan.action != PolarDB_Query_RoutePlan::RouteAction::PASSTHROUGH ||
+													plan.txn_wait_read) {
 												PolarDB_Query_ExecuteResult result = polardb_execute(
 													plan, polardb_route_ctx, pkt);
 												current_hostgroup = result.final_target_hg;
@@ -3868,7 +3869,7 @@ handler_again:
 				finishQuery(myds, myconn,
 					has_pending_messages
 #if POLARDB_PROXY
-					|| polardb_split_completed
+					|| polardb_txn_reader_completed
 #endif // POLARDB_PROXY
 				);
 
@@ -3876,10 +3877,12 @@ handler_again:
 				if (polardb_split_completed) {
 					if (polardb_split_wrapper_failed) {
 						polardb_abort_txn_split_read("wrapper statement failed");
-					} else {
-						polardb_complete_txn_split_read();
+						} else {
+							polardb_complete_txn_split_read();
+						}
+					} else if (polardb_txn_wait_completed) {
+						polardb_complete_txn_wait_read();
 					}
-				}
 #endif // POLARDB_PROXY
 
 				if (processing_extended_query) {
@@ -4913,12 +4916,12 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 	// PostgreSQL has no MySQL-style `SET a=..., b=...`; comma tails are value
 	// lists for the same variable, so there is no later-assignment partial
 	// apply case to stage here.
-	std::string polar_var_name;
-	std::string polar_mode_value;
+	std::string polar_pvar;
+	std::string polar_value;
 	if (RE2::FullMatch(nq,
-		"(?i)\\s*SET\\s+proxysql\\.([a-zA-Z0-9_]+)\\s*(?:=|TO)\\s*([^\\s;]+)\\s*",
-		&polar_var_name, &polar_mode_value)) {
-		return handle_polardb_internal_set(polar_var_name, polar_mode_value);
+		"(?i)\\s*SET\\s+proxysql\\.([A-Za-z0-9_]+)\\s*(?:=|TO)\\s*([^\\s;]+)\\s*",
+		&polar_pvar, &polar_value)) {
+		return handle_polardb_internal_set(polar_pvar, polar_value);
 	}
 #endif // POLARDB_PROXY
 	if (
@@ -4993,23 +4996,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 			// and are not forwarded to the backend.
 			if (var.size() > 9 && strncasecmp(var.c_str(), "proxysql.", 9) == 0) {
 				std::string pvar = var.substr(9);
-				if (strcasecmp(pvar.c_str(), "polardb_consistency_mode") == 0) {
-					int mode = -1;
-					if (!parse_polardb_consistency_mode_value(value1, &mode)) {
-						return reject_polardb_consistency_mode_value();
-					}
-					polardb_set_session_override(mode);
-					continue;
-				}
-
-				std::string errmsg = "unrecognized proxysql parameter: " + var;
-				client_myds->DSS = STATE_QUERY_SENT_NET;
-				bool send_ready_packet = is_extended_query_ready_for_query();
-				client_myds->myprot.generate_error_packet(true, send_ready_packet,
-					errmsg.c_str(),
-					PGSQL_ERROR_CODES::ERRCODE_INVALID_PARAMETER_VALUE, false, true);
-				RequestEnd(NULL, true);
-				return true;
+				return handle_polardb_internal_set(pvar, value1);
 			}
 #endif // POLARDB_PROXY
 			if (std::find(pgsql_critical_variables.begin(), pgsql_critical_variables.end(), var) != pgsql_critical_variables.end() ||
@@ -5193,39 +5180,18 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 				pvar.pop_back();
 			}
 
+			bool recognized = true;
 			if (strcasecmp(pvar.c_str(), "polardb_consistency_mode") == 0) {
-				polardb_clear_staged_wait_state_for_reset(/*reset_override=*/true);
+				polardb_clear_staged_wait_state_for_reset(/*reset_override=*/false);
 				polardb_set_session_override(-1);
-				client_myds->DSS = STATE_QUERY_SENT_NET;
-				bool send_ready_packet = is_extended_query_ready_for_query();
-				unsigned int nTrx = NumActiveTransactions();
-				const char txn_state = (nTrx ? 'T' : 'I');
-				client_myds->myprot.generate_ok_packet(true, send_ready_packet, NULL, 0, dig, txn_state, NULL, {});
-
-				if (mirror == false) {
-					RequestEnd(NULL, false);
-				} else {
-					client_myds->DSS = STATE_SLEEP;
-					status = WAITING_CLIENT_DATA;
-				}
-				return true;
 			} else if (strcasecmp(pvar.c_str(), "polardb_txn_split_warmup") == 0) {
 				polardb_clear_staged_wait_state_for_reset(/*reset_override=*/false);
 				polardb_set_txn_split_warmup_mode(-1);
-				client_myds->DSS = STATE_QUERY_SENT_NET;
-				bool send_ready_packet = is_extended_query_ready_for_query();
-				unsigned int nTrx = NumActiveTransactions();
-				const char txn_state = (nTrx ? 'T' : 'I');
-				client_myds->myprot.generate_ok_packet(true, send_ready_packet, NULL, 0, dig, txn_state, NULL, {});
-
-				if (mirror == false) {
-					RequestEnd(NULL, false);
-				} else {
-					client_myds->DSS = STATE_SLEEP;
-					status = WAITING_CLIENT_DATA;
-				}
-				return true;
 			} else {
+				recognized = false;
+			}
+
+			if (!recognized) {
 				std::string errmsg = "unrecognized proxysql parameter: proxysql." + pvar;
 				client_myds->DSS = STATE_QUERY_SENT_NET;
 				bool send_ready_packet = is_extended_query_ready_for_query();
@@ -5235,6 +5201,19 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 				RequestEnd(NULL, true);
 				return true;
 			}
+			client_myds->DSS = STATE_QUERY_SENT_NET;
+			bool send_ready_packet = is_extended_query_ready_for_query();
+			unsigned int nTrx = NumActiveTransactions();
+			const char txn_state = (nTrx ? 'T' : 'I');
+			client_myds->myprot.generate_ok_packet(true, send_ready_packet, NULL, 0, dig, txn_state, NULL, {});
+
+			if (mirror == false) {
+				RequestEnd(NULL, false);
+			} else {
+				client_myds->DSS = STATE_SLEEP;
+				status = WAITING_CLIENT_DATA;
+			}
+			return true;
 		}
 	}
 #endif // POLARDB_PROXY
@@ -5345,9 +5324,12 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 	}
 #if POLARDB_PROXY
 	// Any successfully handled RESET drops staged per-query wait/notice state.
-	// Only RESET ALL and RESET proxysql.polardb_consistency_mode clear the
-	// per-session consistency override.
+	// RESET ALL clears all PolarDB session overrides. Single-variable
+	// RESET proxysql.* paths above clear only the named override.
 	polardb_clear_staged_wait_state_for_reset(reset_override);
+	if (reset_override) {
+		polardb_reapply_user_attributes_after_reset();
+	}
 #endif // POLARDB_PROXY
 	client_myds->DSS = STATE_QUERY_SENT_NET;
 
@@ -5400,8 +5382,8 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 		bool transaction_persistent = this->transaction_persistent;
 
 #if POLARDB_PROXY
-		// Full session reset: clear staged PolarDB wait/notice state and the
-		// consistency override, and FREE pending notices BEFORE reset()/init() so a
+		// Full session reset: clear staged PolarDB wait/notice state and
+		// session overrides, and FREE pending notices BEFORE reset()/init() so a
 		// later re-init can never leak an allocated queue.
 		polardb_clear_staged_wait_state_for_reset(/*reset_override=*/true);
 #endif // POLARDB_PROXY
@@ -5413,6 +5395,9 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 		// Recover the relevant session values
 		this->default_hostgroup = default_hostgroup;
 		this->transaction_persistent = transaction_persistent;
+#if POLARDB_PROXY
+		polardb_reapply_user_attributes_after_reset();
+#endif // POLARDB_PROXY
 		handled = true;
 	} else if (strncasecmp(discard_value, "PLANS", 5) == 0) {
 		// ignore
@@ -5905,8 +5890,8 @@ void PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 		bool transaction_persistent = this->transaction_persistent;
 
 #if POLARDB_PROXY
-		// Full session reset: clear staged PolarDB wait/notice state and the
-		// consistency override, and FREE pending notices BEFORE reset()/init() so a
+		// Full session reset: clear staged PolarDB wait/notice state and
+		// session overrides, and FREE pending notices BEFORE reset()/init() so a
 		// later re-init can never leak an allocated queue.
 		polardb_clear_staged_wait_state_for_reset(/*reset_override=*/true);
 #endif // POLARDB_PROXY
@@ -5920,16 +5905,9 @@ void PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 		this->transaction_persistent = transaction_persistent;
 		//-- client_myds->myconn->set_charset(default_charset, NAMES);
 
-		if (user_attributes != NULL && strlen(user_attributes)) {
-			nlohmann::json j_user_attributes = nlohmann::json::parse(user_attributes);
-			auto default_transaction_isolation = j_user_attributes.find("default-transaction_isolation");
-
-			if (default_transaction_isolation != j_user_attributes.end()) {
-				std::string def_trx_isolation_val =
-					j_user_attributes["default-transaction_isolation"].get<std::string>();
-				pgsql_variables.client_set_value(this, SQL_ISOLATION_LEVEL, def_trx_isolation_val.c_str());
-			}
-		}
+#if POLARDB_PROXY
+		polardb_reapply_user_attributes_after_reset();
+#endif // POLARDB_PROXY
 
 		l_free(pkt->size, pkt->ptr);
 		client_myds->setDSS_STATE_QUERY_SENT_NET();

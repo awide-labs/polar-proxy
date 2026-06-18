@@ -4792,7 +4792,7 @@ void PgSQL_HostGroups_Manager::polardb_refresh_all_writer_epochs_locked(
 	}
 }
 
-std::shared_ptr<const PgSQL_HostGroups_Manager::PolarDB_TopologySnapshot>
+const std::shared_ptr<const PgSQL_HostGroups_Manager::PolarDB_TopologySnapshot>&
 PgSQL_HostGroups_Manager::get_polardb_topology_snapshot_cached() const {
 	const uint64_t generation = polardb_topology_generation_.load(std::memory_order_acquire);
 	static thread_local const PgSQL_HostGroups_Manager* cached_owner = nullptr;
@@ -4808,11 +4808,8 @@ PgSQL_HostGroups_Manager::get_polardb_topology_snapshot_cached() const {
 	if (cached_generation != generation) {
 		auto snapshot = std::atomic_load_explicit(&polardb_topology_snapshot_,
 			std::memory_order_acquire);
-		if (!snapshot || snapshot->generation != generation) {
-			return snapshot;
-		}
 		cached_snapshot = snapshot;
-		cached_generation = generation;
+		cached_generation = snapshot ? snapshot->generation : 0;
 	}
 
 	return cached_snapshot;
@@ -4820,7 +4817,7 @@ PgSQL_HostGroups_Manager::get_polardb_topology_snapshot_cached() const {
 
 bool PgSQL_HostGroups_Manager::is_polardb_hostgroup(unsigned int hostgroup_id) {
 	if (!status.polardb_active.load(std::memory_order_relaxed)) return false;
-	auto snapshot = get_polardb_topology_snapshot_cached();
+	const auto& snapshot = get_polardb_topology_snapshot_cached();
 	if (!snapshot) return false;
 	bool result = snapshot->by_hostgroup.count(hostgroup_id) > 0;
 	proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5,
@@ -4832,7 +4829,7 @@ bool PgSQL_HostGroups_Manager::is_polardb_hostgroup(unsigned int hostgroup_id) {
 
 int PgSQL_HostGroups_Manager::get_writer_hostgroup_for_reader(unsigned int reader_hostgroup_id) {
 	if (!status.polardb_active.load(std::memory_order_relaxed)) return -1;
-	auto snapshot = get_polardb_topology_snapshot_cached();
+	const auto& snapshot = get_polardb_topology_snapshot_cached();
 	if (!snapshot) return -1;
 	auto it = snapshot->by_hostgroup.find(reader_hostgroup_id);
 	return (it != snapshot->by_hostgroup.end()) ? it->second.writer_hostgroup : -1;
@@ -4840,7 +4837,7 @@ int PgSQL_HostGroups_Manager::get_writer_hostgroup_for_reader(unsigned int reade
 
 int PgSQL_HostGroups_Manager::get_reader_hostgroup_for_writer(unsigned int writer_hostgroup_id) {
 	if (!status.polardb_active.load(std::memory_order_relaxed)) return -1;
-	auto snapshot = get_polardb_topology_snapshot_cached();
+	const auto& snapshot = get_polardb_topology_snapshot_cached();
 	if (!snapshot) return -1;
 	auto it = snapshot->by_hostgroup.find(writer_hostgroup_id);
 	int result = (it != snapshot->by_hostgroup.end()) ? it->second.reader_hostgroup : -1;
@@ -4851,36 +4848,45 @@ int PgSQL_HostGroups_Manager::get_reader_hostgroup_for_writer(unsigned int write
 	return result;
 }
 
-PgSQL_HostGroups_Manager::PolarDB_HG_Config PgSQL_HostGroups_Manager::get_polardb_hg_config(unsigned int hostgroup_id) {
-	PolarDB_HG_Config config;
-	if (!status.polardb_active.load(std::memory_order_relaxed)) return config;
+const PgSQL_HostGroups_Manager::PolarDB_HG_Config*
+PgSQL_HostGroups_Manager::find_polardb_hg_config(unsigned int hostgroup_id) {
+	if (!status.polardb_active.load(std::memory_order_relaxed)) return nullptr;
 
-	auto snapshot = get_polardb_topology_snapshot_cached();
-	if (!snapshot) return config;
+	const auto& snapshot = get_polardb_topology_snapshot_cached();
+	if (!snapshot) return nullptr;
 	auto it = snapshot->by_hostgroup.find(hostgroup_id);
 	if (it == snapshot->by_hostgroup.end()) {
-		return config;
+		return nullptr;
 	}
-	return it->second;
+	return &it->second;
+}
+
+PgSQL_HostGroups_Manager::PolarDB_HG_Config
+PgSQL_HostGroups_Manager::get_polardb_hg_config(unsigned int hostgroup_id) {
+	PolarDB_HG_Config config;
+	const PolarDB_HG_Config* found = find_polardb_hg_config(hostgroup_id);
+	return found ? *found : config;
 }
 
 PgSQL_HostGroups_Manager::PolarDB_HG_Policy PgSQL_HostGroups_Manager::get_polardb_hg_policy(unsigned int hostgroup_id) {
-	return get_polardb_hg_config(hostgroup_id).policy;
+	PolarDB_HG_Policy policy;
+	const PolarDB_HG_Config* found = find_polardb_hg_config(hostgroup_id);
+	return found ? found->policy : policy;
 }
 
 bool PgSQL_HostGroups_Manager::polardb_hostgroup_requests_rfq_lsn(unsigned int hostgroup_id) {
-	const PolarDB_HG_Config config = get_polardb_hg_config(hostgroup_id);
-	if (!config.is_polardb_hostgroup) {
+	const PolarDB_HG_Config* config = find_polardb_hg_config(hostgroup_id);
+	if (!config || !config->is_polardb_hostgroup) {
 		return false;
 	}
-	const int protocol = config.policy.proxy_protocol >= 0 ?
-		config.policy.proxy_protocol : current_global_polardb_proxy_protocol();
+	const int protocol = config->policy.proxy_protocol >= 0 ?
+		config->policy.proxy_protocol : current_global_polardb_proxy_protocol();
 	return PolarDB_StartupProfile::from_protocol(
 		polardb_proxy_protocol_from_int(protocol)).has_rfq_lsn();
 }
 
 void PgSQL_HostGroups_Manager::polardb_warn_config_mismatches() {
-	auto snapshot = get_polardb_topology_snapshot_cached();
+	const auto& snapshot = get_polardb_topology_snapshot_cached();
 	if (!snapshot || snapshot->by_hostgroup.empty()) {
 		return;
 	}
@@ -5014,7 +5020,7 @@ bool PgSQL_HostGroups_Manager::polardb_update_server_lsn(
 uint64_t PgSQL_HostGroups_Manager::get_polardb_primary_lsn(unsigned int writer_hostgroup_id) {
 	if (!status.polardb_active.load(std::memory_order_relaxed)) return 0;
 
-	auto snapshot = get_polardb_topology_snapshot_cached();
+	const auto& snapshot = get_polardb_topology_snapshot_cached();
 	if (!snapshot) return 0;
 	auto it = snapshot->by_hostgroup.find(writer_hostgroup_id);
 	if (it == snapshot->by_hostgroup.end() || !it->second.primary_lsn) {

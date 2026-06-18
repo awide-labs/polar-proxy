@@ -8,6 +8,8 @@
  *     supplies the global default and forwards to the header-inline resolver.
  *   - PgSQL_Session::polardb_set_session_override(): stores the per-session
  *     consistency-mode override (top tier of mode resolution).
+ *   - PgSQL_Session::polardb_set_txn_split_warmup_mode(): stores the
+ *     per-session timing policy for transaction-split pool warmup.
  *
  * The pure, side-effect-free policy functions that share this domain
  * (the two-argument polardb_resolve_wait_timeout_ms(), the three-tier
@@ -22,6 +24,7 @@
 #include "PgSQL_PolarDB.h"
 #include "proxysql.h"
 #include "cpp.h"
+#include "../deps/json/json.hpp"
 
 #include <atomic>
 #include <cctype>
@@ -30,6 +33,23 @@
 extern PgSQL_HostGroups_Manager* PgHGM;
 
 #if POLARDB_PROXY
+
+namespace {
+
+bool polardb_value_is_read_committed(const char* raw) {
+	if (!raw || !raw[0]) {
+		return false;
+	}
+	std::string normalized;
+	for (const unsigned char ch : std::string(raw)) {
+		if (std::isalnum(ch)) {
+			normalized.push_back((char)std::tolower(ch));
+		}
+	}
+	return normalized == "readcommitted";
+}
+
+} // namespace
 
 // Resolves the effective wait timeout from a hostgroup value, inheriting the
 // global default (@brief on the declaration in PgSQL_PolarDB.h).
@@ -92,9 +112,14 @@ void PgSQL_Session::polardb_apply_user_attributes(const char* attributes) {
 		}
 	}
 	polardb_config.txn_reader_wait_default_read_committed = read_committed;
+	polardb_config.txn_reader_wait_backend_default_seen = false;
 	POLARDB_TRACE(
 		"PolarDB USER: default_transaction_isolation_read_committed=%d\n",
 		read_committed ? 1 : 0);
+}
+
+void PgSQL_Session::polardb_reapply_user_attributes_after_reset() {
+	polardb_apply_user_attributes(user_attributes);
 }
 
 void PgSQL_Session::polardb_apply_backend_isolation_status(

@@ -17,6 +17,7 @@
 
 class PgSQL_Query_Result;
 class PgSQL_ExplicitTxnStateMgr;
+class PgSQL_Connection;
 class PgSQL_Parse_Message;
 class PgSQL_Describe_Message;
 class PgSQL_Close_Message;
@@ -515,10 +516,17 @@ public:
 		// Per-session transaction-split warmup timing override. -1 means use the
 		// built-in default (demand warmup, matching the original lazy behavior).
 		int txn_split_warmup_mode = -1;
+		// Operator-declared transaction isolation for pre-write transaction reads.
+		// PostgreSQL tracked variables do not currently include transaction
+		// isolation, so this is seeded from pgsql_users.attributes, adjusted by
+		// explicit BEGIN/SET isolation statements, and overridden by backend
+		// ParameterStatus when a PolarDB backend reports transaction isolation.
+		bool txn_reader_wait_default_read_committed = true;
+		bool txn_reader_wait_backend_default_seen = false;
 	} polardb_config;
 
 	// Durable per-session consistency truth: the read-your-writes LSN target
-	// (write and observed positions), the missing-LSN latches, and the writer
+	// (write and observed positions), the missing-LSN sticky flags, and the writer
 	// hostgroup/epoch scope those values belong to. This lives for the whole
 	// session: the write LSN deliberately survives RESET, because a RESET clears
 	// session settings but does not undo writes the client already made. Only a
@@ -565,7 +573,7 @@ public:
 	// before each query and at query end, so nothing leaks into the next query.
 	PolarDB_QueryState polardb_query;
 
-	// Safety latch. When set, this session forces the writer instead of sending an
+	// Safety flag. When set, this session forces the writer instead of sending an
 	// unwrapped read to a replica. It is set when a wait wrapper cannot be built,
 	// which would otherwise break read-your-writes silently. Cleared on RESET.
 	bool polardb_wait_disabled = false;
@@ -771,7 +779,7 @@ public:
 	 * Reads session, HostGroups_Manager, and thread state into @p route_ctx, which
 	 * polardb_plan() then decides from. One side effect: if the replication group's
 	 * writer scope changed since this session last collected, it first clears the
-	 * session's now-stale LSN targets and latches before copying them in.
+	 * session's now-stale LSN targets and sticky flags before copying them in.
 	 */
 	void polardb_collect(PolarDB_Query_RouteCtx& route_ctx, int current_hg, int qpo_replica_eligible, bool qpo_force_primary_hint);
 	/**
@@ -861,7 +869,7 @@ public:
 	 *
 	 * Runs on the success path. Reads the WAL LSN the backend appended to its
 	 * ReadyForQuery message (no extra round-trip), advances the session's observed
-	 * and write LSN positions, maintains the missing-LSN latches, and refreshes the
+	 * and write LSN positions, maintains the missing-LSN sticky flags, and refreshes the
 	 * per-server LSN cache. Writer-epoch-stale RFQs are rejected first.
 	 */
 	void polardb_process_result(PgSQL_Data_Stream* myds, const char* query_digest_text);
@@ -889,8 +897,21 @@ public:
 	void polardb_set_txn_split_warmup_mode(int mode);
 	/** @brief Return the active transaction-split warmup mode for this session. */
 	int polardb_effective_txn_split_warmup_mode() const;
+	/** @brief Apply PolarDB-relevant pgsql_users.attributes to this session. */
+	void polardb_apply_user_attributes(const char* attributes);
+	/** @brief Re-apply user attributes after a full session reset command. */
+	void polardb_reapply_user_attributes_after_reset();
+	/** @brief Apply backend-reported transaction isolation, when available. */
+	void polardb_apply_backend_isolation_status(PgSQL_Connection* conn,
+		const char* reason);
 	/** @brief Queue transaction-split reader warmup for this session, if possible. */
 	void polardb_request_txn_split_warmup(int reader_hg, const char* reason);
+	/** @brief Mark the current transaction unsafe for pre-write reader waits. */
+	void polardb_note_txn_non_read_committed(const char* reason);
+	/** @brief Mark primary-only transaction-local state for pre-write reads. */
+	void polardb_note_txn_local_state_change(const char* reason);
+	/** @brief True when the tracked transaction isolation is READ COMMITTED. */
+	bool polardb_txn_reader_wait_isolation_read_committed();
 
 	// ---- PolarDB wait wrapping and notices ----
 
@@ -935,7 +956,7 @@ public:
 	 *
 	 * The single point where the wrapper is applied, called once at ASYNC_IDLE
 	 * after the backend connection exists. Idempotent (a second call after success
-	 * is a no-op). If a needed wrapper cannot be built it latches the session to
+	 * is a no-op). If a needed wrapper cannot be built it marks the session to
 	 * the writer and returns FAILED, and the caller must abort the query
 	 * rather than send it unwrapped.
 	 */
@@ -1008,10 +1029,10 @@ public:
 	 *
 	 * Handles RESET / RESET ALL / DISCARD ALL / RESET CONNECTION. Clears the
 	 * per-query wait, notices, and wrapper state, and lifts the wait-disabled
-	 * latch. It deliberately does NOT clear the durable session write/observed
+	 * sticky flag. It deliberately does NOT clear the durable session write/observed
 	 * LSNs: a RESET clears session settings, not the fact that the client has
 	 * written, so read-your-writes must survive it. @p reset_override additionally
-	 * clears the per-session consistency-mode override.
+	 * clears per-session PolarDB overrides.
 	 */
 	void polardb_clear_staged_wait_state_for_reset(bool reset_override);
 #endif // POLARDB_PROXY
@@ -1160,7 +1181,7 @@ private:
 	/**
 	 * @brief Stop safely when the wait wrapper cannot be built or installed.
 	 *
-	 * Counts the abort, logs @p reason, latches polardb_wait_disabled so later
+	 * Counts the abort, logs @p reason, sets polardb_wait_disabled so later
 	 * reads in this session go to the writer until RESET, and clears the half-built
 	 * wrapper and wait state. Always returns PolarDB_WrapFinalizeResult::FAILED; the
 	 * caller must stop before running the query and return a clean error.

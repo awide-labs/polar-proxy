@@ -1039,7 +1039,7 @@ static bool polardb_wait_reader_can_return_to_pool(PgSQL_Connection* conn) {
  * so staged libpq results and the failed query packet must be discarded before
  * the stream is returned to the pool or destroyed.
  */
-static void polardb_release_wait_reader(PgSQL_Data_Stream* failed_myds,
+void PgSQL_Session::polardb_release_wait_reader(PgSQL_Data_Stream* failed_myds,
 		bool can_return_to_pool) {
 	if (!failed_myds) {
 		return;
@@ -1055,9 +1055,9 @@ static void polardb_release_wait_reader(PgSQL_Data_Stream* failed_myds,
 	failed_conn->async_free_result();
 	if (can_return_to_pool) {
 		failed_conn->async_state_machine = ASYNC_IDLE;
-		failed_myds->return_MySQL_Connection_To_Pool();
+		polardb_return_or_destroy_backend_stream(failed_myds, true);
 	} else {
-		failed_myds->destroy_MySQL_Connection_From_Pool(false);
+		polardb_return_or_destroy_backend_stream(failed_myds, false);
 		failed_myds->fd = 0;
 		failed_myds->DSS = STATE_NOT_INITIALIZED;
 	}
@@ -1272,6 +1272,10 @@ PolarDB_FailureAction PgSQL_Session::polardb_handle_failed_wait_read(
 		return PolarDB_FailureAction::PASSTHROUGH;
 	}
 
+	if (txn_wait_read) {
+		release_failed_wait_reader(failure.can_return_to_pool);
+	}
+
 	PgSQL_Backend* writer_mybe = find_or_create_backend(failure.fallback_writer_hg);
 	if (!writer_mybe || !writer_mybe->server_myds ||
 			writer_mybe->server_myds == failure.failed_myds) {
@@ -1334,8 +1338,10 @@ PolarDB_FailureAction PgSQL_Session::polardb_handle_failed_wait_read(
 			POLARDB_REPLICA_FAILURE_ERROR_CODE);
 	}
 
-	polardb_release_wait_reader(
-		failure.failed_myds, failure.can_return_to_pool);
+	if (!txn_wait_read) {
+		polardb_release_wait_reader(
+			failure.failed_myds, failure.can_return_to_pool);
+	}
 
 	if (!polardb_move_retry_packet_to_writer(
 			writer_mybe, failure.fallback_writer_hg, retry_pkt)) {

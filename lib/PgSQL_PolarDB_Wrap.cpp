@@ -250,7 +250,7 @@ void PgSQL_Session::build_wrapped_wait_query(const char* orig_query, size_t orig
  *
  * Read-your-writes must never be broken silently, so a read that needed a wait
  * wrapper but could not get one is aborted rather than sent to a replica
- * unwrapped. This helper counts the abort, logs the reason, latches
+ * unwrapped. This helper counts the abort, logs the reason, sets
  * polardb_wait_disabled so later reads in this session go to the writer until
  * RESET, and clears the half-built wrapper and wait state. The caller must stop
  * before running the query and return a clean error to the client.
@@ -265,7 +265,7 @@ PolarDB_WrapFinalizeResult PgSQL_Session::fail_wait_wrap_finalize(const char* re
 
 	// Latch the session so later reads use the writer, and require the
 	// current caller to stop before RunQuery() so this query's original text is
-	// never sent unwrapped to a replica. The latch clears on RESET.
+	// never sent unwrapped to a replica. The sticky flag clears on RESET.
 	polardb_wait_disabled = true;
 	polardb_query.wrapped_query_buf.clear();
 	polardb_query.reset_wait();
@@ -420,19 +420,20 @@ bool PgSQL_Session::polardb_account_wait_timeout(const char* source) {
  *        DISCARD ALL / RESET CONNECTION command.
  *
  * Tears down the per-query wait, reader, and wrapper state and any pending
- * notices, and re-arms two per-session latches: the writer-fallback safety
- * latch (polardb_wait_disabled) and the one-shot degraded-route log guard. Replica
+ * notices, and re-arms two per-session sticky flags: the writer-fallback safety
+ * sticky flag (polardb_wait_disabled) and the one-shot degraded-route log guard. Replica
  * reads can therefore resume after a RESET.
  *
- * It does NOT dispose backend connections and does NOT clear the session
+ * It does NOT return or destroy backend connections and does NOT clear the session
  * write/observed LSNs. Those LSNs record committed positions this client has
  * already observed; a RESET clears session configuration, not that history, so
- * read-your-writes still holds after a RESET. The consistency-mode override is
+ * read-your-writes still holds after a RESET. PolarDB session overrides are
  * cleared only when @p reset_override is true.
  *
- * @param reset_override When true, also clears the per-session consistency-mode
- *                       override. Callers set it for RESET ALL, DISCARD ALL,
- *                       RESET CONNECTION, and RESET proxysql.polardb_consistency_mode.
+ * @param reset_override When true, also clears per-session PolarDB overrides.
+ *                       Callers set it for RESET ALL, DISCARD ALL, and
+ *                       RESET CONNECTION. RESET proxysql.<name> clears only the
+ *                       named override after this helper clears transient state.
  */
 void PgSQL_Session::polardb_clear_staged_wait_state_for_reset(bool reset_override) {
 	polardb_query.reset_for_new_query();
@@ -441,6 +442,7 @@ void PgSQL_Session::polardb_clear_staged_wait_state_for_reset(bool reset_overrid
 	polardb_rfq_degraded_route_warning_sent = false;
 	if (reset_override) {
 		polardb_set_session_override(-1);
+		polardb_set_txn_split_warmup_mode(-1);
 	}
 }
 

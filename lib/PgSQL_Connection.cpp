@@ -555,6 +555,9 @@ handler_again:
 		// Turn on PolarDB WAL-LSN reporting on this backend so a later writer
 		// query can expose its LSN via PQgetLSN() with no extra round-trip.
 		polardb_init_connection_tracking();
+		if (myds && myds->sess) {
+			myds->sess->polardb_apply_backend_isolation_status(this, "connect");
+		}
 #endif
 		break;
 	case ASYNC_CONNECT_FAILED:
@@ -954,6 +957,13 @@ handler_again:
 				NEXT_IMMEDIATE(ASYNC_RESYNC_START);
 			}
 		}
+
+#if POLARDB_PROXY
+		if (myds && myds->sess) {
+			myds->sess->polardb_apply_backend_isolation_status(
+				this, "query_result");
+		}
+#endif // POLARDB_PROXY
 
 		// finally add ready for query packet
 		query_result->add_ready_status(PQtransactionStatus(pgsql_conn));
@@ -1708,8 +1718,14 @@ void PgSQL_Connection::connect_cont(short event) {
 	int current_fd = PQsocket(pgsql_conn);
 	if (current_fd != fd) {
 		proxy_warning("PgSQL Connection FD has been changed by PQconnectPoll(). oldFD:%d newFD:%d\n", fd, current_fd);
+#if POLARDB_PROXY
+		proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 5, "PgSQL Connection FD has been changed by PQconnectPoll()"
+			"Session=%p, Conn=%p, myds=%p, oldFD=%d, newFD=%d\n",
+			myds ? myds->sess : nullptr, this, myds, fd, current_fd);
+#else
 		proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 5, "PgSQL Connection FD has been changed by PQconnectPoll()"
 			"Session=%p, Conn=%p, myds=%p, oldFD=%d, newFD=%d\n", myds->sess, this, myds, fd, current_fd);
+#endif // POLARDB_PROXY
 		fd = current_fd;
 	}
 }

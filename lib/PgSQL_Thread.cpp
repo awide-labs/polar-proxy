@@ -3392,6 +3392,17 @@ void PgSQL_Thread::run() {
 	pthread_mutex_lock(&thread_mutex);
 	while (shutdown == 0) {
 
+#if POLARDB_PROXY
+		// Split warmup requests are queued by sessions, but socket creation must
+		// stay outside query dispatch. Drain pending work before this worker goes
+		// back to poll/idle maintenance so BEGIN-mode warmup is prompt.
+		if (PgHGM &&
+				PgHGM->status.polardb_warmup_pending.load(
+					std::memory_order_relaxed) > 0) {
+			PgHGM->warm_split_pools();
+		}
+#endif // POLARDB_PROXY
+
 #ifdef IDLE_THREADS
 		if (idle_maintenance_thread) {
 			goto __run_skip_1;
