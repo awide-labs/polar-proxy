@@ -1,6 +1,6 @@
 --- src/interfaces/libpq/exports.txt
 +++ src/interfaces/libpq/exports.txt
-@@ -187,3 +187,7 @@ PQsetTraceFlags           184
+@@ -187,3 +187,11 @@
  PQmblenBounded            185
  PQsendFlushRequest        186
  PQconnectionUsedGSSAPI    187
@@ -8,9 +8,13 @@
 +PQgetLSN                  188
 +PQhasLSN                  189
 +PQsetPolarSendLSN         190
++PQgetXactSplitXids        191
++PQisXactSplittable        192
++PQisXactWalPending        193
++PQsetPolarSendXact        194
 --- src/interfaces/libpq/fe-connect.c
 +++ src/interfaces/libpq/fe-connect.c
-@@ -361,6 +361,54 @@ static const internalPQconninfoOption PQconninfoOptions[] = {
+@@ -361,6 +361,62 @@
  		"Load-Balance-Hosts", "", 8,	/* sizeof("disable") = 8 */
  	offsetof(struct pg_conn, load_balance_hosts)},
  
@@ -19,6 +23,10 @@
 +	{"_polar_send_lsn", NULL, NULL, NULL,
 +		"PolarDB-Send-LSN", "D", 6,
 +	offsetof(struct pg_conn, _polar_send_lsn)},
++
++	{"_polar_send_xact", NULL, NULL, NULL,
++		"PolarDB-Send-Xact", "D", 6,
++	offsetof(struct pg_conn, _polar_send_xact)},
 +
 +	{"_polar_origin_client_ip", NULL, NULL, NULL,
 +		"PolarDB-Client-IP", "D", 45,
@@ -40,6 +48,10 @@
 +	{"_polar_proxy_send_lsn", NULL, NULL, NULL,
 +		"PolarDB-Proxy-Send-LSN", "D", 6,
 +	offsetof(struct pg_conn, _polar_proxy_send_lsn)},
++
++	{"_polar_proxy_send_xact", NULL, NULL, NULL,
++		"PolarDB-Proxy-Send-Xact", "D", 6,
++	offsetof(struct pg_conn, _polar_proxy_send_xact)},
 +
 +	/* PG15-only metadata */
 +	{"_polar_proxy_session_id", NULL, NULL, NULL,
@@ -65,14 +77,13 @@
  	/* Terminating entry --- MUST BE LAST */
  	{NULL, NULL, NULL, NULL,
  	NULL, NULL, 0}
-@@ -1745,6 +1793,20 @@ connectOptions2(PGconn *conn)
- 			goto oom_error;
+@@ -1746,6 +1802,24 @@
  	}
  
-+	/*
+ 	/*
 +	 * PolarDB proxy options - convert string options to bool flags.
 +	 * The bool flags are used by getReadyForQuery() to parse PolarDB's
-+	 * extended ReadyForQuery message that includes LSN data.
++	 * extended ReadyForQuery message that includes LSN/Xact data.
 +	 */
 +	/*
 +	 * Old PG11-style names are the compatibility baseline.  If both old and
@@ -82,23 +93,31 @@
 +		conn->polar_proxy_send_lsn = (strcmp(conn->_polar_send_lsn, "true") == 0);
 +	else if (conn->_polar_proxy_send_lsn)
 +		conn->polar_proxy_send_lsn = (strcmp(conn->_polar_proxy_send_lsn, "true") == 0);
++	if (conn->_polar_send_xact)
++		conn->polar_proxy_send_xact = (strcmp(conn->_polar_send_xact, "true") == 0);
++	else if (conn->_polar_proxy_send_xact)
++		conn->polar_proxy_send_xact = (strcmp(conn->_polar_proxy_send_xact, "true") == 0);
 +
- 	/*
++	/*
  	 * Only if we get this far is it appropriate to try to connect. (We need a
  	 * state flag, rather than just the boolean result of this function, in
-@@ -4458,6 +4520,21 @@ freePGconn(PGconn *conn)
+ 	 * case someone tries to PQreset() the PGconn.)
+@@ -4458,6 +4532,24 @@
  	free(conn->rowBuf);
  	free(conn->target_session_attrs);
  	free(conn->load_balance_hosts);
++	free(conn->polar_xact_xids);
 +	/* PolarDB proxy connection string parameters */
 +	/* PG11 style */
 +	free(conn->_polar_send_lsn);
++	free(conn->_polar_send_xact);
 +	free(conn->_polar_origin_client_ip);
 +	free(conn->_polar_origin_client_port);
 +	/* PG15 aliases */
 +	free(conn->_polar_proxy_client_host);
 +	free(conn->_polar_proxy_client_port);
 +	free(conn->_polar_proxy_send_lsn);
++	free(conn->_polar_proxy_send_xact);
 +	/* PG15-only metadata */
 +	free(conn->_polar_proxy_session_id);
 +	free(conn->_polar_proxy_cancel_key);
@@ -108,7 +127,7 @@
  	termPQExpBuffer(&conn->errorMessage);
  	termPQExpBuffer(&conn->workBuffer);
  
-@@ -7810,3 +7887,34 @@ PQregisterThreadLock(pgthreadlock_t newhandler)
+@@ -7810,3 +7902,74 @@
  
  	return prev;
  }
@@ -143,9 +162,49 @@
 +		return;
 +	conn->polar_proxy_send_lsn = (enable != 0);
 +}
++
++/*
++ * PolarDB Transaction Split API
++ */
++
++/* PQgetXactSplitXids - get transaction XIDs from last ReadyForQuery */
++const char *
++PQgetXactSplitXids(const PGconn *conn)
++{
++	if (!conn)
++		return NULL;
++	return conn->polar_xact_xids;
++}
++
++/* PQisXactSplittable - check if current transaction can be split ('x' marker) */
++int
++PQisXactSplittable(const PGconn *conn)
++{
++	if (!conn)
++		return 0;
++	return conn->polar_xact_splittable ? 1 : 0;
++}
++
++/* PQisXactWalPending - WAL not flushed but xids available ('w' marker) */
++int
++PQisXactWalPending(const PGconn *conn)
++{
++	if (!conn)
++		return 0;
++	return conn->polar_xact_wal_pending ? 1 : 0;
++}
++
++/* PQsetPolarSendXact - enable/disable polar_proxy_send_xact flag */
++void
++PQsetPolarSendXact(PGconn *conn, int enable)
++{
++	if (!conn)
++		return;
++	conn->polar_proxy_send_xact = (enable != 0);
++}
 --- src/interfaces/libpq/fe-protocol3.c
 +++ src/interfaces/libpq/fe-protocol3.c
-@@ -1655,6 +1655,44 @@ getReadyForQuery(PGconn *conn)
+@@ -1655,6 +1655,91 @@
  			break;
  	}
  
@@ -164,6 +223,7 @@
 +
 +	/* PolarDB extension: parse LSN if present */
 +	conn->polar_has_lsn = false;
++	conn->polar_last_lsn = 0;
 +	if (conn->polar_proxy_send_lsn && MSG_REMAINING() >= 8)
 +	{
 +		char lsn_buf[8];
@@ -178,8 +238,54 @@
 +	}
 +
 +	/*
++	 * PolarDB extension: parse transaction split info if present.
++	 *
++	 * Marker byte meanings:
++	 *   'x' - splittable: WAL flushed, xids follow
++	 *   'w' - WAL pending: xids follow but replica wait is not safe yet
++	 *   absent/other - not splittable; remaining extension bytes are skipped
++	 */
++	conn->polar_xact_splittable = false;
++	conn->polar_xact_wal_pending = false;
++	if (conn->polar_xact_xids)
++	{
++		free(conn->polar_xact_xids);
++		conn->polar_xact_xids = NULL;
++	}
++	if (conn->polar_proxy_send_xact && MSG_REMAINING() >= 1)
++	{
++		char marker;
++		if (pqGetc(&marker, conn) == 0 && (marker == 'x' || marker == 'w'))
++		{
++			const int remaining = MSG_REMAINING();
++			int len = 0;
++
++			while (len < remaining && conn->inBuffer[conn->inCursor + len] != '\0')
++				len++;
++
++			if (len < remaining)
++			{
++				conn->polar_xact_xids = malloc((size_t) len + 1);
++				if (conn->polar_xact_xids)
++				{
++					memcpy(conn->polar_xact_xids, conn->inBuffer + conn->inCursor, len);
++					conn->polar_xact_xids[len] = '\0';
++					conn->inCursor += len + 1;
++					if (len > 0)
++					{
++						if (marker == 'x')
++							conn->polar_xact_splittable = true;
++						else
++							conn->polar_xact_wal_pending = true;
++					}
++				}
++			}
++		}
++	}
++
++	/*
 +	 * Skip any remaining bytes we did not parse.  This handles:
-+	 *  - the backend appending extra fields the proxy did not request
++	 *  - the backend appending xact data the proxy did not request
 +	 *  - Future PolarDB protocol extensions
 +	 */
 +	if (MSG_REMAINING() > 0)
@@ -190,7 +296,7 @@
  	return 0;
  }
  
-@@ -2340,6 +2378,35 @@ build_startup_packet(const PGconn *conn, char *packet,
+@@ -2340,6 +2425,39 @@
  		}
  	}
  
@@ -203,6 +309,10 @@
 +		ADD_STARTUP_OPTION("_polar_send_lsn", conn->_polar_send_lsn);
 +	else if (conn->_polar_proxy_send_lsn && conn->_polar_proxy_send_lsn[0])
 +		ADD_STARTUP_OPTION("_polar_proxy_send_lsn", conn->_polar_proxy_send_lsn);
++	if (conn->_polar_send_xact && conn->_polar_send_xact[0])
++		ADD_STARTUP_OPTION("_polar_send_xact", conn->_polar_send_xact);
++	else if (conn->_polar_proxy_send_xact && conn->_polar_proxy_send_xact[0])
++		ADD_STARTUP_OPTION("_polar_proxy_send_xact", conn->_polar_proxy_send_xact);
 +	if (conn->_polar_origin_client_ip && conn->_polar_origin_client_ip[0])
 +		ADD_STARTUP_OPTION("_polar_origin_client_ip", conn->_polar_origin_client_ip);
 +	else if (conn->_polar_proxy_client_host && conn->_polar_proxy_client_host[0])
@@ -228,7 +338,7 @@
  		packet[packet_len] = '\0';
 --- src/interfaces/libpq/libpq-fe.h
 +++ src/interfaces/libpq/libpq-fe.h
-@@ -27,7 +27,7 @@ extern "C"
+@@ -27,7 +27,7 @@
   * such as Oid.
   */
  #include "postgres_ext.h"
@@ -237,7 +347,7 @@
  /*
   * These symbols may be used in compile-time #ifdef tests for the availability
   * of newer libpq features.
-@@ -688,6 +688,13 @@ extern const PGresult *PQgetResultFromPGconn(PGconn *conn);
+@@ -688,6 +688,21 @@
  /* ProxySQL special handler function */
  extern int PShandleRowData(PGconn *conn, bool is_first_packet, PSresult* result);
  
@@ -248,12 +358,20 @@
 +extern int	PQhasLSN(const PGconn *conn);
 +extern void PQsetPolarSendLSN(PGconn *conn, int enable);
 +
++/*
++ * PolarDB Transaction Split API - for routing reads within transactions
++ */
++extern const char *PQgetXactSplitXids(const PGconn *conn);
++extern int	PQisXactSplittable(const PGconn *conn);
++extern int	PQisXactWalPending(const PGconn *conn);
++extern void PQsetPolarSendXact(PGconn *conn, int enable);
++
  /* Send a pipeline sync message without flushing the send buffer */
  extern int	PQsendPipelineSync(PGconn *conn);
  
 --- src/interfaces/libpq/libpq-int.h
 +++ src/interfaces/libpq/libpq-int.h
-@@ -493,6 +493,27 @@ struct pg_conn
+@@ -493,6 +493,33 @@
  								 * tried host */
  	bool		send_appname;	/* okay to send application_name? */
  
@@ -261,16 +379,22 @@
 +	bool		polar_proxy_send_lsn;	/* request LSN in ReadyForQuery? */
 +	uint64		polar_last_lsn;			/* LSN from last ReadyForQuery */
 +	bool		polar_has_lsn;			/* was LSN present in last RFQ? */
++	bool		polar_proxy_send_xact;	/* request xact info in ReadyForQuery? */
++	char	   *polar_xact_xids;		/* "cmdId,xid1,xid2,..." from RFQ */
++	bool		polar_xact_splittable;	/* 'x' marker: WAL flushed, safe to split */
++	bool		polar_xact_wal_pending;	/* 'w' marker: WAL not flushed, xids cached */
 +
 +	/* PolarDB connection string options (passed directly in startup packet) */
 +	/* PG11 style names - work with both PolarDB 11 and 15 */
 +	char	   *_polar_send_lsn;           /* "true" to request LSN */
++	char	   *_polar_send_xact;          /* "true" to request xact split info */
 +	char	   *_polar_origin_client_ip;   /* Client IP passthrough */
 +	char	   *_polar_origin_client_port; /* Client port passthrough */
 +	/* PG15 aliases.  If both old and new names are provided, old names win. */
 +	char	   *_polar_proxy_client_host;  /* Client host passthrough */
 +	char	   *_polar_proxy_client_port;  /* Client port passthrough */
 +	char	   *_polar_proxy_send_lsn;     /* "true" to request LSN */
++	char	   *_polar_proxy_send_xact;    /* "true" to request xact split info */
 +	/* PG15-only metadata */
 +	char	   *_polar_proxy_session_id;   /* Session ID for cancel routing */
 +	char	   *_polar_proxy_cancel_key;   /* Cancel key for verification */

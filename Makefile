@@ -483,7 +483,16 @@ polardb-libpq:
 	@echo "    Configure test/polardb/.env, then run:"
 	@echo "      make -C test/polardb help"
 	@echo "      make -C test/polardb run-c-libpq-lsn"
+	@echo "      make -C test/polardb run-c-libpq-xact"
 	@echo "      make -C test/polardb run-c-extended-protocol QUERY='SELECT 1'"
+
+# Refresh deps/postgresql/polardb_libpq.patch from the expanded vendored
+# PostgreSQL tree and verify that the regenerated patch applies cleanly.
+# Usage:
+#   make polardb-libpq-patch
+.PHONY: polardb-libpq-patch
+polardb-libpq-patch:
+	./scripts/regenerate-polardb-libpq-patch.sh --verify
 
 
 ### packaging targets
