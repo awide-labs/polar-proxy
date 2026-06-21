@@ -318,7 +318,11 @@ bool PgSQL_Session::polardb_prepare_txn_wait_read(
 		polardb_query.reset_wait();
 	}
 	if (needs_wait) {
-		POLARDB_THREAD_COUNT_ONE(thread, session_lsn_routing);
+		if (plan.reader.consistency_mode == PolarDB_ConsistencyMode::GLOBAL_LSN) {
+			POLARDB_THREAD_COUNT_ONE(thread, global_lsn_routing);
+		} else {
+			POLARDB_THREAD_COUNT_ONE(thread, session_lsn_routing);
+		}
 		POLARDB_THREAD_COUNT_ONE(thread, wait_wrap_prepared);
 		if (!bypass_wait) {
 			polardb_query.reader_plan = plan.reader;

@@ -48,9 +48,10 @@ struct PolarDB_Query_ReaderPlan;
 // PolarDB consistency-mode integer constants used where an int plus -1 sentinel
 // is needed (thread variables, HG policy, admin SQL). The values align with
 // PolarDB_ConsistencyMode.
-constexpr int POLARDB_CONSISTENCY_OFF     = 0;  // No consistency routing
-constexpr int POLARDB_CONSISTENCY_LSN     = 1;  // LSN-based read-your-own-writes (per-session)
-constexpr int POLARDB_CONSISTENCY_PRIMARY = 3;  // Force all reads to the primary
+constexpr int POLARDB_CONSISTENCY_OFF        = 0;  // No consistency routing
+constexpr int POLARDB_CONSISTENCY_LSN        = 1;  // LSN-based read-your-own-writes (per-session)
+constexpr int POLARDB_CONSISTENCY_GLOBAL_LSN = 2;  // LSN-based read-all-observed-writes
+constexpr int POLARDB_CONSISTENCY_PRIMARY    = 3;  // Force all reads to the primary
 
 // User-facing PolarDB proxy protocol dialect. Hostgroup config may use -1 to
 // inherit the global pgsql-polardb_proxy_protocol value.
@@ -1114,7 +1115,7 @@ public:
 		// PolarDB LSN session-consistency knobs. The mode knobs are word-valued
 		// (validated to off|lsn|primary and best_effort|strict); the
 		// rest are integer/bool.
-		char* polardb_consistency_mode;       // off | lsn | primary
+		char* polardb_consistency_mode;       // off | lsn | global_lsn | primary
 		int polardb_lag_bytes;                // reader lag-cap (bytes); 0=off
 		int polardb_lag_ms;                   // reserved ms lag cap; T13 accepts only 0, no PgSQL producer yet
 		int polardb_lag_wait_ms;              // polar_xact_split_wait_lsn timeout (ms); 0=wait indefinitely

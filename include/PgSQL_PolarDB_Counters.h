@@ -276,6 +276,9 @@
 	T(session_lsn_routing, "PolarDB_Session_LSN_Routing", \
 		"proxysql_polardb_session_lsn_routing_total", \
 		"Reads routed to a reader with a session-LSN wait requirement") \
+	T(global_lsn_routing, "PolarDB_Global_LSN_Routing", \
+		"proxysql_polardb_global_lsn_routing_total", \
+		"Reads routed to a reader with a global-LSN wait requirement") \
 	T(route_planner_total, "PolarDB_Route_Planner_Total", \
 		"proxysql_polardb_route_planner_total", \
 		"Queries examined by the automatic PolarDB route planner") \

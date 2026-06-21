@@ -1136,10 +1136,10 @@ __thread int pgsql_thread___max_allowed_packet;
 
 #if POLARDB_PROXY
 /* PolarDB LSN session-consistency knobs. The consistency/wait mode knobs are
- * stored here as ints (off=0/lsn=1/primary=3,
+ * stored here as ints (off=0/lsn=1/global_lsn=2/primary=3,
  * best_effort=1/strict=2); the admin string<->int mapping lives in
  * PgSQL_Thread.cpp. */
-__thread int pgsql_thread___polardb_consistency_mode;        // off=0, lsn=1, primary=3
+__thread int pgsql_thread___polardb_consistency_mode;        // off=0, lsn=1, global_lsn=2, primary=3
 __thread int pgsql_thread___polardb_lag_bytes;               // reader lag-cap (bytes); 0=off
 __thread int pgsql_thread___polardb_lag_ms;                  // reserved ms lag cap; T13 accepts only 0, no PgSQL producer yet
 __thread int pgsql_thread___polardb_lag_wait_ms;             // polar_xact_split_wait_lsn timeout (ms); 0=wait indefinitely

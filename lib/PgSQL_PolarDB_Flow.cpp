@@ -152,6 +152,10 @@ bool PgSQL_Session::polardb_query_cache_disabled_for_current_rule() const {
 		return true;
 	case PolarDB_ConsistencyMode::SESSION_LSN:
 		break;
+	case PolarDB_ConsistencyMode::GLOBAL_LSN:
+		// GLOBAL_LSN always consults the writer mirror, so the ordinary backend
+		// cache cannot decide routing before the PolarDB planner runs.
+		return true;
 	}
 
 	// In LSN mode, cache is safe until the session has an LSN target or a missing
@@ -368,9 +372,12 @@ void PgSQL_Session::polardb_collect(PolarDB_Query_RouteCtx& route_ctx,
 		polardb_config.session_consistency_mode,
 		policy.consistency_mode,
 		pgsql_thread___polardb_consistency_mode);
-	const bool lsn_mode = route_ctx.effective_consistency_mode >= 0 &&
-		polardb_consistency_from_int(route_ctx.effective_consistency_mode) ==
-			PolarDB_ConsistencyMode::SESSION_LSN;
+	const PolarDB_ConsistencyMode consistency_mode =
+		route_ctx.effective_consistency_mode >= 0
+		? polardb_consistency_from_int(route_ctx.effective_consistency_mode)
+		: PolarDB_ConsistencyMode::OFF;
+	const bool lsn_mode =
+		polardb_consistency_mode_uses_lsn_wait(consistency_mode);
 
 	// Wait config + lag-cap input
 	route_ctx.wait_timeout_ms = polardb_resolve_wait_timeout_ms(policy.lsn_wait_timeout_ms);
@@ -692,6 +699,11 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(const PolarDB_Query_RouteCtx
 	PolarDB_WaitMode wait_mode =
 		(route_ctx.wait_timeout_mode == (int)PolarDB_WaitMode::STRICT)
 		? PolarDB_WaitMode::STRICT : PolarDB_WaitMode::BEST_EFFORT;
+	if (mode == PolarDB_ConsistencyMode::GLOBAL_LSN) {
+		// A best-effort timeout explicitly permits stale reads. GLOBAL_LSN is a
+		// read-all-observed-writes contract, so its wait must fail closed.
+		wait_mode = PolarDB_WaitMode::STRICT;
+	}
 
 	// Transaction split is LSN-only and simple-query only. This stage names a
 	// split-readable route when primary RFQ evidence is complete; execute borrows
@@ -785,9 +797,30 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(const PolarDB_Query_RouteCtx
 		}
 
 		if (!allow_transaction_wait_read) {
+			uint64_t split_target_lsn = route_ctx.transaction_split.primary_lsn;
+			if (mode == PolarDB_ConsistencyMode::GLOBAL_LSN) {
+				bool primary_lsn_unknown = false;
+				const uint64_t primary_lsn =
+					PgHGM->get_polardb_primary_lsn(route_ctx.writer_scope.hg);
+				split_target_lsn = polardb_target_with_global_lsn(
+					split_target_lsn,
+					primary_lsn,
+					&primary_lsn_unknown);
+				if (primary_lsn_unknown) {
+					plan = PolarDB_Query_RoutePlan::force_primary(
+						route_ctx.writer_scope.hg,
+						PolarDB_Query_RoutePlan::RouteActionReason::PRIMARY_LSN_UNKNOWN);
+					POLARDB_TRACE(
+						"PolarDB PLAN: transaction split GLOBAL_LSN primary LSN "
+						"unknown -> FORCE_PRIMARY primary_hg=%d\n",
+						route_ctx.writer_scope.hg);
+					return plan;
+				}
+			}
+
 			PolarDB_WaitSpec split_wait;
 			split_wait.type = PolarDB_WaitType::LSN;
-			split_wait.target = route_ctx.transaction_split.primary_lsn;
+			split_wait.target = split_target_lsn;
 			split_wait.timeout_ms = route_ctx.wait_timeout_ms;
 			split_wait.mode = wait_mode;
 
@@ -796,6 +829,7 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(const PolarDB_Query_RouteCtx
 				route_ctx.writer_scope.hg,
 				split_wait,
 				route_ctx.transaction_split_xids);
+			plan.reader.consistency_mode = mode;
 			plan.reader.route_rfq_policy = route_ctx.route_rfq_policy;
 			plan.reader.allow_best_effort_degrade = false;
 			polardb_reader_lag_plan(plan, route_ctx);
@@ -860,29 +894,37 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(const PolarDB_Query_RouteCtx
 			route_ctx.route_rfq_policy, (int)plan.action, plan.target_hg);
 		return plan;
 	}
-	// Consistency subdecision. The session target is max(write, observed),
-	// optionally seeded from the configured baseline, with no global-LSN fallback.
+	// Consistency subdecision. SESSION_LSN uses max(write, observed),
+	// optionally seeded from the configured baseline. GLOBAL_LSN uses
+	// max(session target, writer mirror LSN), and fails closed when the writer
+	// mirror is unknown.
+	const bool global_lsn_mode = mode == PolarDB_ConsistencyMode::GLOBAL_LSN;
 	bool primary_lsn_unknown = false;
 	uint64_t primary_lsn = 0;
-	if (polardb_session_lsn_baseline_from_int(route_ctx.session_lsn_baseline) ==
-			PolarDB_SessionLsnBaseline::PRIMARY &&
-			route_ctx.session.target() == 0) {
+	if (global_lsn_mode ||
+			(polardb_session_lsn_baseline_from_int(route_ctx.session_lsn_baseline) ==
+				PolarDB_SessionLsnBaseline::PRIMARY &&
+				route_ctx.session.target() == 0)) {
 		primary_lsn = PgHGM->get_polardb_primary_lsn(route_ctx.writer_scope.hg);
 	}
-	uint64_t session_lsn = route_ctx.session.target_with_baseline(
-		route_ctx.session_lsn_baseline,
-		primary_lsn,
-		&primary_lsn_unknown);
+	uint64_t session_lsn = global_lsn_mode
+		? route_ctx.session.target_with_global_lsn(
+			primary_lsn,
+			&primary_lsn_unknown)
+		: route_ctx.session.target_with_baseline(
+			route_ctx.session_lsn_baseline,
+			primary_lsn,
+			&primary_lsn_unknown);
 	if (primary_lsn_unknown) {
 		plan = PolarDB_Query_RoutePlan::rfq_unavailable(
 				PolarDB_Query_RoutePlan::RouteActionReason::PRIMARY_LSN_UNKNOWN,
 				route_ctx.route_rfq_policy,
 				route_ctx.writer_scope.hg,
 				route_ctx.reader_hg,
-				!route_ctx.is_extended_protocol);
+				!global_lsn_mode && !route_ctx.is_extended_protocol);
 		POLARDB_TRACE(
-			"PolarDB PLAN: primary baseline LSN unknown policy=%d -> action=%d target=%d\n",
-			route_ctx.route_rfq_policy, (int)plan.action, plan.target_hg);
+			"PolarDB PLAN: primary LSN unknown mode=%d policy=%d -> action=%d target=%d\n",
+			(int)mode, route_ctx.route_rfq_policy, (int)plan.action, plan.target_hg);
 		return plan;
 	}
 	PolarDB_Query_WaitPlan wait_plan = PolarDB_Query_WaitPlan::build_consistency(
@@ -911,9 +953,9 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(const PolarDB_Query_RouteCtx
 		plan.target_hg = route_ctx.reader_hg;
 		plan.txn_wait_read = allow_transaction_wait_read;
 		POLARDB_TRACE(
-			"PolarDB PLAN: no consistency wait needed (session_lsn=%lu) -> "
+			"PolarDB PLAN: no consistency wait needed (mode=%d session_lsn=%lu primary_lsn=%lu) -> "
 			"reader=%d txn_wait_read=%d\n",
-			(unsigned long)session_lsn, route_ctx.reader_hg,
+			(int)mode, (unsigned long)session_lsn, (unsigned long)primary_lsn, route_ctx.reader_hg,
 			allow_transaction_wait_read ? 1 : 0);
 		return plan;
 	}
@@ -937,17 +979,22 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(const PolarDB_Query_RouteCtx
 	// acquisition, where the selected server is known.
 	polardb_reader_lag_plan(plan, route_ctx);
 
-	plan.action          = PolarDB_Query_RoutePlan::RouteAction::REPLICA_WITH_WAIT;
-	plan.target_hg       = route_ctx.reader_hg;
-	plan.wait_spec            = wait_plan.spec;
+	plan.action = PolarDB_Query_RoutePlan::RouteAction::REPLICA_WITH_WAIT;
+	plan.target_hg = route_ctx.reader_hg;
+	plan.wait_spec = wait_plan.spec;
 	plan.txn_wait_read = allow_transaction_wait_read;
 	plan.reader.consistency_target_lsn = wait_plan.spec.target;
 	plan.reader.fallback_writer_hg = route_ctx.writer_scope.hg;
 	plan.reader.route_rfq_policy = route_ctx.route_rfq_policy;
-	plan.reader.allow_best_effort_degrade = !route_ctx.is_extended_protocol;
+	plan.reader.consistency_mode = mode;
+	plan.reader.allow_best_effort_degrade =
+		!route_ctx.is_extended_protocol &&
+		!polardb_consistency_mode_disallows_degraded_reader(mode);
 	POLARDB_TRACE(
-		"PolarDB PLAN: REPLICA_WITH_WAIT reader=%d wait_target=%lu timeout_ms=%u wait_mode=%d\n",
-		route_ctx.reader_hg, (unsigned long)plan.wait_spec.target, plan.wait_spec.timeout_ms, (int)plan.wait_spec.mode);
+		"PolarDB PLAN: REPLICA_WITH_WAIT reader=%d wait_target=%lu primary_lsn=%lu mode=%d timeout_ms=%u wait_mode=%d\n",
+		route_ctx.reader_hg, (unsigned long)plan.wait_spec.target,
+		(unsigned long)primary_lsn, (int)mode, plan.wait_spec.timeout_ms,
+		(int)plan.wait_spec.mode);
 	return plan;
 }
 
@@ -1177,7 +1224,11 @@ PolarDB_Query_ExecuteResult PgSQL_Session::polardb_execute(
 
 	// Record the per-query reader target for backend acquisition.
 	polardb_query.reader_plan = plan.reader;
-	POLARDB_THREAD_COUNT_ONE(thread, session_lsn_routing);
+	if (plan.reader.consistency_mode == PolarDB_ConsistencyMode::GLOBAL_LSN) {
+		POLARDB_THREAD_COUNT_ONE(thread, global_lsn_routing);
+	} else {
+		POLARDB_THREAD_COUNT_ONE(thread, session_lsn_routing);
+	}
 
 	// Prepare the query wait state: save intent only. The query wrapping is deferred to
 	// finalize_wait_timeout_injection(), which runs after the connection is
@@ -1378,8 +1429,8 @@ void PgSQL_Session::polardb_process_result(PgSQL_Data_Stream* myds, const char* 
 		pgsql_thread___polardb_consistency_mode);
 	const bool lsn_consistency_mode =
 		effective_consistency_mode >= 0 &&
-		polardb_consistency_from_int(effective_consistency_mode) ==
-			PolarDB_ConsistencyMode::SESSION_LSN;
+		polardb_consistency_mode_uses_lsn_wait(
+			polardb_consistency_from_int(effective_consistency_mode));
 	// Split RFQ observation is only operationally meaningful in LSN mode. In
 	// mode=primary/off, planning cannot dispatch split reads, so the observer is
 	// called with split disabled to clear stale state without inflating

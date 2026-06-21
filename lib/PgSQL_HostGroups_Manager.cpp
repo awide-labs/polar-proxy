@@ -1977,10 +1977,13 @@ static void polardb_warn_effective_config_mismatches(
 		if (effective_proxy_protocol != POLARDB_PROXY_PROTOCOL_OFF) {
 			saw_rfq_capable_polardb_row = true;
 		}
-		if (effective_consistency_mode == POLARDB_CONSISTENCY_LSN &&
+		const PolarDB_ConsistencyMode resolved_mode =
+			polardb_consistency_from_int(effective_consistency_mode);
+		if (polardb_consistency_mode_uses_lsn_wait(resolved_mode) &&
 				effective_proxy_protocol == POLARDB_PROXY_PROTOCOL_OFF) {
-			proxy_warning("PolarDB replication hostgroup writer=%d reader=%d resolves consistency_mode=lsn but effective proxy_protocol=off; RFQ LSN startup requests are disabled for this group\n",
-				hg_config.writer_hostgroup, hg_config.reader_hostgroup);
+			proxy_warning("PolarDB replication hostgroup writer=%d reader=%d resolves consistency_mode=%s but effective proxy_protocol=off; RFQ LSN startup requests are disabled for this group\n",
+				hg_config.writer_hostgroup, hg_config.reader_hostgroup,
+				polardb_consistency_mode_name(resolved_mode));
 		}
 	}
 

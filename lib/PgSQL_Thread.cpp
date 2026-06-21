@@ -1936,7 +1936,7 @@ bool PgSQL_Threads_Handler::set_variable(char* name, const char* value) {	// thi
 			variables.polardb_consistency_mode = strdup(value);
 			return true;
 		}
-		proxy_error("Invalid value '%s' for pgsql-polardb_consistency_mode (allowed: off, lsn, primary)\n", value);
+		proxy_error("Invalid value '%s' for pgsql-polardb_consistency_mode (allowed: off, lsn, global_lsn, primary)\n", value);
 		return false;
 	}
 	if (!strcasecmp(name, "polardb_wait_timeout_mode")) {

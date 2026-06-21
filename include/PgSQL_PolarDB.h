@@ -863,6 +863,7 @@ enum class PolarDB_Query_WrapperKind : uint8_t {
 enum class PolarDB_ConsistencyMode : uint8_t {
     OFF = 0,            // No consistency routing; reads go to default hostgroup
     SESSION_LSN = 1,    // Track per-session write LSN, wait on replica before reads
+    GLOBAL_LSN = 2,     // Wait on max(session target, writer mirror LSN)
     PRIMARY_ONLY = 3    // Route all reads to primary (no replica reads)
 };
 
@@ -874,6 +875,8 @@ inline PolarDB_ConsistencyMode polardb_consistency_from_int(int v) {
     switch (v) {
         case static_cast<int>(PolarDB_ConsistencyMode::SESSION_LSN):
             return PolarDB_ConsistencyMode::SESSION_LSN;
+        case static_cast<int>(PolarDB_ConsistencyMode::GLOBAL_LSN):
+            return PolarDB_ConsistencyMode::GLOBAL_LSN;
         case static_cast<int>(PolarDB_ConsistencyMode::PRIMARY_ONLY):
             return PolarDB_ConsistencyMode::PRIMARY_ONLY;
         default:
@@ -881,7 +884,7 @@ inline PolarDB_ConsistencyMode polardb_consistency_from_int(int v) {
     }
 }
 
-/// @brief Map a config string ("off"/"lsn"/"primary") to the consistency-mode
+/// @brief Map a config string ("off"/"lsn"/"global_lsn"/"primary") to the consistency-mode
 /// int. Null, empty, "default", or any unknown value returns @p default_value.
 static inline int polardb_consistency_mode_from_string(
     const char* value,
@@ -895,10 +898,57 @@ static inline int polardb_consistency_mode_from_string(
     if (strcasecmp(value, "lsn") == 0) {
         return static_cast<int>(PolarDB_ConsistencyMode::SESSION_LSN);
     }
+    if (strcasecmp(value, "global_lsn") == 0 ||
+            strcasecmp(value, "lsn_global") == 0 ||
+            strcasecmp(value, "global") == 0) {
+        return static_cast<int>(PolarDB_ConsistencyMode::GLOBAL_LSN);
+    }
     if (strcasecmp(value, "primary") == 0) {
         return static_cast<int>(PolarDB_ConsistencyMode::PRIMARY_ONLY);
     }
     return default_value;
+}
+
+static inline bool polardb_consistency_mode_uses_lsn_wait(
+    PolarDB_ConsistencyMode mode) {
+    return mode == PolarDB_ConsistencyMode::SESSION_LSN ||
+        mode == PolarDB_ConsistencyMode::GLOBAL_LSN;
+}
+
+static inline bool polardb_consistency_mode_disallows_degraded_reader(
+    PolarDB_ConsistencyMode mode) {
+    return mode == PolarDB_ConsistencyMode::GLOBAL_LSN;
+}
+
+static inline const char* polardb_consistency_mode_name(
+    PolarDB_ConsistencyMode mode) {
+    switch (mode) {
+    case PolarDB_ConsistencyMode::OFF:
+        return "off";
+    case PolarDB_ConsistencyMode::SESSION_LSN:
+        return "lsn";
+    case PolarDB_ConsistencyMode::GLOBAL_LSN:
+        return "global_lsn";
+    case PolarDB_ConsistencyMode::PRIMARY_ONLY:
+        return "primary";
+    }
+    return "unknown";
+}
+
+static inline uint64_t polardb_target_with_global_lsn(
+    uint64_t local_target_lsn,
+    uint64_t primary_lsn,
+    bool* primary_lsn_unknown) {
+    if (primary_lsn_unknown) {
+        *primary_lsn_unknown = false;
+    }
+    if (primary_lsn == 0) {
+        if (primary_lsn_unknown) {
+            *primary_lsn_unknown = true;
+        }
+        return 0;
+    }
+    return local_target_lsn > primary_lsn ? local_target_lsn : primary_lsn;
 }
 
 /**
@@ -1312,6 +1362,23 @@ struct PolarDB_SessionConsistency {
         return primary_lsn;
     }
 
+    /**
+     * @brief GLOBAL_LSN target for a committed-state read.
+     *
+     * The caller must provide the current writer-scope primary LSN mirror. A
+     * missing mirror is unknown rather than "no wait": global consistency cannot
+     * be proven without a writer target. When present, wait on the max of this
+     * session's own monotonic target and the writer mirror.
+     */
+    uint64_t target_with_global_lsn(
+        uint64_t primary_lsn,
+        bool* primary_lsn_unknown) const {
+        return polardb_target_with_global_lsn(
+            target(),
+            primary_lsn,
+            primary_lsn_unknown);
+    }
+
     void reset_lsn_state() {
         write_lsn = 0;
         observed_lsn = 0;
@@ -1503,6 +1570,7 @@ struct PolarDB_Query_WaitPlan {
             wait_plan.route_hint = PolarDB_Query_ConsistencyRouteHint::PRIMARY;
             break;
         case PolarDB_ConsistencyMode::SESSION_LSN:
+        case PolarDB_ConsistencyMode::GLOBAL_LSN:
             wait_plan.spec = PolarDB_WaitSpec::lsn(
                 session_lsn,
                 wait_timeout_ms,
@@ -2123,6 +2191,8 @@ struct PolarDB_Query_ReaderPlan {
     int max_lag_bytes = -1;      // reader lag cap in WAL bytes; <=0 = disabled
     int fallback_writer_hg = -1; // writer hostgroup to fall back to
     int route_rfq_policy = (int)PolarDB_RfqRoutePolicy::STRICT;
+	uint32_t wait_timeout_ms = POLARDB_DEFAULT_WAIT_TIMEOUT_MS;
+    PolarDB_ConsistencyMode consistency_mode = PolarDB_ConsistencyMode::SESSION_LSN;
     bool allow_best_effort_degrade = true;
 
     /// @brief True if this read has a consistency target LSN.
@@ -2152,6 +2222,8 @@ struct PolarDB_Query_ReaderPlan {
         max_lag_bytes = -1;
         fallback_writer_hg = -1;
         route_rfq_policy = (int)PolarDB_RfqRoutePolicy::STRICT;
+		wait_timeout_ms = POLARDB_DEFAULT_WAIT_TIMEOUT_MS;
+        consistency_mode = PolarDB_ConsistencyMode::SESSION_LSN;
         allow_best_effort_degrade = true;
     }
 };
@@ -2245,7 +2317,7 @@ struct PolarDB_Query_RoutePlan {
         HINT_PRIMARY,          // /* route=primary */ per-query hint
         WRITE_LSN_UNKNOWN,     // a prior write completed but RFQ carried no LSN
         OBSERVED_LSN_UNKNOWN,  // a prior tracked read completed but RFQ carried no LSN
-        PRIMARY_LSN_UNKNOWN,   // primary baseline requested but writer mirror is unknown
+        PRIMARY_LSN_UNKNOWN,   // primary baseline/global LSN requested but writer mirror is unknown
         READER_FAILURE_FORCE_WRITER, // full retry: rest of txn is pinned to writer after reader failure
         WAL_PENDING,           // split: transaction WAL is not yet replay-safe
         SPLIT_BLOCKED,         // split: a prior split read failed in this transaction

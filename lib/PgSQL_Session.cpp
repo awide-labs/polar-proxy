@@ -4856,6 +4856,10 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 		} else if (strcasecmp(value.c_str(), "lsn") == 0 ||
 			strcasecmp(value.c_str(), "session") == 0) {
 			*mode = POLARDB_CONSISTENCY_LSN;
+		} else if (strcasecmp(value.c_str(), "global_lsn") == 0 ||
+			strcasecmp(value.c_str(), "lsn_global") == 0 ||
+			strcasecmp(value.c_str(), "global") == 0) {
+			*mode = POLARDB_CONSISTENCY_GLOBAL_LSN;
 		} else if (strcasecmp(value.c_str(), "primary") == 0) {
 			*mode = POLARDB_CONSISTENCY_PRIMARY;
 		} else {
