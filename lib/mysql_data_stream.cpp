@@ -426,7 +426,13 @@ MySQL_Data_Stream::~MySQL_Data_Stream() {
 	 * Note: Each data stream maintains its poll_fds_idx to track its position in the poll array
 	 *       for efficient removal without requiring find_index() lookup.
 	 */
-	if (mypolls) mypolls->remove_index_fast(poll_fds_idx);
+	if (mypolls) {
+#if POLARDB_PROXY
+		mypolls->remove_data_stream(this);
+#else
+		mypolls->remove_index_fast(poll_fds_idx);
+#endif // POLARDB_PROXY
+	}
 
 
 	if (fd>0) {
@@ -1741,9 +1747,15 @@ void MySQL_Data_Stream::unplug_backend() {
 	DSS=STATE_NOT_INITIALIZED;
 	myconn=NULL;
 	myds_type=MYDS_BACKEND_NOT_CONNECTED;
-  mypolls->remove_index_fast(poll_fds_idx);
-  mypolls=NULL;
-  fd=0;
+#if POLARDB_PROXY
+	if (mypolls) {
+		mypolls->remove_data_stream(this);
+	}
+#else
+	mypolls->remove_index_fast(poll_fds_idx);
+#endif // POLARDB_PROXY
+	mypolls=NULL;
+	fd=0;
 }
 
 void MySQL_Data_Stream::set_net_failure() {

@@ -1077,7 +1077,11 @@ void PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 				newsess->handler(); // execute immediately
 				//newsess->to_process=0;
 				if (newsess->status == WAITING_CLIENT_DATA) { // the mirror session has completed
+#if POLARDB_PROXY
+					thread->unregister_session(newsess);
+#else
 					thread->unregister_session(thread->mysql_sessions->len - 1);
+#endif // POLARDB_PROXY
 					unsigned int l = (unsigned int)pgsql_thread___mirror_max_concurrency;
 					if (thread->mirror_queue_mysql_sessions->len * 0.3 > l) l = thread->mirror_queue_mysql_sessions->len * 0.3;
 					if (thread->mirror_queue_mysql_sessions_cache->len <= l) {
@@ -3275,8 +3279,23 @@ int PgSQL_Session::handler() {
 		if (client_myds == NULL) {
 			// if we are here, probably we are trying to ping backends
 			proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 5, "Processing session %p without client_myds\n", this);
+#if POLARDB_PROXY
+			if (!mybe || !mybe->server_myds) {
+				// Backend-only helper sessions are registered for async ping/reset
+				// work and have no frontend to report to. If their backend was
+				// already detached by a pool/reset cleanup path, the helper has no
+				// remaining work; return -1 so the owning thread unregisters and
+				// deletes it instead of aborting the whole proxy on an assert.
+				proxy_warning(
+					"Closing backend-only PgSQL session %p with no backend state "
+					"(status=%d, mybe=%p)\n",
+					this, status, mybe);
+				return -1;
+			}
+#else
 			assert(mybe);
 			assert(mybe->server_myds);
+#endif // POLARDB_PROXY
 			goto handler_again;
 		}
 		else {
@@ -6656,8 +6675,15 @@ void PgSQL_Session::create_new_session_and_reset_connection(PgSQL_Data_Stream* _
 	}
 	int rc = new_sess->handler();
 	if (rc == -1) {
+#if POLARDB_PROXY
+		// The reset helper is registered without a frontend. It normally sits at
+		// the tail of the session array, but unregister by pointer so session-array
+		// churn during handler() cannot leave a dangling helper entry behind.
+		thread->unregister_session(new_sess);
+#else
 		unsigned int sess_idx = thread->mysql_sessions->len - 1;
 		thread->unregister_session(sess_idx);
+#endif // POLARDB_PROXY
 		delete new_sess;
 	}
 }

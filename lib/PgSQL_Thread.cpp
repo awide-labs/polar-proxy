@@ -3314,9 +3314,25 @@ void PgSQL_Thread::poll_listener_del(int sock) {
 
 void PgSQL_Thread::unregister_session(int idx) {
 	if (mysql_sessions == NULL) return;
+#if POLARDB_PROXY
+	if (idx < 0 || static_cast<unsigned int>(idx) >= mysql_sessions->len) return;
+#endif // POLARDB_PROXY
 	proxy_debug(PROXY_DEBUG_NET, 1, "Thread=%p, Session=%p -- Unregistered session\n", this, mysql_sessions->index(idx));
 	mysql_sessions->remove_index_fast(idx);
 }
+
+#if POLARDB_PROXY
+bool PgSQL_Thread::unregister_session(PgSQL_Session* sess) {
+	if (mysql_sessions == NULL || sess == NULL) return false;
+	for (unsigned int idx = 0; idx < mysql_sessions->len; idx++) {
+		if (mysql_sessions->index(idx) == sess) {
+			unregister_session(static_cast<int>(idx));
+			return true;
+		}
+	}
+	return false;
+}
+#endif // POLARDB_PROXY
 
 
 // this function was inline in PgSQL_Thread::run()
@@ -3343,8 +3359,16 @@ void PgSQL_Thread::run___get_multiple_idle_connections(int& num_idles) {
 		register_session_connection_handler(sess, true);
 		int rc = sess->handler();
 		if (rc == -1) {
+#if POLARDB_PROXY
+			// The helper is usually the last registered session, but handler()
+			// can execute enough cleanup work to make that assumption unsafe.
+			// Remove by pointer so a completed backend-only helper cannot leave
+			// a stale session entry behind.
+			unregister_session(sess);
+#else
 			unsigned int sess_idx = mysql_sessions->len - 1;
 			unregister_session(sess_idx);
+#endif // POLARDB_PROXY
 			delete sess;
 		}
 	}
@@ -3680,10 +3704,14 @@ void PgSQL_Thread::idle_thread_to_kill_idle_sessions() {
 		if (mysess->idle_since < min_idle || mysess->killed == true) {
 			mysess->killed = true;
 			PgSQL_Data_Stream* tmp_myds = mysess->client_myds;
-			int dsidx = tmp_myds->poll_fds_idx;
 			//fprintf(stderr,"Removing session %p, DS %p idx %d\n",mysess,tmp_myds,dsidx);
+#if POLARDB_PROXY
+			mypolls.remove_data_stream(tmp_myds);
+#else
+			int dsidx = tmp_myds->poll_fds_idx;
 			mypolls.remove_index_fast(dsidx);
 			tmp_myds->mypolls = NULL;
+#endif // POLARDB_PROXY
 			mysess->thread = NULL;
 			// we first delete the association in sessmap
 			sessmap.erase(mysess->thread_session_id);
@@ -3708,10 +3736,14 @@ void PgSQL_Thread::idle_thread_prepares_session_to_send_to_worker_thread(int i) 
 		uint32_t sess_pos = sessmap[sess_thr_id];
 		PgSQL_Session* mysess = (PgSQL_Session*)mysql_sessions->index(sess_pos);
 		PgSQL_Data_Stream* tmp_myds = mysess->client_myds;
-		int dsidx = tmp_myds->poll_fds_idx;
 		//fprintf(stderr,"Removing session %p, DS %p idx %d\n",mysess,tmp_myds,dsidx);
+#if POLARDB_PROXY
+		mypolls.remove_data_stream(tmp_myds);
+#else
+		int dsidx = tmp_myds->poll_fds_idx;
 		mypolls.remove_index_fast(dsidx);
 		tmp_myds->mypolls = NULL;
+#endif // POLARDB_PROXY
 		mysess->thread = NULL;
 		// we first delete the association in sessmap
 		sessmap.erase(mysess->thread_session_id);
@@ -6488,7 +6520,11 @@ void PgSQL_Thread::handle_mirror_queue_mysql_sessions() {
 			register_session(this, newsess);
 			newsess->handler(); // execute immediately
 			if (newsess->status == WAITING_CLIENT_DATA) { // the mirror session has completed
+#if POLARDB_PROXY
+				unregister_session(newsess);
+#else
 				unregister_session(mysql_sessions->len - 1);
+#endif // POLARDB_PROXY
 				unsigned int l = (unsigned int)pgsql_thread___mirror_max_concurrency;
 				if (mirror_queue_mysql_sessions->len * 0.3 > l) l = mirror_queue_mysql_sessions->len * 0.3;
 				if (mirror_queue_mysql_sessions_cache->len <= l) {

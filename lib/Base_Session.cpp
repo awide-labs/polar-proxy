@@ -95,6 +95,11 @@ void Base_Session<S,DS,B,T>::init() {
 
 template<typename S, typename DS, typename B, typename T>
 B * Base_Session<S,DS,B,T>::find_backend(int hostgroup_id) {
+#if POLARDB_PROXY
+	if (mybes == nullptr) {
+		return NULL;
+	}
+#endif // POLARDB_PROXY
 	B *_mybe;
 	unsigned int i;
 	for (i=0; i < mybes->len; i++) {
@@ -119,6 +124,12 @@ B * Base_Session<S,DS,B,T>::find_backend(int hostgroup_id) {
  */
 template<typename S, typename DS, typename B, typename T>
 B * Base_Session<S,DS,B,T>::create_backend(int hostgroup_id, DS *_myds) {
+#if POLARDB_PROXY
+	if (mybes == nullptr) {
+		// Teardown-only sessions can have their backend array detached already.
+		return NULL;
+	}
+#endif // POLARDB_PROXY
 	B *_mybe = new B();
 	proxy_debug(PROXY_DEBUG_NET,4,"HID=%d, _myds=%p, _mybe=%p\n" , hostgroup_id, _myds, _mybe);
 	_mybe->hostgroup_id=hostgroup_id;
@@ -371,6 +382,11 @@ void Base_Session<S, DS, B, T>::return_proxysql_internal(PtrSize_t* pkt) {
  */
 template<typename S, typename DS, typename B, typename T>
 bool Base_Session<S,DS,B,T>::has_any_backend() {
+#if POLARDB_PROXY
+	if (mybes == nullptr) {
+		return false;
+	}
+#endif // POLARDB_PROXY
 	for (unsigned int j=0;j < mybes->len;j++) {
 		B * tmp_mybe=(B *)mybes->index(j);
 		DS *__myds=tmp_mybe->server_myds;
@@ -393,6 +409,11 @@ bool Base_Session<S,DS,B,T>::has_any_backend() {
  */
 template<typename S, typename DS, typename B, typename T>
 void Base_Session<S,DS,B,T>::reset_all_backends() {
+#if POLARDB_PROXY
+	if (mybes == nullptr) {
+		return;
+	}
+#endif // POLARDB_PROXY
 	while(mybes->len) {
 		B *mybe=(B *)mybes->remove_index_fast(0);
 		mybe->reset();
@@ -560,6 +581,11 @@ using TypeConn = typename std::conditional<
 
 template<typename S, typename DS, typename B, typename T>
 void Base_Session<S,DS,B,T>::update_expired_conns(const vector<function<bool(TypeConn *)>>& checks) {
+#if POLARDB_PROXY
+	if (mybes == nullptr) {
+		return;
+	}
+#endif // POLARDB_PROXY
 	for (uint32_t i = 0; i < mybes->len; i++) { // iterate through the list of backends 
 		B * mybe = static_cast<B *>(mybes->index(i));
 		DS * myds = mybe != nullptr ? mybe->server_myds : nullptr;

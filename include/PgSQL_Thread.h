@@ -472,6 +472,9 @@ public:
 	 *
 	 */
 	void unregister_session(int);
+#if POLARDB_PROXY
+	bool unregister_session(PgSQL_Session*);
+#endif // POLARDB_PROXY
 
 	/**
 	 * @brief Returns a pointer to the `pollfd` structure for a specific data stream.

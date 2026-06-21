@@ -48,6 +48,10 @@ class ProxySQL_Poll {
 	void add(uint32_t _events, int _fd, T *_myds, unsigned long long sent_time);
 	void update_fd_at_index(unsigned int idx, int _fd);
 	void remove_index_fast(unsigned int i);
+#if POLARDB_PROXY
+	int find_data_stream(T *_myds);
+	void remove_data_stream(T *_myds);
+#endif // POLARDB_PROXY
 	int find_index(int fd);
 };
 #endif // __CLASS_PROXYSQL_POLL

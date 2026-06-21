@@ -349,7 +349,13 @@ PgSQL_Data_Stream::~PgSQL_Data_Stream() {
 	 * Note: Each data stream maintains its poll_fds_idx to track its position in the poll array
 	 *       for efficient removal without requiring find_index() lookup.
 	 */
-	if (mypolls) mypolls->remove_index_fast(poll_fds_idx);
+	if (mypolls) {
+#if POLARDB_PROXY
+		mypolls->remove_data_stream(this);
+#else
+		mypolls->remove_index_fast(poll_fds_idx);
+#endif // POLARDB_PROXY
+	}
 
 	if (fd > 0) {
 		//	// Changing logic here. The socket should be closed only if it is not a backend
@@ -1190,7 +1196,11 @@ void PgSQL_Data_Stream::unplug_backend() {
 	myconn = NULL;
 	myds_type = MYDS_BACKEND_NOT_CONNECTED;
 	if (mypolls) {
+#if POLARDB_PROXY
+		mypolls->remove_data_stream(this);
+#else
 		mypolls->remove_index_fast(poll_fds_idx);
+#endif // POLARDB_PROXY
 	}
 	mypolls = NULL;
 	fd = 0;

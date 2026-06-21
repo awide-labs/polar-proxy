@@ -241,6 +241,25 @@ void ProxySQL_Poll<T>::update_fd_at_index(unsigned int idx, int _fd) {
  */
 template<class T>
 void ProxySQL_Poll<T>::remove_index_fast(unsigned int i) {
+#if POLARDB_PROXY
+	if ((int)i==-1 || i >= len || myds == NULL) return;
+	T *removed = myds[i];
+	if (removed) {
+		removed->poll_fds_idx=-1; // this prevents further delete
+		removed->mypolls=NULL;
+	}
+	if (i != (len-1)) {
+		myds[i]=myds[len-1];
+		fds[i].fd=fds[len-1].fd;
+		fds[i].events=fds[len-1].events;
+		fds[i].revents=fds[len-1].revents;
+		if (myds[i]) {
+			myds[i]->poll_fds_idx=i;  // fix a serious bug
+		}
+		last_recv[i]=last_recv[len-1];
+		last_sent[i]=last_sent[len-1];
+	}
+#else
 	if ((int)i==-1) return;
 	myds[i]->poll_fds_idx=-1; // this prevents further delete
 	if (i != (len-1)) {
@@ -252,11 +271,52 @@ void ProxySQL_Poll<T>::remove_index_fast(unsigned int i) {
 		last_recv[i]=last_recv[len-1];
 		last_sent[i]=last_sent[len-1];
 	}
+#endif // POLARDB_PROXY
 	len--;
 	if ( ( len>MIN_POLL_LEN ) && ( size > len*MIN_POLL_DELETE_RATIO ) ) {
 		shrink();
 	}
 }
+
+#if POLARDB_PROXY
+template<class T>
+int ProxySQL_Poll<T>::find_data_stream(T *_myds) {
+	if (_myds == NULL || myds == NULL) return -1;
+	for (unsigned int i=0; i<len; i++) {
+		if (myds[i] == _myds) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+template<class T>
+void ProxySQL_Poll<T>::remove_data_stream(T *_myds) {
+	if (_myds == NULL) return;
+
+	int idx = -1;
+	if (_myds->poll_fds_idx >= 0) {
+		unsigned int cached_idx = static_cast<unsigned int>(_myds->poll_fds_idx);
+		if (cached_idx < len && myds && myds[cached_idx] == _myds) {
+			idx = static_cast<int>(cached_idx);
+		}
+	}
+	if (idx < 0) {
+		// Some cleanup paths detach/swap poll entries before the stream
+		// destructor runs. Fall back to pointer lookup instead of trusting a
+		// stale cached index and removing the wrong entry or reading out of range.
+		idx = find_data_stream(_myds);
+	}
+	if (idx >= 0) {
+		remove_index_fast(static_cast<unsigned int>(idx));
+	} else {
+		// The stream is already out of the poll array. Clear its back-pointers so
+		// later cleanup does not try to remove it by a stale index.
+		_myds->mypolls = NULL;
+		_myds->poll_fds_idx = -1;
+	}
+}
+#endif // POLARDB_PROXY
 
 /**
  * @brief Finds the index of a file descriptor (FD) in the ProxySQL_Poll object.
