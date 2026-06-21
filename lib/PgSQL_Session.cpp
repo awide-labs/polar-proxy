@@ -4943,6 +4943,40 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 		return handle_polardb_internal_set(polar_pvar, polar_value);
 	}
 #endif // POLARDB_PROXY
+#if POLARDB_PROXY
+	std::string session_default_isolation;
+	std::string session_transaction_scope;
+	bool session_default_update = false;
+	if (RE2::FullMatch(nq,
+			"(?i)\\s*SET\\s+SESSION\\s+CHARACTERISTICS\\s+AS\\s+"
+			"TRANSACTION\\s+ISOLATION\\s+LEVEL\\s+"
+			"(READ\\s+UNCOMMITTED|READ\\s+COMMITTED|REPEATABLE\\s+READ|SERIALIZABLE)\\s*;?\\s*",
+			&session_default_isolation)) {
+		session_default_update = true;
+	} else if (RE2::FullMatch(nq,
+			"(?i)\\s*SET\\s+(SESSION\\s+)?TRANSACTION\\s+"
+			"ISOLATION\\s+LEVEL\\s+"
+			"(READ\\s+UNCOMMITTED|READ\\s+COMMITTED|REPEATABLE\\s+READ|SERIALIZABLE)\\s*;?\\s*",
+			&session_transaction_scope, &session_default_isolation)) {
+		session_default_update = !session_transaction_scope.empty();
+	}
+	if (!session_default_isolation.empty()) {
+		if (session_default_update && is_in_transaction()) {
+			return false;
+		}
+		RE2::GlobalReplace(&session_default_isolation, "\\s+", " ");
+		if (session_default_update) {
+			// These SESSION spellings change the default for future transactions.
+			// Plain SET TRANSACTION is transaction-scoped, so it is forwarded
+			// without changing PolarDB's session-default routing gate.
+			polardb_config.txn_reader_wait_default_read_committed =
+				strcasecmp(session_default_isolation.c_str(), "READ COMMITTED") == 0;
+			polardb_config.txn_reader_wait_backend_default_seen = false;
+		}
+		return false;
+	}
+#endif // POLARDB_PROXY
+
 	if (
 		(match_regexes && match_regexes[1]->match(dig))
 		)
