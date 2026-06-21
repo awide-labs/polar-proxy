@@ -1144,6 +1144,10 @@ __thread int pgsql_thread___polardb_lag_bytes;               // reader lag-cap (
 __thread int pgsql_thread___polardb_lag_ms;                  // reserved ms lag cap; T13 accepts only 0, no PgSQL producer yet
 __thread int pgsql_thread___polardb_lag_wait_ms;             // polar_xact_split_wait_lsn timeout (ms); 0=wait indefinitely
 __thread int pgsql_thread___polardb_lsn_freshness_ms;        // max age of a cached per-server LSN to trust
+__thread int pgsql_thread___polardb_lag_cap_freshness_ms;    // max LSN-cache age under byte-lag cap + finite wait; 0=wait-fraction only
+__thread int pgsql_thread___polardb_reader_lsn_lag_range_bytes; // 0=exact best-behind reader only
+__thread int pgsql_thread___polardb_reader_affinity_ttl_ms;  // 0=disabled; session-local reader affinity TTL
+__thread int pgsql_thread___polardb_reader_affinity_max_uses; // max reads per affinity window
 __thread bool pgsql_thread___polardb_monitor_lsn_updates;    // enable monitor LSN cache updates
 __thread bool pgsql_thread___polardb_lazy_warmup_split;      // demand-warm connected split-reader pool entries
 __thread int pgsql_thread___polardb_wait_timeout_mode;       // best_effort=1, strict=2
@@ -1507,6 +1511,10 @@ extern __thread int pgsql_thread___polardb_lag_bytes;
 extern __thread int pgsql_thread___polardb_lag_ms;
 extern __thread int pgsql_thread___polardb_lag_wait_ms;
 extern __thread int pgsql_thread___polardb_lsn_freshness_ms;
+extern __thread int pgsql_thread___polardb_lag_cap_freshness_ms;
+extern __thread int pgsql_thread___polardb_reader_lsn_lag_range_bytes;
+extern __thread int pgsql_thread___polardb_reader_affinity_ttl_ms;
+extern __thread int pgsql_thread___polardb_reader_affinity_max_uses;
 extern __thread bool pgsql_thread___polardb_monitor_lsn_updates;
 extern __thread bool pgsql_thread___polardb_lazy_warmup_split;
 extern __thread int pgsql_thread___polardb_wait_timeout_mode;

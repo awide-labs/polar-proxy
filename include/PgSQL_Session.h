@@ -533,6 +533,10 @@ public:
 	// new client connection (a fresh session object) starts it at zero.
 	// See doc/polardb-arch/10-SESSION-INTEGRATION.md section 6.4.
 	PolarDB_SessionConsistency polardb_session_consistency;
+	// Short-lived hint for avoiding repeated waits on a reader this session has
+	// already proven reached a target LSN. It is disabled unless
+	// pgsql-polardb_reader_affinity_ttl_ms is greater than zero.
+	PolarDB_ReaderAffinity polardb_reader_affinity;
 
 	// Observed transaction-split RFQ state. The planner reads it to decide
 	// whether one in-transaction read can be sent to a replica with exported
@@ -795,6 +799,8 @@ public:
 	/** @brief Update counters and emit the rate-limited log for a produced route plan. */
 	void polardb_account_route_plan(const PolarDB_Query_RoutePlan& plan,
 		const PolarDB_Query_RouteCtx& route_ctx);
+	/** @brief Count a manual query-rule/sticky-hostgroup route that bypassed the planner. */
+	void polardb_account_manual_route(int effective_hg, bool forced_writer);
 	/**
 	 * @brief Apply the route plan's side effects and stage wait state if needed.
 	 *
@@ -949,6 +955,8 @@ public:
 	 *               build_polar_consistency_mode_set(). The timeout and wait SETs
 	 *               are appended after it, then the user query.
 	 */
+	bool append_wrapped_wait_query(const char* orig_query, size_t orig_len,
+		const PolarDB_Query_WaitState& wait_state, const std::string& prefix, std::string& out);
 	void build_wrapped_wait_query(const char* orig_query, size_t orig_len,
 		const PolarDB_Query_WaitState& wait_state, const std::string& prefix, std::string& out);
 	/**
@@ -971,6 +979,18 @@ public:
 	 * the per-query wait state is reset, or the elapsed time is lost.
 	 */
 	void record_wait_latency(PolarDB_Query_WaitState& state);
+	/**
+	 * @brief Advance the selected reader's cached LSN after a successful wait.
+	 *
+	 * A finalized LSN wait proves that this backend reached the target before
+	 * executing the user query. Recording that target in the reader cache lets
+	 * later reads bypass the wait wrapper when the same freshness/epoch checks
+	 * still hold. Failure paths and structured wait timeouts are ignored.
+	 */
+	void polardb_note_successful_wait_target(PgSQL_Data_Stream* myds, bool called_on_failure);
+	void polardb_note_reader_affinity(PgSQL_SrvC* srv, uint64_t reached_lsn,
+		const PolarDB_WriterScope& writer_scope);
+	void polardb_clear_reader_affinity(bool count_failure);
 	/**
 	 * @brief Count one proven PolarDB wait timeout and its elapsed latency.
 	 *
@@ -1067,6 +1087,8 @@ private:
 	void polardb_release_txn_split_backend(bool want_reuse);
 	/** @brief Add the current split read's elapsed time to split latency counters. */
 	void polardb_record_txn_split_latency();
+	/** @brief Add the current split wait wrapper's elapsed time to wait buckets. */
+	void polardb_record_txn_split_wait_latency();
 	/** @brief Snapshot the failed backend before normal rc==-1 handling mutates it. */
 	PolarDB_RequestOutcome polardb_capture_outcome(PgSQL_Backend* backend, bool ok);
 	/** @brief Handle a PolarDB rc==-1 replica-reader failure before generic retries. */

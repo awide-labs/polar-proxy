@@ -2569,15 +2569,18 @@ __implicit_sync:
 											&manual_scope_hg, &dest_hg, &replica_eligible);
 
 									if (manual_mode) {
+										bool forced_writer = false;
 										if (polardb_txn_reader_failure_pin == PolarDB_RoutePin::FORCE_WRITER &&
 												polardb_txn_writer_hg >= 0) {
 											current_hostgroup = polardb_txn_writer_hg;
+											forced_writer = true;
 											POLARDB_TRACE(
 												"PolarDB PIPELINE: manual route overridden by "
 												"reader-failure writer pin writer_hg=%d\n",
 												polardb_txn_writer_hg);
 										}
 										polardb_capture_request_writer_scope(manual_scope_hg);
+										polardb_account_manual_route(current_hostgroup, forced_writer);
 										POLARDB_TRACE(
 											"PolarDB PIPELINE: MANUAL mode (replica_eligible=%d "
 											"dest_hg=%d scope_hg=%d) -- PolarDB routing skipped\n",
@@ -6586,9 +6589,10 @@ __cleanup:
 	// next query. The session write/observed positions are NOT cleared here: they
 	// record committed positions this client has observed and must survive across
 	// queries. Any pending notices that were not forwarded (error paths) are freed
-	// here. record_wait_latency() runs BEFORE the reset so a completed wait
-	// contributes its elapsed time to PolarDB_Wait_LSN_Sum_Us (no-op when no wait
-	// was active).
+	// here. A completed wait first advances the selected reader's LSN cache, then
+	// record_wait_latency() runs BEFORE the reset so it contributes its elapsed
+	// time to PolarDB_Wait_LSN_Sum_Us (no-op when no wait was active).
+	polardb_note_successful_wait_target(myds, called_on_failure);
 	record_wait_latency(polardb_query.wait);
 	polardb_query.reset_for_new_query();
 	clear_pending_notices(/*free_buffers=*/true);

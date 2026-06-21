@@ -69,6 +69,96 @@ static void polardb_fold_thread_counters_to_global(
 #undef X
 }
 
+void polardb_count_lsn_wait_elapsed_bucket(
+	PgSQL_Thread* thread,
+	unsigned long long elapsed_us,
+	bool transaction_split)
+{
+	// Coarse buckets show whether waits are immediate, visible, or timeout-scale
+	// without adding detailed per-query tracing to the hot path.
+	if (elapsed_us <= 1000) {
+		if (transaction_split) {
+			POLARDB_THREAD_COUNT_ONE(thread, split_lsn_wait_elapsed_le_1ms);
+		} else {
+			POLARDB_THREAD_COUNT_ONE(thread, wait_lsn_elapsed_le_1ms);
+		}
+	} else if (elapsed_us <= 5000) {
+		if (transaction_split) {
+			POLARDB_THREAD_COUNT_ONE(thread, split_lsn_wait_elapsed_le_5ms);
+		} else {
+			POLARDB_THREAD_COUNT_ONE(thread, wait_lsn_elapsed_le_5ms);
+		}
+	} else if (elapsed_us <= 10000) {
+		if (transaction_split) {
+			POLARDB_THREAD_COUNT_ONE(thread, split_lsn_wait_elapsed_le_10ms);
+		} else {
+			POLARDB_THREAD_COUNT_ONE(thread, wait_lsn_elapsed_le_10ms);
+		}
+	} else if (elapsed_us <= 50000) {
+		if (transaction_split) {
+			POLARDB_THREAD_COUNT_ONE(thread, split_lsn_wait_elapsed_le_50ms);
+		} else {
+			POLARDB_THREAD_COUNT_ONE(thread, wait_lsn_elapsed_le_50ms);
+		}
+	} else if (elapsed_us <= 100000) {
+		if (transaction_split) {
+			POLARDB_THREAD_COUNT_ONE(thread, split_lsn_wait_elapsed_le_100ms);
+		} else {
+			POLARDB_THREAD_COUNT_ONE(thread, wait_lsn_elapsed_le_100ms);
+		}
+	} else if (elapsed_us <= 500000) {
+		if (transaction_split) {
+			POLARDB_THREAD_COUNT_ONE(thread, split_lsn_wait_elapsed_le_500ms);
+		} else {
+			POLARDB_THREAD_COUNT_ONE(thread, wait_lsn_elapsed_le_500ms);
+		}
+	} else if (elapsed_us <= 1000000) {
+		if (transaction_split) {
+			POLARDB_THREAD_COUNT_ONE(thread, split_lsn_wait_elapsed_le_1s);
+		} else {
+			POLARDB_THREAD_COUNT_ONE(thread, wait_lsn_elapsed_le_1s);
+		}
+	} else {
+		if (transaction_split) {
+			POLARDB_THREAD_COUNT_ONE(thread, split_lsn_wait_elapsed_gt_1s);
+		} else {
+			POLARDB_THREAD_COUNT_ONE(thread, wait_lsn_elapsed_gt_1s);
+		}
+	}
+}
+
+void polardb_count_reader_target_lsn_gap_bucket(
+	PgSQL_Thread* thread,
+	uint64_t target_lsn,
+	uint64_t reader_lsn,
+	bool reader_lsn_fresh)
+{
+	if (target_lsn == 0 || reader_lsn == 0) {
+		POLARDB_THREAD_COUNT_ONE(thread, reader_target_selected_lsn_unknown);
+		return;
+	}
+	if (!reader_lsn_fresh) {
+		POLARDB_THREAD_COUNT_ONE(thread, reader_target_selected_lsn_stale);
+		return;
+	}
+	if (reader_lsn >= target_lsn) {
+		POLARDB_THREAD_COUNT_ONE(thread, reader_target_gap_zero);
+		return;
+	}
+	const uint64_t gap = target_lsn - reader_lsn;
+	if (gap <= 4ULL * 1024ULL) {
+		POLARDB_THREAD_COUNT_ONE(thread, reader_target_gap_le_4kb);
+	} else if (gap <= 64ULL * 1024ULL) {
+		POLARDB_THREAD_COUNT_ONE(thread, reader_target_gap_le_64kb);
+	} else if (gap <= 1024ULL * 1024ULL) {
+		POLARDB_THREAD_COUNT_ONE(thread, reader_target_gap_le_1mb);
+	} else if (gap <= 16ULL * 1024ULL * 1024ULL) {
+		POLARDB_THREAD_COUNT_ONE(thread, reader_target_gap_le_16mb);
+	} else {
+		POLARDB_THREAD_COUNT_ONE(thread, reader_target_gap_gt_16mb);
+	}
+}
+
 static bool polardb_parse_proxy_identity_port(const char* value, int* port) {
 	if (!value || !*value || !port) return false;
 
@@ -408,6 +498,10 @@ static char* pgsql_thread_variables_names[] = {
 	(char*)"polardb_lag_ms",
 	(char*)"polardb_lag_wait_ms",
 	(char*)"polardb_lsn_freshness_ms",
+	(char*)"polardb_lag_cap_freshness_ms",
+	(char*)"polardb_reader_lsn_lag_range_bytes",
+	(char*)"polardb_reader_affinity_ttl_ms",
+	(char*)"polardb_reader_affinity_max_uses",
 	(char*)"polardb_monitor_lsn_updates",
 	(char*)"polardb_lazy_warmup_split",
 	(char*)"polardb_wait_timeout_mode",
@@ -1166,6 +1260,10 @@ PgSQL_Threads_Handler::PgSQL_Threads_Handler() {
 	variables.polardb_lag_ms = 0;                                // reserved: T13 accepts only 0; no PgSQL ms-lag producer yet
 	variables.polardb_lag_wait_ms = 1000;                        // default finite wait timeout
 	variables.polardb_lsn_freshness_ms = 5000;                   // 5s max age for a trusted cached LSN
+	variables.polardb_lag_cap_freshness_ms = 250;                // cap trusted LSN age under byte-lag + finite wait
+	variables.polardb_reader_lsn_lag_range_bytes = 0;            // 0 = exact best-behind reader only
+	variables.polardb_reader_affinity_ttl_ms = 0;                // disabled unless explicitly enabled
+	variables.polardb_reader_affinity_max_uses = 8;              // short cap when affinity is enabled
 	variables.polardb_monitor_lsn_updates = true;                // monitor LSN cache updates enabled
 	variables.polardb_lazy_warmup_split = true;                  // demand warm split-reader pool entries
 	variables.polardb_wait_timeout_mode = strdup((char*)"best_effort");
@@ -2577,6 +2675,10 @@ char** PgSQL_Threads_Handler::get_variables_list() {
 		VariablesPointers_int["polardb_lag_ms"] = make_tuple(&variables.polardb_lag_ms, 0, 0, false);                // reserved for future PgSQL ms-lag producer; T13 accepts only 0
 		VariablesPointers_int["polardb_lag_wait_ms"] = make_tuple(&variables.polardb_lag_wait_ms, 0, 60000, false);  // 0 = wait indefinitely, max 60s
 		VariablesPointers_int["polardb_lsn_freshness_ms"] = make_tuple(&variables.polardb_lsn_freshness_ms, 100, 60000, false); // 100ms-60s
+		VariablesPointers_int["polardb_lag_cap_freshness_ms"] = make_tuple(&variables.polardb_lag_cap_freshness_ms, 0, 60000, false); // 0 = wait-fraction only
+		VariablesPointers_int["polardb_reader_lsn_lag_range_bytes"] = make_tuple(&variables.polardb_reader_lsn_lag_range_bytes, 0, INT_MAX, false); // 0 = exact
+		VariablesPointers_int["polardb_reader_affinity_ttl_ms"] = make_tuple(&variables.polardb_reader_affinity_ttl_ms, 0, 60000, false); // 0 = disabled
+		VariablesPointers_int["polardb_reader_affinity_max_uses"] = make_tuple(&variables.polardb_reader_affinity_max_uses, 1, 1000, false);
 		VariablesPointers_int["polardb_proxy_identity_port"] = make_tuple(&variables.polardb_proxy_identity_port, 0, 65535, false); // 0 = unset
 #endif // POLARDB_PROXY
 		VariablesPointers_int["max_connections"] = make_tuple(&variables.max_connections, 1, 1000 * 1000, false);
@@ -4299,6 +4401,14 @@ void PgSQL_Thread::refresh_variables() {
 	pgsql_thread___polardb_lag_ms = GloPTH->get_variable_int((char*)"polardb_lag_ms");
 	pgsql_thread___polardb_lag_wait_ms = GloPTH->get_variable_int((char*)"polardb_lag_wait_ms");
 	pgsql_thread___polardb_lsn_freshness_ms = GloPTH->get_variable_int((char*)"polardb_lsn_freshness_ms");
+	pgsql_thread___polardb_lag_cap_freshness_ms =
+		GloPTH->get_variable_int((char*)"polardb_lag_cap_freshness_ms");
+	pgsql_thread___polardb_reader_lsn_lag_range_bytes =
+		GloPTH->get_variable_int((char*)"polardb_reader_lsn_lag_range_bytes");
+	pgsql_thread___polardb_reader_affinity_ttl_ms =
+		GloPTH->get_variable_int((char*)"polardb_reader_affinity_ttl_ms");
+	pgsql_thread___polardb_reader_affinity_max_uses =
+		GloPTH->get_variable_int((char*)"polardb_reader_affinity_max_uses");
 	pgsql_thread___polardb_monitor_lsn_updates = (bool)GloPTH->get_variable_int((char*)"polardb_monitor_lsn_updates");
 	pgsql_thread___polardb_lazy_warmup_split = (bool)GloPTH->get_variable_int((char*)"polardb_lazy_warmup_split");
 	{
@@ -4807,6 +4917,7 @@ static void polardb_export_stats(PgSQL_Threads_Handler* handler, SQLite3_result*
 	} while (0);
 
 	POLARDB_COUNTER_LIST(POLARDB_ADD_THREAD_COUNTER_ROW, POLARDB_ADD_GLOBAL_COUNTER_ROW)
+	POLARDB_GAUGE_LIST(POLARDB_ADD_GLOBAL_COUNTER_ROW)
 
 #undef POLARDB_ADD_GLOBAL_COUNTER_ROW
 #undef POLARDB_ADD_THREAD_COUNTER_ROW

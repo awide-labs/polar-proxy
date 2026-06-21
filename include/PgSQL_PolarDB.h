@@ -74,6 +74,12 @@ class PgSQL_SrvC;
 #define POLARDB_DEBUG 0
 #endif
 
+// POLARDB_PROFILE defaults OFF for production. Enable it for benchmark builds
+// that need per-phase latency counters in the query path.
+#ifndef POLARDB_PROFILE
+#define POLARDB_PROFILE 0
+#endif
+
 // Compile switch for PolarDB code paths that are designed but not yet active.
 // Off by default. It keeps this not-yet-finished code visible in the source
 // without letting it affect runtime behavior.
@@ -1205,6 +1211,42 @@ struct PolarDB_WriterScope {
 };
 
 /**
+ * @brief Short-lived reader preference proven by this client session.
+ *
+ * A successful backend wait proves that one reader reached at least
+ * last_reached_lsn. Replica replay LSNs only move forward, so the session can
+ * safely reuse that reader for later reads whose target is not higher than the
+ * proven value, even if the shared server LSN sample has aged out.
+ *
+ * This is a wait-avoidance hint, not a correctness requirement. If any check
+ * fails, reader acquisition falls back to the normal weighted selector.
+ */
+struct PolarDB_ReaderAffinity {
+    int reader_hg = -1;
+    std::string address;
+    int port = -1;
+    uint64_t valid_until_us = 0;
+    uint32_t uses_left = 0;
+    uint64_t last_reached_lsn = 0;
+    PolarDB_WriterScope writer_scope;
+
+    bool active() const {
+        return reader_hg >= 0 && port >= 0 && !address.empty() &&
+            uses_left > 0 && last_reached_lsn > 0;
+    }
+
+    void clear() {
+        reader_hg = -1;
+        address.clear();
+        port = -1;
+        valid_until_us = 0;
+        uses_left = 0;
+        last_reached_lsn = 0;
+        writer_scope.reset();
+    }
+};
+
+/**
  * @brief Per-session PolarDB consistency state.
  *
  * The write component tracks this session's positioned writes. The observed
@@ -1666,6 +1708,14 @@ static inline bool polardb_lsn_cache_fresh(uint64_t updated_at_us,
     if (updated_at_us == 0) return false;
     if (now_us < updated_at_us) return true;  // monotonic clock skew guard
     return (now_us - updated_at_us) <= ((uint64_t)freshness_ms * 1000ULL);
+}
+
+static inline bool polardb_reader_lsn_in_best_behind_range(
+		uint64_t reader_lsn, uint64_t best_lsn, int range_bytes) {
+	if (reader_lsn == 0 || best_lsn == 0) return false;
+	if (reader_lsn == best_lsn) return true;
+	if (range_bytes <= 0 || reader_lsn > best_lsn) return false;
+	return (best_lsn - reader_lsn) <= (uint64_t)range_bytes;
 }
 
 #if POLARDB_PROXY_TODO

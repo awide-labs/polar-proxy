@@ -60,6 +60,9 @@ endif
 ifeq ($(POLARDB_DEBUG),1)
 	PSQLPOLAR += -DPOLARDB_DEBUG=1
 endif
+ifeq ($(POLARDB_PROFILE),1)
+	PSQLPOLAR += -DPOLARDB_PROFILE=1
+endif
 
 PSQL40 :=
 ifeq ($(PROXYSQL40),1)
@@ -155,7 +158,7 @@ libproxysql.a: $(ODIR) $(OBJ) $(OBJ_CXX) $(SQLITE3_LDIR)/sqlite3.o
 	ar rcs $@ $(OBJ) $(OBJ_CXX) $(SQLITE3_LDIR)/sqlite3.o
 
 $(ODIR):
-	mkdir $(ODIR)
+	mkdir -p $(ODIR)
 
 #all: $(EXECUTABLE)
 

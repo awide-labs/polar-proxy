@@ -1119,6 +1119,10 @@ public:
 		int polardb_lag_ms;                   // reserved ms lag cap; T13 accepts only 0, no PgSQL producer yet
 		int polardb_lag_wait_ms;              // polar_xact_split_wait_lsn timeout (ms); 0=wait indefinitely
 		int polardb_lsn_freshness_ms;         // max age of a cached per-server LSN to trust
+		int polardb_lag_cap_freshness_ms;     // max LSN-cache age under byte-lag cap + finite wait; 0=wait-fraction only
+		int polardb_reader_lsn_lag_range_bytes; // 0 keeps exact best-behind reader choice
+		int polardb_reader_affinity_ttl_ms;   // 0 disables session-local reader affinity
+		int polardb_reader_affinity_max_uses; // max reads before one affinity hint expires
 		bool polardb_monitor_lsn_updates;     // enable monitor LSN cache updates
 		bool polardb_lazy_warmup_split;       // demand-warm connected split-reader pool entries
 		char* polardb_wait_timeout_mode;      // best_effort | strict

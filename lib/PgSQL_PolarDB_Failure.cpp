@@ -645,6 +645,7 @@ void PgSQL_Session::polardb_forward_reader_error(
 
 void PgSQL_Session::polardb_record_reader_failure_status(
 		const PolarDB_ReaderFailure& failure) {
+	polardb_clear_reader_affinity(/*count_failure=*/true);
 	if (failure.reader_hg >= 0 && !failure.reader_address.empty()) {
 		POLARDB_TRACE(
 			"PolarDB FAILURE: recording reader failure status hg=%d endpoint=%s:%d\n",

@@ -41,6 +41,7 @@
 #include "PgSQL_Connection.h"
 #include "PgSQL_Backend.h"
 #include "PgSQL_Data_Stream.h"
+#include "PgSQL_HostGroups_Manager.h"
 #include "PgSQL_Thread.h"
 #include "proxysql.h"
 
@@ -200,16 +201,15 @@ const std::string& PgSQL_Session::build_polar_consistency_mode_set(
  * @param mode_set    Consistency-mode SET from build_polar_consistency_mode_set().
  * @param out         Output buffer for the wrapped SQL; cleared on entry, empty on skip.
  */
-void PgSQL_Session::build_wrapped_wait_query(const char* orig_query, size_t orig_len,
+bool PgSQL_Session::append_wrapped_wait_query(const char* orig_query, size_t orig_len,
 	const PolarDB_Query_WaitState& wait_state, const std::string& mode_set, std::string& out) {
-	out.clear();
 	if (!orig_query || orig_len == 0) {
 		POLARDB_TRACE("PolarDB WAIT WRAP: skip — empty query\n");
-		return;
+		return false;
 	}
 	if (wait_state.spec.type == PolarDB_WaitType::NONE) {
 		POLARDB_TRACE("PolarDB WAIT WRAP: skip — wait_type=NONE\n");
-		return;
+		return false;
 	}
 	// A zero LSN is the "invalid / nothing to wait for" sentinel. Wrapping with
 	// it would emit a wait request that blocks on nothing, so bail and let
@@ -217,11 +217,11 @@ void PgSQL_Session::build_wrapped_wait_query(const char* orig_query, size_t orig
 	if (wait_state.spec.type == PolarDB_WaitType::LSN &&
 			XLogRecPtrIsInvalid(static_cast<XLogRecPtr>(wait_state.spec.target))) {
 		POLARDB_TRACE("PolarDB WAIT WRAP: skip — LSN target invalid\n");
-		return;
+		return false;
 	}
 
 	// 128 bytes of slack covers the three SET statements; the buffer grows if needed.
-	out.reserve(mode_set.size() + orig_len + 128);
+	out.reserve(out.size() + mode_set.size() + orig_len + 128);
 #if POLARDB_PROXY && POLARDB_DEBUG
 	if (polardb_debug_fail_wait_set_once()) {
 		out.append("SET polar_xact_split_wait_lsn = 'not-a-lsn'; ");
@@ -243,6 +243,13 @@ void PgSQL_Session::build_wrapped_wait_query(const char* orig_query, size_t orig
 	out.append(orig_query, orig_len);
 	POLARDB_TRACE("PolarDB WAIT WRAP: built wrapped_query_len=%zu query='%s'\n",
 		out.size(), log_snip(out.c_str(), out.size()).c_str());
+	return true;
+}
+
+void PgSQL_Session::build_wrapped_wait_query(const char* orig_query, size_t orig_len,
+	const PolarDB_Query_WaitState& wait_state, const std::string& mode_set, std::string& out) {
+	out.clear();
+	append_wrapped_wait_query(orig_query, orig_len, wait_state, mode_set, out);
 }
 
 /**
@@ -326,9 +333,18 @@ PolarDB_WrapFinalizeResult PgSQL_Session::finalize_wait_timeout_injection(PgSQL_
 	const std::string& mode_set =
 		build_polar_consistency_mode_set(polardb_query.wait.spec.mode);
 	const std::string& original_query = polardb_query.wait.original_query;
+#if POLARDB_PROFILE
+	const unsigned long long build_start_us = monotonic_time();
+#endif // POLARDB_PROFILE
 	build_wrapped_wait_query(
 		original_query.c_str(), original_query.size(), polardb_query.wait,
 		mode_set, polardb_query.wrapped_query_buf);
+#if POLARDB_PROFILE
+	const unsigned long long build_end_us = monotonic_time();
+	POLARDB_PROFILE_THREAD_COUNT(thread, wait_wrap_build_sum_us,
+		build_end_us >= build_start_us ? build_end_us - build_start_us : 0);
+	POLARDB_PROFILE_THREAD_COUNT_ONE(thread, wait_wrap_build_count);
+#endif // POLARDB_PROFILE
 
 	// Record how many leading SET results the connection layer must skip before
 	// the user query's result. build_wrapped_wait_query() prepends exactly the
@@ -342,6 +358,9 @@ PolarDB_WrapFinalizeResult PgSQL_Session::finalize_wait_timeout_injection(PgSQL_
 		log_snip(polardb_query.wrapped_query_buf.c_str(), polardb_query.wrapped_query_buf.size()).c_str());
 
 	if (!polardb_query.wrapped_query_buf.empty()) {
+#if POLARDB_PROFILE
+		const unsigned long long install_start_us = monotonic_time();
+#endif // POLARDB_PROFILE
 		replace_simple_query_packet(myds, polardb_query.wrapped_query_buf);
 		polardb_query.dispatch_wrapper_stmts = polardb_query.wait.wrapper_stmts;
 		polardb_query.dispatch_wrapper_kind = PolarDB_Query_WrapperKind::CONSISTENCY_WAIT;
@@ -349,6 +368,13 @@ PolarDB_WrapFinalizeResult PgSQL_Session::finalize_wait_timeout_injection(PgSQL_
 			POLARDB_THREAD_COUNT_ONE(thread, wait_lsn_sent);
 		}
 		// Only the LSN wait type has a per-type sent counter today.
+#if POLARDB_PROFILE
+		const unsigned long long install_end_us = monotonic_time();
+		POLARDB_PROFILE_THREAD_COUNT(thread, wait_wrap_install_sum_us,
+			install_end_us >= install_start_us
+				? install_end_us - install_start_us : 0);
+		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, wait_wrap_install_count);
+#endif // POLARDB_PROFILE
 	} else {
 		return fail_wait_wrap_finalize("wrapped query is empty");
 	}
@@ -379,8 +405,93 @@ void PgSQL_Session::record_wait_latency(PolarDB_Query_WaitState& state) {
 	if (state.spec.type == PolarDB_WaitType::LSN) {
 		POLARDB_THREAD_COUNT(thread, wait_lsn_sum_us,
 			static_cast<unsigned long long>(elapsed_us));
+		polardb_count_lsn_wait_elapsed_bucket(
+			thread, static_cast<unsigned long long>(elapsed_us),
+			/*transaction_split=*/false);
 	}
 	state.wait_started_at_us = 0;
+}
+
+void PgSQL_Session::polardb_note_reader_affinity(PgSQL_SrvC* srv,
+		uint64_t reached_lsn, const PolarDB_WriterScope& writer_scope) {
+	if (!srv || !srv->address || !srv->myhgc || reached_lsn == 0 ||
+			!writer_scope.valid() ||
+			pgsql_thread___polardb_reader_affinity_ttl_ms <= 0) {
+		return;
+	}
+
+	const int max_uses = pgsql_thread___polardb_reader_affinity_max_uses > 0
+		? pgsql_thread___polardb_reader_affinity_max_uses : 1;
+	polardb_reader_affinity.reader_hg = (int)srv->myhgc->hid;
+	polardb_reader_affinity.address = srv->address;
+	polardb_reader_affinity.port = (int)srv->port;
+	polardb_reader_affinity.valid_until_us =
+		monotonic_time() +
+		(uint64_t)pgsql_thread___polardb_reader_affinity_ttl_ms * 1000ULL;
+	polardb_reader_affinity.uses_left = (uint32_t)max_uses;
+	polardb_reader_affinity.last_reached_lsn = reached_lsn;
+	polardb_reader_affinity.writer_scope = writer_scope;
+	POLARDB_THREAD_COUNT_ONE(thread, reader_affinity_set);
+	POLARDB_TRACE(
+		"PolarDB affinity: set reader=%s:%d hg=%d reached_lsn=%lu ttl_ms=%d uses=%d\n",
+		srv->address, (int)srv->port, polardb_reader_affinity.reader_hg,
+		(unsigned long)reached_lsn,
+		pgsql_thread___polardb_reader_affinity_ttl_ms, max_uses);
+}
+
+void PgSQL_Session::polardb_clear_reader_affinity(bool count_failure) {
+	if (!polardb_reader_affinity.active()) {
+		return;
+	}
+	if (count_failure) {
+		POLARDB_THREAD_COUNT_ONE(thread, reader_affinity_clear_failure);
+	}
+	polardb_reader_affinity.clear();
+}
+
+void PgSQL_Session::polardb_note_successful_wait_target(PgSQL_Data_Stream* myds,
+		bool called_on_failure) {
+	if (called_on_failure || !polardb_config.is_polardb_enabled) {
+		return;
+	}
+	const PolarDB_Query_WaitState& state = polardb_query.wait;
+	// Timeout accounting clears wait_started_at_us. If it is already clear, the
+	// reader did not prove it reached this target, so do not update its LSN cache.
+	if (!state.wrapper_finalized || state.timeout_error ||
+			state.spec.type != PolarDB_WaitType::LSN ||
+			state.spec.target == 0 ||
+			state.wait_started_at_us == 0) {
+		return;
+	}
+	if (!myds || !myds->myconn || !myds->myconn->parent ||
+			!myds->myconn->parent->myhgc || !PgHGM) {
+		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, wait_target_lsn_cache_rejected);
+		return;
+	}
+
+	PgSQL_SrvC* srv = myds->myconn->parent;
+	const unsigned int backend_hg = srv->myhgc->hid;
+	const PgSQL_HostGroups_Manager::PolarDB_HG_Config* backend_config =
+		PgHGM->find_polardb_hg_config(backend_hg);
+	if (!backend_config) {
+		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, wait_target_lsn_cache_rejected);
+		return;
+	}
+
+	const bool accepted = PgHGM->polardb_update_server_lsn(
+		srv, backend_hg, *backend_config, state.spec.target,
+		polardb_query.request_writer_scope);
+	if (accepted) {
+		polardb_note_reader_affinity(
+			srv, state.spec.target, polardb_query.request_writer_scope);
+		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, wait_target_lsn_cache_advanced);
+		POLARDB_TRACE(
+			"PolarDB WAIT: advanced reader LSN cache after successful wait "
+			"hg=%u lsn=%lu\n",
+			backend_hg, (unsigned long)state.spec.target);
+	} else {
+		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, wait_target_lsn_cache_rejected);
+	}
 }
 
 /**

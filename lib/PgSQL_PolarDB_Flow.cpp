@@ -959,6 +959,50 @@ void PgSQL_Session::polardb_account_route_plan(
 	const PolarDB_Query_RoutePlan& plan,
 	const PolarDB_Query_RouteCtx& route_ctx)
 {
+	POLARDB_THREAD_COUNT_ONE(thread, route_planner_total);
+	if (!route_ctx.replica_eligible) {
+		// This includes writes and control statements that reached the automatic
+		// planner but were not opted into PolarDB reader routing by query rules.
+		POLARDB_THREAD_COUNT_ONE(thread, route_replica_ineligible);
+	} else {
+		POLARDB_THREAD_COUNT_ONE(thread, route_replica_eligible);
+
+		const bool planned_reader =
+			plan.action == PolarDB_Query_RoutePlan::RouteAction::REPLICA_WITH_WAIT ||
+			plan.action == PolarDB_Query_RoutePlan::RouteAction::REPLICA_TXN_SPLIT ||
+			(plan.action == PolarDB_Query_RoutePlan::RouteAction::PASSTHROUGH &&
+				plan.target_hg == route_ctx.reader_hg);
+		const bool planned_writer =
+			plan.action == PolarDB_Query_RoutePlan::RouteAction::FORCE_PRIMARY ||
+			(plan.action == PolarDB_Query_RoutePlan::RouteAction::PASSTHROUGH &&
+				plan.target_hg == route_ctx.writer_scope.hg);
+
+		if (planned_reader) {
+			POLARDB_THREAD_COUNT_ONE(thread, route_to_reader);
+			if (plan.action == PolarDB_Query_RoutePlan::RouteAction::PASSTHROUGH &&
+					plan.target_hg == route_ctx.reader_hg &&
+					!plan.degraded_rfq_route) {
+				POLARDB_THREAD_COUNT_ONE(thread, route_no_wait_target);
+			}
+			if (plan.action == PolarDB_Query_RoutePlan::RouteAction::REPLICA_WITH_WAIT) {
+				POLARDB_THREAD_COUNT_ONE(thread, route_wait_required);
+			}
+			if (plan.action == PolarDB_Query_RoutePlan::RouteAction::REPLICA_TXN_SPLIT) {
+				POLARDB_THREAD_COUNT_ONE(thread, route_txn_split_planned);
+			}
+			if (plan.txn_wait_read) {
+				POLARDB_THREAD_COUNT_ONE(thread, route_txn_wait_planned);
+			}
+		} else if (planned_writer) {
+			POLARDB_THREAD_COUNT_ONE(thread, route_to_writer);
+		} else if (plan.action == PolarDB_Query_RoutePlan::RouteAction::PASSTHROUGH &&
+				plan.target_hg < 0) {
+			// mode=off: the planner intentionally leaves the existing query-rule
+			// destination unchanged instead of naming reader or writer.
+			POLARDB_THREAD_COUNT_ONE(thread, route_passthrough_rule_owned);
+		}
+	}
+
 	if (plan.action_reason == PolarDB_Query_RoutePlan::RouteActionReason::PRIMARY_LSN_UNKNOWN) {
 		POLARDB_THREAD_COUNT_ONE(thread, primary_lsn_unknown);
 	}
@@ -979,6 +1023,34 @@ void PgSQL_Session::polardb_account_route_plan(
 		}
 	} else {
 		polardb_rfq_degraded_route_warning_sent = false;
+	}
+}
+
+void PgSQL_Session::polardb_account_manual_route(int effective_hg, bool forced_writer)
+{
+	POLARDB_THREAD_COUNT_ONE(thread, route_manual_total);
+	if (forced_writer) {
+		POLARDB_THREAD_COUNT_ONE(thread, route_manual_forced_writer);
+	}
+
+	if (effective_hg < 0) {
+		POLARDB_THREAD_COUNT_ONE(thread, route_manual_other);
+		return;
+	}
+
+	const auto* hg_config =
+		PgHGM->find_polardb_hg_config(static_cast<unsigned int>(effective_hg));
+	if (!hg_config || !hg_config->is_polardb_hostgroup) {
+		POLARDB_THREAD_COUNT_ONE(thread, route_manual_other);
+		return;
+	}
+
+	if (effective_hg == hg_config->reader_hostgroup) {
+		POLARDB_THREAD_COUNT_ONE(thread, route_manual_to_reader);
+	} else if (effective_hg == hg_config->writer_hostgroup) {
+		POLARDB_THREAD_COUNT_ONE(thread, route_manual_to_writer);
+	} else {
+		POLARDB_THREAD_COUNT_ONE(thread, route_manual_other);
 	}
 }
 
@@ -1150,15 +1222,18 @@ void PgSQL_Session::polardb_apply_extended_route()
 	bool manual_mode = polardb_manual_route_scope(
 		&manual_scope_hg, &dest_hg, &replica_eligible);
 	if (manual_mode) {
+		bool forced_writer = false;
 		if (polardb_txn_reader_failure_pin == PolarDB_RoutePin::FORCE_WRITER &&
 				polardb_txn_writer_hg >= 0) {
 			current_hostgroup = polardb_txn_writer_hg;
+			forced_writer = true;
 			POLARDB_TRACE(
 				"PolarDB EXTENDED: manual route overridden by "
 				"reader-failure writer pin writer_hg=%d\n",
 				polardb_txn_writer_hg);
 		}
 		polardb_capture_request_writer_scope(manual_scope_hg);
+		polardb_account_manual_route(current_hostgroup, forced_writer);
 		POLARDB_TRACE(
 			"PolarDB EXTENDED: manual destination_hostgroup=%d scope_hg=%d, "
 			"routing left unchanged\n",

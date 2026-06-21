@@ -80,6 +80,9 @@ endif
 ifeq ($(POLARDB_DEBUG),1)
 	PSQLPOLAR += -DPOLARDB_DEBUG=1
 endif
+ifeq ($(POLARDB_PROFILE),1)
+	PSQLPOLAR += -DPOLARDB_PROFILE=1
+endif
 
 PSQL40 :=
 ifeq ($(PROXYSQL40),1)
@@ -214,7 +217,7 @@ else
 endif
 
 $(ODIR):
-	mkdir $(ODIR)
+	mkdir -p $(ODIR)
 
 $(LIBPROXYSQLAR):
 	cd $(PROXYSQL_LDIR) && ${MAKE}

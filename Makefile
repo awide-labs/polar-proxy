@@ -147,6 +147,17 @@ export MAKE
 # PolarDB proxy support. Default ON; build with POLARDB_PROXY=0 to compile the
 # PolarDB compilation units to no-op stubs (no behavior change vs upstream).
 POLARDB_PROXY ?= 1
+# Optional PolarDB profiling counters. Default OFF so production builds avoid
+# per-query timing probes; build with POLARDB_PROFILE=1 when collecting latency
+# phase breakdowns.
+POLARDB_PROFILE ?= 0
+# PolarDB builds do not use ClickHouse. Force it off here so recursive make
+# calls cannot accidentally mix ClickHouse-enabled and disabled objects.
+ifeq ($(POLARDB_PROXY),1)
+override PROXYSQLCLICKHOUSE := 0
+else
+PROXYSQLCLICKHOUSE ?= 1
+endif
 
 ### detect compiler support for c++17 (required)
 CPLUSPLUS := $(shell ${CC} -std=c++17 -dM -E -x c++ /dev/null 2>/dev/null | grep -F __cplusplus | egrep -o '[0-9]{6}L')
@@ -397,29 +408,29 @@ build_src_debug_clickhouse: build_src_debug_default
 
 .PHONY: build_deps_default
 build_deps_default:
-	cd deps && OPTZ="${O2} -ggdb" PROXYSQLCLICKHOUSE=1 POLARDB_PROXY=$(POLARDB_PROXY) POLARDB_DEBUG=$(POLARDB_DEBUG) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE}
+	cd deps && OPTZ="${O2} -ggdb" PROXYSQLCLICKHOUSE=$(PROXYSQLCLICKHOUSE) POLARDB_PROXY=$(POLARDB_PROXY) POLARDB_DEBUG=$(POLARDB_DEBUG) POLARDB_PROFILE=$(POLARDB_PROFILE) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE}
 
 .PHONY: build_deps_debug_default
 build_deps_debug_default:
-	cd deps && OPTZ="${O0} -ggdb -DDEBUG" PROXYSQLCLICKHOUSE=1 POLARDB_PROXY=$(POLARDB_PROXY) POLARDB_DEBUG=$(POLARDB_DEBUG) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) PROXYDEBUG=1 CC=${CC} CXX=${CXX} ${MAKE}
+	cd deps && OPTZ="${O0} -ggdb -DDEBUG" PROXYSQLCLICKHOUSE=$(PROXYSQLCLICKHOUSE) POLARDB_PROXY=$(POLARDB_PROXY) POLARDB_DEBUG=$(POLARDB_DEBUG) POLARDB_PROFILE=$(POLARDB_PROFILE) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) PROXYDEBUG=1 CC=${CC} CXX=${CXX} ${MAKE}
 
 .PHONY: build_lib_default
 build_lib_default: build_deps_default
-	cd lib && OPTZ="${O2} -ggdb" PROXYSQLCLICKHOUSE=1 POLARDB_PROXY=$(POLARDB_PROXY) POLARDB_DEBUG=$(POLARDB_DEBUG) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE}
+	cd lib && OPTZ="${O2} -ggdb" PROXYSQLCLICKHOUSE=$(PROXYSQLCLICKHOUSE) POLARDB_PROXY=$(POLARDB_PROXY) POLARDB_DEBUG=$(POLARDB_DEBUG) POLARDB_PROFILE=$(POLARDB_PROFILE) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE}
 
 .PHONY: build_lib_debug_default
 build_lib_debug_default: build_deps_debug_default
-	cd lib && OPTZ="${O0} -ggdb -DDEBUG" PROXYSQLCLICKHOUSE=1 POLARDB_PROXY=$(POLARDB_PROXY) POLARDB_DEBUG=$(POLARDB_DEBUG) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE}
+	cd lib && OPTZ="${O0} -ggdb -DDEBUG" PROXYSQLCLICKHOUSE=$(PROXYSQLCLICKHOUSE) POLARDB_PROXY=$(POLARDB_PROXY) POLARDB_DEBUG=$(POLARDB_DEBUG) POLARDB_PROFILE=$(POLARDB_PROFILE) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE}
 
 .PHONY: build_src_default
 build_src_default: build_lib_default
-	cd src && OPTZ="${O2} -ggdb" PROXYSQLCLICKHOUSE=1 POLARDB_PROXY=$(POLARDB_PROXY) POLARDB_DEBUG=$(POLARDB_DEBUG) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE}
+	cd src && OPTZ="${O2} -ggdb" PROXYSQLCLICKHOUSE=$(PROXYSQLCLICKHOUSE) POLARDB_PROXY=$(POLARDB_PROXY) POLARDB_DEBUG=$(POLARDB_DEBUG) POLARDB_PROFILE=$(POLARDB_PROFILE) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE}
 	$(if $(filter 1,$(PROXYSQL40)),cd plugins/mysqlx && OPTZ="${O2} -ggdb" PROXYSQL40=$(PROXYSQL40) PROXYSQL31=$(PROXYSQL31) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE},@echo "[skip] mysqlx plugin (PROXYSQL40 not set)")
 	$(if $(filter 1,$(PROXYSQL40)),cd plugins/genai && OPTZ="${O2} -ggdb" PROXYSQL40=$(PROXYSQL40) PROXYSQL31=$(PROXYSQL31) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE},@echo "[skip] genai plugin (PROXYSQL40 not set)")
 
 .PHONY: build_src_debug_default
 build_src_debug_default: build_lib_debug_default
-	cd src && OPTZ="${O0} -ggdb -DDEBUG" PROXYSQLCLICKHOUSE=1 POLARDB_PROXY=$(POLARDB_PROXY) POLARDB_DEBUG=$(POLARDB_DEBUG) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE}
+	cd src && OPTZ="${O0} -ggdb -DDEBUG" PROXYSQLCLICKHOUSE=$(PROXYSQLCLICKHOUSE) POLARDB_PROXY=$(POLARDB_PROXY) POLARDB_DEBUG=$(POLARDB_DEBUG) POLARDB_PROFILE=$(POLARDB_PROFILE) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE}
 	$(if $(filter 1,$(PROXYSQL40)),cd plugins/mysqlx && OPTZ="${O0} -ggdb -DDEBUG" PROXYSQL40=$(PROXYSQL40) PROXYSQL31=$(PROXYSQL31) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE},@echo "[skip] mysqlx plugin (PROXYSQL40 not set)")
 	$(if $(filter 1,$(PROXYSQL40)),cd plugins/genai && OPTZ="${O0} -ggdb -DDEBUG" PROXYSQL40=$(PROXYSQL40) PROXYSQL31=$(PROXYSQL31) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE},@echo "[skip] genai plugin (PROXYSQL40 not set)")
 
@@ -437,6 +448,14 @@ polardb-debug:
 	+$(MAKE) clean
 	+$(MAKE) POLARDB_PROXY=1 POLARDB_DEBUG=1 build_src
 	@echo "=== Built POLARDB_PROXY=1 POLARDB_DEBUG=1 (verbose PolarDB trace enabled) ==="
+
+# Build the optimized PolarDB binary with profiling counters enabled. This is
+# meant for benchmark/profiling runs where query-path timing probes are useful.
+.PHONY: polardb-profile
+polardb-profile:
+	+$(MAKE) clean
+	+$(MAKE) POLARDB_PROXY=1 POLARDB_PROFILE=1 build_src
+	@echo "=== Built POLARDB_PROXY=1 POLARDB_PROFILE=1 (PolarDB profiling counters enabled) ==="
 
 # Build the PolarDB debug binary for coverage attribution. This keeps the same
 # POLARDB_DEBUG traces as polardb-debug, but uses the debug build recipes so
