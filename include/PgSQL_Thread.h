@@ -829,6 +829,26 @@ static inline void polardb_thread_count(
 #define POLARDB_THREAD_COUNT_ONE(thread, name) \
 	POLARDB_THREAD_COUNT((thread), name, 1)
 
+void polardb_count_lsn_wait_elapsed_bucket(
+	PgSQL_Thread* thread,
+	unsigned long long elapsed_us,
+	bool transaction_split);
+void polardb_count_reader_target_lsn_gap_bucket(
+	PgSQL_Thread* thread,
+	uint64_t target_lsn,
+	uint64_t reader_lsn,
+	bool reader_lsn_fresh);
+
+#if POLARDB_PROFILE
+#define POLARDB_PROFILE_THREAD_COUNT(thread, name, value) \
+	POLARDB_THREAD_COUNT((thread), name, (value))
+#define POLARDB_PROFILE_THREAD_COUNT_ONE(thread, name) \
+	POLARDB_PROFILE_THREAD_COUNT((thread), name, 1)
+#else
+#define POLARDB_PROFILE_THREAD_COUNT(thread, name, value) do { } while (0)
+#define POLARDB_PROFILE_THREAD_COUNT_ONE(thread, name) do { } while (0)
+#endif // POLARDB_PROFILE
+
 #endif // POLARDB_PROXY
 
 

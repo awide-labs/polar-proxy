@@ -1622,12 +1622,21 @@ uint64_t PgSQL_Connection::get_polardb_lsn() {
 		return 0;
 	}
 
-	// Returns 0 when the last ReadyForQuery carried no LSN.
+	// Returns 0 when the last ReadyForQuery carried no non-zero LSN.
 	if (PQhasLSN(pgsql_conn)) {
 		return PQgetLSN(pgsql_conn);
 	}
 
 	return 0;
+}
+
+// See PgSQL_Connection.h for the @brief. This deliberately reports payload
+// presence, not whether the payload is a non-zero wait target.
+bool PgSQL_Connection::has_polardb_lsn_payload() {
+	if (!pgsql_conn || PQstatus(pgsql_conn) != CONNECTION_OK) {
+		return false;
+	}
+	return PQhasLSN(pgsql_conn) != 0;
 }
 
 // See PgSQL_Connection.h for the @brief. This is a pure RFQ accessor: libpq

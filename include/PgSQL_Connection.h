@@ -897,9 +897,19 @@ public:
 	 * so it is safe to call on the hot request/result-processing path.
 	 * SQL-based LSN probing lives only in the monitor.
 	 *
-	 * @return LSN value (64-bit), or 0 if the RFQ carried no LSN / no connection.
+	 * @return LSN value (64-bit), or 0 if no non-zero LSN is cached / no connection.
 	 */
 	uint64_t get_polardb_lsn();
+
+	/**
+	 * @brief Whether libpq parsed an RFQ LSN payload on the last ReadyForQuery.
+	 *
+	 * A present payload may still carry value 0 on a session that has no usable
+	 * WAL position yet. Callers that need a wait target must check both this flag
+	 * and get_polardb_lsn() > 0; callers that diagnose RFQ protocol presence must
+	 * not collapse "present zero" into "missing payload".
+	 */
+	bool has_polardb_lsn_payload();
 
 	/**
 	 * @brief Read the transaction XID list carried by the last ReadyForQuery.

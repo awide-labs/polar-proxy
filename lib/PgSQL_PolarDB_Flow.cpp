@@ -1250,10 +1250,31 @@ void PgSQL_Session::polardb_process_result(PgSQL_Data_Stream* myds, const char* 
 		return;
 	}
 
-	// RFQ-only LSN read (no extra round-trip); 0 if the RFQ carried no LSN.
+	// RFQ-only LSN read (no extra round-trip). Value 0 can mean either "payload
+	// absent" or "payload present but no usable wait target"; PQhasLSN() separates
+	// those cases.
 	PgSQL_SrvC* backend_srv = myds->myconn->parent;
 	uint64_t lsn = myds->myconn->get_polardb_lsn();
-	bool has_lsn = (lsn > 0);
+	bool rfq_lsn_payload_present = myds->myconn->has_polardb_lsn_payload();
+	bool has_lsn = rfq_lsn_payload_present && lsn > 0;
+	if (myds->myconn->polardb_startup_profile.has_rfq_lsn()) {
+		if (!rfq_lsn_payload_present) {
+			POLARDB_PROFILE_THREAD_COUNT_ONE(thread, rfq_requested_missing_payload);
+		} else if (lsn == 0) {
+			POLARDB_PROFILE_THREAD_COUNT_ONE(thread, rfq_requested_zero_payload);
+		}
+	}
+	POLARDB_TRACE(
+		"PolarDB PROCESS_RESULT: rfq probe requested_lsn=%d payload_present=%d "
+		"cached_lsn=%lu pgsql_result=%p async_state=%d result_type=%u "
+		"digest='%.60s'\n",
+		myds->myconn->polardb_startup_profile.has_rfq_lsn() ? 1 : 0,
+		rfq_lsn_payload_present ? 1 : 0,
+		(unsigned long)lsn,
+		(void*)myds->myconn->pgsql_result,
+		(int)myds->myconn->async_state_machine,
+		(unsigned int)myds->myconn->result_type,
+		query_digest_text ? query_digest_text : "(null)");
 	int backend_hg = -1;
 	bool backend_is_polar_hg = false;
 	int backend_writer_hg = -1;
@@ -1381,6 +1402,81 @@ void PgSQL_Session::polardb_process_result(PgSQL_Data_Stream* myds, const char* 
 		return true;
 	};
 
+	auto polardb_process_zero_lsn_rfq = [&]() {
+		if (!backend_config || !backend_config->writer_epoch ||
+			!polardb_query.request_writer_scope.matches(
+				PolarDB_WriterScope{backend_writer_hg, backend_writer_epoch})) {
+			POLARDB_TRACE(
+				"PolarDB PROCESS_RESULT: skip zero-LSN RFQ payload due to writer "
+				"group/epoch request_hg=%d request_epoch=%lu request_valid=%d "
+				"current_hg=%d current_epoch=%lu current_valid=%d "
+				"backend_hg=%d is_write=%d\n",
+				polardb_query.request_writer_scope.hg,
+				(unsigned long)polardb_query.request_writer_scope.epoch,
+				polardb_query.request_writer_scope.valid() ? 1 : 0,
+				backend_writer_hg,
+				(unsigned long)backend_writer_epoch,
+				backend_config && backend_config->writer_epoch ? 1 : 0,
+				backend_hg, is_write ? 1 : 0);
+			return;
+		}
+		attach_request_epoch_to_session_lsn();
+
+		const bool zero_rfq_from_primary =
+			polardb_positioned_rfq_from_primary(
+				backend_is_polar_hg,
+				backend_hg,
+				backend_writer_hg);
+		const bool safe_without_wait_target =
+			!is_write || polardb_zero_lsn_payload_can_skip_wait_target(query_digest_text);
+		if (is_write && !safe_without_wait_target) {
+			if (zero_rfq_from_primary) {
+				if (myds && myds->myconn) {
+					// Even a zero-LSN RFQ carries transaction/split state; keep
+					// the split FSM in sync while the sticky unknown-LSN flag
+					// remains the routing source of truth.
+					polardb_observe_transaction_split(
+						myds->myconn,
+						0,
+						split_observation_enabled,
+						/*primary_source=*/true);
+				}
+				const bool first_unknown_write = !polardb_session_consistency.write_unknown;
+				polardb_session_consistency.write_unknown = true;
+				POLARDB_THREAD_COUNT_ONE(thread, write_missing_lsn);
+				if (first_unknown_write) {
+					proxy_warning(
+						"PolarDB PROCESS_RESULT: writer query completed with zero RFQ LSN payload; "
+						"automatic LSN-mode reads in this session will use writer until "
+						"a later primary RFQ carries non-zero LSN (sess=%p digest='%.60s')\n",
+						this, query_digest_text ? query_digest_text : "(null)");
+				}
+			}
+			POLARDB_TRACE(
+				"PolarDB PROCESS_RESULT: RFQ LSN payload present with zero value "
+				"for write-class statement (digest='%.60s') - write LSN marked unknown\n",
+				query_digest_text ? query_digest_text : "(null)");
+			return;
+		}
+		if (zero_rfq_from_primary && myds && myds->myconn) {
+			// RFQ payload presence proves the PolarDB startup profile is active,
+			// but value 0 is not a wait target. This is normal for read-only or
+			// session-state statements before the backend has a session WAL
+			// position. Observe txn status/split flags, but do not poison the
+			// session as missing-LSN.
+			polardb_observe_transaction_split(
+				myds->myconn,
+				0,
+				split_observation_enabled,
+				/*primary_source=*/true);
+		}
+		POLARDB_TRACE(
+			"PolarDB PROCESS_RESULT: RFQ LSN payload present with zero value "
+			"(is_write=%d digest='%.60s') - no wait target recorded, no missing-LSN sticky flag set\n",
+			is_write ? 1 : 0,
+			query_digest_text ? query_digest_text : "(null)");
+	};
+
 	auto polardb_process_missing_rfq = [&]() {
 		if (!backend_config || !backend_config->writer_epoch ||
 			!polardb_query.request_writer_scope.matches(
@@ -1460,6 +1556,8 @@ void PgSQL_Session::polardb_process_result(PgSQL_Data_Stream* myds, const char* 
 
 	if (has_lsn) {
 		(void)polardb_process_positioned_rfq();
+	} else if (rfq_lsn_payload_present) {
+		polardb_process_zero_lsn_rfq();
 	} else {
 		polardb_process_missing_rfq();
 	}

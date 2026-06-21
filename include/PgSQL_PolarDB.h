@@ -131,6 +131,48 @@ class PgSQL_SrvC;
 // or mutable runtime. Keep the detailed structure notes in the PolarDB
 // architecture documents under doc/polardb-arch/.
 
+static inline const char* polardb_skip_sql_space(const char* query) {
+    while (query && *query && std::isspace((unsigned char)*query)) {
+        query++;
+    }
+    return query;
+}
+
+static inline bool polardb_starts_with_sql_keyword(
+        const char* query, const char* keyword) {
+    query = polardb_skip_sql_space(query);
+    if (!query || !keyword || !*keyword) {
+        return false;
+    }
+    const size_t len = strlen(keyword);
+    if (strncasecmp(query, keyword, len) != 0) {
+        return false;
+    }
+    const unsigned char next = (unsigned char)query[len];
+    return next == '\0' || std::isspace(next) || next == ';';
+}
+
+static inline bool polardb_zero_lsn_payload_can_skip_wait_target(
+        const char* query) {
+    // A PolarDB RFQ LSN payload can be present with value 0 before the backend has
+    // a useful session WAL position. That is valid for read-only and session-state
+    // statements, but not for DML/DDL where the session must fail closed if no
+    // usable write LSN was reported. SELECT/SHOW/EXPLAIN are intentionally not in
+    // this list: the caller already knows ordinary reads are safe, and locking
+    // SELECT statements must be handled as writes.
+    static const char* const safe_zero_keywords[] = {
+        "SET", "RESET", "DISCARD",
+        "BEGIN", "START", "COMMIT", "END", "ROLLBACK",
+        "SAVEPOINT", "RELEASE", "DEALLOCATE", "CLOSE"
+    };
+    for (const char* keyword : safe_zero_keywords) {
+        if (polardb_starts_with_sql_keyword(query, keyword)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Stable PolarDB15 errdetail_internal() marker emitted by the backend for
 // proxy LSN wait timeouts. ProxySQL uses this structured field instead of
 // matching human-readable WARNING/ERROR text.
