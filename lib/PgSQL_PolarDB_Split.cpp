@@ -586,7 +586,13 @@ bool PgSQL_Session::polardb_build_txn_split_wrapped_query(
 
 void PgSQL_Session::polardb_reset_txn_split_read() {
 	if (polardb_txn_split_backend && polardb_txn_split_backend->server_myds) {
-		polardb_txn_split_backend->server_myds->pgsql_real_query.reset();
+		if (polardb_txn_wait_read_active) {
+			polardb_txn_split_backend->server_myds->free_pgsql_real_query();
+		} else {
+			// Split reads borrow QueryPtr from polardb_txn_split_wrapped_query.
+			// Clear the pointer before the string is cleared below.
+			polardb_txn_split_backend->server_myds->pgsql_real_query.reset();
+		}
 	}
 	if (polardb_txn_split_original_pkt.ptr) {
 		l_free(polardb_txn_split_original_pkt.size,
@@ -667,6 +673,17 @@ void PgSQL_Session::polardb_release_txn_wait_read(bool want_reuse) {
 		"PolarDB TXN_WAIT: releasing reader after failure want_reuse=%d\n",
 		want_reuse ? 1 : 0);
 	polardb_release_txn_split_backend(want_reuse);
+}
+
+void PgSQL_Session::polardb_reconcile_txn_wait_read_end(
+		const char* reason, bool want_reuse) {
+	if (!polardb_txn_wait_read_active) {
+		return;
+	}
+	POLARDB_TRACE(
+		"PolarDB TXN_WAIT: reconcile terminal path reason=%s want_reuse=%d\n",
+		reason ? reason : "unknown", want_reuse ? 1 : 0);
+	polardb_release_txn_wait_read(want_reuse);
 }
 
 void PgSQL_Session::polardb_release_txn_split_backend(bool want_reuse) {

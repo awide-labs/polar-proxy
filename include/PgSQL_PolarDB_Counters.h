@@ -381,6 +381,9 @@
 	T(route_manual_forced_writer, "PolarDB_Route_Manual_Forced_Writer", \
 		"proxysql_polardb_route_manual_forced_writer_total", \
 		"Manual-route queries overridden to the writer by a reader-failure safety pin") \
+	T(route_locked_hostgroup, "PolarDB_Route_Locked_Hostgroup", \
+		"proxysql_polardb_route_locked_hostgroup_total", \
+		"Queries where a session hostgroup lock skipped automatic PolarDB routing") \
 	T(wait_wrap_prepared, "PolarDB_Wait_Wrap_Prepared", \
 		"proxysql_polardb_wait_wrap_prepared_total", \
 		"Wait wrappers prepared for replica reads") \

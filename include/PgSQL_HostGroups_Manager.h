@@ -264,6 +264,7 @@ class PgSQL_SrvC {	// MySQL Server Container
 	PgSQL_SrvConnList *ConnectionsUsed;
 	PgSQL_SrvConnList *ConnectionsFree;
 #if POLARDB_PROXY
+	alignas(64) std::atomic<int> routing_status{0};
 	// =========================================================================
 	// PolarDB per-server LSN tracking (read-your-writes consistency)
 	// =========================================================================
@@ -312,6 +313,8 @@ class PgSQL_SrvC {	// MySQL Server Container
 	~PgSQL_SrvC();
 	void connect_error(int, bool get_mutex);
 	void shun_and_killall();
+	void set_status(enum MySerStatus new_status);
+	enum MySerStatus status_for_routing() const;
 #if POLARDB_PROXY
 	bool polardb_advance_lsn(uint64_t lsn, uint64_t observed_at_us);
 #endif // POLARDB_PROXY
@@ -881,6 +884,7 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 		std::atomic<unsigned long long> polardb_route_manual_to_writer{0};   // manual routes whose effective HG is a PolarDB writer
 		std::atomic<unsigned long long> polardb_route_manual_other{0};       // manual routes outside known PolarDB reader/writer HGs
 		std::atomic<unsigned long long> polardb_route_manual_forced_writer{0}; // manual route overridden by reader-failure safety pin
+		std::atomic<unsigned long long> polardb_route_locked_hostgroup{0};   // explicit locked_on_hostgroup routes that bypass automatic planning
 		std::atomic<unsigned long long> polardb_wait_wrap_prepared{0};        // wait wrapper intent prepared (REPLICA_WITH_WAIT)
 		std::atomic<unsigned long long> polardb_wait_wrap_bypassed{0};       // selected reader reached consistency target -> wrapper skipped
 		std::atomic<unsigned long long> polardb_wait_lsn_sent{0};             // LSN wait wrapper successfully installed/sent

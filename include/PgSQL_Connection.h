@@ -10,6 +10,22 @@
 #include <string>
 #endif
 
+#if POLARDB_PROXY
+static inline PGTransactionStatusType polardb_client_rfq_transaction_status(
+		bool temporary_reader_active,
+		PGTransactionStatusType backend_status,
+		PGTransactionStatusType transaction_owner_status) {
+	if (!temporary_reader_active) {
+		return backend_status;
+	}
+	if (backend_status == PQTRANS_INERROR ||
+			transaction_owner_status == PQTRANS_INERROR) {
+		return PQTRANS_INERROR;
+	}
+	return PQTRANS_INTRANS;
+}
+#endif
+
 #ifndef PROXYJSON
 #define PROXYJSON
 #include "../deps/json/json_fwd.hpp"
@@ -583,6 +599,15 @@ public:
 	 */
 	void copy_startup_parameters_to_pgsql_variables(bool copy_only_critical_param);
 
+	/**
+	 * @brief Initialize critical startup parameters from backend ParameterStatus.
+	 *
+	 * Warmup connections are opened without a client session, so they do not run
+	 * the client-variable copy path in connect_start(). Before entering the pool,
+	 * they still need the same critical baseline that reset/reuse code expects.
+	 */
+	void init_startup_parameters_from_server();
+
 	struct {
 		unsigned long length;
 		const char* ptr;
@@ -646,15 +671,6 @@ public:
 	bool processing_multi_statement;
 
 #if POLARDB_PROXY
-	/**
-	 * @brief Initialize critical startup parameters from backend ParameterStatus.
-	 *
-	 * Warmup connections are opened without a client session, so they do not run
-	 * the client-variable copy path in connect_start(). Before entering the pool,
-	 * they still need the same critical baseline that reset/reuse code expects.
-	 */
-	void init_startup_parameters_from_server();
-
 	// ---- PolarDB wrapped-wait result filtering ----
 	// A wrapped LSN-wait read prepends N SET statements ahead of the user query
 	// (see PgSQL_PolarDB_Wrap.cpp). The connection layer is the sole owner of SET
@@ -762,6 +778,7 @@ public:
 		uint32_t stmt_pending{0};  // wrapper statements whose result set is still to consume
 		PolarDB_Query_WrapperKind wrapper_kind{PolarDB_Query_WrapperKind::NONE};
 		bool txn_split_xids_reset_pending{false}; // true only for the first wrapper SET
+		PolarDB_WaitCompletion wait_completion;
 
 		bool has_pending() const { return stmt_pending > 0; }  // still consuming wrapper result sets
 		bool consuming_wrapper_set() const { return stmt_pending > 0; }
@@ -790,11 +807,13 @@ public:
 			stmt_pending = n;
 			wrapper_kind = (n > 0) ? kind : PolarDB_Query_WrapperKind::NONE;
 			txn_split_xids_reset_pending = (n > 0) && txn_xids_reset;
+			wait_completion.begin(n > 0 && is_consistency_wait());
 		}
 		void mark_wrapper_set_failed() {
 			stmt_failed = true;
 			stmt_pending = 0;
 			txn_split_xids_reset_pending = false;
+			wait_completion.mark_failed();
 		}
 		void clear() {
 			was_wrapped = false;
@@ -803,9 +822,13 @@ public:
 			stmt_pending = 0;
 			wrapper_kind = PolarDB_Query_WrapperKind::NONE;
 			txn_split_xids_reset_pending = false;
+			wait_completion.reset();
 		}
 	};
 	PolarDB_Query_WrapState polardb_query_wrap_state;
+
+	uint64_t polardb_ready_sequence_at_dispatch{0};
+	PolarDB_PendingReadyResult polardb_pending_ready_result;
 
 	/**
 	 * @brief Backend connection may retain polar_xact_split_xids after split use.
@@ -910,6 +933,10 @@ public:
 	 * not collapse "present zero" into "missing payload".
 	 */
 	bool has_polardb_lsn_payload();
+	bool polardb_has_new_ready_message() const;
+	void polardb_remember_pending_ready_result(const char* query_text,
+		enum PGSQL_QUERY_command query_cmd,
+		const PolarDB_WriterScope& writer_scope);
 
 	/**
 	 * @brief Read the transaction XID list carried by the last ReadyForQuery.

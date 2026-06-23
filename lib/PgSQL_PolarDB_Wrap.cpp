@@ -468,6 +468,10 @@ void PgSQL_Session::polardb_note_successful_wait_target(PgSQL_Data_Stream* myds,
 		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, wait_target_lsn_cache_rejected);
 		return;
 	}
+	if (!myds->myconn->polardb_query_wrap_state.wait_completion.complete()) {
+		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, wait_target_lsn_cache_rejected);
+		return;
+	}
 
 	PgSQL_SrvC* srv = myds->myconn->parent;
 	const unsigned int backend_hg = srv->myhgc->hid;

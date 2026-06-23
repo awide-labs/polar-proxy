@@ -582,6 +582,11 @@ public:
 	// which would otherwise break read-your-writes silently. Cleared on RESET.
 	bool polardb_wait_disabled = false;
 
+	// Frontend capability negotiated from client startup parameters. When true,
+	// ProxySQL appends the backend RFQ LSN to ReadyForQuery packets it sends to
+	// the client, matching PolarDB's extended RFQ layout.
+	bool polardb_client_rfq_lsn_requested = false;
+
 	// Queue of NoticeResponse packets captured from a wrapped consistency read,
 	// flushed to the client just ahead of the user result so the client sees the
 	// same warning-before-result ordering it would without wrapping (e.g. a
@@ -878,7 +883,11 @@ public:
 	 * and write LSN positions, maintains the missing-LSN sticky flags, and refreshes the
 	 * per-server LSN cache. Writer-epoch-stale RFQs are rejected first.
 	 */
-	void polardb_process_result(PgSQL_Data_Stream* myds, const char* query_digest_text);
+	void polardb_process_result(PgSQL_Data_Stream* myds, const char* query_text,
+		PGSQL_QUERY_command query_cmd);
+	bool polardb_client_ready_lsn(PgSQL_Connection* conn,
+		bool backend_payload_present, uint64_t backend_lsn,
+		uint64_t* client_lsn);
 
 	/**
 	 * @brief Observe transaction-split RFQ metadata from an accepted primary result.
@@ -1081,6 +1090,9 @@ private:
 	void polardb_abort_txn_split_read(const char* reason);
 	/** @brief Release a failed pre-write transaction wait read and restore primary. */
 	void polardb_release_txn_wait_read(bool want_reuse);
+	/** @brief Reconcile a terminal txn-wait reader path and restore primary. */
+	void polardb_reconcile_txn_wait_read_end(
+		const char* reason, bool want_reuse);
 	/** @brief Clear temporary split-read buffers and restore mybe. */
 	void polardb_reset_txn_split_read();
 	/** @brief Return/destroy the borrowed split replica connection. */
@@ -1160,6 +1172,8 @@ private:
 	void polardb_apply_reader_failure_route_pin(
 		PolarDB_RoutePin pin, int writer_hg,
 		const PolarDB_ReaderFailure* failure = nullptr);
+	/** @brief Honor a session hostgroup lock by skipping automatic PolarDB routing. */
+	bool polardb_apply_locked_hostgroup_route(const char* stage);
 	/** @brief Redispatch the original client query on an existing live writer. */
 	bool polardb_try_redispatch_to_writer(PolarDB_ReaderFailure& failure,
 		int writer_hg, PgSQL_Backend* writer_backend);
@@ -1180,9 +1194,10 @@ private:
 	bool polardb_build_txn_split_wrapped_query(const PtrSize_t& pkt,
 		const PolarDB_WaitSpec& wait_spec, std::string_view txn_xids,
 		std::string& wrapped_query);
-	/** @brief Forward captured reader error and keep the transaction on writer. */
+	/** @brief Forward the reader error and mark the client transaction failed. */
 	PolarDB_FailureAction polardb_forward_and_continue(
 		PolarDB_ReaderFailure& failure);
+	void polardb_end_writer_transaction_after_reader_error();
 	/** @brief Emit ErrorResponse plus ReadyForQuery with explicit txn status. */
 	void polardb_forward_reader_error(const PolarDB_ReaderFailure& failure,
 		char rfq);

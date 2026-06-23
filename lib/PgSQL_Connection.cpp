@@ -163,6 +163,7 @@ static void polardb_account_wrapper_set_error(PgSQL_Connection* conn, const PGre
 		conn->polardb_query_wrap_state.mark_wrapper_set_failed();
 		POLARDB_TRACE("PolarDB WAIT: wrapper SET failure marked\n");
 	}
+	conn->polardb_query_wrap_state.wait_completion.mark_failed();
 }
 #endif
 
@@ -674,6 +675,9 @@ handler_again:
 						const bool consumed_xids_reset =
 							polardb_query_wrap_state.consuming_txn_split_xids_reset();
 						polardb_query_wrap_state.stmt_pending--;
+						if (polardb_query_wrap_state.stmt_pending == 0) {
+							polardb_query_wrap_state.wait_completion.mark_sets_complete();
+						}
 						if (consumed_xids_reset) {
 							// Clear the dirty flag later, when the whole reset-wrapped
 							// query completes without error. Until then the physical
@@ -711,6 +715,13 @@ handler_again:
 							(int)exec_status_type, polardb_query_wrap_state.stmt_pending);
 						polardb_account_wrapper_set_error(this, result.get(), PQresultErrorMessage(result.get()));
 					}
+				}
+				if (polardb_query_wrap_state.was_wrapped &&
+						!polardb_query_wrap_state.has_pending() &&
+						(exec_status_type == PGRES_FATAL_ERROR ||
+						 exec_status_type == PGRES_NONFATAL_ERROR ||
+						 exec_status_type == PGRES_BAD_RESPONSE)) {
+					polardb_query_wrap_state.wait_completion.mark_failed();
 				}
 #endif // POLARDB_PROXY
 
@@ -966,8 +977,107 @@ handler_again:
 #endif // POLARDB_PROXY
 
 		// finally add ready for query packet
+#if POLARDB_PROXY
+		/*
+		 * PolarDB client RFQ-LSN passthrough.
+		 *
+		 * Backend side: ProxySQL requests RFQ LSN from PolarDB backends through
+		 * its backend startup profile. The patched libpq parser caches the LSN
+		 * from the last backend ReadyForQuery; has_polardb_lsn_payload() tells us
+		 * whether the backend RFQ actually carried the extension, and
+		 * get_polardb_lsn() returns the cached value.
+		 *
+		 * Frontend side: a PolarDB-aware client can opt in with the same startup
+		 * keys used by PolarDB libpq (_polar_send_lsn=true or
+		 * _polar_proxy_send_lsn=true). PgSQL_Protocol consumes those keys during
+		 * client startup and sets polardb_client_rfq_lsn_requested, so they do not
+		 * leak into generic PostgreSQL startup-parameter handling.
+		 *
+		 * Client-visible flow examples:
+		 *  - Autocommit, one query per protocol message:
+		 *      SELECT ...
+		 *    Each backend-backed query ends with ReadyForQuery. If the client
+		 *    startup requested _polar_send_lsn=true or _polar_proxy_send_lsn=true,
+		 *    ProxySQL appends the backend RFQ LSN to that client RFQ.
+		 *
+		 *  - Explicit transaction, separate statements:
+		 *      BEGIN;
+		 *      INSERT ...;
+		 *      SELECT ...;
+		 *      COMMIT;
+		 *    Each statement gets its own backend RFQ and client RFQ:
+		 *      BEGIN  -> RFQ status T + LSN if backend sent it
+		 *      INSERT -> RFQ status T + updated LSN if WAL advanced
+		 *      SELECT -> RFQ status T + current backend RFQ LSN
+		 *      COMMIT -> RFQ status I + commit RFQ LSN
+		 *
+		 *  - Multi-statement in one Simple Query packet:
+		 *      BEGIN; INSERT ...; SELECT ...; COMMIT;
+		 *    PostgreSQL protocol emits only one ReadyForQuery at the end of the
+		 *    packet, so the client gets one final RFQ LSN, not one LSN per
+		 *    semicolon-delimited statement.
+		 *
+		 *  - Extended protocol:
+		 *    ReadyForQuery is emitted after Sync, not after every
+		 *    Parse/Bind/Execute message, so LSN availability follows Sync
+		 *    boundaries. RFQ-LSN forwarding is supported for this backend-backed
+		 *    extended path, but PolarDB wait/split handling is routing-only for
+		 *    extended protocol: it does not inject LSN-wait or split-XID SQL
+		 *    wrappers into Parse/Bind/Execute streams. If an extended-protocol read
+		 *    needs a wait, the PolarDB extended route helper forces the writer
+		 *    instead of trying to wrap the extended message flow.
+		 *
+		 *  - Proxy-local responses:
+		 *    If ProxySQL generates a response locally without a backend RFQ, it
+		 *    sends standard RFQ and does not fabricate an LSN. A patched libpq
+		 *    client should therefore report PQhasLSN() == 0. If a backend-backed
+		 *    response reaches this path but the backend RFQ carried no LSN payload,
+		 *    ProxySQL also sends standard RFQ.
+		 *
+		 * Query cache is disabled for LSN-aware clients because cached wire bytes
+		 * would otherwise replay a stale or missing ReadyForQuery LSN.
+		 */
+		bool include_client_lsn = false;
+		uint64_t client_lsn = 0;
+		PGTransactionStatusType frontend_txn_status =
+			PQtransactionStatus(pgsql_conn);
+		if (myds && myds->sess) {
+			const bool backend_payload_present = has_polardb_lsn_payload();
+			const uint64_t backend_lsn = backend_payload_present
+				? get_polardb_lsn()
+				: 0;
+			include_client_lsn = myds->sess->polardb_client_ready_lsn(
+				this, backend_payload_present, backend_lsn, &client_lsn);
+
+			const bool temporary_reader_active =
+				myds->sess->polardb_txn_split_saved_mybe &&
+				(myds->sess->polardb_txn_split_active ||
+					myds->sess->polardb_txn_wait_read_active);
+			PGTransactionStatusType transaction_owner_status = PQTRANS_UNKNOWN;
+			if (temporary_reader_active) {
+				PgSQL_Backend* transaction_owner =
+					myds->sess->polardb_txn_split_saved_mybe;
+				PgSQL_Data_Stream* owner_myds = transaction_owner->server_myds;
+				PgSQL_Connection* owner_conn = owner_myds
+					? owner_myds->myconn
+					: nullptr;
+				if (owner_conn && owner_conn->pgsql_conn) {
+					transaction_owner_status =
+						PQtransactionStatus(owner_conn->pgsql_conn);
+				}
+			}
+			frontend_txn_status = polardb_client_rfq_transaction_status(
+				temporary_reader_active,
+				frontend_txn_status,
+				transaction_owner_status);
+		}
+		const unsigned int ready_bytes = query_result->add_ready_status(
+			frontend_txn_status, include_client_lsn, client_lsn);
+		update_bytes_recv(ready_bytes);
+#else
 		query_result->add_ready_status(PQtransactionStatus(pgsql_conn));
 		update_bytes_recv(6);
+#endif // POLARDB_PROXY
 		//processing_multi_statement = false;
 		NEXT_IMMEDIATE(fetch_result_end_st);
 	}
@@ -1639,6 +1749,22 @@ bool PgSQL_Connection::has_polardb_lsn_payload() {
 	return PQhasLSN(pgsql_conn) != 0;
 }
 
+bool PgSQL_Connection::polardb_has_new_ready_message() const {
+	return pgsql_conn &&
+		PQgetReadyForQuerySequence(pgsql_conn) !=
+			polardb_ready_sequence_at_dispatch;
+}
+
+void PgSQL_Connection::polardb_remember_pending_ready_result(
+		const char* query_text,
+		enum PGSQL_QUERY_command query_cmd,
+		const PolarDB_WriterScope& writer_scope) {
+	polardb_pending_ready_result.remember(
+		query_text, (int)query_cmd,
+		PolarDB_Protocol::is_write_query(query_text, (int)query_cmd),
+		writer_scope);
+}
+
 // See PgSQL_Connection.h for the @brief. This is a pure RFQ accessor: libpq
 // already cached the payload from the last ReadyForQuery.
 const char* PgSQL_Connection::get_polardb_txn_xids() {
@@ -1727,14 +1853,9 @@ void PgSQL_Connection::connect_cont(short event) {
 	int current_fd = PQsocket(pgsql_conn);
 	if (current_fd != fd) {
 		proxy_warning("PgSQL Connection FD has been changed by PQconnectPoll(). oldFD:%d newFD:%d\n", fd, current_fd);
-#if POLARDB_PROXY
 		proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 5, "PgSQL Connection FD has been changed by PQconnectPoll()"
 			"Session=%p, Conn=%p, myds=%p, oldFD=%d, newFD=%d\n",
 			myds ? myds->sess : nullptr, this, myds, fd, current_fd);
-#else
-		proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 5, "PgSQL Connection FD has been changed by PQconnectPoll()"
-			"Session=%p, Conn=%p, myds=%p, oldFD=%d, newFD=%d\n", myds->sess, this, myds, fd, current_fd);
-#endif // POLARDB_PROXY
 		fd = current_fd;
 	}
 }
@@ -1772,6 +1893,9 @@ void PgSQL_Connection::query_start() {
 	PQsetNoticeReceiver(pgsql_conn, &PgSQL_Connection::notice_handler_cb, this);
 
 	if (PQsendQuery(pgsql_conn, query.ptr) == 0) {
+#if POLARDB_PROXY
+		polardb_query_wrap_state.wait_completion.mark_failed();
+#endif // POLARDB_PROXY
 		set_error_from_PQerrorMessage();
 		proxy_error("Failed to send query. %s\n", get_error_code_with_message().c_str());
 		return;
@@ -2042,7 +2166,7 @@ int PgSQL_Connection::async_query(short event, const char* stmt, unsigned long l
 	PROXY_TRACE2();
 	assert(pgsql_conn);
 
-	server_status = parent->status; // we copy it here to avoid race condition. The caller will see this
+	server_status = parent->status_for_routing();
 	if (IsServerOffline())
 		return -1;
 
@@ -2065,6 +2189,8 @@ int PgSQL_Connection::async_query(short event, const char* stmt, unsigned long l
 		// Only simple queries can be wrapped; extended queries never are. Clearing
 		// the session fields here stops a later query from re-skipping these results.
 		dispatch_state.reset();
+		polardb_ready_sequence_at_dispatch =
+			PQgetReadyForQuerySequence(pgsql_conn);
 		if (!extended_query_info && myds && myds->sess &&
 			myds->sess->polardb_query.dispatch_wrapper_stmts > 0) {
 			dispatch_state.wrapper_stmts = myds->sess->polardb_query.dispatch_wrapper_stmts;
@@ -2178,7 +2304,7 @@ int PgSQL_Connection::async_reset_session(short event) {
 	PROXY_TRACE2();
 	assert(pgsql_conn);
 
-	server_status = parent->status; // we copy it here to avoid race condition. The caller will see this
+	server_status = parent->status_for_routing();
 	if (IsServerOffline())
 		return -1;
 
@@ -2333,7 +2459,7 @@ bool PgSQL_Connection::IsServerOffline() {
 	bool ret = false;
 	if (parent == NULL)
 		return ret;
-	server_status = parent->status; // we copy it here to avoid race condition. The caller will see this
+	server_status = parent->status_for_routing();
 	if (
 		(server_status == MYSQL_SERVER_STATUS_OFFLINE_HARD) // the server is OFFLINE as specific by the user
 		||
@@ -2717,6 +2843,11 @@ void PgSQL_Connection::reset_session_cont(short event) {
 }
 
 bool PgSQL_Connection::requires_RESETTING_CONNECTION(const PgSQL_Connection* client_conn) {
+#if POLARDB_PROXY
+	if (polardb_txn_split_xids_dirty) {
+		return true;
+	}
+#endif // POLARDB_PROXY
 	for (auto i = 0; i < PGSQL_NAME_LAST_LOW_WM; i++) {
 		if (client_conn->var_hash[i] == 0) {
 			if (var_hash[i]) {
@@ -3124,7 +3255,7 @@ int PgSQL_Connection::async_send_simple_command(short event, char* stmt, unsigne
 	PROXY_TRACE2();
 	assert(pgsql_conn);
 
-	server_status = parent->status; // we copy it here to avoid race condition. The caller will see this
+	server_status = parent->status_for_routing();
 	if (IsServerOffline())
 		return -1;
 
@@ -3188,7 +3319,7 @@ int PgSQL_Connection::async_perform_resync(short event) {
 	PROXY_TRACE2();
 	assert(pgsql_conn);
 
-	server_status = parent->status; // we copy it here to avoid race condition. The caller will see this
+	server_status = parent->status_for_routing();
 	if (IsServerOffline())
 		return -1;
 
@@ -3310,6 +3441,8 @@ void PgSQL_Connection::reset() {
 	// to this PgSQL_Connection and must not survive that reset boundary.
 	dispatch_state.reset();
 	polardb_query_wrap_state.clear();
+	polardb_ready_sequence_at_dispatch = 0;
+	polardb_pending_ready_result.reset();
 	polardb_txn_split_xids_dirty = false;
 	polardb_txn_split_xids_reset_consumed = false;
 	polardb_txn_split_xids_reset_query_buf.clear();
@@ -3661,7 +3794,6 @@ void PgSQL_Connection::copy_startup_parameters_to_pgsql_variables(bool copy_only
 	}
 }
 
-#if POLARDB_PROXY
 void PgSQL_Connection::init_startup_parameters_from_server() {
 	if (!pgsql_conn) return;
 
@@ -3686,7 +3818,6 @@ void PgSQL_Connection::init_startup_parameters_from_server() {
 		var_hash[i] = startup_parameters_hash[i];
 	}
 }
-#endif // POLARDB_PROXY
 
 void PgSQL_Connection::init_query_result() {
 	if (!query_result_reuse) {

@@ -271,6 +271,7 @@ void polardb_handle_notice(PgSQL_Connection* conn, const PGresult* result) {
 		sess->polardb_account_txn_split_wait_timeout("notice");
 	} else {
 		sess->polardb_account_wait_timeout("notice");
+		conn->polardb_query_wrap_state.wait_completion.mark_failed();
 	}
 
 	/*

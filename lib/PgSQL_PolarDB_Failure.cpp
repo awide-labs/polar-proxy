@@ -10,7 +10,7 @@
  *
  * The split path has three terminal actions. RETRY re-dispatches the original
  * client query on the live writer backend, FORWARD emits the captured reader
- * error with ReadyForQuery('T') and pins the transaction to the writer, and
+ * error with ReadyForQuery('E') and marks the client transaction failed, and
  * TERMINATE closes the client session if no safe writer state remains.
  */
 
@@ -53,6 +53,8 @@ static void polardb_count_wait_retry_counter(
 	counter.fetch_add(1, std::memory_order_relaxed);
 	POLARDB_TRACE("PolarDB WAIT: retry counter=%s\n", name ? name : "");
 }
+
+static bool polardb_wait_reader_can_return_to_pool(PgSQL_Connection* conn);
 
 static bool polardb_error_text_is_wait_timeout(const std::string& message) {
 	return message.find("LSN wait timeout") != std::string::npos ||
@@ -194,6 +196,31 @@ PolarDB_FailureAction PgSQL_Session::polardb_on_failure(
 		if (failure.wait_read && !failure.reusable) {
 			POLARDB_THREAD_COUNT_ONE(thread, wait_error_connection_lost);
 		}
+		const bool txn_wait_reader_failed =
+			polardb_txn_wait_read_active &&
+			polardb_txn_split_backend &&
+			polardb_txn_split_backend->server_myds == outcome.backend_myds;
+		if (txn_wait_reader_failed && !failure.wait_read) {
+			PgSQL_Connection* failed_conn =
+				outcome.backend_myds ? outcome.backend_myds->myconn : nullptr;
+			failure.wait_read = true;
+			failure.failed_myds = outcome.backend_myds;
+			failure.result_started = outcome.result_started;
+			failure.connected = outcome.connected;
+			failure.reusable = outcome.reusable;
+			failure.can_return_to_pool =
+				polardb_wait_reader_can_return_to_pool(failed_conn);
+			if (failure.fallback_writer_hg < 0) {
+				failure.fallback_writer_hg =
+					polardb_txn_writer_hg >= 0 ?
+					polardb_txn_writer_hg : polardb_writer_hgid();
+			}
+			POLARDB_TRACE(
+				"PolarDB WAIT: txn-wait reader failure did not classify as "
+				"wait_read; forcing borrowed-reader unwind reader_hg=%d "
+				"writer_hg=%d\n",
+				failure.reader_hg, failure.fallback_writer_hg);
+		}
 		if (failure.wait_read) {
 			// Same policy selector as transaction split. The wait-read adapter
 			// below owns the different packet cleanup and retry mechanics.
@@ -328,6 +355,11 @@ PolarDB_FailureAction PgSQL_Session::polardb_on_failure(
 				PolarDB_RoutePin::FORCE_WRITER, writer_hg, &failure);
 			return PolarDB_FailureAction::RETRY;
 		}
+	}
+	if (failure.result_started) {
+		POLARDB_TRACE(
+			"PolarDB FAILURE: terminating because reader rows already reached client\n");
+		return polardb_terminate_reader(failure);
 	}
 
 	polardb_apply_reader_failure_route_pin(
@@ -950,15 +982,32 @@ bool PgSQL_Session::polardb_try_redispatch_to_other_reader(
 
 PolarDB_FailureAction PgSQL_Session::polardb_forward_and_continue(
 		PolarDB_ReaderFailure& failure) {
-	polardb_forward_reader_error(failure, 'T');
-	POLARDB_THREAD_COUNT_ONE(thread, split_reads_forwarded);
-	POLARDB_TRACE(
-		"PolarDB FAILURE: forwarded reader error; transaction remains on writer_hg=%d\n",
-		polardb_txn_writer_hg);
 	polardb_release_reader_backend(
 		failure.reader_backend, failure.reusable);
 	polardb_free_retry_pkt_if_owned(failure);
+	polardb_end_writer_transaction_after_reader_error();
+	polardb_forward_reader_error(failure, 'E');
+	POLARDB_THREAD_COUNT_ONE(thread, split_reads_forwarded);
+	POLARDB_TRACE(
+		"PolarDB FAILURE: forwarded reader error; transaction marked failed\n");
 	return PolarDB_FailureAction::FORWARD;
+}
+
+void PgSQL_Session::polardb_end_writer_transaction_after_reader_error() {
+	if (mybe && mybe->server_myds) {
+		PgSQL_Data_Stream* writer_myds = mybe->server_myds;
+		if (writer_myds->myconn) {
+			writer_myds->destroy_MySQL_Connection_From_Pool(false);
+		}
+		writer_myds->fd = 0;
+		writer_myds->DSS = STATE_NOT_INITIALIZED;
+	}
+	polardb_clear_transaction_split_state(
+		"reader_error_transaction_failed", /*want_reuse=*/false);
+	if (!tx_poisoned) {
+		tx_poisoned = true;
+		thread->status_variables.tx_poisoned_total++;
+	}
 }
 
 PolarDB_FailureAction PgSQL_Session::polardb_terminate_reader(
@@ -1194,7 +1243,8 @@ PolarDB_FailureAction PgSQL_Session::polardb_handle_failed_wait_read(
 				"terminating session\n");
 			return PolarDB_FailureAction::TERMINATE;
 		}
-		polardb_forward_reader_error(failure, 'T');
+		polardb_end_writer_transaction_after_reader_error();
+		polardb_forward_reader_error(failure, 'E');
 		return PolarDB_FailureAction::FORWARD;
 	};
 

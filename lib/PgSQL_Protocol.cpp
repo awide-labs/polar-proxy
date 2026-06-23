@@ -621,6 +621,14 @@ bool PgSQL_Protocol::load_conn_parameters(pgsql_hdr* pkt)
 
 }
 
+#if POLARDB_PROXY
+static bool polardb_startup_bool_is_true(const std::string& value) {
+	std::string lowered(value);
+	std::transform(lowered.begin(), lowered.end(), lowered.begin(), ::tolower);
+	return lowered == "true" || lowered == "1" || lowered == "on" || lowered == "yes";
+}
+#endif // POLARDB_PROXY
+
 bool PgSQL_Protocol::process_startup_packet(unsigned char* pkt, unsigned int len, bool& ssl_request) {
 	
 	ssl_request = false;
@@ -709,6 +717,26 @@ bool PgSQL_Protocol::process_startup_packet(unsigned char* pkt, unsigned int len
 			PGSQL_ERROR_CODES::ERRCODE_PROTOCOL_VIOLATION, true);
 		return false;
 	}
+
+#if POLARDB_PROXY
+	bool client_rfq_lsn_requested = false;
+	for (auto it = (*myds)->myconn->conn_params.connection_parameters.begin();
+			it != (*myds)->myconn->conn_params.connection_parameters.end();) {
+		std::string key_lowercase(it->first);
+		std::transform(key_lowercase.begin(), key_lowercase.end(), key_lowercase.begin(), ::tolower);
+		if (key_lowercase == "_polar_send_lsn" || key_lowercase == "_polar_proxy_send_lsn") {
+			if (polardb_startup_bool_is_true(it->second)) {
+				client_rfq_lsn_requested = true;
+			}
+			it = (*myds)->myconn->conn_params.connection_parameters.erase(it);
+		} else {
+			++it;
+		}
+	}
+	if ((*myds)->sess) {
+		(*myds)->sess->polardb_client_rfq_lsn_requested = client_rfq_lsn_requested;
+	}
+#endif // POLARDB_PROXY
 
 	const unsigned char* user = (unsigned char*)(*myds)->myconn->conn_params.get_value(PG_USER);
 
@@ -2221,6 +2249,52 @@ unsigned int PgSQL_Protocol::copy_ready_status_to_PgSQL_Query_Result(bool send, 
 	return size;
 }
 
+#if POLARDB_PROXY
+unsigned int PgSQL_Protocol::copy_ready_status_to_PgSQL_Query_Result(bool send, PgSQL_Query_Result* pg_query_result,
+		PGTransactionStatusType txn_status, bool include_polardb_lsn, uint64_t polardb_lsn) {
+	assert(pg_query_result);
+
+	if (!include_polardb_lsn) {
+		return copy_ready_status_to_PgSQL_Query_Result(send, pg_query_result, txn_status);
+	}
+
+	char txn_state = 'I';
+	if (txn_status == PQTRANS_INTRANS)
+		txn_state = 'T';
+	else if (txn_status == PQTRANS_INERROR)
+		txn_state = 'E';
+
+	const unsigned int size = 1 + 4 + 1 + 8; // Z, length, I/T/E, PolarDB LSN
+	bool alloced_new_buffer = false;
+
+	unsigned char* _ptr = pg_query_result->buffer_reserve_space(size);
+	if (_ptr == NULL) {
+		_ptr = (unsigned char*)l_alloc(size);
+		alloced_new_buffer = true;
+	}
+
+	PG_pkt pgpkt(_ptr, size);
+
+	pgpkt.put_char('Z');
+	pgpkt.put_uint32(size - 1);
+	pgpkt.put_char(txn_state);
+	pgpkt.put_uint64(polardb_lsn);
+
+	if (send == true) {
+		// not supported
+		//(*myds)->PSarrayOUT->add((void*)_ptr, size);
+	}
+
+	pg_query_result->resultset_size += size;
+
+	if (alloced_new_buffer) {
+		pg_query_result->PSarrayOUT.add(_ptr, size);
+	}
+	pg_query_result->pkt_count++;
+	return size;
+}
+#endif // POLARDB_PROXY
+
 unsigned int PgSQL_Protocol::copy_buffer_to_PgSQL_Query_Result(bool send, PgSQL_Query_Result* pg_query_result, const PSresult* result) {
 	assert(pg_query_result);
 	assert(result && result->len && result->data);
@@ -2680,6 +2754,16 @@ unsigned int PgSQL_Query_Result::add_ready_status(PGTransactionStatusType txn_st
 	result_packet_type |= PGSQL_QUERY_RESULT_READY;
 	return bytes;
 }
+
+#if POLARDB_PROXY
+unsigned int PgSQL_Query_Result::add_ready_status(PGTransactionStatusType txn_status, bool include_polardb_lsn, uint64_t polardb_lsn) {
+	const unsigned int bytes = proto->copy_ready_status_to_PgSQL_Query_Result(
+		false, this, txn_status, include_polardb_lsn, polardb_lsn);
+	buffer_to_PSarrayOut();
+	result_packet_type |= PGSQL_QUERY_RESULT_READY;
+	return bytes;
+}
+#endif // POLARDB_PROXY
 
 bool PgSQL_Query_Result::get_resultset(PtrSizeArray* PSarrayFinal) {
 	transfer_started = true;

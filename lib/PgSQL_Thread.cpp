@@ -6346,6 +6346,8 @@ PgSQL_Connection* PgSQL_Thread::get_MyConn_local(unsigned int _hid, PgSQL_Sessio
 	PgSQL_Connection* c = NULL;
 	for (i = 0; i < cached_connections->len; i++) {
 		c = (PgSQL_Connection*)cached_connections->index(i);
+		if (!c || !c->parent) continue;
+		if (c->parent->status_for_routing() != MYSQL_SERVER_STATUS_ONLINE) continue;
 		if (c->parent->myhgc->hid == _hid && sess->client_myds->myconn->has_same_connection_options(c)) { // options are all identical
 			if (
 				(gtid_uuid == NULL) || // gtid_uuid is not used
@@ -6425,7 +6427,7 @@ PgSQL_Connection* PgSQL_Thread::get_MyConn_local_polardb_reader(
 		PgSQL_Connection* c = (PgSQL_Connection*)cached_connections->index(i);
 		if (!c || !c->parent || !c->parent->myhgc) continue;
 		if (c->parent->myhgc->hid != _hid) continue;
-		if (c->parent->status != MYSQL_SERVER_STATUS_ONLINE) continue;
+		if (c->parent->status_for_routing() != MYSQL_SERVER_STATUS_ONLINE) continue;
 		if (!client_conn->has_same_connection_options(c)) continue;
 
 		// LSN-protected reads need a backend whose startup profile requested RFQ
@@ -6496,7 +6498,7 @@ void PgSQL_Thread::push_MyConn_local(PgSQL_Connection * c) {
 	// workers at high client count, while preserving most of the lock-amortization
 	// benefit at lower client counts.
 	PgSQL_SrvC* mysrvc = (PgSQL_SrvC*)c->parent;
-	if (mysrvc->status == MYSQL_SERVER_STATUS_ONLINE) {
+	if (mysrvc->status_for_routing() == MYSQL_SERVER_STATUS_ONLINE) {
 		if (c->async_state_machine == ASYNC_IDLE) {
 			unsigned int n = (GloPTH && GloPTH->num_threads > 0) ? GloPTH->num_threads : 1;
 			if ((push_local_counter++ % n) == 0) {

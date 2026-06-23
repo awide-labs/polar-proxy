@@ -398,6 +398,7 @@ void PgSQL_Session::reset() {
 	// command handlers, not here.
 #if POLARDB_PROXY
 	polardb_query.reset_for_new_query();
+	polardb_client_rfq_lsn_requested = false;
 	polardb_clear_transaction_split_state("session_reset", /*want_reuse=*/false);
 	clear_pending_notices(/*free_buffers=*/true);
 #endif // POLARDB_PROXY
@@ -2550,6 +2551,14 @@ __implicit_sync:
 								// runtime state is owned by the query cleanup path.
 								polardb_query.reset_reader_target();
 								polardb_query.request_writer_scope.reset();
+								if (polardb_txn_wait_read_active) {
+									proxy_warning(
+										"PolarDB TXN_WAIT: stale borrowed reader at dispatch entry; "
+										"restoring primary backend and dropping reader (sess=%p)\n",
+										this);
+									polardb_reconcile_txn_wait_read_end(
+										"dispatch_entry_stale", false);
+								}
 
 								// collect -> plan -> execute.
 								//
@@ -2561,14 +2570,18 @@ __implicit_sync:
 								//                     -1 = unset (manual if destination_hostgroup set,
 								//                          else default routing).
 								if (PgHGM->status.polardb_active.load(std::memory_order_relaxed)) {
+									bool manual_mode =
+										polardb_apply_locked_hostgroup_route("PIPELINE");
 									int replica_eligible = -1;
 									int dest_hg = -1;
 									int manual_scope_hg = -1;
-									bool manual_mode =
-										polardb_manual_route_scope(
-											&manual_scope_hg, &dest_hg, &replica_eligible);
+									if (!manual_mode) {
+										manual_mode =
+											polardb_manual_route_scope(
+												&manual_scope_hg, &dest_hg, &replica_eligible);
+									}
 
-									if (manual_mode) {
+									if (manual_mode && locked_on_hostgroup < 0) {
 										bool forced_writer = false;
 										if (polardb_txn_reader_failure_pin == PolarDB_RoutePin::FORCE_WRITER &&
 												polardb_txn_writer_hg >= 0) {
@@ -3684,12 +3697,22 @@ handler_again:
 				// the original query; this is the single wrapping point.
 				if (finalize_wait_timeout_injection(myconn, myds) ==
 					PolarDB_WrapFinalizeResult::FAILED) {
+					const bool txn_wait_reader =
+						polardb_txn_wait_read_active &&
+						polardb_txn_split_backend &&
+						polardb_txn_split_backend->server_myds == myds;
+					if (txn_wait_reader) {
+						polardb_reconcile_txn_wait_read_end(
+							"finalize_wait_failed", true);
+					}
 					client_myds->setDSS_STATE_QUERY_SENT_NET();
 					client_myds->myprot.generate_error_packet(true, true,
 						"PolarDB LSN wait wrapper could not be built safely",
 						PGSQL_ERROR_CODES::ERRCODE_INTERNAL_ERROR, false, true);
-					RequestEnd(myds, true);
-					finishQuery(myds, myconn, false);
+					RequestEnd(txn_wait_reader ? NULL : myds, true);
+					if (!txn_wait_reader) {
+						finishQuery(myds, myconn, false);
+					}
 					goto __exit_DSS__STATE_NOT_INITIALIZED;
 				}
 #endif // POLARDB_PROXY
@@ -6543,17 +6566,76 @@ void PgSQL_Session::RequestEnd(PgSQL_Data_Stream* myds, bool called_on_failure) 
 
 	if (called_on_failure == false && myds && myds->myconn) {
 		// if we are here, means query was executed successfully
+#if POLARDB_PROXY
+		PGSQL_QUERY_command polardb_query_cmd = PGSQL_QUERY_UNKNOWN;
+		const char* polardb_query_text = NULL;
+		std::string polardb_query_text_storage;
+#endif // POLARDB_PROXY
 		switch (status)
 		{
 		case PROCESSING_QUERY:
 			query_digest_text = CurrentQuery.get_digest_text();
+#if POLARDB_PROXY
+			if (query_digest_text) {
+				polardb_query_text = query_digest_text;
+			} else if (CurrentQuery.QueryPointer && CurrentQuery.QueryLength > 0) {
+				polardb_query_text_storage.assign(
+					reinterpret_cast<const char*>(CurrentQuery.QueryPointer),
+					static_cast<size_t>(CurrentQuery.QueryLength));
+				polardb_query_text = polardb_query_text_storage.c_str();
+			}
+			polardb_query_cmd = CurrentQuery.PgQueryCmd;
+#endif // POLARDB_PROXY
 			break;
 		case PROCESSING_STMT_EXECUTE:
-			query_digest_text = CurrentQuery.extended_query_info.stmt_info->digest_text;
+			if (CurrentQuery.extended_query_info.stmt_info) {
+				query_digest_text =
+					CurrentQuery.extended_query_info.stmt_info->digest_text;
+#if POLARDB_PROXY
+				if (query_digest_text) {
+					polardb_query_text = query_digest_text;
+				} else if (CurrentQuery.extended_query_info.stmt_info->query &&
+						CurrentQuery.extended_query_info.stmt_info->query_length > 0) {
+					polardb_query_text_storage.assign(
+						CurrentQuery.extended_query_info.stmt_info->query,
+						static_cast<size_t>(
+							CurrentQuery.extended_query_info.stmt_info->query_length));
+					polardb_query_text = polardb_query_text_storage.c_str();
+				}
+				polardb_query_cmd =
+					CurrentQuery.extended_query_info.stmt_info->PgQueryCmd;
+#endif // POLARDB_PROXY
+			}
 			break;
 		default:
 			break;
 		}
+
+#if POLARDB_PROXY
+		if (polardb_config.is_polardb_enabled) {
+			PgSQL_Connection* result_conn = myds->myconn;
+			if (!result_conn->polardb_has_new_ready_message()) {
+				if (status == PROCESSING_STMT_EXECUTE) {
+					result_conn->polardb_remember_pending_ready_result(
+						polardb_query_text, polardb_query_cmd,
+						polardb_query.request_writer_scope);
+				}
+			} else {
+				if (result_conn->polardb_pending_ready_result.active) {
+					polardb_query_text =
+						result_conn->polardb_pending_ready_result.query_text.c_str();
+					polardb_query_cmd =
+						static_cast<PGSQL_QUERY_command>(
+							result_conn->polardb_pending_ready_result.query_cmd);
+					polardb_query.request_writer_scope =
+						result_conn->polardb_pending_ready_result.writer_scope;
+				}
+				polardb_process_result(myds, polardb_query_text,
+					polardb_query_cmd);
+				result_conn->polardb_pending_ready_result.reset();
+			}
+		}
+#endif // POLARDB_PROXY
 
 		if (query_digest_text) {
 			// is savepoint currently present in transaction.
@@ -6566,20 +6648,6 @@ void PgSQL_Session::RequestEnd(PgSQL_Data_Stream* myds, bool called_on_failure) 
 			}
 
 			myds->myconn->ProcessQueryAndSetStatusFlags(query_digest_text, savepoint_count);
-
-#if POLARDB_PROXY
-			// PolarDB result hook (success path; the caller passes
-			// called_on_failure==false). Reads the backend's WAL LSN from the
-			// extended ReadyForQuery and updates this session's consistency
-			// LSNs: the observed LSN advances for any RFQ that carries an LSN,
-			// and the own-write LSN advances only when this query was a write.
-			// The LSN comes from whichever backend ran the query (reader or
-			// writer); a reader's RFQ never touches the write position. See
-			// polardb_process_result().
-			if (polardb_config.is_polardb_enabled) {
-				polardb_process_result(myds, query_digest_text);
-			}
-#endif // POLARDB_PROXY
 		}
 	}
 
@@ -6588,6 +6656,9 @@ void PgSQL_Session::RequestEnd(PgSQL_Data_Stream* myds, bool called_on_failure) 
 __cleanup:
 
 #if POLARDB_PROXY
+	if (called_on_failure && myds && myds->myconn) {
+		myds->myconn->polardb_pending_ready_result.reset();
+	}
 
 	// Clear per-query PolarDB wait state at query end so it never leaks into the
 	// next query. The session write/observed positions are NOT cleared here: they
@@ -6596,6 +6667,16 @@ __cleanup:
 	// here. A completed wait first advances the selected reader's LSN cache, then
 	// record_wait_latency() runs BEFORE the reset so it contributes its elapsed
 	// time to PolarDB_Wait_LSN_Sum_Us (no-op when no wait was active).
+	if (polardb_wait_active() && myds && myds->myconn) {
+		PolarDB_WaitCompletion& wait_completion =
+			myds->myconn->polardb_query_wrap_state.wait_completion;
+		if (called_on_failure || polardb_query.wait.timeout_error ||
+				polardb_query.wait.wait_started_at_us == 0) {
+			wait_completion.mark_failed();
+		} else {
+			wait_completion.mark_complete_on_ready();
+		}
+	}
 	polardb_note_successful_wait_target(myds, called_on_failure);
 	record_wait_latency(polardb_query.wait);
 	polardb_query.reset_for_new_query();

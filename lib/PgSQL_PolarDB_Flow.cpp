@@ -118,6 +118,10 @@ bool PgSQL_Session::polardb_manual_route_scope(
 }
 
 bool PgSQL_Session::polardb_query_cache_disabled_for_current_rule() const {
+	if (polardb_client_rfq_lsn_requested) {
+		return true;
+	}
+
 	if (!qpo || qpo->replica_eligible != 1 ||
 			!PgHGM->status.polardb_active.load(std::memory_order_relaxed)) {
 		return false;
@@ -437,11 +441,11 @@ void PgSQL_Session::polardb_collect(PolarDB_Query_RouteCtx& route_ctx,
 		const char* query = (const char*)CurrentQuery.QueryPointer;
 		const bool is_top_level_select =
 			(CurrentQuery.PgQueryCmd == PGSQL_QUERY_SELECT);
-		route_ctx.is_txn_split_locking_read =
-			is_top_level_select &&
-			PolarDB_Protocol::is_locking_select_query(query);
 		route_ctx.is_txn_split_safe_read =
-			is_top_level_select && !route_ctx.is_txn_split_locking_read;
+			PolarDB_Protocol::is_txn_split_safe_select(
+				is_top_level_select, query);
+		route_ctx.is_txn_split_locking_read =
+			is_top_level_select && !route_ctx.is_txn_split_safe_read;
 	}
 
 	// Protocol detection. The wait wrapper is plain SQL text, so it can only be
@@ -500,8 +504,13 @@ void PgSQL_Session::polardb_collect(PolarDB_Query_RouteCtx& route_ctx,
 	}
 	route_ctx.txn_reader_wait_isolation_read_committed =
 		polardb_txn_reader_wait_isolation_read_committed();
-	route_ctx.txn_reader_wait_local_state_clean =
-		!polardb_txn_local_state_changed;
+	PgSQL_Connection* txn_primary_conn =
+		(mybe && mybe->server_myds) ? mybe->server_myds->myconn : nullptr;
+	const bool txn_backend_state_clean =
+		!route_ctx.in_transaction ||
+		(txn_primary_conn && !txn_primary_conn->MultiplexDisabled(false));
+	route_ctx.txn_split_state_clean =
+		!polardb_txn_local_state_changed && txn_backend_state_clean;
 
 	// Per-query routing hint parsed from the query's first comment
 	// (a leading SQL comment "/* route=primary */"); plan turns it into a force-writer route.
@@ -520,7 +529,7 @@ void PgSQL_Session::polardb_collect(PolarDB_Query_RouteCtx& route_ctx,
 			"rfq_policy=%d lsn_baseline=%d txn_split_enabled=%d "
 			"txn_safe_read=%d txn_locking_read=%d txn_stage=%d "
 			"txn_lsn=%lu txn_xids_len=%zu txn_wal_pending=%d "
-			"txn_wait_rc=%d txn_wait_local_clean=%d "
+			"txn_wait_rc=%d txn_split_state_clean=%d "
 			"writer_hg=%d writer_epoch=%lu Q='%.*s'\n",
 			current_hg, route_ctx.writer_scope.hg, route_ctx.reader_hg,
 			route_ctx.effective_consistency_mode,
@@ -539,7 +548,7 @@ void PgSQL_Session::polardb_collect(PolarDB_Query_RouteCtx& route_ctx,
 			route_ctx.transaction_split_xids.size(),
 			route_ctx.transaction_split.wal_pending ? 1 : 0,
 			route_ctx.txn_reader_wait_isolation_read_committed ? 1 : 0,
-			route_ctx.txn_reader_wait_local_state_clean ? 1 : 0,
+			route_ctx.txn_split_state_clean ? 1 : 0,
 			route_ctx.writer_scope.hg, (unsigned long)route_ctx.writer_scope.epoch,
 			query_len, query_text);
 	}
@@ -726,7 +735,8 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(const PolarDB_Query_RouteCtx
 				route_ctx.is_multi_statement,
 				route_ctx.is_extended_protocol,
 				route_ctx.is_txn_split_safe_read,
-				route_ctx.is_txn_split_locking_read);
+				route_ctx.is_txn_split_locking_read,
+				route_ctx.txn_split_state_clean);
 		if (split_reason == PolarDB_Query_RoutePlan::RouteActionReason::IN_TRANSACTION &&
 				route_ctx.txn_split_enabled &&
 				route_ctx.transaction_split.stage ==
@@ -734,7 +744,7 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(const PolarDB_Query_RouteCtx
 				route_ctx.transaction_split_xids.empty() &&
 				route_ctx.is_txn_split_safe_read) {
 			if (route_ctx.txn_reader_wait_isolation_read_committed &&
-					route_ctx.txn_reader_wait_local_state_clean) {
+				route_ctx.txn_split_state_clean) {
 				// Pre-write phase: no transaction XIDs exist yet, so this is not a
 				// transaction-split read. Under READ COMMITTED, a safe SELECT may use
 				// the normal reader wait path while execute keeps the primary
@@ -752,7 +762,7 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(const PolarDB_Query_RouteCtx
 					"read_committed=%d local_state_clean=%d -> FORCE_PRIMARY "
 					"primary_hg=%d\n",
 					route_ctx.txn_reader_wait_isolation_read_committed ? 1 : 0,
-					route_ctx.txn_reader_wait_local_state_clean ? 1 : 0,
+					route_ctx.txn_split_state_clean ? 1 : 0,
 					route_ctx.writer_scope.hg);
 				plan = PolarDB_Query_RoutePlan::force_primary(
 					route_ctx.writer_scope.hg,
@@ -1103,6 +1113,22 @@ void PgSQL_Session::polardb_account_manual_route(int effective_hg, bool forced_w
 	}
 }
 
+bool PgSQL_Session::polardb_apply_locked_hostgroup_route(const char* stage)
+{
+	if (locked_on_hostgroup < 0) {
+		return false;
+	}
+
+	current_hostgroup = locked_on_hostgroup;
+	polardb_capture_request_writer_scope(locked_on_hostgroup);
+	polardb_account_manual_route(current_hostgroup, false);
+	POLARDB_THREAD_COUNT_ONE(thread, route_locked_hostgroup);
+	POLARDB_TRACE(
+		"PolarDB %s: locked hostgroup route hg=%d; automatic routing skipped\n",
+		stage ? stage : "ROUTE", locked_on_hostgroup);
+	return true;
+}
+
 /**
  * @brief Execute the routing decision — apply side effects.
  *
@@ -1268,6 +1294,18 @@ void PgSQL_Session::polardb_apply_extended_route()
 	if (!PgHGM->status.polardb_active.load(std::memory_order_relaxed) || !qpo) {
 		return;
 	}
+	if (locked_on_hostgroup >= 0) {
+		if (current_hostgroup == locked_on_hostgroup) {
+			polardb_capture_request_writer_scope(locked_on_hostgroup);
+			polardb_account_manual_route(current_hostgroup, false);
+			POLARDB_THREAD_COUNT_ONE(thread, route_locked_hostgroup);
+			POLARDB_TRACE(
+				"PolarDB EXTENDED: locked hostgroup route hg=%d; "
+				"automatic routing skipped\n",
+				locked_on_hostgroup);
+		}
+		return;
+	}
 
 	int replica_eligible = -1;
 	int dest_hg = -1;
@@ -1336,6 +1374,67 @@ void PgSQL_Session::polardb_apply_extended_route()
 	}
 }
 
+bool PgSQL_Session::polardb_client_ready_lsn(PgSQL_Connection* conn,
+		bool backend_payload_present, uint64_t backend_lsn,
+		uint64_t* client_lsn) {
+	if (!client_lsn) {
+		return false;
+	}
+	*client_lsn = 0;
+	if (!polardb_client_rfq_lsn_requested) {
+		return false;
+	}
+
+	bool response_from_writer = false;
+	if (conn && conn->parent && conn->parent->myhgc && PgHGM) {
+		const int backend_hg = (int)conn->parent->myhgc->hid;
+		const auto* backend_config =
+			PgHGM->find_polardb_hg_config((unsigned int)backend_hg);
+		response_from_writer = backend_config &&
+			polardb_positioned_rfq_from_primary(
+				backend_config->is_polardb_hostgroup,
+				backend_hg,
+				backend_config->writer_hostgroup) &&
+			polardb_query.request_writer_scope.matches(
+				PolarDB_WriterScope{
+					backend_config->writer_hostgroup,
+					backend_config->writer_epoch
+						? backend_config->writer_epoch->load(
+							std::memory_order_acquire)
+						: 0});
+	}
+
+	uint64_t session_target = 0;
+	if (polardb_query.request_writer_scope.valid() &&
+			polardb_session_consistency.writer_scope.matches(
+				polardb_query.request_writer_scope)) {
+		session_target = polardb_session_consistency.target();
+	}
+
+	const PolarDB_ClientRfqDecision decision =
+		polardb_client_rfq_decision(
+			polardb_client_rfq_lsn_requested,
+			backend_payload_present,
+			backend_lsn,
+			session_target,
+			response_from_writer);
+	if (!decision.include_lsn) {
+		return false;
+	}
+
+	if (decision.raised_to_target) {
+		POLARDB_TRACE(
+			"PolarDB CLIENT_RFQ: raised writer backend_lsn=%lu "
+			"to client_lsn=%lu session_target=%lu\n",
+			(unsigned long)backend_lsn,
+			(unsigned long)decision.lsn,
+			(unsigned long)session_target);
+	}
+
+	*client_lsn = decision.lsn;
+	return true;
+}
+
 // ======================================================================
 // Stage 4: process_result — response-path state update (LSN capture)
 // ======================================================================
@@ -1369,9 +1468,12 @@ void PgSQL_Session::polardb_apply_extended_route()
  * LSN cache.
  *
  * @param myds              Backend data stream that produced the result.
- * @param query_digest_text Digest text of the query (write classification).
+ * @param query_digest_text Digest text or bounded raw query text.
+ * @param query_cmd Stable command classification captured at dispatch time.
  */
-void PgSQL_Session::polardb_process_result(PgSQL_Data_Stream* myds, const char* query_digest_text) {
+void PgSQL_Session::polardb_process_result(
+		PgSQL_Data_Stream* myds, const char* query_digest_text,
+		PGSQL_QUERY_command query_cmd) {
 	if (!polardb_config.is_polardb_enabled || !myds || !myds->myconn) {
 		POLARDB_TRACE("PolarDB PROCESS_RESULT: skip (enabled=%d myconn=%p)\n",
 			polardb_config.is_polardb_enabled ? 1 : 0, (void*)(myds ? myds->myconn : nullptr));
@@ -1424,7 +1526,7 @@ void PgSQL_Session::polardb_process_result(PgSQL_Data_Stream* myds, const char* 
 				backend_config->writer_epoch->load(std::memory_order_acquire);
 		}
 	}
-	bool is_write = PolarDB_Protocol::is_write_query(query_digest_text);
+	bool is_write = PolarDB_Protocol::is_write_query(query_digest_text, query_cmd);
 	const int effective_consistency_mode = polardb_resolve_consistency_mode(
 		polardb_config.session_consistency_mode,
 		backend_consistency_mode,
@@ -1558,7 +1660,9 @@ void PgSQL_Session::polardb_process_result(PgSQL_Data_Stream* myds, const char* 
 		const bool safe_without_wait_target =
 			!is_write || polardb_zero_lsn_payload_can_skip_wait_target(query_digest_text);
 		if (is_write && !safe_without_wait_target) {
-			if (zero_rfq_from_primary) {
+			const bool mark_unknown =
+				zero_rfq_from_primary && lsn_consistency_mode;
+			if (mark_unknown) {
 				if (myds && myds->myconn) {
 					// Even a zero-LSN RFQ carries transaction/split state; keep
 					// the split FSM in sync while the sticky unknown-LSN flag
@@ -1582,8 +1686,9 @@ void PgSQL_Session::polardb_process_result(PgSQL_Data_Stream* myds, const char* 
 			}
 			POLARDB_TRACE(
 				"PolarDB PROCESS_RESULT: RFQ LSN payload present with zero value "
-				"for write-class statement (digest='%.60s') - write LSN marked unknown\n",
-				query_digest_text ? query_digest_text : "(null)");
+				"for write-class statement (digest='%.60s') - marked_unknown=%d\n",
+				query_digest_text ? query_digest_text : "(null)",
+				mark_unknown ? 1 : 0);
 			return;
 		}
 		if (zero_rfq_from_primary && myds && myds->myconn) {
@@ -1647,7 +1752,7 @@ void PgSQL_Session::polardb_process_result(PgSQL_Data_Stream* myds, const char* 
 		// not happen for a writer query. If it does, preserve attribution: missing
 		// write LSN sets write_unknown; missing tracked read LSN sets
 		// observed_unknown. Do not change mode=off sessions.
-		if (is_write) {
+		if (is_write && missing_rfq_from_primary && lsn_consistency_mode) {
 			const bool first_unknown_write = !polardb_session_consistency.write_unknown;
 			polardb_session_consistency.write_unknown = true;
 			POLARDB_THREAD_COUNT_ONE(thread, write_missing_lsn);
@@ -1658,7 +1763,7 @@ void PgSQL_Session::polardb_process_result(PgSQL_Data_Stream* myds, const char* 
 					"a later primary RFQ carries LSN (sess=%p digest='%.60s')\n",
 					this, query_digest_text ? query_digest_text : "(null)");
 			}
-		} else {
+		} else if (!is_write) {
 			if (backend_is_polar_hg &&
 				lsn_consistency_mode) {
 				const bool first_unknown_observed = !polardb_session_consistency.observed_unknown;

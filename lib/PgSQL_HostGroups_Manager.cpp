@@ -393,6 +393,24 @@ PgSQL_SrvC::PgSQL_SrvC(
 	comment=strdup(_comment);
 	ConnectionsUsed=new PgSQL_SrvConnList(this);
 	ConnectionsFree=new PgSQL_SrvConnList(this);
+#if POLARDB_PROXY
+	routing_status.store((int)_status, std::memory_order_relaxed);
+#endif // POLARDB_PROXY
+}
+
+void PgSQL_SrvC::set_status(enum MySerStatus new_status) {
+	status = new_status;
+#if POLARDB_PROXY
+	routing_status.store((int)new_status, std::memory_order_release);
+#endif // POLARDB_PROXY
+}
+
+enum MySerStatus PgSQL_SrvC::status_for_routing() const {
+#if POLARDB_PROXY
+	return (enum MySerStatus)routing_status.load(std::memory_order_acquire);
+#else
+	return status;
+#endif // POLARDB_PROXY
 }
 
 #if POLARDB_PROXY
@@ -480,7 +498,7 @@ void PgSQL_SrvC::connect_error(int err_num, bool get_mutex) {
 			if (get_mutex==true)
 				PgHGM->wrlock(); // to prevent race conditions, lock here. See #627
 			if (status==MYSQL_SERVER_STATUS_ONLINE) {
-				status=MYSQL_SERVER_STATUS_SHUNNED;
+				set_status(MYSQL_SERVER_STATUS_SHUNNED);
 				shunned_automatic=true;
 				_shu=true;
 			} else {
@@ -496,7 +514,7 @@ void PgSQL_SrvC::connect_error(int err_num, bool get_mutex) {
 }
 
 void PgSQL_SrvC::shun_and_killall() {
-	status=MYSQL_SERVER_STATUS_SHUNNED;
+	set_status(MYSQL_SERVER_STATUS_SHUNNED);
 	shunned_automatic=true;
 	shunned_and_kill_all_connections=true;
 }
@@ -1510,7 +1528,7 @@ bool PgSQL_HostGroups_Manager::commit(
 			proxy_warning("Removed server at address %lld, hostgroup %s, address %s port %s. Setting status OFFLINE HARD and immediately dropping all free connections. Used connections will be dropped when trying to use them\n", ptr, r->fields[1], r->fields[2], r->fields[3]);
 			pgsql_servers_mutated = true;
 			PgSQL_SrvC *mysrvc=(PgSQL_SrvC *)ptr;
-			mysrvc->status=MYSQL_SERVER_STATUS_OFFLINE_HARD;
+			mysrvc->set_status(MYSQL_SERVER_STATUS_OFFLINE_HARD);
 			mysrvc->ConnectionsFree->drop_all_connections();
 			char *q1=(char *)"DELETE FROM pgsql_servers WHERE mem_pointer=%lld";
 			char *q2=(char *)malloc(strlen(q1)+32);
@@ -1587,7 +1605,7 @@ bool PgSQL_HostGroups_Manager::commit(
 					server_mutated=true;
 					if (GloPTH->variables.hostgroup_manager_verbose)
 						proxy_info("Changing status for server %d:%s:%d (%s:%d) from %d (%d) to %d\n" , mysrvc->myhgc->hid , mysrvc->address, mysrvc->port, r->fields[1], atoi(r->fields[2]), atoi(r->fields[4]) , mysrvc->status , atoi(r->fields[13]));
-					mysrvc->status=(MySerStatus)atoi(r->fields[13]);
+					mysrvc->set_status((MySerStatus)atoi(r->fields[13]));
 					if (mysrvc->status==MYSQL_SERVER_STATUS_SHUNNED) {
 						mysrvc->shunned_automatic=false;
 					}
@@ -1614,7 +1632,7 @@ bool PgSQL_HostGroups_Manager::commit(
 							// the server is currently shunned due to replication lag
 							// but we reset max_replication_lag to 0
 							// therefore we immediately reset the status too
-							mysrvc->status = MYSQL_SERVER_STATUS_ONLINE;
+							mysrvc->set_status(MYSQL_SERVER_STATUS_ONLINE);
 						}
 					}
 				}
@@ -2380,7 +2398,7 @@ PgSQL_SrvC *PgSQL_HGC::get_random_MySrvC(char * gtid_uuid, uint64_t gtid_trxid, 
 									proxy_info("Unshunning server %s:%d.\n", mysrvc->address, mysrvc->port);
 								}
 #endif
-								mysrvc->status=MYSQL_SERVER_STATUS_ONLINE;
+								mysrvc->set_status(MYSQL_SERVER_STATUS_ONLINE);
 								mysrvc->shunned_automatic=false;
 								mysrvc->shunned_and_kill_all_connections=false;
 								mysrvc->connect_ERR_at_time_last_detected_error=0;
@@ -2475,7 +2493,7 @@ PgSQL_SrvC *PgSQL_HGC::get_random_MySrvC(char * gtid_uuid, uint64_t gtid_trxid, 
 				mysrvc=mysrvs->idx(j);
 				if (mysrvc->status==MYSQL_SERVER_STATUS_SHUNNED && mysrvc->shunned_automatic==true) {
 					if ((t - mysrvc->time_last_detected_error) > max_wait_sec) {
-						mysrvc->status=MYSQL_SERVER_STATUS_ONLINE;
+						mysrvc->set_status(MYSQL_SERVER_STATUS_ONLINE);
 						mysrvc->shunned_automatic=false;
 						mysrvc->connect_ERR_at_time_last_detected_error=0;
 						mysrvc->time_last_detected_error=0;
@@ -2877,7 +2895,7 @@ void PgSQL_HostGroups_Manager::unshun_server_all_hostgroups(const char * address
 							if (GloPTH->variables.hostgroup_manager_verbose >= 3) {
 								proxy_info("Unshunning server %d:%s:%d . time_last_detected_error=%lu\n", mysrvc->myhgc->hid, address, port, mysrvc->time_last_detected_error);
 							}
-							mysrvc->status=MYSQL_SERVER_STATUS_ONLINE;
+							mysrvc->set_status(MYSQL_SERVER_STATUS_ONLINE);
 							mysrvc->shunned_automatic=false;
 							mysrvc->shunned_and_kill_all_connections=false;
 							mysrvc->connect_ERR_at_time_last_detected_error=0;
@@ -3048,7 +3066,7 @@ void PgSQL_HostGroups_Manager::replication_lag_action_inner(PgSQL_HGC *myhgc, co
 					mysrvc->cur_replication_lag_count += 1;
 					if (mysrvc->cur_replication_lag_count >= (unsigned int)pgsql_thread___monitor_replication_lag_count) {
 						proxy_warning("Shunning server %s:%d from HG %u with replication lag of %d second, count number: '%d'\n", address, port, myhgc->hid, current_replication_lag, mysrvc->cur_replication_lag_count);
-						mysrvc->status=MYSQL_SERVER_STATUS_SHUNNED_REPLICATION_LAG;
+						mysrvc->set_status(MYSQL_SERVER_STATUS_SHUNNED_REPLICATION_LAG);
 					} else {
 						proxy_info(
 							"Not shunning server %s:%d from HG %u with replication lag of %d second, count number: '%d' < replication_lag_count: '%d'\n",
@@ -3070,7 +3088,7 @@ void PgSQL_HostGroups_Manager::replication_lag_action_inner(PgSQL_HGC *myhgc, co
 						||
 						(current_replication_lag==-2) // see issue 959
 					) {
-						mysrvc->status=MYSQL_SERVER_STATUS_ONLINE;
+						mysrvc->set_status(MYSQL_SERVER_STATUS_ONLINE);
 						proxy_warning("Re-enabling server %s:%d from HG %u with replication lag of %d second\n", address, port, myhgc->hid, current_replication_lag);
 						mysrvc->cur_replication_lag_count = 0;
 					}
@@ -3895,7 +3913,7 @@ bool PgSQL_HostGroups_Manager::shun_and_killall(char *hostname, int port) {
 							if (mysrvc->status == MYSQL_SERVER_STATUS_ONLINE) {
 								ret = true;
 							}
-							mysrvc->status=MYSQL_SERVER_STATUS_SHUNNED;
+							mysrvc->set_status(MYSQL_SERVER_STATUS_SHUNNED);
 						case MYSQL_SERVER_STATUS_OFFLINE_SOFT:
 							mysrvc->shunned_automatic=true;
 							mysrvc->shunned_and_kill_all_connections=true;
@@ -4470,7 +4488,7 @@ int PgSQL_HostGroups_Manager::create_new_server_in_hg(
 		if (mysrvc && mysrvc->status == MYSQL_SERVER_STATUS_OFFLINE_HARD) {
 			reset_hg_attrs_server_defaults(mysrvc);
 			update_hg_attrs_server_defaults(mysrvc, mysrvc->myhgc);
-			mysrvc->status = MYSQL_SERVER_STATUS_ONLINE;
+			mysrvc->set_status(MYSQL_SERVER_STATUS_ONLINE);
 
 			proxy_info(
 				"Found healthy previously discovered %s node %s:%d as 'OFFLINE_HARD', setting back as 'ONLINE' with:"
@@ -4502,7 +4520,7 @@ int PgSQL_HostGroups_Manager::remove_server_in_hg(uint32_t hid, const string& ad
 	);
 
 	// Set the server status
-	mysrvc->status=MYSQL_SERVER_STATUS_OFFLINE_HARD;
+	mysrvc->set_status(MYSQL_SERVER_STATUS_OFFLINE_HARD);
 	mysrvc->ConnectionsFree->drop_all_connections();
 
 	// TODO-NOTE: This is only required in case the caller isn't going to perform:
@@ -4586,7 +4604,7 @@ void PgSQL_HostGroups_Manager::HostGroup_Server_Mapping::copy_if_not_exists(Type
 			node.srv->status == MYSQL_SERVER_STATUS_SHUNNED_REPLICATION_LAG) {
 			// Status updated from "*SHUNNED" to "ONLINE" as "read_only" value was successfully 
 			// retrieved from the backend server, indicating server is now online.
-			node.srv->status = MYSQL_SERVER_STATUS_ONLINE;
+			node.srv->set_status(MYSQL_SERVER_STATUS_ONLINE);
 		}
 
 		PgSQL_SrvC* new_srv = insert_HGM(get_hostgroup_id(dest_type, node), node.srv);
@@ -4655,7 +4673,7 @@ PgSQL_SrvC* PgSQL_HostGroups_Manager::HostGroup_Server_Mapping::insert_HGM(unsig
 				mysrvc->use_ssl = srv->use_ssl;
 				mysrvc->max_latency_us = srv->max_latency_us;
 				mysrvc->comment = strdup(srv->comment);
-				mysrvc->status = MYSQL_SERVER_STATUS_ONLINE;
+				mysrvc->set_status(MYSQL_SERVER_STATUS_ONLINE);
 
 				if (GloPTH->variables.hostgroup_manager_verbose) {
 					proxy_info(
@@ -4691,7 +4709,7 @@ PgSQL_SrvC* PgSQL_HostGroups_Manager::HostGroup_Server_Mapping::insert_HGM(unsig
 
 void PgSQL_HostGroups_Manager::HostGroup_Server_Mapping::remove_HGM(PgSQL_SrvC* srv) {
 	proxy_warning("Removed server at address %p, hostgroup %d, address %s port %d. Setting status OFFLINE HARD and immediately dropping all free connections. Used connections will be dropped when trying to use them\n", (void*)srv, srv->myhgc->hid, srv->address, srv->port);
-	srv->status = MYSQL_SERVER_STATUS_OFFLINE_HARD;
+	srv->set_status(MYSQL_SERVER_STATUS_OFFLINE_HARD);
 	srv->ConnectionsFree->drop_all_connections();
 }
 

@@ -1406,6 +1406,32 @@ struct PolarDB_SessionConsistency {
     }
 };
 
+struct PolarDB_ClientRfqDecision {
+    bool include_lsn = false;
+    uint64_t lsn = 0;
+    bool raised_to_target = false;
+};
+
+static inline PolarDB_ClientRfqDecision polardb_client_rfq_decision(
+        bool client_requested_lsn,
+        bool backend_payload_present,
+        uint64_t backend_lsn,
+        uint64_t session_target,
+        bool response_from_writer) {
+    PolarDB_ClientRfqDecision decision;
+    if (!client_requested_lsn || !backend_payload_present) {
+        return decision;
+    }
+
+    decision.include_lsn = true;
+    decision.lsn = backend_lsn;
+    if (response_from_writer && session_target > decision.lsn) {
+        decision.lsn = session_target;
+        decision.raised_to_target = true;
+    }
+    return decision;
+}
+
 /**
  * @brief Transaction-split lifecycle stage for a client transaction.
  *
@@ -1642,6 +1668,53 @@ struct PolarDB_Query_WaitState {
         timeout_error = false;
         fallback_writer_hg = -1;
         original_query.clear();
+    }
+};
+
+enum class PolarDB_WaitCompletionState : uint8_t {
+    NONE = 0,
+    SETS_PENDING,
+    SETS_COMPLETE,
+    COMPLETE,
+    FAILED,
+};
+
+struct PolarDB_WaitCompletion {
+    PolarDB_WaitCompletionState state = PolarDB_WaitCompletionState::NONE;
+
+    void reset() {
+        state = PolarDB_WaitCompletionState::NONE;
+    }
+
+    void begin(bool consistency_wait) {
+        state = consistency_wait
+            ? PolarDB_WaitCompletionState::SETS_PENDING
+            : PolarDB_WaitCompletionState::NONE;
+    }
+
+    void mark_sets_complete() {
+        if (state == PolarDB_WaitCompletionState::SETS_PENDING) {
+            state = PolarDB_WaitCompletionState::SETS_COMPLETE;
+        }
+    }
+
+    void mark_failed() {
+        if (state == PolarDB_WaitCompletionState::SETS_PENDING ||
+                state == PolarDB_WaitCompletionState::SETS_COMPLETE) {
+            state = PolarDB_WaitCompletionState::FAILED;
+        }
+    }
+
+    bool mark_complete_on_ready() {
+        if (state != PolarDB_WaitCompletionState::SETS_COMPLETE) {
+            return false;
+        }
+        state = PolarDB_WaitCompletionState::COMPLETE;
+        return true;
+    }
+
+    bool complete() const {
+        return state == PolarDB_WaitCompletionState::COMPLETE;
     }
 };
 
@@ -2092,6 +2165,7 @@ public:
      * @return true if the query likely modifies data.
      */
     static bool is_write_query(const char* query);
+    static bool is_write_query(const char* query, int command_type);
 
     /**
      * @brief True when transaction split may dispatch this query to a replica.
@@ -2114,7 +2188,8 @@ public:
      */
     static bool is_txn_split_safe_select(
             bool is_top_level_select, const char* query) {
-        return is_top_level_select && !is_locking_select_query(query);
+        return is_top_level_select &&
+            !polardb_split_has_locking_for_clause(query);
     }
 
     /**
@@ -2162,6 +2237,35 @@ public:
         out.append("; ");
     }
 
+};
+
+struct PolarDB_PendingReadyResult {
+    bool active = false;
+    bool write = false;
+    int query_cmd = -1;
+    std::string query_text;
+    PolarDB_WriterScope writer_scope;
+
+    void reset() {
+        active = false;
+        write = false;
+        query_cmd = -1;
+        query_text.clear();
+        writer_scope.reset();
+    }
+
+    void remember(const char* text, int command, bool current_is_write,
+            const PolarDB_WriterScope& scope) {
+        if (active && write && !current_is_write) {
+            return;
+        }
+
+        active = true;
+        write = current_is_write;
+        query_cmd = command;
+        query_text = text ? text : "";
+        writer_scope = scope;
+    }
 };
 
 /**
@@ -2251,7 +2355,7 @@ struct PolarDB_Query_RouteCtx {
     bool is_txn_split_safe_read = false;   // split: top-level SELECT with no locking clause
     bool is_txn_split_locking_read = false; // split: SELECT ... FOR UPDATE/SHARE-style lock
     bool txn_reader_wait_isolation_read_committed = true; // pre-write reader waits require READ COMMITTED
-    bool txn_reader_wait_local_state_clean = true; // false after in-txn SET/SET LOCAL
+    bool txn_split_state_clean = true;       // false when writer-only session or transaction state exists
     bool force_primary_hint = false;       // /* route=primary */ first-comment hint (plan L0)
     // Transaction-scoped pin set after a split-reader failure. Checked by the
     // normal planner plus manual/qpo paths that may bypass planning.
@@ -2504,7 +2608,8 @@ static inline PolarDB_Query_RoutePlan::RouteActionReason polardb_txn_split_rejec
     bool is_multi_statement,
     bool is_extended_protocol,
     bool is_txn_split_safe_read,
-    bool is_txn_split_locking_read) {
+    bool is_txn_split_locking_read,
+    bool txn_local_state_clean = true) {
     using RAR = PolarDB_Query_RoutePlan::RouteActionReason;
 
     if (!txn_split_enabled) return RAR::HG_SPLIT_DISABLED;
@@ -2512,6 +2617,7 @@ static inline PolarDB_Query_RoutePlan::RouteActionReason polardb_txn_split_rejec
     if (is_extended_protocol) return RAR::EXTENDED_PROTOCOL;
     if (is_txn_split_locking_read) return RAR::SPLIT_LOCKING_READ;
     if (!is_txn_split_safe_read) return RAR::SPLIT_NOT_SELECT;
+    if (!txn_local_state_clean) return RAR::IN_TRANSACTION;
     if (write_lsn_unknown) return RAR::SPLIT_WRITE_LSN_UNKNOWN;
     if (observed_lsn_unknown) return RAR::SPLIT_OBSERVED_LSN_UNKNOWN;
     if (transaction_split.blocked) return RAR::SPLIT_BLOCKED;

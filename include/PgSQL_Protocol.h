@@ -221,6 +221,11 @@ public:
 	void write_ReadyForQuery(char txn_state = 'I') {
 		write_generic('Z', "c", txn_state);
 	}
+#if POLARDB_PROXY
+	void write_ReadyForQuery(char txn_state, uint64_t polardb_lsn) {
+		write_generic('Z', "cq", txn_state, polardb_lsn);
+	}
+#endif // POLARDB_PROXY
 	void write_CommandComplete(const char* desc) {
 		write_generic('C', "s", desc);
 	}
@@ -448,6 +453,9 @@ public:
 	 *       ready for a new query and that any previous query has completed.
 	 */
 	unsigned int add_ready_status(PGTransactionStatusType txn_status);
+#if POLARDB_PROXY
+	unsigned int add_ready_status(PGTransactionStatusType txn_status, bool include_polardb_lsn, uint64_t polardb_lsn);
+#endif // POLARDB_PROXY
 
     /**
      * @brief Adds the start of a COPY OUT response to the packet.
@@ -971,6 +979,10 @@ public:
 	 * @return The number of bytes copied to the `PgSQL_Query_Result` object.
 	 */
 	unsigned int copy_ready_status_to_PgSQL_Query_Result(bool send, PgSQL_Query_Result* pg_query_result, PGTransactionStatusType txn_status);
+#if POLARDB_PROXY
+	unsigned int copy_ready_status_to_PgSQL_Query_Result(bool send, PgSQL_Query_Result* pg_query_result,
+		PGTransactionStatusType txn_status, bool include_polardb_lsn, uint64_t polardb_lsn);
+#endif // POLARDB_PROXY
 
 	/**
 	 * @brief Copies a buffer from a PSresult to a PgSQL_Query_Result.

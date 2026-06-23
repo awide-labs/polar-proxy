@@ -1,6 +1,6 @@
 --- src/interfaces/libpq/exports.txt
 +++ src/interfaces/libpq/exports.txt
-@@ -187,3 +187,11 @@
+@@ -187,3 +187,12 @@
  PQmblenBounded            185
  PQsendFlushRequest        186
  PQconnectionUsedGSSAPI    187
@@ -12,6 +12,7 @@
 +PQisXactSplittable        192
 +PQisXactWalPending        193
 +PQsetPolarSendXact        194
++PQgetReadyForQuerySequence 195
 --- src/interfaces/libpq/fe-connect.c
 +++ src/interfaces/libpq/fe-connect.c
 @@ -361,6 +361,62 @@
@@ -127,7 +128,7 @@
  	termPQExpBuffer(&conn->errorMessage);
  	termPQExpBuffer(&conn->workBuffer);
  
-@@ -7810,3 +7902,74 @@
+@@ -7810,3 +7902,83 @@
  
  	return prev;
  }
@@ -161,6 +162,15 @@
 +	if (!conn)
 +		return;
 +	conn->polar_proxy_send_lsn = (enable != 0);
++}
++
++/* PQgetReadyForQuerySequence - count of parsed ReadyForQuery messages */
++uint64_t
++PQgetReadyForQuerySequence(const PGconn *conn)
++{
++	if (!conn)
++		return 0;
++	return conn->polar_ready_sequence;
 +}
 +
 +/*
@@ -204,7 +214,7 @@
 +}
 --- src/interfaces/libpq/fe-protocol3.c
 +++ src/interfaces/libpq/fe-protocol3.c
-@@ -1655,6 +1655,91 @@
+@@ -1655,6 +1655,93 @@
  			break;
  	}
  
@@ -293,10 +303,12 @@
 +
 +#undef MSG_REMAINING
 +
++	conn->polar_ready_sequence++;
++
  	return 0;
  }
  
-@@ -2340,6 +2425,39 @@
+@@ -2340,6 +2427,39 @@
  		}
  	}
  
@@ -336,6 +348,11 @@
  	/* Add trailing terminator */
  	if (packet)
  		packet[packet_len] = '\0';
+@@ -2452,4 +2572,3 @@
+ 	}
+ 	return 1;
+ }
+-
 --- src/interfaces/libpq/libpq-fe.h
 +++ src/interfaces/libpq/libpq-fe.h
 @@ -27,7 +27,7 @@
@@ -347,7 +364,7 @@
  /*
   * These symbols may be used in compile-time #ifdef tests for the availability
   * of newer libpq features.
-@@ -688,6 +688,21 @@
+@@ -688,6 +688,22 @@
  /* ProxySQL special handler function */
  extern int PShandleRowData(PGconn *conn, bool is_first_packet, PSresult* result);
  
@@ -357,6 +374,7 @@
 +extern uint64_t PQgetLSN(const PGconn *conn);
 +extern int	PQhasLSN(const PGconn *conn);
 +extern void PQsetPolarSendLSN(PGconn *conn, int enable);
++extern uint64_t PQgetReadyForQuerySequence(const PGconn *conn);
 +
 +/*
 + * PolarDB Transaction Split API - for routing reads within transactions
@@ -371,7 +389,7 @@
  
 --- src/interfaces/libpq/libpq-int.h
 +++ src/interfaces/libpq/libpq-int.h
-@@ -493,6 +493,33 @@
+@@ -493,6 +493,34 @@
  								 * tried host */
  	bool		send_appname;	/* okay to send application_name? */
  
@@ -379,6 +397,7 @@
 +	bool		polar_proxy_send_lsn;	/* request LSN in ReadyForQuery? */
 +	uint64		polar_last_lsn;			/* LSN from last ReadyForQuery */
 +	bool		polar_has_lsn;			/* was LSN present in last RFQ? */
++	uint64		polar_ready_sequence;		/* parsed ReadyForQuery count */
 +	bool		polar_proxy_send_xact;	/* request xact info in ReadyForQuery? */
 +	char	   *polar_xact_xids;		/* "cmdId,xid1,xid2,..." from RFQ */
 +	bool		polar_xact_splittable;	/* 'x' marker: WAL flushed, safe to split */
