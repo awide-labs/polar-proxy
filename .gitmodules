@@ -1,0 +1,3 @@
+[submodule "deps/sysbench-polar-rfq"]
+	path = deps/sysbench-polar-rfq
+	url = ../sysbench-polar-rfq.git
