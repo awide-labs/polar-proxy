@@ -570,6 +570,8 @@ void PgSQL_Session::polardb_reader_lag_plan(
 		PolarDB_Query_RoutePlan& plan,
 		const PolarDB_Query_RouteCtx& route_ctx)
 {
+	plan.reader.wait_timeout_ms = route_ctx.wait_timeout_ms;
+
 	// Resolve the byte cap: HG policy (>=0) overrides, else the global thread var.
 	int max_lag = (route_ctx.max_lag_bytes >= 0) ? route_ctx.max_lag_bytes
 	                                        : pgsql_thread___polardb_lag_bytes;

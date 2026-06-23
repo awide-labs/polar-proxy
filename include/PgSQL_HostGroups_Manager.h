@@ -798,7 +798,26 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 		std::atomic<unsigned long long> polardb_primary_lsn_unknown{0};      // PRIMARY baseline requested but writer mirror had no LSN
 		std::atomic<unsigned long long> polardb_rfq_best_effort_degraded_routes{0}; // RFQ-unavailable reads sent to reader without wait
 		std::atomic<unsigned long long> polardb_consistency_writer_fallback{0}; // consistency reads redirected to writer after reader acquisition status
+		std::atomic<unsigned long long> polardb_lag_cap_freshness_clamped{0}; // byte-lag cap reduced effective cached-LSN freshness for an acquisition
+		std::atomic<unsigned long long> polardb_lag_cap_lsn_unknown{0}; // lag-cap reader candidate had no cached LSN
+		std::atomic<unsigned long long> polardb_lag_cap_lsn_stale{0}; // lag-cap reader candidate had a stale cached LSN
+		std::atomic<unsigned long long> polardb_lag_cap_rejected{0}; // lag-cap reader candidate exceeded max_lag_bytes
+		std::atomic<unsigned long long> polardb_lag_cap_accepted{0}; // lag-cap reader candidate passed max_lag_bytes
 		std::atomic<unsigned long long> polardb_wait_reads_retried_on_writer{0}; // wait-wrapped reads retried once on the writer after timeout or reader loss
+		std::atomic<unsigned long long> polardb_wait_retry_evaluated{0}; // wait-read failures that entered retry-to-writer decision handling
+		std::atomic<unsigned long long> polardb_wait_retry_attempted{0}; // wait-read retries with a rebuilt packet ready for writer dispatch
+		std::atomic<unsigned long long> polardb_wait_retry_declined_policy_forward{0}; // retry skipped because policy forwards reader error
+		std::atomic<unsigned long long> polardb_wait_retry_declined_policy_terminate{0}; // retry skipped because policy terminates the session
+		std::atomic<unsigned long long> polardb_wait_retry_declined_target_not_writer{0}; // retry skipped because target is not WRITER
+		std::atomic<unsigned long long> polardb_wait_retry_declined_not_recoverable{0}; // retry skipped because failure is not timeout or connection loss
+		std::atomic<unsigned long long> polardb_wait_retry_declined_result_started{0}; // retry skipped because user result transfer started
+		std::atomic<unsigned long long> polardb_wait_retry_declined_writer_hg_unknown{0}; // retry skipped because writer HG is unknown
+		std::atomic<unsigned long long> polardb_wait_retry_declined_original_query_missing{0}; // retry skipped because original query was unavailable
+		std::atomic<unsigned long long> polardb_wait_retry_declined_writer_unavailable{0}; // retry skipped because writer backend stream was unavailable
+		std::atomic<unsigned long long> polardb_wait_retry_declined_same_stream{0}; // retry skipped because writer stream equals failed reader stream
+		std::atomic<unsigned long long> polardb_wait_retry_declined_writer_busy{0}; // retry skipped because writer stream was not idle
+		std::atomic<unsigned long long> polardb_wait_retry_declined_packet_build_failed{0}; // retry skipped because packet rebuild failed
+		std::atomic<unsigned long long> polardb_wait_retry_declined_move_failed{0}; // retry skipped because retry packet move failed
 		std::atomic<unsigned long long> polardb_rfq_profile_skipped{0};      // incompatible pooled-backend skip attempts for RFQ-LSN reads
 		std::atomic<unsigned long long> polardb_rfq_profile_evicted{0};      // incompatible free pooled backends evicted to create RFQ-LSN-capable replacements
 		std::atomic<unsigned long long> polardb_tl_cache_bypassed_for_target{0}; // thread-local cache bypasses for consistency-target RFQ-LSN reads

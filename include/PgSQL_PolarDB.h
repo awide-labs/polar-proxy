@@ -447,6 +447,25 @@ static inline bool polardb_reader_status_redirects_to_writer(
 }
 
 /**
+ * @brief Whether transaction-split demand warmup can help this acquire failure.
+ *
+ * Warmup can create or prepare RFQ-compatible reader backends. It cannot fix a
+ * policy refusal caused by missing/stale LSN samples or byte lag above the cap;
+ * those readers must stay rejected until monitor/RFQ freshness catches up.
+ */
+static inline bool polardb_reader_status_split_warmup_can_help(
+	PolarDB_ReaderStatus status) {
+	switch (status) {
+	case PolarDB_ReaderStatus::READER_UNAVAILABLE:
+	case PolarDB_ReaderStatus::READER_BUSY:
+	case PolarDB_ReaderStatus::RFQ_UNAVAILABLE:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/**
  * @brief Initial SESSION_LSN target source for a first read-only session.
  *
  * Values match the hot-path integer mapping for
@@ -1769,13 +1788,81 @@ static inline int polardb_resolve_consistency_mode(
 /// Default for pgsql-polardb_lsn_freshness_ms (max age of a cached per-server
 /// LSN to trust), used when that runtime knob is unset or non-positive.
 static constexpr int POLARDB_LSN_FRESHNESS_MS_DEFAULT = 5000;
+static constexpr uint32_t POLARDB_LSN_FRESHNESS_WAIT_FRACTION_DIVISOR = 4;
 
 static inline bool polardb_lsn_cache_fresh(uint64_t updated_at_us,
                                            uint64_t now_us,
                                            uint32_t freshness_ms) {
-    if (updated_at_us == 0) return false;
-    if (now_us < updated_at_us) return true;  // monotonic clock skew guard
-    return (now_us - updated_at_us) <= ((uint64_t)freshness_ms * 1000ULL);
+	if (updated_at_us == 0) return false;
+	if (now_us < updated_at_us) return true;  // monotonic clock skew guard
+	return (now_us - updated_at_us) <= ((uint64_t)freshness_ms * 1000ULL);
+}
+
+/*
+ * Effective LSN-cache freshness for reader acquisition.
+ *
+ * The configured pgsql-polardb_lsn_freshness_ms is the general maximum age of a
+ * cached per-server LSN. When a byte-lag cap and a finite backend wait timeout
+ * are both active, the configured age can be too loose: a reader that was within
+ * max_lag_bytes several seconds ago can drift far outside the cap before the
+ * backend gets only wait_timeout_ms to catch up.
+ *
+ * v1 uses a conservative pseudo-dynamic clamp:
+ *   - no byte cap, or timeout 0 (wait indefinitely): use configured freshness;
+ *   - finite wait + byte cap: trust cached LSNs for at most one quarter of the
+ *     wait timeout, optionally capped by pgsql-polardb_lag_cap_freshness_ms.
+ *
+ * A future rate-based policy can replace this clamp after we store writer WAL
+ * generation rate and per-reader replay rate by writer epoch. Then freshness can
+ * be derived from:
+ *
+ *     allowed_age_ms ~= remaining_lag_budget_bytes / observed_growth_bytes_per_ms
+ */
+static inline uint32_t polardb_effective_lsn_freshness_ms(
+		int configured_freshness_ms,
+		uint32_t wait_timeout_ms,
+		int max_lag_bytes,
+		int lag_cap_freshness_ms,
+		bool* clamped = nullptr) {
+	uint32_t effective =
+		configured_freshness_ms > 0
+			? (uint32_t)configured_freshness_ms
+			: (uint32_t)POLARDB_LSN_FRESHNESS_MS_DEFAULT;
+	if (clamped) *clamped = false;
+
+	if (max_lag_bytes <= 0 || wait_timeout_ms == 0) {
+		return effective;
+	}
+
+	uint32_t wait_fraction_ms =
+		wait_timeout_ms / POLARDB_LSN_FRESHNESS_WAIT_FRACTION_DIVISOR;
+	if (wait_fraction_ms == 0) {
+		wait_fraction_ms = 1;
+	}
+	if (lag_cap_freshness_ms > 0 &&
+			wait_fraction_ms > (uint32_t)lag_cap_freshness_ms) {
+		wait_fraction_ms = (uint32_t)lag_cap_freshness_ms;
+	}
+	if (effective > wait_fraction_ms) {
+		effective = wait_fraction_ms;
+		if (clamped) *clamped = true;
+	}
+	return effective;
+}
+
+static inline bool polardb_should_handle_wait_timeout_result(
+		bool simple_query_result,
+		bool wait_active,
+		bool timeout_error,
+		bool wrapper_finalized,
+		bool consistency_wait,
+		bool result_started) {
+	return simple_query_result &&
+		wait_active &&
+		timeout_error &&
+		wrapper_finalized &&
+		consistency_wait &&
+		!result_started;
 }
 
 static inline bool polardb_reader_lsn_in_best_behind_range(

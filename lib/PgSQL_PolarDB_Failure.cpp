@@ -1154,6 +1154,8 @@ PolarDB_FailureAction PgSQL_Session::polardb_handle_failed_wait_read(
 	if (!failure.wait_read) {
 		return PolarDB_FailureAction::PASSTHROUGH;
 	}
+	polardb_count_wait_retry_counter(
+		PgHGM->status.polardb_wait_retry_evaluated, "evaluated");
 
 	// A finalized wait-read has already replaced pgsql_real_query with the
 	// prepended-SET wrapper and moved the SET-result countdown to the connection.
@@ -1278,8 +1280,23 @@ PolarDB_FailureAction PgSQL_Session::polardb_handle_failed_wait_read(
 	}
 
 	PgSQL_Backend* writer_mybe = find_or_create_backend(failure.fallback_writer_hg);
-	if (!writer_mybe || !writer_mybe->server_myds ||
-			writer_mybe->server_myds == failure.failed_myds) {
+	if (!writer_mybe || !writer_mybe->server_myds) {
+		polardb_count_wait_retry_counter(
+			PgHGM->status.polardb_wait_retry_declined_writer_unavailable,
+			"writer_unavailable");
+		POLARDB_TRACE(
+			"PolarDB WAIT: failed wait-read cleaned wrapper; "
+			"primary retry stream unavailable writer_hg=%d\n",
+			failure.fallback_writer_hg);
+		if (txn_wait_read) {
+			return finish_txn_wait_with_error();
+		}
+		return PolarDB_FailureAction::PASSTHROUGH;
+	}
+	if (writer_mybe->server_myds == failure.failed_myds) {
+		polardb_count_wait_retry_counter(
+			PgHGM->status.polardb_wait_retry_declined_same_stream,
+			"same_stream");
 		POLARDB_TRACE(
 			"PolarDB WAIT: failed wait-read cleaned wrapper; "
 			"primary retry stream unavailable writer_hg=%d\n",
@@ -1299,6 +1316,9 @@ PolarDB_FailureAction PgSQL_Session::polardb_handle_failed_wait_read(
 	if ((writer_myds->myconn &&
 				writer_myds->myconn->async_state_machine != ASYNC_IDLE) ||
 			writer_retry_declined_by_debug) {
+		polardb_count_wait_retry_counter(
+			PgHGM->status.polardb_wait_retry_declined_writer_busy,
+			"writer_busy");
 		POLARDB_TRACE(
 			"PolarDB WAIT: failed wait-read cleaned wrapper; "
 			"primary retry declined writer_hg=%d debug=%d\n",
@@ -1327,8 +1347,8 @@ PolarDB_FailureAction PgSQL_Session::polardb_handle_failed_wait_read(
 		"unwrapped query to writer_hg=%d reader_hg=%d\n",
 		failure.timeout ? "strict wait timeout" : "reader connection lost",
 		failure.fallback_writer_hg, failure.reader_hg);
-	PgHGM->status.polardb_wait_reads_retried_on_writer.fetch_add(
-		1, std::memory_order_relaxed);
+	polardb_count_wait_retry_counter(
+		PgHGM->status.polardb_wait_retry_attempted, "attempted");
 
 	if (failure.reader_hg >= 0 && !failure.reader_address.empty()) {
 		PgHGM->p_update_pgsql_error_counter(

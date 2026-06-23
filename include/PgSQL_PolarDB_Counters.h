@@ -201,9 +201,66 @@
 	T(consistency_writer_fallback, "PolarDB_Consistency_Writer_Fallback", \
 		"proxysql_polardb_consistency_writer_fallback_total", \
 		"Consistency reads redirected to the writer after reader acquisition") \
+	T(lag_cap_freshness_clamped, "PolarDB_Lag_Cap_Freshness_Clamped", \
+		"proxysql_polardb_lag_cap_freshness_clamped_total", \
+		"Reader acquisitions where byte-lag cap reduced the effective LSN-cache freshness window") \
+	T(lag_cap_lsn_unknown, "PolarDB_Lag_Cap_LSN_Unknown", \
+		"proxysql_polardb_lag_cap_lsn_unknown_total", \
+		"Reader candidates rejected by byte-lag cap because their cached LSN was unknown") \
+	T(lag_cap_lsn_stale, "PolarDB_Lag_Cap_LSN_Stale", \
+		"proxysql_polardb_lag_cap_lsn_stale_total", \
+		"Reader candidates rejected by byte-lag cap because their cached LSN sample was stale") \
+	T(lag_cap_rejected, "PolarDB_Lag_Cap_Rejected", \
+		"proxysql_polardb_lag_cap_rejected_total", \
+		"Reader candidates rejected because cached byte lag exceeded max_lag_bytes") \
+	T(lag_cap_accepted, "PolarDB_Lag_Cap_Accepted", \
+		"proxysql_polardb_lag_cap_accepted_total", \
+		"Reader candidates accepted by the byte-lag cap") \
 	G(wait_reads_retried_on_writer, "PolarDB_Wait_Reads_Retried_On_Writer", \
 		"proxysql_polardb_wait_reads_retried_on_writer_total", \
 		"Wait reads retried once on the writer") \
+	G(wait_retry_evaluated, "PolarDB_Wait_Retry_Evaluated", \
+		"proxysql_polardb_wait_retry_evaluated_total", \
+		"Wait-read failures evaluated by the retry-to-writer path") \
+	G(wait_retry_attempted, "PolarDB_Wait_Retry_Attempted", \
+		"proxysql_polardb_wait_retry_attempted_total", \
+		"Wait-read failures with a rebuilt packet ready to move to the writer") \
+	G(wait_retry_declined_policy_forward, "PolarDB_Wait_Retry_Declined_Policy_Forward", \
+		"proxysql_polardb_wait_retry_declined_policy_forward_total", \
+		"Wait-read retries declined because policy forwards the reader error") \
+	G(wait_retry_declined_policy_terminate, "PolarDB_Wait_Retry_Declined_Policy_Terminate", \
+		"proxysql_polardb_wait_retry_declined_policy_terminate_total", \
+		"Wait-read retries declined because policy terminates the client session") \
+	G(wait_retry_declined_target_not_writer, "PolarDB_Wait_Retry_Declined_Target_Not_Writer", \
+		"proxysql_polardb_wait_retry_declined_target_not_writer_total", \
+		"Wait-read retries declined because the configured retry target is not the writer") \
+	G(wait_retry_declined_not_recoverable, "PolarDB_Wait_Retry_Declined_Not_Recoverable", \
+		"proxysql_polardb_wait_retry_declined_not_recoverable_total", \
+		"Wait-read retries declined because the failure is not timeout or connection loss") \
+	G(wait_retry_declined_result_started, "PolarDB_Wait_Retry_Declined_Result_Started", \
+		"proxysql_polardb_wait_retry_declined_result_started_total", \
+		"Wait-read retries declined because user-result transfer had already started") \
+	G(wait_retry_declined_writer_hg_unknown, "PolarDB_Wait_Retry_Declined_Writer_HG_Unknown", \
+		"proxysql_polardb_wait_retry_declined_writer_hg_unknown_total", \
+		"Wait-read retries declined because the writer hostgroup was unknown") \
+	G(wait_retry_declined_original_query_missing, "PolarDB_Wait_Retry_Declined_Original_Query_Missing", \
+		"proxysql_polardb_wait_retry_declined_original_query_missing_total", \
+		"Wait-read retries declined because the original unwrapped query was not saved") \
+	G(wait_retry_declined_writer_unavailable, "PolarDB_Wait_Retry_Declined_Writer_Unavailable", \
+		"proxysql_polardb_wait_retry_declined_writer_unavailable_total", \
+		"Wait-read retries declined because no writer backend stream was available") \
+	G(wait_retry_declined_same_stream, "PolarDB_Wait_Retry_Declined_Same_Stream", \
+		"proxysql_polardb_wait_retry_declined_same_stream_total", \
+		"Wait-read retries declined because the writer stream was the failed reader stream") \
+	G(wait_retry_declined_writer_busy, "PolarDB_Wait_Retry_Declined_Writer_Busy", \
+		"proxysql_polardb_wait_retry_declined_writer_busy_total", \
+		"Wait-read retries declined because the writer stream was not idle") \
+	G(wait_retry_declined_packet_build_failed, "PolarDB_Wait_Retry_Declined_Packet_Build_Failed", \
+		"proxysql_polardb_wait_retry_declined_packet_build_failed_total", \
+		"Wait-read retries declined because rebuilding the simple-query packet failed") \
+	G(wait_retry_declined_move_failed, "PolarDB_Wait_Retry_Declined_Move_Failed", \
+		"proxysql_polardb_wait_retry_declined_move_failed_total", \
+		"Wait-read retries declined because moving the retry packet to the writer failed") \
 	T(rfq_profile_skipped, "PolarDB_RFQ_Profile_Skipped", \
 		"proxysql_polardb_rfq_profile_skipped_total", \
 		"Pooled backends skipped because their startup profile cannot return RFQ LSN") \

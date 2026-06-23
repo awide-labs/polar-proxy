@@ -49,6 +49,11 @@ static PgSQL_Session* sess_stopat;
 #define PROXYSQL_LISTEN_LEN 1024
 #define MIN_THREADS_FOR_MAINTENANCE 8
 
+static_assert(static_cast<int>(PG_st_var_END) == static_cast<int>(MY_st_var_END),
+	"PgSQL generic status-variable storage must match shared st_var_* indexes");
+static_assert(static_cast<int>(PG_st_var_END) > static_cast<int>(st_var_client_host_error_killed_connections),
+	"PgSQL status-variable storage must cover client-host-error counter");
+
 extern PgSQL_Query_Processor* GloPgQPro;
 extern PgSQL_Threads_Handler* GloPTH;
 extern MySQL_Monitor* GloMyMon;
@@ -6397,9 +6402,16 @@ PgSQL_Connection* PgSQL_Thread::get_MyConn_local_polardb_reader(
 	if (!reader_plan.has_consistency_target_lsn()) return NULL;
 
 	const uint64_t now_us = monotonic_time();
-	const int fresh_ms = pgsql_thread___polardb_lsn_freshness_ms > 0
-		? pgsql_thread___polardb_lsn_freshness_ms
-		: POLARDB_LSN_FRESHNESS_MS_DEFAULT;
+	bool freshness_clamped = false;
+	const uint32_t fresh_ms = polardb_effective_lsn_freshness_ms(
+		pgsql_thread___polardb_lsn_freshness_ms,
+		reader_plan.wait_timeout_ms,
+		reader_plan.max_lag_bytes,
+		pgsql_thread___polardb_lag_cap_freshness_ms,
+		&freshness_clamped);
+	if (freshness_clamped) {
+		POLARDB_THREAD_COUNT_ONE(this, lag_cap_freshness_clamped);
+	}
 	PgSQL_Connection* client_conn = sess->client_myds->myconn;
 	// A thread-local cached reader may have been opened under an older RFQ-capable
 	// startup profile. Re-check the current effective HG/global protocol before
@@ -6431,11 +6443,25 @@ PgSQL_Connection* PgSQL_Thread::get_MyConn_local_polardb_reader(
 		const bool lsn_fresh =
 			polardb_lsn_cache_fresh(updated_us, now_us, (uint32_t)fresh_ms);
 
-		if (!lsn_fresh || !reader_plan.reader_lsn_reaches_consistency_target(reader_lsn))
+		if (!lsn_fresh ||
+				!reader_plan.reader_lsn_reaches_consistency_target(reader_lsn)) {
+			if (reader_plan.lag_cap_enabled()) {
+				if (reader_lsn == 0) {
+					POLARDB_THREAD_COUNT_ONE(this, lag_cap_lsn_unknown);
+				} else if (!lsn_fresh) {
+					POLARDB_THREAD_COUNT_ONE(this, lag_cap_lsn_stale);
+				}
+			}
 			continue;
+		}
 		if (reader_plan.lag_cap_enabled() &&
-				!reader_plan.within_byte_cap(reader_lsn))
+				!reader_plan.within_byte_cap(reader_lsn)) {
+			POLARDB_THREAD_COUNT_ONE(this, lag_cap_rejected);
 			continue;
+		}
+		if (reader_plan.lag_cap_enabled()) {
+			POLARDB_THREAD_COUNT_ONE(this, lag_cap_accepted);
+		}
 		if (c->requires_RESETTING_CONNECTION(client_conn))
 			continue;
 

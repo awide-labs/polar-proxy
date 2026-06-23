@@ -6567,6 +6567,8 @@ PolarDB_ReaderResult PgSQL_HostGroups_Manager::get_MyConn_polardb_reader(unsigne
 						PolarDB_ReaderStatus::READER_LAG_EXCEEDED);
 					continue;
 				}
+				POLARDB_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
+					lag_cap_accepted);
 			}
 
 			// Target-reached means this reader's cached LSN sample is fresh and

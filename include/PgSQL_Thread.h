@@ -181,7 +181,11 @@ enum PgSQL_Thread_status_variable {
 	st_var_mysql_whitelisted_sqli_fingerprint,
 	st_var_client_host_error_killed_connections,
 	*/
-	PG_st_var_END = 42 // to avoid ASAN complaining. TO FIX
+	// PgSQL reuses the shared st_var_* indexes declared by MySQL_Thread.h.
+	// Keep this sized to MY_st_var_END; PgSQL_Thread.cpp has a static_assert
+	// to catch drift without introducing a PgSQL_Thread.h <-> MySQL_Thread.h
+	// include cycle.
+	PG_st_var_END = 45
 };
 
 
