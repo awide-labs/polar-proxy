@@ -105,12 +105,18 @@ ifeq ($(PROXYSQLTSDB),1)
 endif
 
 
+ENABLE_EPOLL := -DENABLE_EPOLL
+ifeq ($(UNAME_S),Darwin)
+	ENABLE_EPOLL :=
+endif
+
 
 MYCXXFLAGS := $(STDCPP)
-ifeq ($(CXX),clang++)
-	MYCXXFLAGS += -fuse-ld=lld
+CLANG_LDFLAGS :=
+ifneq ($(findstring clang,$(notdir $(CXX))),)
+	CLANG_LDFLAGS += -fuse-ld=lld
 endif
-MYCXXFLAGS += $(IDIRS) $(OPTZ) $(DEBUG) $(PSQLCH) $(PSQLPOLAR) $(PSQL40) $(PSQL31) $(PSQLFFTO) $(PSQLTSDB) -DGITVERSION=\"$(GIT_VERSION)\" $(NOJEM) $(WGCOV) $(WASAN)
+MYCXXFLAGS += $(IDIRS) $(OPTZ) $(DEBUG) $(PSQLCH) $(PSQLPOLAR) $(PSQL40) $(PSQL31) $(PSQLFFTO) $(PSQLTSDB) $(ENABLE_EPOLL) -DGITVERSION=\"$(GIT_VERSION)\" $(NOJEM) $(WGCOV) $(WASAN) $(POLARDB_OPT_CXXFLAGS)
 
 
 STATICMYLIBS := -Wl,-Bstatic \
@@ -204,11 +210,11 @@ $(ODIR)/%.o: %.cpp
 
 $(EXECUTABLE): $(ODIR) $(OBJ) $(LIBPROXYSQLAR)
 ifeq ($(PROXYSQLCLICKHOUSE),1)
-	$(CXX) -o $@ $(OBJ) $(CLANGFIX) -Wl,--whole-archive $(PROXYSQL_LDIR)/libproxysql.a -Wl,--no-whole-archive $(filter-out $(PROXYSQL_LDIR)/libproxysql.a,$(LIBPROXYSQLAR)) $(CLICKHOUSE_CPP_LDIR)/libclickhouse-cpp-lib.a $(LZ4_LDIR)/liblz4.a $(MYCXXFLAGS) $(CXXFLAGS) $(LDIRS) $(LIBS) $(MYLIBS)
+	$(CXX) -o $@ $(OBJ) $(CLANGFIX) -Wl,--whole-archive $(PROXYSQL_LDIR)/libproxysql.a -Wl,--no-whole-archive $(filter-out $(PROXYSQL_LDIR)/libproxysql.a,$(LIBPROXYSQLAR)) $(CLICKHOUSE_CPP_LDIR)/libclickhouse-cpp-lib.a $(LZ4_LDIR)/liblz4.a $(MYCXXFLAGS) $(CXXFLAGS) $(CLANG_LDFLAGS) $(POLARDB_OPT_LDFLAGS) $(LDIRS) $(LIBS) $(MYLIBS)
 else ifeq ($(UNAME_S),Darwin)
-	$(CXX) -o $@ $(OBJ) $(CLANGFIX) -force_load $(PROXYSQL_LDIR)/libproxysql.a $(filter-out $(PROXYSQL_LDIR)/libproxysql.a,$(LIBPROXYSQLAR)) $(MYCXXFLAGS) $(CXXFLAGS) $(LDIRS) $(LIBS) $(MYLIBS)
+	$(CXX) -o $@ $(OBJ) $(CLANGFIX) -force_load $(PROXYSQL_LDIR)/libproxysql.a $(filter-out $(PROXYSQL_LDIR)/libproxysql.a,$(LIBPROXYSQLAR)) $(MYCXXFLAGS) $(CXXFLAGS) $(CLANG_LDFLAGS) $(POLARDB_OPT_LDFLAGS) $(LDIRS) $(LIBS) $(MYLIBS)
 else
-	$(CXX) -o $@ $(OBJ) $(CLANGFIX) -Wl,--whole-archive $(PROXYSQL_LDIR)/libproxysql.a -Wl,--no-whole-archive $(filter-out $(PROXYSQL_LDIR)/libproxysql.a,$(LIBPROXYSQLAR)) $(MYCXXFLAGS) $(CXXFLAGS) $(LDIRS) $(LIBS) $(MYLIBS)
+	$(CXX) -o $@ $(OBJ) $(CLANGFIX) -Wl,--whole-archive $(PROXYSQL_LDIR)/libproxysql.a -Wl,--no-whole-archive $(filter-out $(PROXYSQL_LDIR)/libproxysql.a,$(LIBPROXYSQLAR)) $(MYCXXFLAGS) $(CXXFLAGS) $(CLANG_LDFLAGS) $(POLARDB_OPT_LDFLAGS) $(LDIRS) $(LIBS) $(MYLIBS)
 endif
 ifeq ($(UNAME_S),Darwin)
 	shasum $(EXECUTABLE) > $(EXECUTABLE).sha1

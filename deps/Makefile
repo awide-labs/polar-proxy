@@ -101,6 +101,16 @@ endif
 libinjection: libinjection/libinjection/src/libinjection.a
 
 
+LIBHTTPSERVER_CPPFLAGS := -I$(shell pwd)/libmicrohttpd/libmicrohttpd/src/include
+ifneq ($(UNAME_S),Darwin)
+LIBHTTPSERVER_CPPFLAGS += -DENABLE_EPOLL
+endif
+
+LIBMICROHTTPD_CONFIGURE_ENV :=
+ifeq ($(POLARDB_OPT_BUILD),1)
+LIBMICROHTTPD_CONFIGURE_ENV := CFLAGS="-fPIC"
+endif
+
 libhttpserver/libhttpserver/build/src/.libs/libhttpserver.a: libmicrohttpd/libmicrohttpd/src/microhttpd/.libs/libmicrohttpd.a re2/re2/obj/libre2.a
 	cd libhttpserver && rm -rf libhttpserver-*/ || true
 	cd libhttpserver && tar -zxf libhttpserver-*.tar.gz
@@ -114,7 +124,7 @@ ifeq ($(UNAME_S),FreeBSD)
 	sed -i -e 's/\/bin\/bash/\/usr\/local\/bin\/bash/' libhttpserver/libhttpserver/bootstrap
 endif
 	cd libhttpserver/libhttpserver && ./bootstrap && mkdir build
-	cd libhttpserver/libhttpserver/build && LDFLAGS=-L$(shell pwd)/libmicrohttpd/libmicrohttpd/src/microhttpd/.libs/ CPPFLAGS=-I$(shell pwd)/libmicrohttpd/libmicrohttpd/src/include ../configure --disable-doxygen-doc --disable-doxygen-dot --disable-doxygen-man --disable-doxygen-html --enable-fastopen=false --disable-examples
+	cd libhttpserver/libhttpserver/build && LDFLAGS=-L$(shell pwd)/libmicrohttpd/libmicrohttpd/src/microhttpd/.libs/ CPPFLAGS="$(LIBHTTPSERVER_CPPFLAGS)" ../configure --disable-doxygen-doc --disable-doxygen-dot --disable-doxygen-man --disable-doxygen-html --enable-fastopen=false --disable-examples
 	cd libhttpserver/libhttpserver/build && CC=${CC} CXX=${CXX} ${MAKE}
 
 libhttpserver: libhttpserver/libhttpserver/build/src/.libs/libhttpserver.a
@@ -157,7 +167,7 @@ curl: curl/curl/lib/.libs/libcurl.a
 libmicrohttpd/libmicrohttpd/src/microhttpd/.libs/libmicrohttpd.a:
 	cd libmicrohttpd && rm -rf libmicrohttpd-*/ || true
 	cd libmicrohttpd && tar -zxf libmicrohttpd-*.tar.gz
-	cd libmicrohttpd/libmicrohttpd && ./configure --enable-https && CC=${CC} CXX=${CXX} ${MAKE}
+	cd libmicrohttpd/libmicrohttpd && $(LIBMICROHTTPD_CONFIGURE_ENV) ./configure --enable-https && CC=${CC} CXX=${CXX} ${MAKE}
 
 microhttpd: libmicrohttpd/libmicrohttpd/src/microhttpd/.libs/libmicrohttpd.a
 
@@ -386,6 +396,18 @@ pcre/pcre/.libs/libpcre.a:
 	cd pcre/pcre && CC=${CC} CXX=${CXX} ${MAKE}
 
 pcre: pcre/pcre/.libs/libpcre.a
+
+# PostgreSQL records LDFLAGS from configure into src/Makefile.global. For
+# PolarDB Clang optimization builds, configure libpq/pgbench to use lld without
+# passing LDFLAGS as a recursive make command-line override, which would erase
+# PostgreSQL's internal frontend library link flags.
+POLARDB_POSTGRESQL_CONFIGURE_ENV :=
+ifeq ($(POLARDB_OPT_BUILD),1)
+ifneq ($(POLARDB_OPT_IS_CLANG),)
+POLARDB_POSTGRESQL_CONFIGURE_ENV := LDFLAGS="-fuse-ld=lld -Wl,--undefined-version $${LDFLAGS:-}"
+endif
+endif
+
 postgresql/postgresql/src/interfaces/libpq/libpq.a:
 	cd postgresql && rm -rf postgresql-*/ || true
 	cd postgresql && tar -zxf postgresql-*.tar.gz
@@ -405,7 +427,7 @@ endif
 ifeq ($(UNAME_S),Darwin)
 	cd postgresql/postgresql && LDFLAGS="-L$$(brew --prefix icu4c)/lib" CPPFLAGS="-I$$(brew --prefix icu4c)/include" PKG_CONFIG_PATH="$$(brew --prefix icu4c)/lib/pkgconfig:$$PKG_CONFIG_PATH" DYLD_LIBRARY_PATH="$(SSL_LDIR):$$DYLD_LIBRARY_PATH" ./configure --with-ssl=openssl --with-includes="$(SSL_IDIR)" --with-libraries="$(SSL_LDIR)" --without-readline --with-icu
 else
-	cd postgresql/postgresql && LD_LIBRARY_PATH="$(SSL_LDIR)" ./configure --with-ssl=openssl --with-includes="$(SSL_IDIR)" --with-libraries="$(SSL_LDIR)" --without-readline
+	cd postgresql/postgresql && LD_LIBRARY_PATH="$(SSL_LDIR)" $(POLARDB_POSTGRESQL_CONFIGURE_ENV) ./configure --with-ssl=openssl --with-includes="$(SSL_IDIR)" --with-libraries="$(SSL_LDIR)" --without-readline
 endif
 	+cd postgresql/postgresql/src/interfaces/libpq && CC=${CC} CXX=${CXX} ${MAKE} MAKELEVEL=0
 

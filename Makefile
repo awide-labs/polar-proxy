@@ -434,6 +434,26 @@ build_src_debug_default: build_lib_debug_default
 	$(if $(filter 1,$(PROXYSQL40)),cd plugins/mysqlx && OPTZ="${O0} -ggdb -DDEBUG" PROXYSQL40=$(PROXYSQL40) PROXYSQL31=$(PROXYSQL31) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE},@echo "[skip] mysqlx plugin (PROXYSQL40 not set)")
 	$(if $(filter 1,$(PROXYSQL40)),cd plugins/genai && OPTZ="${O0} -ggdb -DDEBUG" PROXYSQL40=$(PROXYSQL40) PROXYSQL31=$(PROXYSQL31) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX} ${MAKE},@echo "[skip] genai plugin (PROXYSQL40 not set)")
 
+# Core + PolarDB build chain used by compile/link optimization targets.
+# It forces PROXYSQLCLICKHOUSE=0 and does not build plugins.
+# Keep this path narrow: deps/lib/src only, with PolarDB libpq support enabled.
+.PHONY: build_deps_polardb_core
+build_deps_polardb_core:
+	cd deps && ${MAKE} OPTZ="${O2} -ggdb" PROXYSQLCLICKHOUSE=0 POLARDB_PROXY=$(POLARDB_PROXY) POLARDB_DEBUG=$(POLARDB_DEBUG) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX}
+
+.PHONY: build_lib_polardb_core
+build_lib_polardb_core: build_deps_polardb_core
+	cd lib && ${MAKE} OPTZ="${O2} -ggdb" PROXYSQLCLICKHOUSE=0 POLARDB_PROXY=$(POLARDB_PROXY) POLARDB_DEBUG=$(POLARDB_DEBUG) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX}
+
+.PHONY: build_src_polardb_core
+build_src_polardb_core: build_lib_polardb_core
+	cd src && ${MAKE} OPTZ="${O2} -ggdb" PROXYSQLCLICKHOUSE=0 POLARDB_PROXY=$(POLARDB_PROXY) POLARDB_DEBUG=$(POLARDB_DEBUG) PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) CC=${CC} CXX=${CXX}
+
+.PHONY: clean_polardb_core_build
+clean_polardb_core_build:
+	cd lib && ${MAKE} clean
+	cd src && ${MAKE} clean
+
 # Rebuild only libpq (e.g. after editing the PolarDB libpq patch) without a full
 # postgres re-extract. Mirrors deps/ libpq-rebuild.
 .PHONY: libpq-rebuild
@@ -473,6 +493,195 @@ polardb-coverage-debug:
 polardb:
 	+$(MAKE) POLARDB_PROXY=1 build_src
 	@echo "=== Built POLARDB_PROXY=1 (PolarDB release tier) ==="
+
+
+# PolarDB-only optimization builds. These targets are explicit so normal
+# ProxySQL, ClickHouse, deps, and packaging builds remain unchanged.
+POLARDB_OPT_PGO_DIR ?= $(CURDIR)/build/polardb-pgo
+POLARDB_OPT_PGO_CS_DIR ?= $(CURDIR)/build/polardb-pgo-cs
+POLARDB_OPT_PGO_CS_PROFILE ?= $(POLARDB_OPT_PGO_CS_DIR)/clang-cs.profdata
+POLARDB_OPT_BOLT_DIR ?= $(CURDIR)/build/polardb-bolt
+POLARDB_OPT_BOLT_BINARY ?= $(CURDIR)/src/proxysql
+POLARDB_OPT_BOLT_INSTRUMENTED ?= $(CURDIR)/src/proxysql.bolt.inst
+POLARDB_OPT_BOLT_RAW_FDATA ?= $(POLARDB_OPT_BOLT_DIR)/proxysql.fdata
+POLARDB_OPT_BOLT_FDATA ?= $(POLARDB_OPT_BOLT_DIR)/proxysql.merged.fdata
+POLARDB_OPT_BOLT_OUT ?= $(CURDIR)/src/proxysql.bolt
+POLARDB_OPT_REMARKS_DIR ?= $(CURDIR)/build/polardb-remarks
+
+# BOLT optimization policy for the PolarDB/core binary:
+#   -reorder-blocks=ext-tsp    profile-guided basic-block layout for I-cache locality.
+#   -reorder-functions=cdsort  cache-directed function clustering. LLVM 22 treats
+#                              hfsort+ as a deprecated spelling for this mode.
+#   -split-functions           split hot/cold fragments inside profiled functions.
+#   -split-all-cold            move all cold blocks BOLT can prove cold out of hot code.
+#   -split-eh                  keep C++ exception-handling paths in cold fragments.
+#   -icf                       fold identical functions; keep a non-BOLT/non-ICF binary
+#                              when debugging exact symbol identity matters.
+#   -use-gnu-stack             compatibility workaround for generated segment metadata.
+#   -dyno-stats                print dynamic instruction/branch deltas from the profile.
+POLARDB_OPT_BOLT_FLAGS ?= -reorder-blocks=ext-tsp -reorder-functions=cdsort -split-functions -split-all-cold -split-eh -icf -use-gnu-stack -dyno-stats
+
+# Report-only flags: keep them separate so production BOLT generation can run
+# quietly while the report target captures profile quality, cache, and pass timing.
+POLARDB_OPT_BOLT_REPORT_FLAGS ?= -print-profile-stats -print-function-statistics=100 -print-cache-metrics -print-large-functions -time-opts
+
+.PHONY: polardb-lto-gcc polardb-pgo-gcc-generate polardb-pgo-gcc-use polardb-pgo-lto-gcc
+.PHONY: polardb-lto-clang polardb-pgo-clang-generate polardb-pgo-clang-merge polardb-pgo-clang-use
+.PHONY: polardb-pgo-clang-cs-generate polardb-pgo-clang-cs-merge polardb-pgo-clang-cs-use
+.PHONY: polardb-bolt-build polardb-bolt-instrument polardb-bolt-merge polardb-bolt-optimize
+.PHONY: polardb-pgo-gcc-use-remarks polardb-pgo-lto-gcc-remarks
+.PHONY: polardb-pgo-clang-use-remarks polardb-pgo-clang-cs-use-remarks
+.PHONY: polardb-bolt-optimize-report polardb-opt-report
+
+polardb-lto-gcc:
+	+$(MAKE) clean_polardb_core_build
+	+CCACHE_DISABLE=1 $(MAKE) CC=gcc CXX=g++ POLARDB_PROXY=1 PROXYSQLCLICKHOUSE=0 POLARDB_OPT_BUILD=1 POLARDB_OPT_LTO=1 POLARDB_OPT_LTO_MODE=auto build_src_polardb_core
+	@echo "=== Built POLARDB_PROXY=1 with GCC LTO ==="
+
+polardb-pgo-gcc-generate:
+	@mkdir -p "$(POLARDB_OPT_PGO_DIR)"
+	+$(MAKE) clean_polardb_core_build
+	+CCACHE_DISABLE=1 $(MAKE) CC=gcc CXX=g++ POLARDB_PROXY=1 PROXYSQLCLICKHOUSE=0 POLARDB_OPT_BUILD=1 POLARDB_OPT_PGO=generate POLARDB_OPT_PGO_DIR="$(POLARDB_OPT_PGO_DIR)" build_src_polardb_core
+	@echo "=== Built GCC PGO-instrumented PolarDB binary ==="
+	@echo "    Train with: make -C test/polardb pgo-train-core"
+
+polardb-pgo-gcc-use:
+	+$(MAKE) clean_polardb_core_build
+	+CCACHE_DISABLE=1 $(MAKE) CC=gcc CXX=g++ POLARDB_PROXY=1 PROXYSQLCLICKHOUSE=0 POLARDB_OPT_BUILD=1 POLARDB_OPT_PGO=use POLARDB_OPT_PGO_DIR="$(POLARDB_OPT_PGO_DIR)" build_src_polardb_core
+	@echo "=== Built POLARDB_PROXY=1 with GCC PGO ==="
+
+polardb-pgo-gcc-use-remarks:
+	@mkdir -p "$(POLARDB_OPT_REMARKS_DIR)"
+	+$(MAKE) clean_polardb_core_build
+	+bash -o pipefail -c 'CCACHE_DISABLE=1 $(MAKE) CC=gcc CXX=g++ POLARDB_PROXY=1 PROXYSQLCLICKHOUSE=0 POLARDB_OPT_BUILD=1 POLARDB_OPT_PGO=use POLARDB_OPT_PGO_DIR="$(POLARDB_OPT_PGO_DIR)" POLARDB_OPT_REMARKS=1 POLARDB_OPT_REMARKS_DIR="$(POLARDB_OPT_REMARKS_DIR)" build_src_polardb_core 2>&1 | tee "$(POLARDB_OPT_REMARKS_DIR)/gcc-pgo-use-build.log"'
+	@$(CURDIR)/test/polardb/tools/opt_remarks_report.py --root "$(CURDIR)" --remarks-dir "$(POLARDB_OPT_REMARKS_DIR)" --pgo-dir "$(POLARDB_OPT_PGO_DIR)" --cs-dir "$(POLARDB_OPT_PGO_CS_DIR)" --bolt-dir "$(POLARDB_OPT_BOLT_DIR)" --output "$(POLARDB_OPT_REMARKS_DIR)/summary.md"
+	@echo "=== Wrote optimization remarks report: $(POLARDB_OPT_REMARKS_DIR)/summary.md ==="
+
+polardb-pgo-lto-gcc:
+	+$(MAKE) clean_polardb_core_build
+	+CCACHE_DISABLE=1 $(MAKE) CC=gcc CXX=g++ POLARDB_PROXY=1 PROXYSQLCLICKHOUSE=0 POLARDB_OPT_BUILD=1 POLARDB_OPT_PGO=use POLARDB_OPT_PGO_DIR="$(POLARDB_OPT_PGO_DIR)" POLARDB_OPT_LTO=1 POLARDB_OPT_LTO_MODE=auto build_src_polardb_core
+	@echo "=== Built POLARDB_PROXY=1 with GCC PGO + LTO ==="
+
+polardb-pgo-lto-gcc-remarks:
+	@mkdir -p "$(POLARDB_OPT_REMARKS_DIR)"
+	+$(MAKE) clean_polardb_core_build
+	+bash -o pipefail -c 'CCACHE_DISABLE=1 $(MAKE) CC=gcc CXX=g++ POLARDB_PROXY=1 PROXYSQLCLICKHOUSE=0 POLARDB_OPT_BUILD=1 POLARDB_OPT_PGO=use POLARDB_OPT_PGO_DIR="$(POLARDB_OPT_PGO_DIR)" POLARDB_OPT_LTO=1 POLARDB_OPT_LTO_MODE=auto POLARDB_OPT_REMARKS=1 POLARDB_OPT_REMARKS_DIR="$(POLARDB_OPT_REMARKS_DIR)" build_src_polardb_core 2>&1 | tee "$(POLARDB_OPT_REMARKS_DIR)/gcc-pgo-lto-build.log"'
+	@$(CURDIR)/test/polardb/tools/opt_remarks_report.py --root "$(CURDIR)" --remarks-dir "$(POLARDB_OPT_REMARKS_DIR)" --pgo-dir "$(POLARDB_OPT_PGO_DIR)" --cs-dir "$(POLARDB_OPT_PGO_CS_DIR)" --bolt-dir "$(POLARDB_OPT_BOLT_DIR)" --output "$(POLARDB_OPT_REMARKS_DIR)/summary.md"
+	@echo "=== Wrote optimization remarks report: $(POLARDB_OPT_REMARKS_DIR)/summary.md ==="
+
+polardb-lto-clang:
+	@command -v ld.lld >/dev/null 2>&1 || { echo "ld.lld is required for clang LTO on this tree" >&2; exit 1; }
+	+$(MAKE) clean_polardb_core_build
+	+CCACHE_DISABLE=1 $(MAKE) CC=clang CXX=clang++ POLARDB_PROXY=1 PROXYSQLCLICKHOUSE=0 POLARDB_OPT_BUILD=1 POLARDB_OPT_LTO=1 POLARDB_OPT_LTO_MODE=thin build_src_polardb_core
+	@echo "=== Built POLARDB_PROXY=1 with clang ThinLTO ==="
+
+polardb-pgo-clang-generate:
+	@mkdir -p "$(POLARDB_OPT_PGO_DIR)"
+	+$(MAKE) clean_polardb_core_build
+	+CCACHE_DISABLE=1 $(MAKE) CC=clang CXX=clang++ POLARDB_PROXY=1 PROXYSQLCLICKHOUSE=0 POLARDB_OPT_BUILD=1 POLARDB_OPT_PGO=generate POLARDB_OPT_PGO_DIR="$(POLARDB_OPT_PGO_DIR)" build_src_polardb_core
+	@echo "=== Built clang IR PGO-instrumented PolarDB binary ==="
+	@echo "    Train with: make -C test/polardb pgo-train-core"
+	@echo "    Then merge: make polardb-pgo-clang-merge"
+
+polardb-pgo-clang-merge:
+	@command -v llvm-profdata >/dev/null 2>&1 || { echo "llvm-profdata is required to merge clang PGO profiles" >&2; exit 1; }
+	@mkdir -p "$(POLARDB_OPT_PGO_DIR)"
+	@set -- "$(POLARDB_OPT_PGO_DIR)"/*.profraw; [ -e "$$1" ] || { echo "No clang .profraw files found in $(POLARDB_OPT_PGO_DIR)" >&2; exit 1; }; llvm-profdata merge -output="$(POLARDB_OPT_PGO_DIR)/clang.profdata" "$(POLARDB_OPT_PGO_DIR)"/*.profraw
+	@echo "=== Merged clang PGO profile: $(POLARDB_OPT_PGO_DIR)/clang.profdata ==="
+
+polardb-pgo-clang-use:
+	@command -v ld.lld >/dev/null 2>&1 || { echo "ld.lld is required for clang builds on this tree" >&2; exit 1; }
+	@test -f "$(POLARDB_OPT_PGO_DIR)/clang.profdata" || { echo "Missing $(POLARDB_OPT_PGO_DIR)/clang.profdata; run polardb-pgo-clang-merge first" >&2; exit 1; }
+	+$(MAKE) clean_polardb_core_build
+	+CCACHE_DISABLE=1 $(MAKE) CC=clang CXX=clang++ POLARDB_PROXY=1 PROXYSQLCLICKHOUSE=0 POLARDB_OPT_BUILD=1 POLARDB_OPT_PGO=use POLARDB_OPT_PGO_DIR="$(POLARDB_OPT_PGO_DIR)" POLARDB_OPT_PGO_PROFILE="$(POLARDB_OPT_PGO_DIR)/clang.profdata" POLARDB_OPT_LTO=1 POLARDB_OPT_LTO_MODE=thin build_src_polardb_core
+	@echo "=== Built POLARDB_PROXY=1 with clang PGO + ThinLTO ==="
+
+polardb-pgo-clang-use-remarks:
+	@command -v ld.lld >/dev/null 2>&1 || { echo "ld.lld is required for clang builds on this tree" >&2; exit 1; }
+	@test -f "$(POLARDB_OPT_PGO_DIR)/clang.profdata" || { echo "Missing $(POLARDB_OPT_PGO_DIR)/clang.profdata; run polardb-pgo-clang-merge first" >&2; exit 1; }
+	@mkdir -p "$(POLARDB_OPT_REMARKS_DIR)"
+	+$(MAKE) clean_polardb_core_build
+	+bash -o pipefail -c 'CCACHE_DISABLE=1 $(MAKE) CC=clang CXX=clang++ POLARDB_PROXY=1 PROXYSQLCLICKHOUSE=0 POLARDB_OPT_BUILD=1 POLARDB_OPT_PGO=use POLARDB_OPT_PGO_DIR="$(POLARDB_OPT_PGO_DIR)" POLARDB_OPT_PGO_PROFILE="$(POLARDB_OPT_PGO_DIR)/clang.profdata" POLARDB_OPT_LTO=1 POLARDB_OPT_LTO_MODE=thin POLARDB_OPT_REMARKS=1 POLARDB_OPT_REMARKS_DIR="$(POLARDB_OPT_REMARKS_DIR)" build_src_polardb_core 2>&1 | tee "$(POLARDB_OPT_REMARKS_DIR)/clang-pgo-use-build.log"'
+	@$(CURDIR)/test/polardb/tools/opt_remarks_report.py --root "$(CURDIR)" --remarks-dir "$(POLARDB_OPT_REMARKS_DIR)" --pgo-dir "$(POLARDB_OPT_PGO_DIR)" --cs-dir "$(POLARDB_OPT_PGO_CS_DIR)" --bolt-dir "$(POLARDB_OPT_BOLT_DIR)" --output "$(POLARDB_OPT_REMARKS_DIR)/summary.md"
+	@echo "=== Wrote optimization remarks report: $(POLARDB_OPT_REMARKS_DIR)/summary.md ==="
+
+polardb-pgo-clang-cs-generate:
+	@command -v ld.lld >/dev/null 2>&1 || { echo "ld.lld is required for clang builds on this tree" >&2; exit 1; }
+	@test -f "$(POLARDB_OPT_PGO_DIR)/clang.profdata" || { echo "Missing $(POLARDB_OPT_PGO_DIR)/clang.profdata; run polardb-pgo-clang-merge first" >&2; exit 1; }
+	@mkdir -p "$(POLARDB_OPT_PGO_CS_DIR)"
+	+$(MAKE) clean_polardb_core_build
+	+CCACHE_DISABLE=1 $(MAKE) CC=clang CXX=clang++ POLARDB_PROXY=1 PROXYSQLCLICKHOUSE=0 POLARDB_OPT_BUILD=1 POLARDB_OPT_PGO=cs-generate POLARDB_OPT_PGO_DIR="$(POLARDB_OPT_PGO_DIR)" POLARDB_OPT_PGO_PROFILE="$(POLARDB_OPT_PGO_DIR)/clang.profdata" POLARDB_OPT_PGO_CS_DIR="$(POLARDB_OPT_PGO_CS_DIR)" POLARDB_OPT_LTO=1 POLARDB_OPT_LTO_MODE=thin build_src_polardb_core
+	@echo "=== Built clang context-sensitive PGO-instrumented PolarDB binary ==="
+	@echo "    Train with: make -C test/polardb pgo-train-core"
+	@echo "    Then merge: make polardb-pgo-clang-cs-merge"
+
+polardb-pgo-clang-cs-merge:
+	@command -v llvm-profdata >/dev/null 2>&1 || { echo "llvm-profdata is required to merge clang CS PGO profiles" >&2; exit 1; }
+	@mkdir -p "$(POLARDB_OPT_PGO_CS_DIR)"
+	@set -- "$(POLARDB_OPT_PGO_CS_DIR)"/*.profraw; [ -e "$$1" ] || { echo "No clang CS .profraw files found in $(POLARDB_OPT_PGO_CS_DIR)" >&2; exit 1; }; llvm-profdata merge -output="$(POLARDB_OPT_PGO_CS_PROFILE)" "$(POLARDB_OPT_PGO_CS_DIR)"/*.profraw
+	@echo "=== Merged clang CS PGO profile: $(POLARDB_OPT_PGO_CS_PROFILE) ==="
+
+polardb-pgo-clang-cs-use:
+	@command -v ld.lld >/dev/null 2>&1 || { echo "ld.lld is required for clang builds on this tree" >&2; exit 1; }
+	@test -f "$(POLARDB_OPT_PGO_CS_PROFILE)" || { echo "Missing $(POLARDB_OPT_PGO_CS_PROFILE); run polardb-pgo-clang-cs-merge first" >&2; exit 1; }
+	+$(MAKE) clean_polardb_core_build
+	+CCACHE_DISABLE=1 $(MAKE) CC=clang CXX=clang++ POLARDB_PROXY=1 PROXYSQLCLICKHOUSE=0 POLARDB_OPT_BUILD=1 POLARDB_OPT_PGO=use POLARDB_OPT_PGO_PROFILE="$(POLARDB_OPT_PGO_CS_PROFILE)" POLARDB_OPT_LTO=1 POLARDB_OPT_LTO_MODE=thin build_src_polardb_core
+	@echo "=== Built POLARDB_PROXY=1 with clang context-sensitive PGO + ThinLTO ==="
+
+polardb-pgo-clang-cs-use-remarks:
+	@command -v ld.lld >/dev/null 2>&1 || { echo "ld.lld is required for clang builds on this tree" >&2; exit 1; }
+	@test -f "$(POLARDB_OPT_PGO_CS_PROFILE)" || { echo "Missing $(POLARDB_OPT_PGO_CS_PROFILE); run polardb-pgo-clang-cs-merge first" >&2; exit 1; }
+	@mkdir -p "$(POLARDB_OPT_REMARKS_DIR)"
+	+$(MAKE) clean_polardb_core_build
+	+bash -o pipefail -c 'CCACHE_DISABLE=1 $(MAKE) CC=clang CXX=clang++ POLARDB_PROXY=1 PROXYSQLCLICKHOUSE=0 POLARDB_OPT_BUILD=1 POLARDB_OPT_PGO=use POLARDB_OPT_PGO_PROFILE="$(POLARDB_OPT_PGO_CS_PROFILE)" POLARDB_OPT_LTO=1 POLARDB_OPT_LTO_MODE=thin POLARDB_OPT_REMARKS=1 POLARDB_OPT_REMARKS_DIR="$(POLARDB_OPT_REMARKS_DIR)" build_src_polardb_core 2>&1 | tee "$(POLARDB_OPT_REMARKS_DIR)/clang-cs-pgo-use-build.log"'
+	@$(CURDIR)/test/polardb/tools/opt_remarks_report.py --root "$(CURDIR)" --remarks-dir "$(POLARDB_OPT_REMARKS_DIR)" --pgo-dir "$(POLARDB_OPT_PGO_DIR)" --cs-dir "$(POLARDB_OPT_PGO_CS_DIR)" --bolt-dir "$(POLARDB_OPT_BOLT_DIR)" --output "$(POLARDB_OPT_REMARKS_DIR)/summary.md"
+	@echo "=== Wrote optimization remarks report: $(POLARDB_OPT_REMARKS_DIR)/summary.md ==="
+
+polardb-bolt-build:
+	@mkdir -p "$(POLARDB_OPT_BOLT_DIR)"
+	+$(MAKE) clean_polardb_core_build
+	+CCACHE_DISABLE=1 $(MAKE) CC=gcc CXX=g++ POLARDB_PROXY=1 PROXYSQLCLICKHOUSE=0 POLARDB_OPT_BUILD=1 POLARDB_OPT_BOLT_READY=1 build_src_polardb_core
+	@echo "=== Built BOLT-ready PolarDB binary with --emit-relocs ==="
+	@echo "    Instrument next: make polardb-bolt-instrument"
+
+polardb-bolt-instrument:
+	@command -v llvm-bolt >/dev/null 2>&1 || { echo "llvm-bolt is required for BOLT instrumentation" >&2; exit 1; }
+	@test -f "$(POLARDB_OPT_BOLT_BINARY)" || { echo "Missing binary: $(POLARDB_OPT_BOLT_BINARY)" >&2; exit 1; }
+	@mkdir -p "$(POLARDB_OPT_BOLT_DIR)"
+	rm -f "$(POLARDB_OPT_BOLT_RAW_FDATA)" "$(POLARDB_OPT_BOLT_RAW_FDATA)".*
+	llvm-bolt "$(POLARDB_OPT_BOLT_BINARY)" -instrument -instrumentation-file="$(POLARDB_OPT_BOLT_RAW_FDATA)" -instrumentation-file-append-pid -o "$(POLARDB_OPT_BOLT_INSTRUMENTED)"
+	@echo "=== Wrote BOLT-instrumented binary: $(POLARDB_OPT_BOLT_INSTRUMENTED) ==="
+	@echo "    Train with: make -C test/polardb bolt-train-core"
+
+polardb-bolt-merge:
+	@command -v merge-fdata >/dev/null 2>&1 || { echo "merge-fdata is required to merge BOLT instrumentation profiles" >&2; exit 1; }
+	@mkdir -p "$(POLARDB_OPT_BOLT_DIR)"
+	@files=$$(find "$(POLARDB_OPT_BOLT_DIR)" -maxdepth 1 -type f \( -name '$(notdir $(POLARDB_OPT_BOLT_RAW_FDATA))' -o -name '$(notdir $(POLARDB_OPT_BOLT_RAW_FDATA)).*' \) | sort); \
+		[ -n "$$files" ] || { echo "No BOLT instrumentation profiles found under $(POLARDB_OPT_BOLT_DIR)" >&2; exit 1; }; \
+		merge-fdata $$files > "$(POLARDB_OPT_BOLT_FDATA)"
+	@echo "=== Merged BOLT profile: $(POLARDB_OPT_BOLT_FDATA) ==="
+
+polardb-bolt-optimize: polardb-bolt-merge
+	@command -v llvm-bolt >/dev/null 2>&1 || { echo "llvm-bolt is required for BOLT optimization" >&2; exit 1; }
+	@test -f "$(POLARDB_OPT_BOLT_BINARY)" || { echo "Missing binary: $(POLARDB_OPT_BOLT_BINARY)" >&2; exit 1; }
+	@test -f "$(POLARDB_OPT_BOLT_FDATA)" || { echo "Missing BOLT profile: $(POLARDB_OPT_BOLT_FDATA)" >&2; exit 1; }
+	@mkdir -p "$(POLARDB_OPT_BOLT_DIR)"
+	llvm-bolt "$(POLARDB_OPT_BOLT_BINARY)" -o "$(POLARDB_OPT_BOLT_OUT)" -data="$(POLARDB_OPT_BOLT_FDATA)" $(POLARDB_OPT_BOLT_FLAGS)
+	@echo "=== Wrote BOLT-optimized binary: $(POLARDB_OPT_BOLT_OUT) ==="
+
+polardb-bolt-optimize-report: polardb-bolt-merge
+	@command -v llvm-bolt >/dev/null 2>&1 || { echo "llvm-bolt is required for BOLT optimization" >&2; exit 1; }
+	@test -f "$(POLARDB_OPT_BOLT_BINARY)" || { echo "Missing binary: $(POLARDB_OPT_BOLT_BINARY)" >&2; exit 1; }
+	@test -f "$(POLARDB_OPT_BOLT_FDATA)" || { echo "Missing BOLT profile: $(POLARDB_OPT_BOLT_FDATA)" >&2; exit 1; }
+	@mkdir -p "$(POLARDB_OPT_BOLT_DIR)" "$(POLARDB_OPT_REMARKS_DIR)"
+	bash -o pipefail -c 'llvm-bolt "$(POLARDB_OPT_BOLT_BINARY)" -o "$(POLARDB_OPT_BOLT_OUT)" -data="$(POLARDB_OPT_BOLT_FDATA)" $(POLARDB_OPT_BOLT_FLAGS) $(POLARDB_OPT_BOLT_REPORT_FLAGS) 2>&1 | tee "$(POLARDB_OPT_BOLT_DIR)/bolt-optimize.log"'
+	@$(CURDIR)/test/polardb/tools/opt_remarks_report.py --root "$(CURDIR)" --remarks-dir "$(POLARDB_OPT_REMARKS_DIR)" --pgo-dir "$(POLARDB_OPT_PGO_DIR)" --cs-dir "$(POLARDB_OPT_PGO_CS_DIR)" --bolt-dir "$(POLARDB_OPT_BOLT_DIR)" --output "$(POLARDB_OPT_REMARKS_DIR)/summary.md"
+	@echo "=== Wrote optimization remarks report: $(POLARDB_OPT_REMARKS_DIR)/summary.md ==="
+
+polardb-opt-report:
+	@mkdir -p "$(POLARDB_OPT_REMARKS_DIR)"
+	@$(CURDIR)/test/polardb/tools/opt_remarks_report.py --root "$(CURDIR)" --remarks-dir "$(POLARDB_OPT_REMARKS_DIR)" --pgo-dir "$(POLARDB_OPT_PGO_DIR)" --cs-dir "$(POLARDB_OPT_PGO_CS_DIR)" --bolt-dir "$(POLARDB_OPT_BOLT_DIR)" --output "$(POLARDB_OPT_REMARKS_DIR)/summary.md"
+	@echo "=== Wrote optimization remarks report: $(POLARDB_OPT_REMARKS_DIR)/summary.md ==="
 
 # Verify BOTH tiers with explicit clean builds. Leaves the tree at POLARDB_PROXY=1.
 # Usage: make polardb-check

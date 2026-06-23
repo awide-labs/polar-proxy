@@ -218,6 +218,14 @@ test/tap/tests/test_cluster_sync_config/test_cluster_sync_withmonitor/cluster_sy
 test/tap/tests/unit/*-t
 
 # test-scripts runtime dependencies (created by run-tests-isolated.bash)
+
+# PolarDB optimization build artifacts
+build/polardb-pgo/
+build/polardb-pgo-cs/
+build/polardb-bolt/
+build/polardb-remarks/
+src/proxysql.bolt
+src/proxysql.bolt.inst
 test-scripts/deps/
 .worktrees/
 test/tap/tests/parsersql_digest_test

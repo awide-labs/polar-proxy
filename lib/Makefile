@@ -93,7 +93,7 @@ ifeq ($(UNAME_S),Darwin)
 endif
 
 
-MYCFLAGS := $(IDIRS) $(OPTZ) $(DEBUG) -Wall -DGITVERSION=\"$(GIT_VERSION)\" $(NOJEM) $(WGCOV) $(WASAN)
+MYCFLAGS := $(IDIRS) $(OPTZ) $(DEBUG) -Wall -DGITVERSION=\"$(GIT_VERSION)\" $(NOJEM) $(WGCOV) $(WASAN) $(POLARDB_OPT_CFLAGS)
 MYCXXFLAGS := $(STDCPP) $(MYCFLAGS) $(PSQLCH) $(PSQLPOLAR) $(PSQL40) $(PSQL31) $(PSQLFFTO) $(PSQLTSDB) $(ENABLE_EPOLL)
 
 default: libproxysql.a
@@ -155,7 +155,7 @@ $(ODIR)/%.oo: %.cpp $(HEADERS)
 	$(CXX) -fPIC -c -o $@ $< $(MYCXXFLAGS) $(CXXFLAGS)
 
 libproxysql.a: $(ODIR) $(OBJ) $(OBJ_CXX) $(SQLITE3_LDIR)/sqlite3.o
-	ar rcs $@ $(OBJ) $(OBJ_CXX) $(SQLITE3_LDIR)/sqlite3.o
+	$(POLARDB_OPT_AR) rcs $@ $(OBJ) $(OBJ_CXX) $(SQLITE3_LDIR)/sqlite3.o
 
 $(ODIR):
 	mkdir -p $(ODIR)

@@ -73,3 +73,127 @@ NOJEM :=
 ifeq ($(NOJEMALLOC),1)
 	NOJEM := -DNOJEM
 endif
+
+
+# PolarDB-only compile/link optimization controls.
+#
+# These variables are intentionally inert for normal ProxySQL builds. They are
+# enabled only by explicit polardb-* optimization targets in the top-level
+# Makefile. The goal is to tune the core + PolarDB path without changing the
+# generic build, ClickHouse targets, or third-party dependency recipes.
+POLARDB_OPT_BUILD ?= 0
+POLARDB_OPT_LTO ?= 0
+POLARDB_OPT_LTO_MODE ?= auto
+POLARDB_OPT_PGO ?= off
+POLARDB_OPT_PGO_DIR ?= $(PROXYSQL_PATH)/build/polardb-pgo
+POLARDB_OPT_PGO_RAW ?= $(POLARDB_OPT_PGO_DIR)/default_%m.profraw
+POLARDB_OPT_PGO_PROFILE ?= $(POLARDB_OPT_PGO_DIR)/clang.profdata
+POLARDB_OPT_PGO_CS_DIR ?= $(PROXYSQL_PATH)/build/polardb-pgo-cs
+POLARDB_OPT_BOLT_READY ?= 0
+POLARDB_OPT_REMARKS ?= 0
+POLARDB_OPT_REMARKS_DIR ?= $(PROXYSQL_PATH)/build/polardb-remarks
+POLARDB_OPT_REMARKS_HOTNESS ?= 1000
+# Escaped pipes are intentional: these regexes are expanded directly into shell
+# compile/link commands. Keep the backslashes so the shell does not treat the
+# regex alternation as a pipeline.
+POLARDB_OPT_REMARKS_PASSES ?= inline\|pgo\|pgo-icall-prom\|loop-vectorize\|slp-vectorizer\|hotcoldsplit\|function-specialization\|ipsccp
+
+POLARDB_OPT_CFLAGS :=
+POLARDB_OPT_CXXFLAGS :=
+POLARDB_OPT_LDFLAGS :=
+POLARDB_OPT_AR := ar
+
+ifeq ($(POLARDB_OPT_BUILD),1)
+ifneq ($(POLARDB_PROXY),1)
+    $(error POLARDB_OPT_BUILD=1 requires POLARDB_PROXY=1)
+endif
+ifeq ($(PROXYSQLCLICKHOUSE),1)
+    $(error POLARDB_OPT_BUILD=1 is scoped to core/PolarDB; do not set PROXYSQLCLICKHOUSE=1)
+endif
+ifneq ($(filter $(POLARDB_OPT_PGO),off generate cs-generate use),$(POLARDB_OPT_PGO))
+    $(error POLARDB_OPT_PGO must be off, generate, cs-generate, or use)
+endif
+ifneq ($(filter $(POLARDB_OPT_LTO_MODE),auto full thin),$(POLARDB_OPT_LTO_MODE))
+    $(error POLARDB_OPT_LTO_MODE must be auto, full, or thin)
+endif
+
+POLARDB_OPT_IS_CLANG := $(findstring clang,$(notdir $(CXX)))
+
+ifeq ($(POLARDB_OPT_LTO),1)
+ifneq ($(POLARDB_OPT_IS_CLANG),)
+ifeq ($(POLARDB_OPT_LTO_MODE),thin)
+    POLARDB_OPT_CFLAGS += -flto=thin
+    POLARDB_OPT_CXXFLAGS += -flto=thin
+else
+    POLARDB_OPT_CFLAGS += -flto
+    POLARDB_OPT_CXXFLAGS += -flto
+endif
+    POLARDB_OPT_AR := $(shell command -v llvm-ar 2>/dev/null || echo ar)
+else
+ifeq ($(POLARDB_OPT_LTO_MODE),thin)
+    $(error POLARDB_OPT_LTO_MODE=thin requires clang/clang++)
+endif
+ifeq ($(POLARDB_OPT_LTO_MODE),full)
+    POLARDB_OPT_CFLAGS += -flto
+    POLARDB_OPT_CXXFLAGS += -flto
+else
+    POLARDB_OPT_CFLAGS += -flto=auto
+    POLARDB_OPT_CXXFLAGS += -flto=auto
+endif
+    POLARDB_OPT_AR := $(shell command -v gcc-ar 2>/dev/null || echo ar)
+endif
+endif
+
+ifeq ($(POLARDB_OPT_PGO),generate)
+ifneq ($(POLARDB_OPT_IS_CLANG),)
+    POLARDB_OPT_CFLAGS += -fprofile-generate=$(POLARDB_OPT_PGO_DIR)
+    POLARDB_OPT_CXXFLAGS += -fprofile-generate=$(POLARDB_OPT_PGO_DIR)
+else
+    POLARDB_OPT_CFLAGS += -fprofile-generate=$(POLARDB_OPT_PGO_DIR)
+    POLARDB_OPT_CXXFLAGS += -fprofile-generate=$(POLARDB_OPT_PGO_DIR)
+endif
+endif
+
+ifeq ($(POLARDB_OPT_PGO),cs-generate)
+ifneq ($(POLARDB_OPT_IS_CLANG),)
+    POLARDB_OPT_CFLAGS += -fprofile-use=$(POLARDB_OPT_PGO_PROFILE) -fcs-profile-generate=$(POLARDB_OPT_PGO_CS_DIR)
+    POLARDB_OPT_CXXFLAGS += -fprofile-use=$(POLARDB_OPT_PGO_PROFILE) -fcs-profile-generate=$(POLARDB_OPT_PGO_CS_DIR)
+else
+    $(error POLARDB_OPT_PGO=cs-generate requires clang/clang++)
+endif
+endif
+
+ifeq ($(POLARDB_OPT_PGO),use)
+ifneq ($(POLARDB_OPT_IS_CLANG),)
+    POLARDB_OPT_CFLAGS += -fprofile-use=$(POLARDB_OPT_PGO_PROFILE)
+    POLARDB_OPT_CXXFLAGS += -fprofile-use=$(POLARDB_OPT_PGO_PROFILE)
+else
+    POLARDB_OPT_CFLAGS += -fprofile-use=$(POLARDB_OPT_PGO_DIR) -fprofile-correction -Wno-error=coverage-mismatch
+    POLARDB_OPT_CXXFLAGS += -fprofile-use=$(POLARDB_OPT_PGO_DIR) -fprofile-correction -Wno-error=coverage-mismatch
+endif
+endif
+
+ifeq ($(POLARDB_OPT_BOLT_READY),1)
+    POLARDB_OPT_CFLAGS += -g
+    POLARDB_OPT_CXXFLAGS += -g
+    POLARDB_OPT_LDFLAGS += -Wl,--emit-relocs
+endif
+
+ifeq ($(POLARDB_OPT_REMARKS),1)
+ifneq ($(POLARDB_OPT_IS_CLANG),)
+    POLARDB_OPT_CFLAGS += -Rpass=$(POLARDB_OPT_REMARKS_PASSES) -Rpass-missed=$(POLARDB_OPT_REMARKS_PASSES) -Rpass-analysis=$(POLARDB_OPT_REMARKS_PASSES)
+    POLARDB_OPT_CFLAGS += -fdiagnostics-show-hotness -fdiagnostics-hotness-threshold=$(POLARDB_OPT_REMARKS_HOTNESS)
+    POLARDB_OPT_CFLAGS += -fsave-optimization-record=yaml -foptimization-record-passes=$(POLARDB_OPT_REMARKS_PASSES) -ftime-trace
+    POLARDB_OPT_CXXFLAGS += -Rpass=$(POLARDB_OPT_REMARKS_PASSES) -Rpass-missed=$(POLARDB_OPT_REMARKS_PASSES) -Rpass-analysis=$(POLARDB_OPT_REMARKS_PASSES)
+    POLARDB_OPT_CXXFLAGS += -fdiagnostics-show-hotness -fdiagnostics-hotness-threshold=$(POLARDB_OPT_REMARKS_HOTNESS)
+    POLARDB_OPT_CXXFLAGS += -fsave-optimization-record=yaml -foptimization-record-passes=$(POLARDB_OPT_REMARKS_PASSES) -ftime-trace
+    POLARDB_OPT_LDFLAGS += -Wl,--opt-remarks-passes=$(POLARDB_OPT_REMARKS_PASSES)
+    POLARDB_OPT_LDFLAGS += -Wl,--opt-remarks-with-hotness -Wl,--opt-remarks-hotness-threshold=$(POLARDB_OPT_REMARKS_HOTNESS)
+    POLARDB_OPT_LDFLAGS += -Wl,--opt-remarks-format=yaml -Wl,--opt-remarks-filename=$(POLARDB_OPT_REMARKS_DIR)/lto.opt.yaml
+    POLARDB_OPT_LDFLAGS += -Wl,--plugin-opt=stats-file=$(POLARDB_OPT_REMARKS_DIR)/lto.stats -Wl,--plugin-opt=time-trace=$(POLARDB_OPT_REMARKS_DIR)/lto-time-trace.json
+else
+    POLARDB_OPT_CFLAGS += -fopt-info -fprofile-report -ftime-report
+    POLARDB_OPT_CXXFLAGS += -fopt-info -fprofile-report -ftime-report
+endif
+endif
+endif
