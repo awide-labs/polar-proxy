@@ -75,6 +75,9 @@ bool PgSQL_Variables::client_set_hash_and_value(PgSQL_Session* session, int idx,
 	}
 
 	session->client_myds->myconn->var_hash[idx] = hash;
+#if POLARDB_PROXY
+	session->client_myds->myconn->polardb_pool_key = PolarDB_PoolKey{};
+#endif // POLARDB_PROXY
 	if (session->client_myds->myconn->variables[idx].value) {
 		free(session->client_myds->myconn->variables[idx].value);
 	}
@@ -93,6 +96,9 @@ void PgSQL_Variables::client_reset_value(PgSQL_Session* session, int idx, bool r
 
 	if (client_conn->var_hash[idx] != 0) {
 		client_conn->var_hash[idx] = 0;
+#if POLARDB_PROXY
+		client_conn->polardb_pool_key = PolarDB_PoolKey{};
+#endif // POLARDB_PROXY
 		if (client_conn->variables[idx].value) {
 			free(client_conn->variables[idx].value);
 			client_conn->variables[idx].value = NULL;
@@ -110,6 +116,9 @@ void PgSQL_Variables::server_set_hash_and_value(PgSQL_Session* session, int idx,
 	}
 
 	session->mybe->server_myds->myconn->var_hash[idx] = hash;
+#if POLARDB_PROXY
+	session->mybe->server_myds->myconn->polardb_pool_key = PolarDB_PoolKey{};
+#endif // POLARDB_PROXY
 	if (session->mybe->server_myds->myconn->variables[idx].value) {
 		free(session->mybe->server_myds->myconn->variables[idx].value);
 	}
@@ -123,6 +132,9 @@ bool PgSQL_Variables::client_set_value(PgSQL_Session* session, int idx, const st
 	}
 
 	session->client_myds->myconn->var_hash[idx] = SpookyHash::Hash32(value.c_str(),strlen(value.c_str()),10);
+#if POLARDB_PROXY
+	session->client_myds->myconn->polardb_pool_key = PolarDB_PoolKey{};
+#endif // POLARDB_PROXY
 	if (session->client_myds->myconn->variables[idx].value) {
 		free(session->client_myds->myconn->variables[idx].value);
 	}
@@ -156,6 +168,9 @@ void PgSQL_Variables::server_set_value(PgSQL_Session* session, int idx, const ch
 	assert(session->mybe->server_myds->myconn);
 	if (!value) return; // FIXME: I am not sure about this implementation . If value == NULL , show the variable be reset?
 	session->mybe->server_myds->myconn->var_hash[idx] = SpookyHash::Hash32(value,strlen(value),10);
+#if POLARDB_PROXY
+	session->mybe->server_myds->myconn->polardb_pool_key = PolarDB_PoolKey{};
+#endif // POLARDB_PROXY
 
 	if (session->mybe->server_myds->myconn->variables[idx].value) {
 		free(session->mybe->server_myds->myconn->variables[idx].value);
@@ -178,6 +193,9 @@ void PgSQL_Variables::server_reset_value(PgSQL_Session* session, int idx, bool r
 	
 	if (backend_conn->var_hash[idx] != 0) {
 		backend_conn->var_hash[idx] = 0;
+#if POLARDB_PROXY
+		backend_conn->polardb_pool_key = PolarDB_PoolKey{};
+#endif // POLARDB_PROXY
 		if (backend_conn->variables[idx].value) {
 			free(backend_conn->variables[idx].value);
 			backend_conn->variables[idx].value = NULL;

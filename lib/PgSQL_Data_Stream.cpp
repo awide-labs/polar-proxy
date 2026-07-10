@@ -10,11 +10,20 @@
 #include "PgSQL_Data_Stream.h"
 
 #include "openssl/x509v3.h"
+#if POLARDB_PROXY
+#include <sys/socket.h>
+#include <sys/uio.h>
+#endif // POLARDB_PROXY
 
 #define RESULTSET_BUFLEN_DS_16K 16000
 #define RESULTSET_BUFLEN_DS_1M 1000*1024
 
 extern PgSQL_Threads_Handler* GloPTH;
+
+#if POLARDB_PROXY && POLARDB_PERF_DEBUG
+static inline void polardb_perf_count_plain_send(
+	PgSQL_Data_Stream* myds, size_t bytes);
+#endif // POLARDB_PROXY && POLARDB_PERF_DEBUG
 
 #ifdef DEBUG
 static void __dump_pkt(const char* func, unsigned char* _ptr, unsigned int len) {
@@ -52,15 +61,20 @@ static void __dump_pkt(const char* func, unsigned char* _ptr, unsigned int len) 
 	_q.partial=0; \
 	_q.pkt.ptr=NULL; \
 	_q.pkt.size=0; \
+	_q.pkt.flags=0; \
+	_q.pkt.owner=NULL; \
 }
 
 #define queue_destroy(_q) { \
 	if (_q.buffer) free(_q.buffer); \
 	_q.buffer=NULL; \
 	if (_q.pkt.ptr) { \
-		l_free(_q.pkt.size,_q.pkt.ptr); \
+		if (ptrsize_is_borrowed_owner(&_q.pkt)) free(_q.pkt.owner ? _q.pkt.owner : _q.pkt.ptr); \
+		else l_free(_q.pkt.size,_q.pkt.ptr); \
 		queueOUT.pkt.ptr=NULL; \
 	} \
+	_q.pkt.flags=0; \
+	_q.pkt.owner=NULL; \
 }
 
 #define queue_zero(_q) { \
@@ -103,6 +117,19 @@ static void __dump_pkt(const char* func, unsigned char* _ptr, unsigned int len) 
 	_o.push<false>(_p,_s);\
 } else { \
 	l_free(_s,_p); \
+}
+
+static inline void pgsql_retire_output_packet(FixedSizeQueue& history, PtrSize_t* pkt) {
+	if (!pkt || !pkt->ptr) return;
+	if (ptrsize_is_borrowed_owner(pkt)) {
+		free(pkt->owner ? pkt->owner : pkt->ptr);
+	} else {
+		add_to_data_packet_history_without_alloc(history, pkt->ptr, pkt->size);
+	}
+	pkt->size = 0;
+	pkt->ptr = NULL;
+	pkt->flags = 0;
+	pkt->owner = NULL;
 }
 //enum sslstatus { SSLSTATUS_OK, SSLSTATUS_WANT_IO, SSLSTATUS_FAIL};
 
@@ -224,6 +251,9 @@ PgSQL_Data_Stream::PgSQL_Data_Stream() {
 	bytes_info.bytes_sent = 0;
 	pkts_recv = 0;
 	pkts_sent = 0;
+#if POLARDB_PROXY
+	polardb_write_head_partial = 0;
+#endif // POLARDB_PROXY
 	client_addr = NULL;
 
 	addr.addr = NULL;
@@ -326,7 +356,7 @@ PgSQL_Data_Stream::~PgSQL_Data_Stream() {
 	if (PSarrayOUT) {
 		while (PSarrayOUT->len) {
 			PSarrayOUT->remove_index_fast(0, &pkt);
-			l_free(pkt.size, pkt.ptr);
+			pgsql_retire_output_packet(data_packets_history_OUT, &pkt);
 		}
 		delete PSarrayOUT;
 	}
@@ -845,11 +875,17 @@ int PgSQL_Data_Stream::write_to_net() {
 		 */
 		if (mypolls) mypolls->last_sent[poll_fds_idx] = sess->thread->curtime;
 		bytes_info.bytes_sent += bytes_io;
-	}
-	if (bytes_io > 0) {
-		if (myds_type == MYDS_FRONTEND) {
-			if (sess) {
-				if (sess->thread) {
+		}
+		if (bytes_io > 0) {
+#if POLARDB_PROXY && POLARDB_PERF_DEBUG
+			if (!encrypted && myds_type == MYDS_FRONTEND && sess &&
+					sess->session_type == PROXYSQL_SESSION_PGSQL) {
+				polardb_perf_count_plain_send(this, static_cast<size_t>(bytes_io));
+			}
+#endif // POLARDB_PROXY && POLARDB_PERF_DEBUG
+			if (myds_type == MYDS_FRONTEND) {
+				if (sess) {
+					if (sess->thread) {
 					sess->thread->status_variables.stvar[st_var_queries_frontends_bytes_sent] += bytes_io;
 				}
 			}
@@ -857,6 +893,359 @@ int PgSQL_Data_Stream::write_to_net() {
 	}
 	return bytes_io;
 }
+
+#if POLARDB_PROXY
+static constexpr int POLARDB_WRITEV_MAX_IOV = 64;
+
+struct PolarDB_WriteVView {
+	struct iovec iov[POLARDB_WRITEV_MAX_IOV];
+	int iovcnt = 0;
+	size_t total = 0;
+};
+
+static PgSQL_Thread* polardb_writev_counter_thread(PgSQL_Data_Stream* myds) {
+	if (myds && myds->sess) return myds->sess->thread;
+	return nullptr;
+}
+
+static inline size_t polardb_frontend_direct_write_budget() {
+	size_t budget = QUEUE_T_DEFAULT_SIZE;
+	if (pgsql_thread___polardb_output_coalesce_bytes > 0 &&
+		static_cast<size_t>(pgsql_thread___polardb_output_coalesce_bytes) > budget) {
+		budget = static_cast<size_t>(pgsql_thread___polardb_output_coalesce_bytes);
+	}
+	return budget;
+}
+
+#define POLARDB_WRITEV_COUNT(ds, name, value) do { \
+		if (PgHGM) { \
+			PgSQL_Thread* _thread = polardb_writev_counter_thread((ds)); \
+			POLARDB_THREAD_COUNT(_thread, name, (value)); \
+		} \
+	} while (0)
+
+#if POLARDB_PERF_DEBUG
+#define POLARDB_WRITEV_PERF_COUNT(ds, name, value) do { \
+		PgSQL_Thread* _thread = polardb_writev_counter_thread((ds)); \
+		if (PgHGM) { \
+			POLARDB_PERF_THREAD_COUNT(_thread, name, (value)); \
+		} \
+	} while (0)
+#else
+#define POLARDB_WRITEV_PERF_COUNT(ds, name, value) do { } while (0)
+#endif
+
+#if POLARDB_PERF_DEBUG
+static inline void polardb_perf_count_write_bytes_bucket(
+		PgSQL_Thread* thread, size_t bytes) {
+	if (bytes <= 512) POLARDB_PERF_THREAD_COUNT(thread, perf_write_bytes_le_512, 1);
+	else if (bytes <= 1024) POLARDB_PERF_THREAD_COUNT(thread, perf_write_bytes_le_1k, 1);
+	else if (bytes <= 2048) POLARDB_PERF_THREAD_COUNT(thread, perf_write_bytes_le_2k, 1);
+	else if (bytes <= 4096) POLARDB_PERF_THREAD_COUNT(thread, perf_write_bytes_le_4k, 1);
+	else if (bytes <= 8192) POLARDB_PERF_THREAD_COUNT(thread, perf_write_bytes_le_8k, 1);
+	else if (bytes <= 16384) POLARDB_PERF_THREAD_COUNT(thread, perf_write_bytes_le_16k, 1);
+	else if (bytes <= 32768) POLARDB_PERF_THREAD_COUNT(thread, perf_write_bytes_le_32k, 1);
+	else if (bytes <= 65536) POLARDB_PERF_THREAD_COUNT(thread, perf_write_bytes_le_64k, 1);
+	else POLARDB_PERF_THREAD_COUNT(thread, perf_write_bytes_gt_64k, 1);
+}
+
+static inline void polardb_perf_count_packet_bytes_bucket(
+		PgSQL_Thread* thread, size_t bytes) {
+	if (bytes <= 512) POLARDB_PERF_THREAD_COUNT(thread, perf_packet_bytes_le_512, 1);
+	else if (bytes <= 1024) POLARDB_PERF_THREAD_COUNT(thread, perf_packet_bytes_le_1k, 1);
+	else if (bytes <= 2048) POLARDB_PERF_THREAD_COUNT(thread, perf_packet_bytes_le_2k, 1);
+	else if (bytes <= 4096) POLARDB_PERF_THREAD_COUNT(thread, perf_packet_bytes_le_4k, 1);
+	else if (bytes <= 8192) POLARDB_PERF_THREAD_COUNT(thread, perf_packet_bytes_le_8k, 1);
+	else if (bytes <= 16384) POLARDB_PERF_THREAD_COUNT(thread, perf_packet_bytes_le_16k, 1);
+	else if (bytes <= 32768) POLARDB_PERF_THREAD_COUNT(thread, perf_packet_bytes_le_32k, 1);
+	else if (bytes <= 65536) POLARDB_PERF_THREAD_COUNT(thread, perf_packet_bytes_le_64k, 1);
+	else POLARDB_PERF_THREAD_COUNT(thread, perf_packet_bytes_gt_64k, 1);
+}
+
+static inline void polardb_perf_count_iovcnt_bucket(
+		PgSQL_Thread* thread, unsigned int iovcnt) {
+	if (iovcnt <= 1) POLARDB_PERF_THREAD_COUNT(thread, perf_write_iov_1, 1);
+	else if (iovcnt == 2) POLARDB_PERF_THREAD_COUNT(thread, perf_write_iov_2, 1);
+	else if (iovcnt <= 4) POLARDB_PERF_THREAD_COUNT(thread, perf_write_iov_3_4, 1);
+	else if (iovcnt <= 8) POLARDB_PERF_THREAD_COUNT(thread, perf_write_iov_5_8, 1);
+	else if (iovcnt <= 16) POLARDB_PERF_THREAD_COUNT(thread, perf_write_iov_9_16, 1);
+	else if (iovcnt <= 32) POLARDB_PERF_THREAD_COUNT(thread, perf_write_iov_17_32, 1);
+	else POLARDB_PERF_THREAD_COUNT(thread, perf_write_iov_33_64, 1);
+}
+
+static inline void polardb_perf_count_packets_per_send_bucket(
+		PgSQL_Thread* thread, unsigned int packets) {
+	if (packets <= 1) POLARDB_PERF_THREAD_COUNT(thread, perf_packets_per_send_1, 1);
+	else if (packets == 2) POLARDB_PERF_THREAD_COUNT(thread, perf_packets_per_send_2, 1);
+	else if (packets <= 4) POLARDB_PERF_THREAD_COUNT(thread, perf_packets_per_send_3_4, 1);
+	else if (packets <= 8) POLARDB_PERF_THREAD_COUNT(thread, perf_packets_per_send_5_8, 1);
+	else if (packets <= 16) POLARDB_PERF_THREAD_COUNT(thread, perf_packets_per_send_9_16, 1);
+	else if (packets <= 32) POLARDB_PERF_THREAD_COUNT(thread, perf_packets_per_send_17_32, 1);
+	else POLARDB_PERF_THREAD_COUNT(thread, perf_packets_per_send_33_64, 1);
+}
+
+static inline void polardb_perf_count_direct_write_shape(
+		PgSQL_Data_Stream* myds, const PolarDB_WriteVView& view) {
+	if (!PgHGM) return;
+	PgSQL_Thread* thread = polardb_writev_counter_thread(myds);
+	polardb_perf_count_write_bytes_bucket(thread, view.total);
+	polardb_perf_count_iovcnt_bucket(thread, static_cast<unsigned int>(view.iovcnt));
+	polardb_perf_count_packets_per_send_bucket(thread, static_cast<unsigned int>(view.iovcnt));
+	for (int i = 0; i < view.iovcnt; ++i) {
+		polardb_perf_count_packet_bytes_bucket(thread, view.iov[i].iov_len);
+	}
+}
+
+static inline void polardb_perf_count_plain_send(
+		PgSQL_Data_Stream* myds, size_t bytes) {
+	if (!PgHGM) return;
+	PgSQL_Thread* thread = polardb_writev_counter_thread(myds);
+	POLARDB_PERF_THREAD_COUNT(thread, perf_plain_send_calls, 1);
+	POLARDB_PERF_THREAD_COUNT(thread, perf_plain_send_bytes, bytes);
+	polardb_perf_count_write_bytes_bucket(thread, bytes);
+}
+
+static inline void polardb_perf_count_writev_skip_reason(
+		PgSQL_Data_Stream* myds) {
+	if (!myds) return;
+	if (!pgsql_thread___polardb_writev_direct &&
+			myds->polardb_write_head_partial == 0) {
+		POLARDB_WRITEV_PERF_COUNT(myds, perf_writev_skip_disabled, 1);
+		return;
+	}
+	if (myds->active == 0 || myds->net_failure || myds->fd <= 0) {
+		POLARDB_WRITEV_PERF_COUNT(myds, perf_writev_skip_inactive, 1);
+		return;
+	}
+	if (myds->encrypted) {
+		POLARDB_WRITEV_PERF_COUNT(myds, perf_writev_skip_encrypted, 1);
+		return;
+	}
+	if (myds->myds_type != MYDS_FRONTEND) {
+		POLARDB_WRITEV_PERF_COUNT(myds, perf_writev_skip_not_frontend, 1);
+		return;
+	}
+	if (myds->DSS != STATE_SLEEP && myds->DSS != STATE_CLIENT_AUTH_OK) {
+		POLARDB_WRITEV_PERF_COUNT(myds, perf_writev_skip_state, 1);
+		return;
+	}
+	if (myds->sess == nullptr ||
+			myds->sess->session_type != PROXYSQL_SESSION_PGSQL) {
+		POLARDB_WRITEV_PERF_COUNT(myds, perf_writev_skip_session, 1);
+		return;
+	}
+	if (myds->sess->mirror) {
+		POLARDB_WRITEV_PERF_COUNT(myds, perf_writev_skip_mirror, 1);
+		return;
+	}
+	if (myds->mypolls == nullptr || myds->poll_fds_idx < 0) {
+		POLARDB_WRITEV_PERF_COUNT(myds, perf_writev_skip_poll, 1);
+		return;
+	}
+	if (myds->PSarrayOUT == nullptr || myds->PSarrayOUT->len == 0) {
+		POLARDB_WRITEV_PERF_COUNT(myds, perf_writev_skip_no_packets, 1);
+		return;
+	}
+	if (queue_data(myds->queueOUT) != 0) {
+		POLARDB_WRITEV_PERF_COUNT(myds, perf_writev_skip_queue_pending, 1);
+		return;
+	}
+	if (myds->queueOUT.partial != 0 || myds->queueOUT.pkt.ptr != nullptr) {
+		POLARDB_WRITEV_PERF_COUNT(myds, perf_writev_skip_queue_partial, 1);
+		return;
+	}
+}
+#else
+static inline void polardb_perf_count_direct_write_shape(
+		PgSQL_Data_Stream*, const PolarDB_WriteVView&) {}
+static inline void polardb_perf_count_writev_skip_reason(PgSQL_Data_Stream*) {}
+#endif // POLARDB_PERF_DEBUG
+
+static void polardb_prepare_direct_frontend_packet(PgSQL_Data_Stream* myds) {
+	if (!myds || myds->DSS != STATE_CLIENT_AUTH_OK) return;
+
+	myds->DSS = STATE_SLEEP;
+	if (myds->myconn) {
+		myds->myconn->set_status(false, STATUS_PGSQL_CONNECTION_COMPRESSION);
+	}
+}
+
+bool PgSQL_Data_Stream::polardb_can_writev_direct() const {
+	if (!pgsql_thread___polardb_writev_direct && polardb_write_head_partial == 0) return false;
+	if (active == 0 || net_failure || fd <= 0) return false;
+	if (encrypted) return false;
+	if (myds_type != MYDS_FRONTEND) return false;
+	if (DSS != STATE_SLEEP && DSS != STATE_CLIENT_AUTH_OK) return false;
+	if (sess == nullptr || sess->session_type != PROXYSQL_SESSION_PGSQL) return false;
+	if (sess->mirror) return false;
+	if (mypolls == nullptr || poll_fds_idx < 0) return false;
+	if (PSarrayOUT == nullptr || PSarrayOUT->len == 0) return false;
+	if (queue_data(queueOUT) != 0) return false;
+	if (queueOUT.partial != 0 || queueOUT.pkt.ptr != nullptr) return false;
+	return true;
+}
+
+bool PgSQL_Data_Stream::polardb_should_writev_direct() const {
+	if (!polardb_can_writev_direct()) return false;
+	return polardb_direct_write_batch_ready();
+}
+
+bool PgSQL_Data_Stream::polardb_direct_write_batch_ready() const {
+	if (polardb_write_head_partial != 0) return true;
+
+	size_t pending = 0;
+	unsigned int packets = 0;
+	for (unsigned int i = 0; i < PSarrayOUT->len; ++i) {
+		const PtrSize_t* pkt = PSarrayOUT->index(i);
+		if (!pkt) continue;
+		++packets;
+		if (packets >= 2) {
+			return true;
+		}
+		if (pkt->size > QUEUE_T_DEFAULT_SIZE ||
+				pending > QUEUE_T_DEFAULT_SIZE - pkt->size) {
+			return true;
+		}
+		pending += pkt->size;
+	}
+	return false;
+}
+
+static bool polardb_build_writev_view(
+	PgSQL_Data_Stream* myds,
+	size_t byte_budget,
+	PolarDB_WriteVView& view) {
+	if (!myds || !myds->PSarrayOUT || myds->PSarrayOUT->len == 0) return false;
+	POLARDB_WRITEV_PERF_COUNT(myds, perf_writev_view_build_calls, 1);
+	if (byte_budget == 0) byte_budget = QUEUE_T_DEFAULT_SIZE;
+
+	for (unsigned int i = 0;
+			i < myds->PSarrayOUT->len && view.iovcnt < POLARDB_WRITEV_MAX_IOV &&
+			view.total < byte_budget; ++i) {
+		PtrSize_t* pkt = myds->PSarrayOUT->index(i);
+		const size_t offset = (i == 0) ? myds->polardb_write_head_partial : 0;
+		if (offset >= pkt->size) return false;
+
+		size_t len = pkt->size - offset;
+		const size_t remaining_budget = byte_budget - view.total;
+		if (len > remaining_budget) len = remaining_budget;
+		if (len == 0) break;
+
+		view.iov[view.iovcnt].iov_base = static_cast<unsigned char*>(pkt->ptr) + offset;
+		view.iov[view.iovcnt].iov_len = len;
+		view.total += len;
+		++view.iovcnt;
+	}
+	if (view.iovcnt > 0) {
+		POLARDB_WRITEV_PERF_COUNT(myds, perf_writev_view_build_packets,
+			static_cast<unsigned long long>(view.iovcnt));
+	}
+	return view.iovcnt > 0;
+}
+
+static unsigned int polardb_advance_after_writev(
+	PgSQL_Data_Stream* myds,
+	size_t bytes) {
+	unsigned int full_packets = 0;
+	while (bytes > 0 && myds->PSarrayOUT && full_packets < myds->PSarrayOUT->len) {
+		PtrSize_t* pkt = myds->PSarrayOUT->index(full_packets);
+		const size_t offset = (full_packets == 0) ?
+			myds->polardb_write_head_partial : 0;
+		const size_t remaining = pkt->size - offset;
+		if (bytes < remaining) {
+			myds->polardb_write_head_partial = offset + bytes;
+			bytes = 0;
+			break;
+		}
+
+		bytes -= remaining;
+		PtrSize_t completed = *pkt;
+		pgsql_retire_output_packet(myds->data_packets_history_OUT, &completed);
+		myds->polardb_write_head_partial = 0;
+		++myds->pkts_sent;
+		++full_packets;
+	}
+
+	if (full_packets > 0) {
+		myds->PSarrayOUT->remove_index_range(0, full_packets);
+	}
+	return full_packets;
+}
+
+int PgSQL_Data_Stream::polardb_writev_to_net_poll(size_t byte_budget) {
+	if (byte_budget == 0) {
+		byte_budget = polardb_frontend_direct_write_budget();
+	}
+	if (!polardb_can_writev_direct()) {
+		polardb_perf_count_writev_skip_reason(this);
+		POLARDB_WRITEV_COUNT(this, writev_buffered_fallback, 1);
+		return 0;
+	}
+	if (!polardb_direct_write_batch_ready()) {
+		POLARDB_WRITEV_COUNT(this, writev_small_batch_fallback, 1);
+		return 0;
+	}
+	return polardb_writev_to_net_poll_ready(byte_budget);
+}
+
+int PgSQL_Data_Stream::polardb_writev_to_net_poll_ready(size_t byte_budget) {
+	PolarDB_WriteVView view;
+	if (!polardb_build_writev_view(this, byte_budget, view)) {
+		return 0;
+	}
+	if (polardb_write_head_partial == 0) {
+		polardb_prepare_direct_frontend_packet(this);
+	}
+
+	POLARDB_WRITEV_COUNT(this, writev_attempts, 1);
+	polardb_perf_count_direct_write_shape(this, view);
+	struct msghdr msg {};
+	msg.msg_iov = view.iov;
+	msg.msg_iovlen = static_cast<size_t>(view.iovcnt);
+#ifdef __APPLE__
+	const int flags = 0;
+#else
+	const int flags = MSG_NOSIGNAL;
+#endif
+	const ssize_t bytes_io = sendmsg(fd, &msg, flags);
+	if (bytes_io < 0) {
+		const int myds_errno = errno;
+		if (myds_errno == EINTR || myds_errno == EAGAIN || myds_errno == EWOULDBLOCK) {
+			POLARDB_WRITEV_COUNT(this, writev_wouldblock, 1);
+			set_pollout();
+			return -1;
+		}
+		POLARDB_WRITEV_COUNT(this, writev_errors, 1);
+		shut_soft();
+		return 0;
+	}
+	if (bytes_io == 0) {
+		set_pollout();
+		return 0;
+	}
+
+	const size_t accepted = static_cast<size_t>(bytes_io);
+	if (accepted < view.total) {
+		POLARDB_WRITEV_COUNT(this, writev_short_writes, 1);
+	}
+	const unsigned int full_packets = polardb_advance_after_writev(this, accepted);
+	POLARDB_WRITEV_COUNT(this, writev_bytes, accepted);
+	if (full_packets) {
+		POLARDB_WRITEV_COUNT(this, writev_packets, full_packets);
+	}
+
+	if (mypolls) mypolls->last_sent[poll_fds_idx] = sess->thread->curtime;
+	bytes_info.bytes_sent += accepted;
+	if (sess && sess->thread) {
+		sess->thread->status_variables.stvar[st_var_queries_frontends_bytes_sent] += accepted;
+	}
+	set_pollout();
+	return static_cast<int>(accepted);
+}
+
+#undef POLARDB_WRITEV_COUNT
+#undef POLARDB_WRITEV_PERF_COUNT
+#endif // POLARDB_PROXY
 
 bool PgSQL_Data_Stream::available_data_out() {
 	int buflen = queue_data(queueOUT);
@@ -983,6 +1372,11 @@ int PgSQL_Data_Stream::write_to_net_poll() {
 			}
 		}
 	}
+#if POLARDB_PROXY
+	if (polardb_can_writev_direct() && polardb_direct_write_batch_ready()) {
+		return polardb_writev_to_net_poll_ready(polardb_frontend_direct_write_budget());
+	}
+#endif // POLARDB_PROXY
 	proxy_debug(PROXY_DEBUG_NET, 1, "Session=%p, DataStream=%p --\n", sess, this);
 	bool call_write_to_net = false;
 	if (queue_data(queueOUT)) {
@@ -1022,6 +1416,11 @@ int PgSQL_Data_Stream::read_pkts() {
 }
 
 int PgSQL_Data_Stream::array2buffer() {
+#if POLARDB_PROXY
+	if (polardb_write_head_partial != 0) {
+		return 0;
+	}
+#endif // POLARDB_PROXY
 	int ret = 0;
 	unsigned int idx = 0;
 	bool cont = true;
@@ -1040,9 +1439,7 @@ int PgSQL_Data_Stream::array2buffer() {
 			if (PSarrayOUT->len - idx) {
 				proxy_debug(PROXY_DEBUG_PKT_ARRAY, 5, "Session=%p . DataStream: %p -- Removing a packet from array\n", sess, this);
 				if (queueOUT.pkt.ptr) {
-					//l_free(queueOUT.pkt.size,queueOUT.pkt.ptr);
-					add_to_data_packet_history_without_alloc(data_packets_history_OUT, queueOUT.pkt.ptr, queueOUT.pkt.size);
-					queueOUT.pkt.ptr = NULL;
+					pgsql_retire_output_packet(data_packets_history_OUT, &queueOUT.pkt);
 				}
 				
 				memcpy(&queueOUT.pkt, PSarrayOUT->index(idx), sizeof(PtrSize_t));
@@ -1075,9 +1472,7 @@ int PgSQL_Data_Stream::array2buffer() {
 		ret = b;
 		if (queueOUT.partial == queueOUT.pkt.size) {
 			if (queueOUT.pkt.ptr) {
-				//l_free(queueOUT.pkt.size,queueOUT.pkt.ptr);
-				add_to_data_packet_history_without_alloc(data_packets_history_OUT, queueOUT.pkt.ptr, queueOUT.pkt.size);
-				queueOUT.pkt.ptr = NULL;
+				pgsql_retire_output_packet(data_packets_history_OUT, &queueOUT.pkt);
 			}
 			proxy_debug(PROXY_DEBUG_PKT_ARRAY, 5, "Session=%p . DataStream: %p -- Packet completely written into send buffer\n", sess, this);
 			queueOUT.partial = 0;
@@ -1177,6 +1572,15 @@ void PgSQL_Data_Stream::copy_buffer_to_resultset(PtrSizeArray* resultset, unsign
 }
 
 int PgSQL_Data_Stream::array2buffer_full() {
+#if POLARDB_PROXY
+	if (polardb_can_writev_direct()) {
+		if (polardb_direct_write_batch_ready()) {
+			return 0;
+		}
+		POLARDB_PROFILE_THREAD_COUNT(polardb_writev_counter_thread(this),
+			writev_small_batch_fallback, 1);
+	}
+#endif // POLARDB_PROXY
 	int rc = 0;
 	int r = 0;
 	while ((r = array2buffer())) rc += r;

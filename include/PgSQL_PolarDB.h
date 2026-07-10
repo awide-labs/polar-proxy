@@ -9,7 +9,7 @@
  *   - health check via polar_node_type() / polar_is_available()
  *   - per-session write-LSN tracking for read-your-writes consistency
  *   - a prepended SET block (consistency mode, wait timeout, and the
- *     `SET polar_xact_split_wait_lsn` wait gate) on replica-eligible autocommit
+ *     `SET polar_xact_split_wait_lsn` wait condition) on replica-eligible autocommit
  *     reads
  *
  * Build switch: everything PolarDB-specific is compiled only under
@@ -30,6 +30,7 @@ class PgSQL_Connection;
 class PgSQL_Backend;
 class PgSQL_Data_Stream;
 class PgSQL_SrvC;
+class PgSQL_Session;
 
 // ===========================================================================
 // PolarDB tracing facility  (debugging map)
@@ -67,7 +68,7 @@ class PgSQL_SrvC;
 //    End-to-end order for a wrapped LSN read:
 //      [H] connect -> [RQ] query -> PLAN -> WRAP -> [H] SET-skip -> [W] wire result -> [S] rc
 //    The per-call counter/local setup stays under #if POLARDB_PROXY && POLARDB_DEBUG
-//    (gating that trace-only state); the log call itself uses POLARDB_TRACE.
+//    (controlling that trace-only state); the log call itself uses POLARDB_TRACE.
 //
 // POLARDB_DEBUG defaults OFF for production.
 #ifndef POLARDB_DEBUG
@@ -190,7 +191,7 @@ static constexpr unsigned int POLARDB_REPLICA_FAILURE_ERROR_CODE = 9999;
 // PolarDB DEBUG fault-injection catalog (test hooks; release builds compile out)
 // =============================================================================
 //
-// Everything below is gated by `#if POLARDB_PROXY && POLARDB_DEBUG` and exists
+// Everything below is enabled by `#if POLARDB_PROXY && POLARDB_DEBUG` and exists
 // only to let the TAP suite drive deterministic failures. None of it compiles
 // into a non-DEBUG (release) build. This block is the single reference for "how
 // to drive PolarDB fault injection" — env var name, mechanism, and accepted
@@ -213,9 +214,9 @@ static constexpr unsigned int POLARDB_REPLICA_FAILURE_ERROR_CODE = 9999;
 //             Force one wait-retry fault of the named kind (ENV path of
 //             polardb_debug_once_enabled in PgSQL_PolarDB_Failure.cpp).
 //
-//   (B) File-based fault files — re-armable without restart. Write a value into
+//   (B) File-based fault files — reusable without restart. Write a value into
 //       the file path named by the env var; the fault fires once and the file is
-//       cleared (truncated) so it re-arms when the test writes to it again. All
+//       cleared (truncated) so it can trigger again when the test rewrites it. All
 //       file mechanics (read first line, strip trailing CR/LF, then clear the
 //       file once the caller confirms a match) are shared via
 //       polardb_debug_consume_fault_file() below; each call site owns its own
@@ -239,7 +240,7 @@ static constexpr unsigned int POLARDB_REPLICA_FAILURE_ERROR_CODE = 9999;
 //             "no_retry_packet" | "writer_busy" | "writer_lost" |
 //             "writer_not_started" -> force that transaction-split
 //             reader-failure branch. "death_twice" injects two reader deaths
-//             in one statement to verify the reader-retry budget falls back to
+//             in one statement to verify the reader-retry limit falls back to
 //             the writer instead of oscillating between replicas.
 //             (PgSQL_PolarDB_Failure.cpp: polardb_debug_split_failure_fault_is)
 //
@@ -253,6 +254,12 @@ static constexpr unsigned int POLARDB_REPLICA_FAILURE_ERROR_CODE = 9999;
 //             "configured_fallback" are the ones the caller acts on) -> force
 //             that startup-identity resolution outcome. (PgSQL_Connection.cpp:
 //             polardb_debug_startup_identity_fault)
+//
+//         POLARDB_DEBUG_POST_SEND_OFFLINE_FILE
+//             Line == "offline_no_error" -> after a transaction-reader query is
+//             sent, mark that reader OFFLINE_HARD before its result is consumed.
+//             This drives the local no-backend-error failure path.
+//             (PgSQL_Connection.cpp: polardb_debug_post_send_offline)
 //
 //         POLARDB_DEBUG_MONITOR_HEALTH_FILE
 //             Line == "node|avail|lsn" where node is "*" or "addr:port" ->
@@ -313,7 +320,7 @@ static inline bool polardb_debug_consume_fault_file(
 }
 
 /**
- * @brief Truncate (clear) a fault file so its one-shot re-arms.
+ * @brief Truncate a fault file so its one-shot can be enabled again.
  *
  * Re-opens the path named by @p env_name in "w" mode and immediately closes it,
  * which truncates the file to zero length. The caller invokes this only after it
@@ -330,6 +337,12 @@ static inline void polardb_debug_clear_fault_file(const char* env_name) {
     if (clear_file) {
         fclose(clear_file);
     }
+}
+
+static inline bool polardb_debug_fault_file_is_set(const char* env_name) {
+    char buf[64] = {0};
+    return polardb_debug_consume_fault_file(env_name, buf, sizeof(buf)) &&
+        buf[0] != '\0';
 }
 #endif // POLARDB_PROXY && POLARDB_DEBUG
 
@@ -393,13 +406,45 @@ enum class PolarDB_RfqRoutePolicy : uint8_t {
 enum class PolarDB_ReaderStatus : uint8_t {
     ACQUIRED = 0,           // Got a usable reader connection
     READER_UNAVAILABLE,     // No reader online/usable (plain availability)
-    READER_BUSY,            // Readers exist but all are at capacity (plain capacity)
+    READER_BUSY,            // Readers exist but none is immediately usable
     RFQ_UNAVAILABLE,        // No free reader with an RFQ-LSN startup profile
     PRIMARY_LSN_UNKNOWN,    // Lag cap on, but the primary LSN sample is missing
     READER_LSN_UNKNOWN,     // Lag cap on, but the reader LSN sample is missing
     READER_LSN_STALE,       // Lag cap on, but the reader LSN sample is too old to trust
     READER_LAG_EXCEEDED,    // Reader is further behind the primary than the byte cap allows
 };
+
+static inline int polardb_reader_status_priority(
+    PolarDB_ReaderStatus status) {
+    // Preserve the most actionable cause: RFQ policy first, then
+    // consistency-safety failures, then ordinary capacity/availability.
+    switch (status) {
+    case PolarDB_ReaderStatus::RFQ_UNAVAILABLE:
+        return 80;
+    case PolarDB_ReaderStatus::PRIMARY_LSN_UNKNOWN:
+        return 70;
+    case PolarDB_ReaderStatus::READER_LSN_UNKNOWN:
+        return 60;
+    case PolarDB_ReaderStatus::READER_LSN_STALE:
+        return 50;
+    case PolarDB_ReaderStatus::READER_LAG_EXCEEDED:
+        return 40;
+    case PolarDB_ReaderStatus::READER_BUSY:
+        return 30;
+    case PolarDB_ReaderStatus::READER_UNAVAILABLE:
+        return 10;
+    case PolarDB_ReaderStatus::ACQUIRED:
+        return 0;
+    }
+    return 0;
+}
+
+static inline PolarDB_ReaderStatus polardb_reader_status_prefer(
+    PolarDB_ReaderStatus current,
+    PolarDB_ReaderStatus next) {
+    return polardb_reader_status_priority(next) >
+        polardb_reader_status_priority(current) ? next : current;
+}
 
 /// @brief Short stable name for a reader status, for logs and counters.
 static inline const char* polardb_reader_status_name(
@@ -431,7 +476,7 @@ static inline const char* polardb_reader_status_name(
  * Only consistency/safety failures (a missing or stale LSN sample, or lag over
  * the cap) redirect the read to the writer. Plain availability or capacity
  * failures return false here so the query keeps ProxySQL's normal
- * no-connection retry behavior instead of being pinned to the writer.
+ * no-connection retry behavior instead of being kept on the writer.
  */
 static inline bool polardb_reader_status_redirects_to_writer(
     PolarDB_ReaderStatus status) {
@@ -550,7 +595,7 @@ enum class PolarDB_StartupIdentitySource : uint8_t {
  *
  * Connection-local record of the chosen proxy protocol and the RFQ payload bits
  * sent in the startup packet. It states intent only: a requested RFQ-LSN bit is
- * not proof the backend will return LSNs. That is confirmed later when result
+ * does not show whether the backend will return LSNs. That is determined later when result
  * RFQs actually carry an LSN.
  */
 struct PolarDB_StartupProfile {
@@ -595,7 +640,248 @@ struct PolarDB_StartupProfile {
     bool emits_startup_params() const {
         return protocol != PolarDB_ProxyProtocol::OFF && request_bits != 0;
     }
+
+    uint32_t generation(int identity_mode = 1) const {
+        const uint32_t identity_bits = emits_startup_params()
+            ? (static_cast<uint32_t>(identity_mode) & 0x3u)
+            : 0;
+        return (static_cast<uint32_t>(protocol) << 24) |
+            (identity_bits << 22) |
+            (request_bits & 0x003fffffu);
+    }
 };
+
+static inline bool polardb_startup_profile_compatible_for_reuse(
+        const PolarDB_StartupProfile& pooled,
+        const PolarDB_StartupProfile& requested) {
+    return pooled.protocol == requested.protocol &&
+        pooled.request_bits == requested.request_bits;
+}
+
+static inline bool polardb_startup_profile_matches_request_generation(
+        const PolarDB_StartupProfile& pooled,
+        uint32_t pooled_generation,
+        const PolarDB_StartupProfile& requested) {
+    return pooled_generation == requested.generation() &&
+        polardb_startup_profile_compatible_for_reuse(pooled, requested);
+}
+
+static inline bool polardb_startup_profile_matches_request_generation(
+        const PolarDB_StartupProfile& pooled,
+        uint32_t pooled_generation,
+        const PolarDB_StartupProfile& requested,
+        int requested_identity_mode) {
+    return pooled_generation == requested.generation(requested_identity_mode) &&
+        polardb_startup_profile_compatible_for_reuse(pooled, requested);
+}
+
+static inline bool polardb_startup_profile_requests_rfq_lsn_xid(
+        const PolarDB_StartupProfile& profile) {
+    return profile.has_rfq_lsn() && profile.has_rfq_xid();
+}
+
+enum class PolarDB_PoolProfile : uint8_t {
+    BASE = 0,
+    RFQ = 1
+};
+
+struct PolarDB_PoolScope {
+    unsigned int hostgroup_id{0};
+    PgSQL_SrvC* server{nullptr};
+
+    bool operator==(const PolarDB_PoolScope& other) const {
+        return hostgroup_id == other.hostgroup_id && server == other.server;
+    }
+
+    bool operator!=(const PolarDB_PoolScope& other) const {
+        return !(*this == other);
+    }
+};
+
+struct PolarDB_PoolKey {
+    uint64_t auth_hash{0};
+    uint64_t startup_identity_hash{0};
+    uint64_t startup_options_hash{0};
+
+    bool empty() const {
+        return auth_hash == 0 && startup_identity_hash == 0 &&
+            startup_options_hash == 0;
+    }
+
+    bool operator==(const PolarDB_PoolKey& other) const {
+        return auth_hash == other.auth_hash &&
+            startup_identity_hash == other.startup_identity_hash &&
+            startup_options_hash == other.startup_options_hash;
+    }
+
+    bool operator!=(const PolarDB_PoolKey& other) const {
+        return !(*this == other);
+    }
+};
+
+enum class PolarDB_ReaderLocalReturn : uint8_t {
+    USE_SHARED_POOL = 0,
+    KEEP_WITH_WORKER,
+    REMOVE_CONNECTION
+};
+
+static inline uint64_t polardb_pool_hash_bytes(
+        uint64_t hash, const void* data, size_t len) {
+    const unsigned char* bytes = static_cast<const unsigned char*>(data);
+    for (size_t i = 0; i < len; i++) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static inline uint64_t polardb_pool_hash_u64(uint64_t hash, uint64_t value) {
+    return polardb_pool_hash_bytes(hash, &value, sizeof(value));
+}
+
+static inline uint64_t polardb_pool_hash_i32(uint64_t hash, int value) {
+    return polardb_pool_hash_bytes(hash, &value, sizeof(value));
+}
+
+static inline uint64_t polardb_pool_hash_string(
+        uint64_t hash, const std::string& value) {
+    hash = polardb_pool_hash_u64(hash, value.size());
+    return polardb_pool_hash_bytes(hash, value.data(), value.size());
+}
+
+static inline uint64_t polardb_pool_hash_cstr(
+        uint64_t hash, const char* value) {
+    const size_t len = value ? strlen(value) : 0;
+    hash = polardb_pool_hash_u64(hash, len);
+    return len ? polardb_pool_hash_bytes(hash, value, len) : hash;
+}
+
+static inline const char* polardb_pool_profile_name(
+        PolarDB_PoolProfile profile) {
+    switch (profile) {
+    case PolarDB_PoolProfile::BASE:
+        return "base";
+    case PolarDB_PoolProfile::RFQ:
+        return "rfq";
+    }
+    return "unknown";
+}
+
+static inline PolarDB_PoolProfile polardb_pool_profile_from_startup_profile(
+        const PolarDB_StartupProfile& profile) {
+    return profile.emits_startup_params()
+        ? PolarDB_PoolProfile::RFQ
+        : PolarDB_PoolProfile::BASE;
+}
+
+static inline bool polardb_pool_profile_matches_startup_profile(
+        const PolarDB_StartupProfile& pooled,
+        PolarDB_PoolProfile expected_profile) {
+    return polardb_pool_profile_from_startup_profile(pooled) ==
+        expected_profile;
+}
+
+struct PolarDB_PoolRequest {
+    PolarDB_PoolScope scope;
+    PolarDB_PoolKey key;
+    PolarDB_PoolProfile expected_profile{PolarDB_PoolProfile::BASE};
+    PolarDB_StartupProfile startup_profile;
+    int startup_identity_mode{1};  // PolarDB_ProxyIdentityMode::PROXY
+    bool only_pooled{false};
+    bool allow_create{true};
+    bool allow_wait_bypass{false};
+    uint64_t consistency_target_lsn{0};
+    int max_lag_bytes{0};
+
+    bool has_consistency_target_lsn() const {
+        return consistency_target_lsn != 0;
+    }
+
+    bool requires_rfq_lsn() const {
+        return has_consistency_target_lsn();
+    }
+
+};
+
+enum class PolarDB_PoolReuseState : uint8_t {
+    EXACT = 0,
+    NEEDS_RESET = 1,
+    NEEDS_VARIABLE_UPDATE = 2,
+    BAD_CONTEXT = 3,
+    PROFILE_MISMATCH = 4,
+    AUTH_MISMATCH = 5,
+    IDENTITY_MISMATCH = 6,
+    SESSION_STATE_MISMATCH = 7
+};
+
+static inline const char* polardb_pool_reuse_state_name(
+        PolarDB_PoolReuseState state) {
+    switch (state) {
+    case PolarDB_PoolReuseState::EXACT:
+        return "exact";
+    case PolarDB_PoolReuseState::NEEDS_RESET:
+        return "needs_reset";
+    case PolarDB_PoolReuseState::NEEDS_VARIABLE_UPDATE:
+        return "needs_variable_update";
+    case PolarDB_PoolReuseState::BAD_CONTEXT:
+        return "bad_context";
+    case PolarDB_PoolReuseState::PROFILE_MISMATCH:
+        return "profile_mismatch";
+    case PolarDB_PoolReuseState::AUTH_MISMATCH:
+        return "auth_mismatch";
+    case PolarDB_PoolReuseState::IDENTITY_MISMATCH:
+        return "identity_mismatch";
+    case PolarDB_PoolReuseState::SESSION_STATE_MISMATCH:
+        return "session_state_mismatch";
+    }
+    return "unknown";
+}
+
+struct PolarDB_PoolReuseClassification {
+    PolarDB_PoolReuseState state{PolarDB_PoolReuseState::BAD_CONTEXT};
+    unsigned int matching_session_variables{0};
+};
+
+static inline PolarDB_PoolRequest polardb_make_read_pool_request(
+        const PolarDB_StartupProfile& startup_profile,
+        bool only_pooled,
+        uint64_t consistency_target_lsn,
+        int max_lag_bytes,
+        bool allow_wait_bypass = false) {
+    PolarDB_PoolRequest request;
+    request.startup_profile = startup_profile;
+    request.expected_profile =
+        consistency_target_lsn != 0
+            ? PolarDB_PoolProfile::RFQ
+            : polardb_pool_profile_from_startup_profile(startup_profile);
+    request.only_pooled = only_pooled;
+    request.allow_create = !only_pooled;
+    request.allow_wait_bypass = allow_wait_bypass;
+    request.consistency_target_lsn = consistency_target_lsn;
+    request.max_lag_bytes = max_lag_bytes;
+    return request;
+}
+
+static inline bool polardb_pool_startup_profile_compatible_for_reuse(
+        const PolarDB_StartupProfile& pooled,
+        const PolarDB_PoolRequest& request) {
+    return polardb_pool_profile_matches_startup_profile(
+            pooled, request.expected_profile) &&
+        polardb_startup_profile_compatible_for_reuse(
+            pooled, request.startup_profile);
+}
+
+static inline bool polardb_startup_parameter_consumed_by_proxy(
+        const std::string& key_lowercase) {
+    return key_lowercase == "_polar_send_lsn" ||
+        key_lowercase == "_polar_proxy_send_lsn" ||
+        key_lowercase == "_polar_send_xact" ||
+        key_lowercase == "_polar_proxy_send_xact" ||
+        key_lowercase == "_polar_origin_client_ip" ||
+        key_lowercase == "_polar_origin_client_port" ||
+        key_lowercase == "_polar_proxy_client_host" ||
+        key_lowercase == "_polar_proxy_client_port";
+}
 
 /**
  * @brief True if the host is empty or an "any" address.
@@ -745,6 +1031,9 @@ struct PolarDB_StartupClientContext {
     }
 };
 
+bool polardb_startup_client_from_session(
+    PgSQL_Session* sess, PolarDB_StartupClientContext* startup_client);
+
 /**
  * @brief Convert a raw socket address into a startup identity.
  *
@@ -819,9 +1108,6 @@ inline bool polardb_identity_config_valid(
 }
 
 static constexpr uint32_t POLARDB_DEFAULT_WAIT_TIMEOUT_MS = 1000;
-static constexpr uint32_t POLARDB_WAIT_WRAPPER_SET_COUNT = 3;  // mode SET + timeout SET + wait SET
-static constexpr uint32_t POLARDB_TXN_SPLIT_WRAPPER_SET_COUNT =
-    POLARDB_WAIT_WRAPPER_SET_COUNT + 1;  // XID SET + wait-wrapper SETs
 static constexpr uint32_t POLARDB_TXN_SPLIT_RESET_WRAPPER_SET_COUNT = 1;  // clear stale split XIDs
 
 /*
@@ -973,7 +1259,7 @@ static inline uint64_t polardb_target_with_global_lsn(
 /**
  * @brief Session policy for when transaction-split reader warmup is requested.
  *
- * Split execution never opens a socket on the query path: it only borrows an
+ * Split execution never opens a socket on the query path: it only temporarily uses an
  * already-pooled compatible reader. This mode controls when the session asks the
  * HGM maintenance pass to create that pooled reader in the background.
  */
@@ -984,73 +1270,60 @@ enum class PolarDB_TxnSplitWarmupMode : uint8_t {
     BOTH = 3     // Queue at BEGIN and also after a later pool miss
 };
 
-/**
- * @brief How split warmup matches pooled reader startup identity.
- *
- * strict keeps the backend-visible client host/port exact. The looser modes are
- * opt-in throughput modes for deployments that do not depend on per-client
- * backend-visible identity. SSL/session-id metadata always forces strict
- * matching because those fields describe one frontend connection.
- */
-enum class PolarDB_SplitWarmupIdentity : uint8_t {
-    STRICT = 0,       // user/db + exact startup identity
-    CLIENT_IP = 1,    // user/db + client IP/source, ignore client port
-    AUTH_PROFILE = 2  // user/db only, unless strict metadata is present
+enum class PolarDB_ProxyIdentityMode : uint8_t {
+    CLIENT = 0,
+    PROXY = 1
 };
 
-static inline int polardb_split_warmup_identity_from_string(
-    const char* value,
-    int default_value) {
+static inline int polardb_proxy_identity_mode_from_string(
+        const char* value,
+        int default_value) {
     if (!value || value[0] == '\0' || strcasecmp(value, "default") == 0) {
         return default_value;
     }
-    if (strcasecmp(value, "strict") == 0) {
-        return static_cast<int>(PolarDB_SplitWarmupIdentity::STRICT);
+    if (strcasecmp(value, "client") == 0) {
+        return static_cast<int>(PolarDB_ProxyIdentityMode::CLIENT);
     }
-    if (strcasecmp(value, "client_ip") == 0 ||
-            strcasecmp(value, "client-ip") == 0) {
-        return static_cast<int>(PolarDB_SplitWarmupIdentity::CLIENT_IP);
-    }
-    if (strcasecmp(value, "auth_profile") == 0 ||
-            strcasecmp(value, "auth-profile") == 0) {
-        return static_cast<int>(PolarDB_SplitWarmupIdentity::AUTH_PROFILE);
+    if (strcasecmp(value, "proxy") == 0) {
+        return static_cast<int>(PolarDB_ProxyIdentityMode::PROXY);
     }
     return default_value;
 }
 
-static inline const char* polardb_split_warmup_identity_name(int mode) {
+static inline const char* polardb_proxy_identity_mode_name(int mode) {
     switch (mode) {
-    case static_cast<int>(PolarDB_SplitWarmupIdentity::STRICT):
-        return "strict";
-    case static_cast<int>(PolarDB_SplitWarmupIdentity::CLIENT_IP):
-        return "client_ip";
-    case static_cast<int>(PolarDB_SplitWarmupIdentity::AUTH_PROFILE):
-        return "auth_profile";
+    case static_cast<int>(PolarDB_ProxyIdentityMode::PROXY):
+        return "proxy";
+    case static_cast<int>(PolarDB_ProxyIdentityMode::CLIENT):
     default:
-        return "strict";
+        return "client";
     }
+}
+
+static inline bool polardb_proxy_identity_mode_uses_client_identity(int mode) {
+    return mode == static_cast<int>(PolarDB_ProxyIdentityMode::CLIENT);
+}
+
+static inline uint64_t polardb_startup_client_reuse_key(
+        const PolarDB_StartupClientContext& startup_client) {
+    uint64_t hash = 1469598103934665603ULL;
+    hash = polardb_pool_hash_string(hash, startup_client.identity.host);
+    hash = polardb_pool_hash_i32(
+        hash, static_cast<int>(startup_client.identity.source));
+    hash = polardb_pool_hash_i32(hash, startup_client.identity.port);
+    hash = polardb_pool_hash_u64(hash, startup_client.frontend_ssl ? 1 : 0);
+    hash = polardb_pool_hash_string(hash, startup_client.ssl_version);
+    hash = polardb_pool_hash_string(hash, startup_client.ssl_cipher);
+    hash = polardb_pool_hash_u64(hash, startup_client.has_proxy_session ? 1 : 0);
+    hash = polardb_pool_hash_u64(hash, startup_client.proxy_session_id);
+    hash = polardb_pool_hash_u64(hash, startup_client.proxy_cancel_key);
+    return hash ? hash : 1;
 }
 
 static inline bool polardb_startup_client_compatible_for_warmup(
         const PolarDB_StartupClientContext& pooled,
-        const PolarDB_StartupClientContext& requested,
-        int mode) {
-    // SSL and proxy session-id fields identify one frontend connection, not a
-    // reusable auth profile. When either side has them, loose warmup modes are
-    // deliberately ignored.
-    if (pooled.has_strict_metadata() || requested.has_strict_metadata()) {
-        return pooled.compatible_for_reuse_strict(requested);
-    }
-    switch (mode) {
-    case static_cast<int>(PolarDB_SplitWarmupIdentity::AUTH_PROFILE):
-        return true;
-    case static_cast<int>(PolarDB_SplitWarmupIdentity::CLIENT_IP):
-        return pooled.identity.source == requested.identity.source &&
-            pooled.identity.host == requested.identity.host;
-    case static_cast<int>(PolarDB_SplitWarmupIdentity::STRICT):
-    default:
-        return pooled.compatible_for_reuse_strict(requested);
-    }
+        const PolarDB_StartupClientContext& requested) {
+    return pooled.compatible_for_reuse_strict(requested);
 }
 
 static inline int polardb_txn_split_warmup_mode_from_string(
@@ -1229,7 +1502,7 @@ struct PolarDB_HealthCheck {
 };
 
 /**
- * @brief Whether an RFQ result that carried an LSN is proven to come from the
+ * @brief Whether an RFQ result that carried an LSN is confirmed to come from the
  * primary (writer).
  *
  * The caller supplies values from the PolarDB topology snapshot for the backend
@@ -1276,42 +1549,6 @@ struct PolarDB_WriterScope {
             current.valid() &&
             hg == current.hg &&
             epoch == current.epoch;
-    }
-};
-
-/**
- * @brief Short-lived reader preference proven by this client session.
- *
- * A successful backend wait proves that one reader reached at least
- * last_reached_lsn. Replica replay LSNs only move forward, so the session can
- * safely reuse that reader for later reads whose target is not higher than the
- * proven value, even if the shared server LSN sample has aged out.
- *
- * This is a wait-avoidance hint, not a correctness requirement. If any check
- * fails, reader acquisition falls back to the normal weighted selector.
- */
-struct PolarDB_ReaderAffinity {
-    int reader_hg = -1;
-    std::string address;
-    int port = -1;
-    uint64_t valid_until_us = 0;
-    uint32_t uses_left = 0;
-    uint64_t last_reached_lsn = 0;
-    PolarDB_WriterScope writer_scope;
-
-    bool active() const {
-        return reader_hg >= 0 && port >= 0 && !address.empty() &&
-            uses_left > 0 && last_reached_lsn > 0;
-    }
-
-    void clear() {
-        reader_hg = -1;
-        address.clear();
-        port = -1;
-        valid_until_us = 0;
-        uses_left = 0;
-        last_reached_lsn = 0;
-        writer_scope.reset();
     }
 };
 
@@ -1386,7 +1623,7 @@ struct PolarDB_SessionConsistency {
      *
      * The caller must provide the current writer-scope primary LSN mirror. A
      * missing mirror is unknown rather than "no wait": global consistency cannot
-     * be proven without a writer target. When present, wait on the max of this
+     * be confirmed without a writer target. When present, wait on the max of this
      * session's own monotonic target and the writer mirror.
      */
     uint64_t target_with_global_lsn(
@@ -1410,14 +1647,33 @@ struct PolarDB_ClientRfqDecision {
     bool include_lsn = false;
     uint64_t lsn = 0;
     bool raised_to_target = false;
+    bool raised_by_writer = false;
+    bool raised_by_wait = false;
 };
 
+/**
+ * @brief Decide the LSN value ProxySQL can expose in a client ReadyForQuery.
+ *
+ * The backend RFQ payload is the default. ProxySQL may raise an existing payload
+ * only when it has an independent confirmation that this response satisfied a higher
+ * frontend-session target:
+ *   - writer response: the query ran on the current writer hostgroup, so the
+ *     result is at least as fresh as this session's already observed/written
+ *     target even if that backend connection reports a lower local RFQ value.
+ *   - wait response: ProxySQL sent a successful LSN wait for this query, so the
+ *     result is at least as fresh as that wait target.
+ *
+ * No-wait replica responses pass through the backend RFQ payload unchanged; this
+ * keeps client-side stale detection meaningful for intentionally eventual routes.
+ * Missing backend RFQ payloads are not fabricated.
+ */
 static inline PolarDB_ClientRfqDecision polardb_client_rfq_decision(
         bool client_requested_lsn,
         bool backend_payload_present,
         uint64_t backend_lsn,
         uint64_t session_target,
-        bool response_from_writer) {
+        bool response_from_writer,
+        uint64_t completed_wait_target) {
     PolarDB_ClientRfqDecision decision;
     if (!client_requested_lsn || !backend_payload_present) {
         return decision;
@@ -1425,9 +1681,23 @@ static inline PolarDB_ClientRfqDecision polardb_client_rfq_decision(
 
     decision.include_lsn = true;
     decision.lsn = backend_lsn;
-    if (response_from_writer && session_target > decision.lsn) {
-        decision.lsn = session_target;
+
+    uint64_t required_target = 0;
+    if (response_from_writer && session_target > required_target) {
+        required_target = session_target;
+    }
+    if (completed_wait_target > required_target) {
+        required_target = completed_wait_target;
+    }
+
+    if (required_target > decision.lsn) {
+        decision.lsn = required_target;
         decision.raised_to_target = true;
+        decision.raised_by_writer =
+            response_from_writer && session_target == required_target;
+        decision.raised_by_wait =
+            completed_wait_target > 0 &&
+            completed_wait_target == required_target;
     }
     return decision;
 }
@@ -1436,8 +1706,8 @@ static inline PolarDB_ClientRfqDecision polardb_client_rfq_decision(
  * @brief Transaction-split lifecycle stage for a client transaction.
  *
  * This records RFQ transaction evidence and the session-side state machine shape.
- * The planner can recognize split-readable state; execution temporarily borrows
- * a replica backend for one split read and then restores the primary backend.
+ * The planner can recognize split-readable state; execution temporarily uses a
+ * replica backend for one split read and then restores the primary backend.
  */
 enum class PolarDB_TransactionSplitStage : uint8_t {
     NONE = 0,                   // No split-capable transaction is being tracked
@@ -1671,53 +1941,6 @@ struct PolarDB_Query_WaitState {
     }
 };
 
-enum class PolarDB_WaitCompletionState : uint8_t {
-    NONE = 0,
-    SETS_PENDING,
-    SETS_COMPLETE,
-    COMPLETE,
-    FAILED,
-};
-
-struct PolarDB_WaitCompletion {
-    PolarDB_WaitCompletionState state = PolarDB_WaitCompletionState::NONE;
-
-    void reset() {
-        state = PolarDB_WaitCompletionState::NONE;
-    }
-
-    void begin(bool consistency_wait) {
-        state = consistency_wait
-            ? PolarDB_WaitCompletionState::SETS_PENDING
-            : PolarDB_WaitCompletionState::NONE;
-    }
-
-    void mark_sets_complete() {
-        if (state == PolarDB_WaitCompletionState::SETS_PENDING) {
-            state = PolarDB_WaitCompletionState::SETS_COMPLETE;
-        }
-    }
-
-    void mark_failed() {
-        if (state == PolarDB_WaitCompletionState::SETS_PENDING ||
-                state == PolarDB_WaitCompletionState::SETS_COMPLETE) {
-            state = PolarDB_WaitCompletionState::FAILED;
-        }
-    }
-
-    bool mark_complete_on_ready() {
-        if (state != PolarDB_WaitCompletionState::SETS_COMPLETE) {
-            return false;
-        }
-        state = PolarDB_WaitCompletionState::COMPLETE;
-        return true;
-    }
-
-    bool complete() const {
-        return state == PolarDB_WaitCompletionState::COMPLETE;
-    }
-};
-
 /**
  * @brief Actions to apply after an error while processing a wrapped query.
  *
@@ -1737,8 +1960,9 @@ struct PolarDB_WrapperErrorAccounting {
  *
  * A strict LSN timeout is counted only when the query was wrapped, a PolarDB
  * wait is still active, and the backend supplied the structured timeout marker.
- * A wrapper SET failure is marked when the error happens before all wrapper SET
- * results have been consumed, or when there is no active wait to account.
+ * A wrapper SET failure is marked only while wrapper SET results are still
+ * being consumed. Once the user query is running, its error must remain a user
+ * error even if the session wait state was already cleared.
  */
 inline PolarDB_WrapperErrorAccounting polardb_wrapper_error_accounting(
         bool query_was_wrapped,
@@ -1749,13 +1973,9 @@ inline PolarDB_WrapperErrorAccounting polardb_wrapper_error_accounting(
     if (!query_was_wrapped) {
         return accounting;
     }
-    if (!wait_active) {
-        accounting.mark_wrapper_failed = true;
-        return accounting;
-    }
     if (lsn_timeout) {
         accounting.mark_timeout_error = true;
-        accounting.account_wait_timeout = true;
+        accounting.account_wait_timeout = wait_active;
     }
     if (consuming_wrapper_set) {
         accounting.mark_wrapper_failed = true;
@@ -1838,7 +2058,7 @@ static inline int polardb_resolve_consistency_mode(
  *
  * Millisecond replica lag is intentionally deferred. The PgSQL/PolarDB path does
  * not currently produce a real per-reader time-lag value; the full PolarDB tree
- * has the same gap. Do not treat `polardb_lag_ms` as a supported routing gate
+ * has the same gap. Do not treat `polardb_lag_ms` as a supported routing condition
  * until a PgSQL monitor/session producer is defined and tested.
  *
  * Future direction:
@@ -1867,7 +2087,7 @@ static inline bool polardb_lsn_cache_fresh(uint64_t updated_at_us,
                                            uint64_t now_us,
                                            uint32_t freshness_ms) {
 	if (updated_at_us == 0) return false;
-	if (now_us < updated_at_us) return true;  // monotonic clock skew guard
+	if (now_us < updated_at_us) return true;  // monotonic clock skew check
 	return (now_us - updated_at_us) <= ((uint64_t)freshness_ms * 1000ULL);
 }
 
@@ -1889,7 +2109,7 @@ static inline bool polardb_lsn_cache_fresh(uint64_t updated_at_us,
  * generation rate and per-reader replay rate by writer epoch. Then freshness can
  * be derived from:
  *
- *     allowed_age_ms ~= remaining_lag_budget_bytes / observed_growth_bytes_per_ms
+ *     allowed_age_ms ~= remaining_lag_bytes / observed_growth_bytes_per_ms
  */
 static inline uint32_t polardb_effective_lsn_freshness_ms(
 		int configured_freshness_ms,
@@ -1956,7 +2176,7 @@ static inline bool polardb_reader_lsn_in_best_behind_range(
  *
  *     estimated_catchup_ms = byte_lag / recent_replay_bytes_per_ms
  *
- * Today the supported LSN-only lag gate is `polardb_lag_bytes`, not this helper.
+ * Today the supported LSN-only lag check is `polardb_lag_bytes`, not this helper.
  */
 static inline bool polardb_lag_ms_within_cap(uint64_t lag_us, int max_lag_ms) {
     if (max_lag_ms <= 0) return true;
@@ -1970,96 +2190,6 @@ static inline bool polardb_lag_ms_within_cap(uint64_t lag_us, int max_lag_ms) {
 static inline bool polardb_should_update_monitor_lsn(bool monitor_lsn_updates,
                                                      uint64_t observed_lsn) {
     return monitor_lsn_updates && observed_lsn > 0;
-}
-
-static inline bool polardb_split_ascii_space(char c) {
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
-}
-
-static inline const char* polardb_split_skip_leading_space(const char* query) {
-    if (!query) {
-        return nullptr;
-    }
-    while (*query && polardb_split_ascii_space(*query)) {
-        query++;
-    }
-    return query;
-}
-
-static inline char polardb_split_ascii_lower(char c) {
-    return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
-}
-
-static inline const char* polardb_split_next_word(
-        const char* p, char* out, size_t out_len) {
-    if (!p || !out || out_len == 0) {
-        return nullptr;
-    }
-    while (*p && polardb_split_ascii_space(*p)) {
-        p++;
-    }
-    if (!*p) {
-        return nullptr;
-    }
-
-    size_t len = 0;
-    while (p[len] && !polardb_split_ascii_space(p[len]) &&
-            p[len] != ';' && p[len] != ',' &&
-            p[len] != '(' && p[len] != ')') {
-        if (len + 1 < out_len) {
-            out[len] = polardb_split_ascii_lower(p[len]);
-        }
-        len++;
-    }
-    const size_t copied = len < out_len ? len : out_len - 1;
-    out[copied] = '\0';
-    return p + len;
-}
-
-static inline bool polardb_split_has_locking_for_clause(const char* query) {
-    if (!query) {
-        return false;
-    }
-
-    for (const char* p = query; *p; ++p) {
-        const bool left_ok = p == query || polardb_split_ascii_space(*(p - 1));
-        if (!left_ok || strncasecmp(p, "FOR", 3) != 0) {
-            continue;
-        }
-        if (p[3] != '\0' && !polardb_split_ascii_space(p[3])) {
-            continue;
-        }
-
-        char first[8];
-        char second[8];
-        char third[8];
-        const char* next = polardb_split_next_word(p + 3, first, sizeof(first));
-        if (!next) {
-            return false;
-        }
-        if (strcmp(first, "update") == 0 || strcmp(first, "share") == 0) {
-            return true;
-        }
-
-        next = polardb_split_next_word(next, second, sizeof(second));
-        if (!next) {
-            return false;
-        }
-        if (strcmp(first, "key") == 0 && strcmp(second, "share") == 0) {
-            return true;
-        }
-        if (strcmp(first, "no") == 0 && strcmp(second, "key") == 0) {
-            next = polardb_split_next_word(next, third, sizeof(third));
-            return next && strcmp(third, "update") == 0;
-        }
-    }
-    return false;
-}
-
-static inline bool polardb_split_starts_with_select(const char* query) {
-    query = polardb_split_skip_leading_space(query);
-    return query && strncasecmp(query, "SELECT", 6) == 0 &&
-        (query[6] == '\0' || polardb_split_ascii_space(query[6]));
 }
 
 /**
@@ -2168,16 +2298,24 @@ public:
     static bool is_write_query(const char* query, int command_type);
 
     /**
+     * @brief True when a completed statement can advance the session write LSN.
+     *
+     * This is narrower than routing write detection. PostgreSQL locking reads
+     * (SELECT ... FOR UPDATE/SHARE) must stay on the writer for routing, but
+     * their RFQ LSN is still an observed read position, not an own-write
+     * position.
+     */
+    static bool is_write_lsn_query(const char* query);
+    static bool is_write_lsn_query(const char* query, int command_type);
+
+    /**
      * @brief True when transaction split may dispatch this query to a replica.
      *
      * Split is deliberately narrower than generic read detection: only a
      * top-level SELECT without a locking FOR clause is eligible. SHOW, EXPLAIN,
      * WITH, and ambiguous shapes stay on the primary until explicitly supported.
      */
-    static bool is_txn_split_safe_read(const char* query) {
-        return polardb_split_starts_with_select(query) &&
-            !is_locking_select_query(query);
-    }
+    static bool is_txn_split_safe_read(const char* query);
 
     /**
      * @brief Fast split eligibility for the hot routing path.
@@ -2187,19 +2325,12 @@ public:
      * the row-locking clause check still needs SQL text.
      */
     static bool is_txn_split_safe_select(
-            bool is_top_level_select, const char* query) {
-        return is_top_level_select &&
-            !polardb_split_has_locking_for_clause(query);
-    }
+            bool is_top_level_select, const char* query);
 
     /**
      * @brief True for SELECT statements with a PostgreSQL row-locking FOR clause.
      */
-    static bool is_locking_select_query(const char* query) {
-        query = polardb_split_skip_leading_space(query);
-        return polardb_split_starts_with_select(query) &&
-            polardb_split_has_locking_for_clause(query);
-    }
+    static bool is_locking_select_query(const char* query);
 
     /**
      * @brief Append a single `SET polar_xact_split_wait_lsn = '<target>'; ` statement.
@@ -2237,35 +2368,6 @@ public:
         out.append("; ");
     }
 
-};
-
-struct PolarDB_PendingReadyResult {
-    bool active = false;
-    bool write = false;
-    int query_cmd = -1;
-    std::string query_text;
-    PolarDB_WriterScope writer_scope;
-
-    void reset() {
-        active = false;
-        write = false;
-        query_cmd = -1;
-        query_text.clear();
-        writer_scope.reset();
-    }
-
-    void remember(const char* text, int command, bool current_is_write,
-            const PolarDB_WriterScope& scope) {
-        if (active && write && !current_is_write) {
-            return;
-        }
-
-        active = true;
-        write = current_is_write;
-        query_cmd = command;
-        query_text = text ? text : "";
-        writer_scope = scope;
-    }
 };
 
 /**
@@ -2347,17 +2449,17 @@ struct PolarDB_Query_RouteCtx {
 
     // --- bool fields (packed) ---
     bool is_polar_hg = false;              // from HGM cache (resolved once)
-    bool replica_eligible = false;         // from qpo->replica_eligible (policy gate)
-    bool is_multi_statement = false;       // semicolon scan (hard safety guard)
+    bool replica_eligible = false;         // from qpo->replica_eligible (policy condition)
+    bool is_multi_statement = false;       // semicolon scan (hard safety check)
     bool is_extended_protocol = false;     // Parse/Bind/Execute: regular ProxySQL routing only; no PolarDB wait wrapper
     bool in_transaction = false;           // session is inside an explicit transaction
     bool txn_split_enabled = false;        // HG policy: request/observe split RFQ and allow planning
     bool is_txn_split_safe_read = false;   // split: top-level SELECT with no locking clause
     bool is_txn_split_locking_read = false; // split: SELECT ... FOR UPDATE/SHARE-style lock
     bool txn_reader_wait_isolation_read_committed = true; // pre-write reader waits require READ COMMITTED
-    bool txn_split_state_clean = true;       // false when writer-only session or transaction state exists
+    bool txn_reader_wait_local_state_clean = true; // false after in-txn SET/SET LOCAL
     bool force_primary_hint = false;       // /* route=primary */ first-comment hint (plan L0)
-    // Transaction-scoped pin set after a split-reader failure. Checked by the
+    // Transaction-scoped route set after a split-reader failure. Checked by the
     // normal planner plus manual/qpo paths that may bypass planning.
     bool txn_force_writer_after_reader_failure = false;
     int txn_writer_hg = -1;
@@ -2367,33 +2469,26 @@ struct PolarDB_Query_RouteCtx {
  * @brief Per-query inputs for picking a reader connection (Plan).
  *
  * Built by the planner and consumed when a reader connection is acquired. It
- * carries the consistency target LSN so acquisition can prefer a reader whose
- * cached replay LSN already reaches it, plus the optional byte-lag safety cap
- * and the fallback policy for when no suitable reader is available.
+ * carries reader-selection parameters: writer mirror LSN for the byte-lag cap,
+ * fallback writer hostgroup, RFQ policy, and consistency mode. The wait target
+ * and timeout live in PolarDB_Query_RoutePlan::wait_spec and are passed beside
+ * this record to reader acquisition.
  *
- * The consistency target is normally enforced by the
- * SET polar_xact_split_wait_lsn statement on the wire. Backend acquisition may
- * skip that wrapper only after the selected reader is proven to have a fresh
- * cached LSN at or beyond this target.
+ * The wait target is normally enforced by the SET polar_xact_split_wait_lsn
+ * statement on the wire. Backend acquisition may skip that wrapper only after
+ * the selected reader is confirmed to have a fresh cached LSN at or beyond the
+ * target from the wait spec.
  */
 struct PolarDB_Query_ReaderPlan {
-    uint64_t consistency_target_lsn = 0;   // target LSN for this read; 0 = no target
     uint64_t primary_lsn = 0;    // writer position, for the byte-lag cap
     int max_lag_bytes = -1;      // reader lag cap in WAL bytes; <=0 = disabled
     int fallback_writer_hg = -1; // writer hostgroup to fall back to
     int route_rfq_policy = (int)PolarDB_RfqRoutePolicy::STRICT;
-	uint32_t wait_timeout_ms = POLARDB_DEFAULT_WAIT_TIMEOUT_MS;
     PolarDB_ConsistencyMode consistency_mode = PolarDB_ConsistencyMode::SESSION_LSN;
     bool allow_best_effort_degrade = true;
 
-    /// @brief True if this read has a consistency target LSN.
-    bool has_consistency_target_lsn() const { return consistency_target_lsn > 0; }
     /// @brief True if the byte-lag safety cap is enabled for this query.
     bool lag_cap_enabled() const { return max_lag_bytes > 0; }
-    /// @brief True if this reader's cached LSN reaches the consistency target.
-    bool reader_lsn_reaches_consistency_target(uint64_t reader_lsn) const {
-        return consistency_target_lsn > 0 && reader_lsn >= consistency_target_lsn;
-    }
     /**
      * @brief True if this replica is within the byte-lag cap behind the primary.
      *
@@ -2408,12 +2503,10 @@ struct PolarDB_Query_ReaderPlan {
         return (primary_lsn - replica_lsn) <= (uint64_t)max_lag_bytes;
     }
     void reset() {
-        consistency_target_lsn = 0;
         primary_lsn = 0;
         max_lag_bytes = -1;
         fallback_writer_hg = -1;
         route_rfq_policy = (int)PolarDB_RfqRoutePolicy::STRICT;
-		wait_timeout_ms = POLARDB_DEFAULT_WAIT_TIMEOUT_MS;
         consistency_mode = PolarDB_ConsistencyMode::SESSION_LSN;
         allow_best_effort_degrade = true;
     }
@@ -2435,6 +2528,7 @@ struct PolarDB_QueryState {
     std::string wrapped_query_buf;
     uint8_t reader_retry_attempts = 0;
     uint32_t dispatch_wrapper_stmts = 0;
+    bool backend_isolation_status_needed = false;
     PolarDB_Query_WrapperKind dispatch_wrapper_kind =
         PolarDB_Query_WrapperKind::NONE;
 
@@ -2457,6 +2551,7 @@ struct PolarDB_QueryState {
         reset_wait();
         wrapped_query_buf.clear();
         reader_retry_attempts = 0;
+        backend_isolation_status_needed = false;
         reset_dispatch_wrapper();
     }
 };
@@ -2472,6 +2567,8 @@ struct PolarDB_QueryState {
 struct PolarDB_ReaderResult {
     PgSQL_Connection* conn = nullptr;
     PgSQL_SrvC* srv = nullptr;
+    // Keeps srv valid between selection and connection retrieval.
+    std::shared_ptr<const void> selected_server_snapshot;
     PolarDB_ReaderStatus status =
         PolarDB_ReaderStatus::READER_UNAVAILABLE;
     bool wait_bypass_allowed = false;  // selected reader already reached consistency target
@@ -2509,7 +2606,7 @@ struct PolarDB_Query_RoutePlan {
         WRITE_LSN_UNKNOWN,     // a prior write completed but RFQ carried no LSN
         OBSERVED_LSN_UNKNOWN,  // a prior tracked read completed but RFQ carried no LSN
         PRIMARY_LSN_UNKNOWN,   // primary baseline/global LSN requested but writer mirror is unknown
-        READER_FAILURE_FORCE_WRITER, // full retry: rest of txn is pinned to writer after reader failure
+        READER_FAILURE_FORCE_WRITER, // full retry: rest of txn stays on writer after reader failure
         WAL_PENDING,           // split: transaction WAL is not yet replay-safe
         SPLIT_BLOCKED,         // split: a prior split read failed in this transaction
         SPLIT_NOT_SELECT,      // split: only top-level SELECT is eligible
@@ -2555,7 +2652,6 @@ struct PolarDB_Query_RoutePlan {
         plan.target_hg = reader_hg;
         plan.wait_spec = wait_spec;
         plan.txn_xids = txn_xids;
-        plan.reader.consistency_target_lsn = wait_spec.target;
         plan.reader.fallback_writer_hg = writer_hg;
         return plan;
     }
@@ -2596,8 +2692,8 @@ struct PolarDB_Query_RoutePlan {
  * @brief Explain why the current transaction cannot be planned as a split read.
  *
  * NONE means the observed transaction state has enough RFQ evidence for the
- * planner to name a split-read route. The executor may still decline it if a
- * suitable replica connection cannot be obtained for this query.
+ * planner to name a split-read route. The executor may still decline the plan
+ * if a suitable replica connection cannot be obtained for this query.
  */
 static inline PolarDB_Query_RoutePlan::RouteActionReason polardb_txn_split_rejection_reason(
     bool txn_split_enabled,
@@ -2608,8 +2704,7 @@ static inline PolarDB_Query_RoutePlan::RouteActionReason polardb_txn_split_rejec
     bool is_multi_statement,
     bool is_extended_protocol,
     bool is_txn_split_safe_read,
-    bool is_txn_split_locking_read,
-    bool txn_local_state_clean = true) {
+    bool is_txn_split_locking_read) {
     using RAR = PolarDB_Query_RoutePlan::RouteActionReason;
 
     if (!txn_split_enabled) return RAR::HG_SPLIT_DISABLED;
@@ -2617,7 +2712,6 @@ static inline PolarDB_Query_RoutePlan::RouteActionReason polardb_txn_split_rejec
     if (is_extended_protocol) return RAR::EXTENDED_PROTOCOL;
     if (is_txn_split_locking_read) return RAR::SPLIT_LOCKING_READ;
     if (!is_txn_split_safe_read) return RAR::SPLIT_NOT_SELECT;
-    if (!txn_local_state_clean) return RAR::IN_TRANSACTION;
     if (write_lsn_unknown) return RAR::SPLIT_WRITE_LSN_UNKNOWN;
     if (observed_lsn_unknown) return RAR::SPLIT_OBSERVED_LSN_UNKNOWN;
     if (transaction_split.blocked) return RAR::SPLIT_BLOCKED;
@@ -2688,7 +2782,6 @@ static inline const char* polardb_route_action_reason_name(
  * intentionally not part of this LSN-only branch.
  */
 struct PolarDB_RequestOutcome {
-    bool ok = false;
     bool result_started = false;
     bool reusable = false;
     bool connected = false;
@@ -2760,11 +2853,11 @@ enum class PolarDB_RetryTarget : uint8_t {
     OTHER_READER = 1
 };
 
-/// @brief Transaction-scoped route pin installed after handled reader failures.
-enum class PolarDB_RoutePin : uint8_t {
+/// @brief Transaction-scoped routing state installed after handled reader failures.
+enum class PolarDB_ReaderFailureRoute : uint8_t {
     NONE = 0,
     FORCE_WRITER = 1,
-    SHUN_READER = 2
+    SKIP_READER = 2
 };
 
 /// @brief State of the writer transaction when a replica-reader failure is seen.
@@ -2829,14 +2922,15 @@ static inline const char* polardb_retry_target_name(
     return "unknown";
 }
 
-static inline const char* polardb_route_pin_name(PolarDB_RoutePin pin) {
-    switch (pin) {
-    case PolarDB_RoutePin::NONE:
+static inline const char* polardb_reader_failure_route_name(
+        PolarDB_ReaderFailureRoute route) {
+    switch (route) {
+    case PolarDB_ReaderFailureRoute::NONE:
         return "none";
-    case PolarDB_RoutePin::FORCE_WRITER:
+    case PolarDB_ReaderFailureRoute::FORCE_WRITER:
         return "force_writer";
-    case PolarDB_RoutePin::SHUN_READER:
-        return "shun_reader";
+    case PolarDB_ReaderFailureRoute::SKIP_READER:
+        return "skip_reader";
     }
     return "unknown";
 }
@@ -2922,10 +3016,12 @@ static inline unsigned int polardb_write_notice_response_packet(
  */
 static inline PolarDB_Query_RoutePlan::RouteActionReason polardb_writer_required_reason(
     bool in_transaction,
-    bool is_multi_statement) {
+    bool is_multi_statement,
+    bool is_locking_select) {
     using RAR = PolarDB_Query_RoutePlan::RouteActionReason;
     if (in_transaction) return RAR::IN_TRANSACTION;
     if (is_multi_statement) return RAR::MULTI_STATEMENT;
+    if (is_locking_select) return RAR::SPLIT_LOCKING_READ;
     return RAR::NONE;
 }
 

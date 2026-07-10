@@ -54,95 +54,128 @@ static bool polardb_token_equals(const char* token, size_t len, const char* word
     return true;
 }
 
-static const char* polardb_skip_sql_literal(const char* p) {
+static bool polardb_starts_with_keyword(const char* query, const char* word) {
+    query = polardb_skip_leading_space(query);
+    if (!query) {
+        return false;
+    }
+    const size_t word_len = strlen(word);
+    if (!polardb_token_equals(query, word_len, word)) {
+        return false;
+    }
+    return query[word_len] == '\0' || !polardb_is_ident_char(query[word_len]);
+}
+
+static const char* polardb_skip_single_quoted(const char* p, bool backslash_escapes) {
     p++;
     while (*p) {
-        if (*p == '\'' && p[1] == '\'') {
+        if (backslash_escapes && *p == '\\' && p[1] != '\0') {
             p += 2;
             continue;
         }
-        if (*p++ == '\'') {
-            break;
+        if (*p == '\'') {
+            p++;
+            if (*p == '\'') {
+                p++;
+                continue;
+            }
+            return p;
         }
+        p++;
     }
     return p;
 }
 
-static const char* polardb_skip_quoted_identifier(const char* p) {
+static const char* polardb_skip_double_quoted(const char* p) {
     p++;
     while (*p) {
-        if (*p == '"' && p[1] == '"') {
-            p += 2;
-            continue;
+        if (*p == '"') {
+            p++;
+            if (*p == '"') {
+                p++;
+                continue;
+            }
+            return p;
         }
-        if (*p++ == '"') {
-            break;
-        }
+        p++;
     }
     return p;
 }
 
-static const char* polardb_skip_dollar_quote(const char* p) {
+static const char* polardb_skip_line_comment(const char* p) {
+    p += 2;
+    while (*p && *p != '\n' && *p != '\r') {
+        p++;
+    }
+    return p;
+}
+
+static const char* polardb_skip_block_comment(const char* p) {
+    p += 2;
+    while (*p) {
+        if (p[0] == '*' && p[1] == '/') {
+            return p + 2;
+        }
+        p++;
+    }
+    return p;
+}
+
+static const char* polardb_skip_dollar_quoted(const char* p) {
     if (*p != '$') {
         return p;
     }
     const char* tag_end = p + 1;
-    while (*tag_end && polardb_is_ident_char(*tag_end)) {
+    while (polardb_is_ident_char(*tag_end)) {
         tag_end++;
     }
     if (*tag_end != '$') {
         return p;
     }
-    const size_t tag_len = static_cast<size_t>(tag_end - p + 1);
+    const size_t delim_len = static_cast<size_t>(tag_end - p + 1);
     const char* body = tag_end + 1;
     while (*body) {
-        if (strncmp(body, p, tag_len) == 0) {
-            return body + tag_len;
+        if (*body == '$' && strncmp(body, p, delim_len) == 0) {
+            return body + delim_len;
         }
         body++;
     }
     return body;
 }
 
-static const char* polardb_next_sql_token(
+static const char* polardb_next_sql_word(
         const char* p, const char** token, size_t* token_len) {
     *token = nullptr;
     *token_len = 0;
     while (p && *p) {
-        if (polardb_ascii_space(*p) || *p == ';' || *p == ',' ||
-                *p == '(' || *p == ')') {
+        if (polardb_ascii_space(*p)) {
             p++;
             continue;
         }
-        if (*p == '-' && p[1] == '-') {
-            p += 2;
-            while (*p && *p != '\n' && *p != '\r') {
-                p++;
-            }
+        if (p[0] == '-' && p[1] == '-') {
+            p = polardb_skip_line_comment(p);
             continue;
         }
-        if (*p == '/' && p[1] == '*') {
-            p += 2;
-            while (*p && !(p[0] == '*' && p[1] == '/')) {
-                p++;
-            }
-            if (*p) {
-                p += 2;
-            }
+        if (p[0] == '/' && p[1] == '*') {
+            p = polardb_skip_block_comment(p);
+            continue;
+        }
+        if ((p[0] == 'e' || p[0] == 'E') && p[1] == '\'') {
+            p = polardb_skip_single_quoted(p + 1, true);
             continue;
         }
         if (*p == '\'') {
-            p = polardb_skip_sql_literal(p);
+            p = polardb_skip_single_quoted(p, false);
             continue;
         }
         if (*p == '"') {
-            p = polardb_skip_quoted_identifier(p);
+            p = polardb_skip_double_quoted(p);
             continue;
         }
         if (*p == '$') {
-            const char* after = polardb_skip_dollar_quote(p);
-            if (after != p) {
-                p = after;
+            const char* after_dollar = polardb_skip_dollar_quoted(p);
+            if (after_dollar != p) {
+                p = after_dollar;
                 continue;
             }
         }
@@ -167,7 +200,7 @@ static bool polardb_select_has_locking_for_clause(const char* query) {
     const char* p = query;
     const char* token = nullptr;
     size_t len = 0;
-    while ((p = polardb_next_sql_token(p, &token, &len))) {
+    while ((p = polardb_next_sql_word(p, &token, &len))) {
         if (!token) {
             break;
         }
@@ -176,7 +209,7 @@ static bool polardb_select_has_locking_for_clause(const char* query) {
         }
         const char* next = nullptr;
         size_t next_len = 0;
-        p = polardb_next_sql_token(p, &next, &next_len);
+        const char* lookahead = polardb_next_sql_word(p, &next, &next_len);
         if (!next) {
             return false;
         }
@@ -187,10 +220,10 @@ static bool polardb_select_has_locking_for_clause(const char* query) {
         if (polardb_token_equals(next, next_len, "no")) {
             const char* key = nullptr;
             size_t key_len = 0;
-            p = polardb_next_sql_token(p, &key, &key_len);
+            lookahead = polardb_next_sql_word(lookahead, &key, &key_len);
             const char* update = nullptr;
             size_t update_len = 0;
-            p = polardb_next_sql_token(p, &update, &update_len);
+            lookahead = polardb_next_sql_word(lookahead, &update, &update_len);
             if (key && update &&
                     polardb_token_equals(key, key_len, "key") &&
                     polardb_token_equals(update, update_len, "update")) {
@@ -199,7 +232,7 @@ static bool polardb_select_has_locking_for_clause(const char* query) {
         } else if (polardb_token_equals(next, next_len, "key")) {
             const char* share = nullptr;
             size_t share_len = 0;
-            p = polardb_next_sql_token(p, &share, &share_len);
+            lookahead = polardb_next_sql_word(lookahead, &share, &share_len);
             if (share && polardb_token_equals(share, share_len, "share")) {
                 return true;
             }
@@ -233,28 +266,23 @@ bool parse_polardb_full_health_check(const char* node_type_str, const char* is_a
 // doc/polardb-arch/09-PUBLISH-AND-WRITE-TRACKING.md.
 //
 // The argument is normally query digest text, but can be raw query text when
-// digests are disabled. Locking SELECT detection must therefore ignore SQL
-// literals and comments.
+// digests are disabled. Locking SELECT detection uses a deliberately small word
+// scanner. Ambiguous text can over-classify as a write, which keeps routing on
+// the conservative side.
 bool PolarDB_Protocol::is_write_query(const char* query) {
     if (query == nullptr) {
         return false;
     }
 
-    // The digest can keep leading whitespace, so advance to the first keyword
-    // before matching prefixes.
-    query = polardb_skip_leading_space(query);
-
     // Only these prefixes are treated as reads. Anything else (including WITH,
     // whose CTE body may modify data) falls through to the write branch below so
     // that its result advances this session's write LSN.
-    if (strncasecmp(query, "SELECT", 6) == 0 ||
-        strncasecmp(query, "SHOW", 4) == 0 ||
-        strncasecmp(query, "EXPLAIN", 7) == 0) {
+    if (polardb_starts_with_keyword(query, "select") ||
+        polardb_starts_with_keyword(query, "show") ||
+        polardb_starts_with_keyword(query, "explain")) {
 
         // SELECT ... FOR UPDATE/SHARE takes row locks, so treat it as a write.
-        // The scanner skips literals/comments/quoted identifiers so ordinary
-        // expressions such as substring(x from ? for ?) remain reads.
-        if (strncasecmp(query, "SELECT", 6) == 0) {
+        if (polardb_starts_with_keyword(query, "select")) {
             if (polardb_select_has_locking_for_clause(query)) {
                 return true;
             }
@@ -264,6 +292,21 @@ bool PolarDB_Protocol::is_write_query(const char* query) {
 
     // Everything else is considered a write.
     return true;
+}
+
+bool PolarDB_Protocol::is_txn_split_safe_read(const char* query) {
+    return polardb_starts_with_keyword(query, "select") &&
+        !polardb_select_has_locking_for_clause(query);
+}
+
+bool PolarDB_Protocol::is_txn_split_safe_select(
+        bool is_top_level_select, const char* query) {
+    return is_top_level_select && !polardb_select_has_locking_for_clause(query);
+}
+
+bool PolarDB_Protocol::is_locking_select_query(const char* query) {
+    return polardb_starts_with_keyword(query, "select") &&
+        polardb_select_has_locking_for_clause(query);
 }
 
 bool PolarDB_Protocol::is_write_query(
@@ -278,6 +321,36 @@ bool PolarDB_Protocol::is_write_query(
     case PGSQL_QUERY__UNINITIALIZED:
     case PGSQL_QUERY___NONE:
         return is_write_query(query);
+    default:
+        return true;
+    }
+}
+
+bool PolarDB_Protocol::is_write_lsn_query(const char* query) {
+    if (query == nullptr) {
+        return false;
+    }
+
+    if (polardb_starts_with_keyword(query, "select") ||
+        polardb_starts_with_keyword(query, "show") ||
+        polardb_starts_with_keyword(query, "explain")) {
+        return false;
+    }
+
+    return true;
+}
+
+bool PolarDB_Protocol::is_write_lsn_query(
+        const char* query, int command_type) {
+    switch (command_type) {
+    case PGSQL_QUERY_SELECT:
+    case PGSQL_QUERY_SHOW:
+    case PGSQL_QUERY_EXPLAIN:
+        return false;
+    case PGSQL_QUERY_UNKNOWN:
+    case PGSQL_QUERY__UNINITIALIZED:
+    case PGSQL_QUERY___NONE:
+        return is_write_lsn_query(query);
     default:
         return true;
     }

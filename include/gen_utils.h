@@ -246,12 +246,14 @@ class PtrSizeArray {
 	explicit PtrSizeArray(unsigned int sz=0);
 	~PtrSizeArray();
 
-	void add(void *p, unsigned int s) {
+	void add_with_meta(void *p, unsigned int s, unsigned int flags, void *owner) {
 		if (len==size) {
 			expand(1);
 		}
 		pdata[len].ptr=p;
 		pdata[len].size=s;
+		pdata[len].flags=flags;
+		pdata[len].owner=owner;
 		len++;
 //#ifdef DEBUG
 //		mysql_hdr *m=(mysql_hdr *)p;
@@ -259,10 +261,17 @@ class PtrSizeArray {
 //#endif /* DEBUG */
 	};
 
+	void add(void *p, unsigned int s) {
+		add_with_meta(p, s, 0, NULL);
+	};
+
+	void add_borrowed_owner(void *p, unsigned int s, void *owner) {
+		add_with_meta(p, s, PTRSIZE_FLAG_BORROWED_OWNER, owner);
+	};
+
 	void remove_index(unsigned int i, PtrSize_t *ps) {
 		if (ps) {
-			ps->ptr=pdata[i].ptr;
-			ps->size=pdata[i].size;
+			*ps=pdata[i];
 		}
 		if (i != (len-1)) {
 			memmove(pdata+i,pdata+i+1,(len-i-1)*sizeof(PtrSize_t));

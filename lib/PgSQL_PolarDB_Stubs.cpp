@@ -7,11 +7,11 @@
  * definitions for any PolarDB function that always-compiled core code might
  * call when the feature is disabled, so the binary still links.
  *
- * The PolarDB LSN session-consistency feature is gated by `#if POLARDB_PROXY`
+ * The PolarDB LSN session-consistency feature is enabled by `#if POLARDB_PROXY`
  * on BOTH sides: the declarations (include/PgSQL_PolarDB.h, plus the PolarDB
  * members added to PgSQL_Session.h / PgSQL_Connection.h /
  * PgSQL_HostGroups_Manager.h) AND every place in the core that calls into it.
- * Because the call sites are guarded, a POLARDB_PROXY=0 build contains no
+ * Because the call sites are protected, a POLARDB_PROXY=0 build contains no
  * reference to any PolarDB symbol. So there is nothing to stub, and the active
  * body of this file is empty.
  *

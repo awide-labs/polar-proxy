@@ -10,6 +10,9 @@
 #include "Base_Thread.h"
 #include "ProxySQL_Poll.h"
 #include "PgSQL_PolarDB_Counters.h"
+#if POLARDB_PROXY
+#include "PgSQL_PolarDB.h"
+#endif // POLARDB_PROXY
 #include "PgSQL_Variables.h"
 #ifdef IDLE_THREADS
 #include <sys/epoll.h>
@@ -44,6 +47,7 @@ constexpr const char* AUTHENTICATION_METHOD_STR[] = {
 
 #if POLARDB_PROXY
 struct PolarDB_Query_ReaderPlan;
+struct PolarDB_WaitSpec;
 
 // PolarDB consistency-mode integer constants used where an int plus -1 sentinel
 // is needed (thread variables, HG policy, admin SQL). The values align with
@@ -301,6 +305,8 @@ public:
 	struct {
 		unsigned long long stvar[PG_st_var_END];
 		unsigned int active_transactions;
+		unsigned long long pgconnpoll_get;
+		unsigned long long pgconnpoll_get_ok;
 		// tx-poisoned feature counters. Each PgSQL thread maintains its own
 		// (lock-free) and PgSQL_Threads_Handler aggregates across threads for
 		// stats_pgsql_global exposure. See preserve_client_on_broken_backend_in_tx.
@@ -688,18 +694,9 @@ public:
 	 */
 	PgSQL_Connection* get_MyConn_local(unsigned int, PgSQL_Session * sess, char* gtid_uuid, uint64_t gtid_trxid, int max_lag_ms);
 #if POLARDB_PROXY
-	/**
-	 * @brief Try the thread-local cache for a PolarDB consistency-target reader.
-	 *
-	 * This is a conservative fast path for LSN-protected reads. It returns a
-	 * cached backend only when the normal local-cache requirements match and the
-	 * backend was created with an RFQ-LSN startup profile. It also requires a
-	 * fresh cached server LSN that already reaches the consistency target, so
-	 * taking the local cache does not bypass route-smart's safety checks. Misses
-	 * fall through to HostGroups Manager reader selection.
-	 */
-	PgSQL_Connection* get_MyConn_local_polardb_reader(unsigned int, PgSQL_Session* sess,
-		const PolarDB_Query_ReaderPlan& reader_plan);
+	PgSQL_Connection* get_local_polardb_reader_connection(
+		PgSQL_SrvC* server, uint32_t profile_generation,
+		const PolarDB_PoolKey& pool_key);
 #endif // POLARDB_PROXY
 
 	/**
@@ -853,6 +850,16 @@ void polardb_count_reader_target_lsn_gap_bucket(
 #define POLARDB_PROFILE_THREAD_COUNT(thread, name, value) do { } while (0)
 #define POLARDB_PROFILE_THREAD_COUNT_ONE(thread, name) do { } while (0)
 #endif // POLARDB_PROFILE
+
+#if POLARDB_PERF_DEBUG
+#define POLARDB_PERF_THREAD_COUNT(thread, name, value) \
+	POLARDB_THREAD_COUNT((thread), name, (value))
+#define POLARDB_PERF_THREAD_COUNT_ONE(thread, name) \
+	POLARDB_PERF_THREAD_COUNT((thread), name, 1)
+#else
+#define POLARDB_PERF_THREAD_COUNT(thread, name, value) do { } while (0)
+#define POLARDB_PERF_THREAD_COUNT_ONE(thread, name) do { } while (0)
+#endif // POLARDB_PERF_DEBUG
 
 #endif // POLARDB_PROXY
 
@@ -1126,10 +1133,13 @@ public:
 		int polardb_lsn_freshness_ms;         // max age of a cached per-server LSN to trust
 		int polardb_lag_cap_freshness_ms;     // max LSN-cache age under byte-lag cap + finite wait; 0=wait-fraction only
 		int polardb_reader_lsn_lag_range_bytes; // 0 keeps exact best-behind reader choice
-		int polardb_reader_affinity_ttl_ms;   // 0 disables session-local reader affinity
-		int polardb_reader_affinity_max_uses; // max reads before one affinity hint expires
+		int polardb_output_coalesce_bytes;   // 0 disables incomplete streaming output coalescing by bytes
+		int polardb_output_coalesce_packets; // 0 disables incomplete streaming output coalescing by packets
 		bool polardb_monitor_lsn_updates;     // enable monitor LSN cache updates
 		bool polardb_lazy_warmup_split;       // demand-warm connected split-reader pool entries
+		bool polardb_writev_direct;           // plaintext frontend direct scatter/gather send path
+		bool polardb_result_fast_forward;     // batch contiguous backend DataRow frames into one result packet
+		int polardb_split_warmup_max_connections_per_request; // max backend connections per warmup request
 		char* polardb_wait_timeout_mode;      // best_effort | strict
 		char* polardb_proxy_protocol;         // v15 | legacy | off
 		char* polardb_route_rfq_policy;       // strict | best_effort
@@ -1137,7 +1147,7 @@ public:
 		char* polardb_reader_death_action;    // retry | forward | terminate
 		char* polardb_reader_timeout_action;  // retry | forward | terminate
 		char* polardb_reader_error_action;    // retry | forward | terminate
-		char* polardb_split_warmup_identity;  // strict | client_ip | auth_profile
+		char* polardb_proxy_identity_mode;    // client | proxy
 		char* polardb_proxy_identity_host;    // empty or IP literal
 		int polardb_proxy_identity_port;      // 0..65535
 #endif // POLARDB_PROXY
@@ -1787,9 +1797,9 @@ public:
 	 */
 	unsigned int get_active_transations();
 
-	// Aggregated tx-poisoned counters across all PgSQL threads. These back the
-	// pgsql_tx_poisoned_total / pgsql_tx_poisoned_recovered_total /
-	// pgsql_tx_poisoned_rejected_statements_total rows in stats_pgsql_global.
+	// Aggregated per-worker counters across all PgSQL threads.
+	unsigned long long get_pgconnpoll_get();
+	unsigned long long get_pgconnpoll_get_ok();
 	unsigned long long get_tx_poisoned_total();
 	unsigned long long get_tx_poisoned_recovered_total();
 	unsigned long long get_tx_poisoned_rejected_statements_total();

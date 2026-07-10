@@ -32,6 +32,36 @@
 
 #if POLARDB_PROXY
 
+void PgSQL_Session::PolarDB_NoticeQueueState::clear(bool free_buffers) {
+	if (!pending) {
+		return;
+	}
+	while (pending->len > 0) {
+		if (free_buffers) {
+			PtrSize_t ps;
+			pending->remove_index(pending->len - 1, &ps);
+			if (ps.ptr) {
+				l_free(ps.size, ps.ptr);
+			}
+		} else {
+			pending->remove_index(pending->len - 1, nullptr);
+		}
+	}
+	delete pending;
+	pending = nullptr;
+}
+
+void PgSQL_Session::PolarDB_NoticeQueueState::add(
+		unsigned char* pkt, unsigned int size) {
+	if (!pkt || size == 0) {
+		return;
+	}
+	if (!pending) {
+		pending = new PtrSizeArray();
+	}
+	pending->add(pkt, size);
+}
+
 /**
  * @brief Clear any queued NoticeResponse packets for this session.
  *
@@ -39,28 +69,13 @@
  * SELECT result; we clear the queue on completion or error to avoid duplicates
  * and leaks.
  *
- * @note Always deletes and nullifies the pending_notices queue, even if
- *       free_buffers is false (the packet bytes may have been transferred to the
- *       client output array, which then owns them).
+ * @note Always deletes and nullifies the notice queue, even if free_buffers is
+ *       false (the packet bytes may have been transferred to the client output
+ *       array, which then owns them).
  * @param free_buffers If true, free the packet buffers before clearing.
  */
 void PgSQL_Session::clear_pending_notices(bool free_buffers) {
-	if (!pending_notices) {
-		return;
-	}
-	while (pending_notices->len > 0) {
-		if (free_buffers) {
-			PtrSize_t ps;
-			pending_notices->remove_index(pending_notices->len - 1, &ps);
-			if (ps.ptr) {
-				l_free(ps.size, ps.ptr);
-			}
-		} else {
-			pending_notices->remove_index(pending_notices->len - 1, nullptr);
-		}
-	}
-	delete pending_notices;
-	pending_notices = nullptr;
+	polardb_notices.clear(free_buffers);
 }
 
 /**
@@ -71,13 +86,13 @@ void PgSQL_Session::clear_pending_notices(bool free_buffers) {
  * ownership rule.
  */
 void PgSQL_Session::polardb_flush_pending_notices_to_client() {
-	if (!pending_notices || pending_notices->len == 0 ||
+	if (!polardb_notices.pending || polardb_notices.pending->len == 0 ||
 			!client_myds || !client_myds->PSarrayOUT) {
 		return;
 	}
 
-	for (unsigned int i = 0; i < pending_notices->len; i++) {
-		PtrSize_t* ps = pending_notices->index(i);
+	for (unsigned int i = 0; i < polardb_notices.pending->len; i++) {
+		PtrSize_t* ps = polardb_notices.pending->index(i);
 		if (ps && ps->ptr && ps->size > 0) {
 			client_myds->PSarrayOUT->add(ps->ptr, ps->size);
 		}
@@ -96,14 +111,7 @@ void PgSQL_Session::polardb_flush_pending_notices_to_client() {
  * @param size Packet size in bytes.
  */
 void PgSQL_Session::enqueue_pending_notice(unsigned char* pkt, unsigned int size) {
-	if (!pkt || size == 0) {
-		return;
-	}
-	if (!pending_notices) {
-		// Lazily allocate on the first notice.
-		pending_notices = new PtrSizeArray();
-	}
-	pending_notices->add(pkt, size);
+	polardb_notices.add(pkt, size);
 }
 
 /**
@@ -176,7 +184,7 @@ void PgSQL_Session::polardb_enqueue_degraded_rfq_notice(const char* reason,
 
 	POLARDB_TRACE(
 		"PolarDB PLAN: queued degraded RFQ NoticeResponse pending_len=%u\n",
-		pending_notices ? pending_notices->len : 0);
+		polardb_notices.len());
 }
 
 /**
@@ -198,7 +206,7 @@ void PgSQL_Session::polardb_enqueue_degraded_rfq_notice(
  * @brief Handle PolarDB LSN wait-timeout notices emitted while a wrapped query runs.
  *
  * Called from notice_handler_cb() for every backend notice. This helper first
- * proves that the notice belongs to the current active LSN wait using PolarDB's
+ * shows that the notice belongs to the current active LSN wait using PolarDB's
  * stable proxy wait-timeout detail marker plus wrapper state. It then performs
  * timeout accounting and applies the forwarding ownership rule below: generic
  * forwarding owns user-result notices; the PolarDB pending path only rescues
@@ -216,7 +224,7 @@ void PgSQL_Session::polardb_enqueue_degraded_rfq_notice(
  */
 void polardb_handle_notice(PgSQL_Connection* conn, const PGresult* result) {
 	if (!conn || !result) {
-		// libpq should never pass NULL, but guard against it.
+		// libpq should never pass NULL, but check against it.
 		return;
 	}
 
@@ -235,7 +243,7 @@ void polardb_handle_notice(PgSQL_Connection* conn, const PGresult* result) {
 	POLARDB_TRACE("PolarDB WAIT: LSN timeout detected in notice: %s\n",
 		PQresultErrorMessage(result));
 
-	// Prove that an in-flight consistency wrapper is active before accounting.
+	// show that an in-flight consistency wrapper is active before accounting.
 	// The best_effort timeout WARNING is emitted while the user's SELECT obtains
 	// its snapshot, after the leading SET results may already be consumed. Do not
 	// require stmt_pending > 0 here; an active PolarDB wait plus wrapper_kind is
@@ -271,7 +279,6 @@ void polardb_handle_notice(PgSQL_Connection* conn, const PGresult* result) {
 		sess->polardb_account_txn_split_wait_timeout("notice");
 	} else {
 		sess->polardb_account_wait_timeout("notice");
-		conn->polardb_query_wrap_state.wait_completion.mark_failed();
 	}
 
 	/*
@@ -287,7 +294,7 @@ void polardb_handle_notice(PgSQL_Connection* conn, const PGresult* result) {
 	 *    consumes those SET results and does not forward them to the client. If the
 	 *    LSN timeout WARNING is attached to one of those hidden SET results, the
 	 *    generic path would hide the WARNING too. In that case this helper copies
-	 *    the notice into session->pending_notices so it is forwarded once with the
+	 *    the notice into the session notice queue so it is forwarded once with the
 	 *    user result.
 	 *
 	 *  - Do not enqueue when conn->query_result is already the user result.
@@ -302,7 +309,7 @@ void polardb_handle_notice(PgSQL_Connection* conn, const PGresult* result) {
 		return;
 	}
 
-	POLARDB_TRACE("PolarDB WAIT: saving timeout notice to session->pending_notices\n");
+	POLARDB_TRACE("PolarDB WAIT: saving timeout notice to session notice queue\n");
 
 	const char* severity = PQresultErrorField(result, PG_DIAG_SEVERITY);
 	const char* severity_nonlocalized =
@@ -316,7 +323,7 @@ void polardb_handle_notice(PgSQL_Connection* conn, const PGresult* result) {
 	}
 
 	POLARDB_TRACE("PolarDB WAIT: saved notice packet pending_len=%u\n",
-		sess->pending_notices ? sess->pending_notices->len : 0);
+		sess->polardb_notices.len());
 }
 
 #endif // POLARDB_PROXY

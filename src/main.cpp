@@ -955,10 +955,10 @@ void ProxySQL_Main_init_main_modules() {
 	GloMyStmt=new MySQL_STMT_Manager_v14();
 	GloPgStmt=new PgSQL_STMT_Manager();
 	PgHGM = new PgSQL_HostGroups_Manager();
-	PgHGM->init();
 	PgSQL_Threads_Handler* _tmp_GloPTH = NULL;
 	_tmp_GloPTH = new PgSQL_Threads_Handler();
 	GloPTH = _tmp_GloPTH;
+	PgHGM->init();
 }
 
 void ProxySQL_Main_init_Admin_module(const bootstrap_info_t& bootstrap_info) {
@@ -1286,6 +1286,11 @@ void ProxySQL_Main_shutdown_all_modules() {
 		std::cerr << "GloMTH shutdown in ";
 #endif
 	}
+#if POLARDB_PROXY
+	if (PgHGM) {
+		PgHGM->shutdown_split_warmup_thread();
+	}
+#endif // POLARDB_PROXY
 	if (GloPTH) {
 		cpu_timer t;
 		pthread_mutex_lock(&GloVars.global.ext_glopth_mutex);

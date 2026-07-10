@@ -221,11 +221,6 @@ public:
 	void write_ReadyForQuery(char txn_state = 'I') {
 		write_generic('Z', "c", txn_state);
 	}
-#if POLARDB_PROXY
-	void write_ReadyForQuery(char txn_state, uint64_t polardb_lsn) {
-		write_generic('Z', "cq", txn_state, polardb_lsn);
-	}
-#endif // POLARDB_PROXY
 	void write_CommandComplete(const char* desc) {
 		write_generic('C', "s", desc);
 	}
@@ -378,6 +373,23 @@ public:
 	 * @return The number of bytes added to the query result.
 	 */
 	unsigned int add_row(const PSresult* result);
+
+	/**
+	 * @brief Adds a contiguous run of PostgreSQL DataRow frames.
+	 *
+	 * The input points to complete wire-format DataRow packets. This method
+	 * copies the run into the normal result buffer.
+	 */
+	unsigned int add_row_run(const void* data, unsigned int size, unsigned int frames);
+
+	/**
+	 * @brief Adds a referenced contiguous run of PostgreSQL DataRow frames.
+	 *
+	 * Ownership of @p owner is transferred to the result object. The result
+	 * packet points inside that allocation until the frontend output path
+	 * retires it.
+	 */
+	unsigned int add_row_run_borrowed(void* owner, const void* data, unsigned int size, unsigned int frames);
 
 	/**
 	 * @brief Adds a command completion message to the query result.

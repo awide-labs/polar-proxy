@@ -283,6 +283,7 @@ private:
 	bool handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_DISCARD_command(const char* dig);
 	bool handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_DEALLOCATE_command(const char* dig);
 	bool handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_special_commands(const char* dig, bool* lock_hostgroup);
+	void reapply_user_attributes_after_reset();
 	bool handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY_qpo(PtrSize_t*, bool* lock_hostgroup, 
 		PgSQL_Extended_Query_Type stmt_type = PGSQL_EXTENDED_QUERY_TYPE_NOT_SET);
 	bool handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_PARSE(PtrSize_t& pkt);
@@ -506,7 +507,7 @@ public:
 	struct PgSQL_PolarDB_Config {
 		// Set true once this session attaches to a backend in a PolarDB-enabled
 		// hostgroup (on fresh connect, or when a pooled connection is reused). It
-		// gates the response-path result processing. Only ever turned on: a session
+		// controls the response-path result processing. Only ever turned on: a session
 		// that has talked to a PolarDB backend keeps capturing LSNs for its life.
 		bool is_polardb_enabled = false;
 		// Per-session consistency-mode override, and the top tier of mode resolution
@@ -533,75 +534,194 @@ public:
 	// new client connection (a fresh session object) starts it at zero.
 	// See doc/polardb-arch/10-SESSION-INTEGRATION.md section 6.4.
 	PolarDB_SessionConsistency polardb_session_consistency;
-	// Short-lived hint for avoiding repeated waits on a reader this session has
-	// already proven reached a target LSN. It is disabled unless
-	// pgsql-polardb_reader_affinity_ttl_ms is greater than zero.
-	PolarDB_ReaderAffinity polardb_reader_affinity;
 
 	// Observed transaction-split RFQ state. The planner reads it to decide
 	// whether one in-transaction read can be sent to a replica with exported
 	// transaction XIDs and an LSN wait.
 	PolarDB_TransactionSplitState polardb_transaction_split;
 
-	// Temporary state for one in-flight transaction reader read. Split reads
-	// add exported XIDs; pre-write consistency reads only use the normal wait
-	// wrapper. Both borrow a reader backend while the primary backend keeps
-	// the client transaction open.
-	PgSQL_Backend* polardb_txn_split_backend = nullptr;
-	PgSQL_Backend* polardb_txn_split_saved_mybe = nullptr;
-	bool polardb_txn_split_active = false;
-	bool polardb_txn_wait_read_active = false;
-	// Fail-closed gates for pre-write transaction reader waits. READ COMMITTED is
-	// required because higher isolation levels pin the transaction snapshot; any
+	/**
+	 * @brief Session-owned state for one temporary transaction reader request.
+	 *
+	 * Both transaction-split reads and pre-write transaction wait reads move mybe
+	 * to a reader while the writer transaction remains open on the primary backend.
+	 */
+	struct PolarDB_TxnReaderState {
+		PgSQL_Backend* backend = nullptr;
+		PgSQL_Backend* primary_backend = nullptr;
+		bool split_active = false;
+		bool wait_read_active = false;
+		std::string wrapped_query;
+		PtrSize_t original_pkt{0, nullptr};
+		PolarDB_WaitSpec wait_spec;
+		PolarDB_WriterScope writer_scope;
+		unsigned long long read_start_us = 0;
+		unsigned long long wait_start_us = 0;
+
+		bool active() const {
+			return split_active || wait_read_active;
+		}
+
+		bool has_primary_backend() const {
+			return primary_backend != nullptr;
+		}
+
+		void clear_request_state() {
+			wrapped_query.clear();
+			original_pkt.size = 0;
+			original_pkt.ptr = nullptr;
+			wait_spec.reset();
+			writer_scope.reset();
+			read_start_us = 0;
+			wait_start_us = 0;
+			primary_backend = nullptr;
+			split_active = false;
+			wait_read_active = false;
+		}
+	};
+
+	// Temporary state for one in-flight transaction reader read. Split reads add
+	// exported XIDs; pre-write consistency reads only use the normal wait wrapper.
+	PolarDB_TxnReaderState polardb_txn_reader;
+	// Fail-closed checks for pre-write transaction reader waits. READ COMMITTED is
+	// required because higher isolation levels keep the transaction snapshot fixed; any
 	// in-transaction SET may create transaction-local backend state not present on
 	// the temporary reader.
-	bool polardb_txn_non_read_committed = false;
-	bool polardb_txn_local_state_changed = false;
-	std::string polardb_txn_split_wrapped_query;
-	PtrSize_t polardb_txn_split_original_pkt{0, nullptr};
-	PolarDB_WaitSpec polardb_txn_split_wait_spec;
-	unsigned long long polardb_txn_split_read_start_us = 0;
-	unsigned long long polardb_txn_split_wait_start_us = 0;
-	// Transaction-scoped route pin set after a split-reader failure. FORCE_WRITER
-	// keeps the remainder of the transaction on the writer even on paths that
-	// bypass the normal planner, such as manual route rules and query-cache
-	// lookup. SHUN_READER keeps split eligible but excludes one failed endpoint.
-	PolarDB_RoutePin polardb_txn_reader_failure_pin = PolarDB_RoutePin::NONE;
-	int polardb_txn_writer_hg = -1;
-	int polardb_txn_shunned_reader_hg = -1;
-	std::string polardb_txn_shunned_reader_address;
-	int polardb_txn_shunned_reader_port = -1;
+	struct PolarDB_TxnReaderWaitSafetyState {
+		bool non_read_committed = false;
+		bool local_state_changed = false;
+
+		void clear() {
+			non_read_committed = false;
+			local_state_changed = false;
+		}
+	};
+	PolarDB_TxnReaderWaitSafetyState polardb_txn_wait_safety;
+	struct PolarDB_TxnReaderFailureState {
+		PolarDB_ReaderFailureRoute route = PolarDB_ReaderFailureRoute::NONE;
+		int writer_hg = -1;
+		int reader_hg = -1;
+		std::string reader_address;
+		int reader_port = -1;
+
+		bool active() const {
+			return route != PolarDB_ReaderFailureRoute::NONE;
+		}
+
+		bool force_writer(int* out_writer_hg = nullptr) const {
+			const bool force =
+				route == PolarDB_ReaderFailureRoute::FORCE_WRITER && writer_hg >= 0;
+			if (force && out_writer_hg) {
+				*out_writer_hg = writer_hg;
+			}
+			return force;
+		}
+
+		bool reader_skip(int target_hg, const char** out_address,
+				int* out_port) const {
+			const bool skip =
+				route == PolarDB_ReaderFailureRoute::SKIP_READER &&
+				reader_hg == target_hg &&
+				!reader_address.empty() &&
+				reader_port >= 0;
+			if (skip) {
+				if (out_address) {
+					*out_address = reader_address.c_str();
+				}
+				if (out_port) {
+					*out_port = reader_port;
+				}
+			}
+			return skip;
+		}
+
+		void clear() {
+			route = PolarDB_ReaderFailureRoute::NONE;
+			writer_hg = -1;
+			reader_hg = -1;
+			reader_address.clear();
+			reader_port = -1;
+		}
+
+		void set_force_writer(int hg) {
+			clear();
+			route = PolarDB_ReaderFailureRoute::FORCE_WRITER;
+			writer_hg = hg;
+		}
+
+		void set_reader_skip(int hg, const std::string& address, int port) {
+			clear();
+			route = PolarDB_ReaderFailureRoute::SKIP_READER;
+			reader_hg = hg;
+			reader_address = address;
+			reader_port = port;
+		}
+	};
+
+	// Transaction-scoped reader-failure route state. FORCE_WRITER keeps the
+	// remainder of the transaction on the writer even on paths that bypass the
+	// normal planner, such as manual route rules and query-cache lookup.
+	// SKIP_READER keeps split eligible but excludes one failed endpoint.
+	PolarDB_TxnReaderFailureState polardb_txn_reader_failure;
 
 	// Mutable state for the one query in flight: the reader acquisition plan, the
 	// wait state, the wrapped-query buffer, and the request writer scope. Reset
 	// before each query and at query end, so nothing leaks into the next query.
 	PolarDB_QueryState polardb_query;
 
-	// Safety flag. When set, this session forces the writer instead of sending an
-	// unwrapped read to a replica. It is set when a wait wrapper cannot be built,
-	// which would otherwise break read-your-writes silently. Cleared on RESET.
-	bool polardb_wait_disabled = false;
+	struct PolarDB_SessionRouteState {
+		// When set, this session forces the writer instead of sending an
+		// unwrapped read to a replica. It is set when a wait wrapper cannot be
+		// built, which would otherwise break read-your-writes silently.
+		bool wait_disabled = false;
+		// Frontend capability negotiated from client startup parameters. When
+		// true, ProxySQL appends the backend RFQ LSN to ReadyForQuery packets it
+		// sends to the client, matching PolarDB's extended RFQ layout.
+		bool client_rfq_lsn_requested = false;
+		// One-shot flag so the per-session "RFQ route degraded" log line is
+		// written at most once while a degradation stays active. The client
+		// NoticeResponse and counters are still emitted for every degraded route.
+		bool rfq_degraded_route_warning_sent = false;
+		// Cached per-session startup identity key for ReaderPool lookups. The
+		// endpoint is fixed for a frontend connection; the mode check below
+		// invalidates it if the runtime identity policy changes.
+		uint64_t reader_pool_startup_identity_hash = 0;
+		int reader_pool_startup_identity_mode = -1;
 
-	// Frontend capability negotiated from client startup parameters. When true,
-	// ProxySQL appends the backend RFQ LSN to ReadyForQuery packets it sends to
-	// the client, matching PolarDB's extended RFQ layout.
-	bool polardb_client_rfq_lsn_requested = false;
+		void clear_resettable() {
+			wait_disabled = false;
+			rfq_degraded_route_warning_sent = false;
+		}
 
-	// Queue of NoticeResponse packets captured from a wrapped consistency read,
-	// flushed to the client just ahead of the user result so the client sees the
-	// same warning-before-result ordering it would without wrapping (e.g. a
-	// best_effort LSN wait-timeout WARNING, or a synthetic degraded-route WARNING).
-	// This is the only heap-owned PolarDB session field: it is allocated lazily on
-	// the first captured notice and freed by clear_pending_notices(). The flush
-	// path hands the bytes to the client output array and clears without freeing;
-	// every other teardown path frees. See doc/polardb-arch/10-SESSION-INTEGRATION.md
-	// section 6.3.
-	PtrSizeArray* pending_notices = nullptr;
-	// One-shot guard so the per-session "RFQ route degraded" log line is written at
-	// most once while a degradation stays active. The client NoticeResponse and the
-	// counters are still emitted for every degraded route; only the log line is
-	// rate-limited. Re-armed (set back to false) when the degradation clears.
-	bool polardb_rfq_degraded_route_warning_sent = false;
+		void clear_session() {
+			clear_resettable();
+			client_rfq_lsn_requested = false;
+			reader_pool_startup_identity_hash = 0;
+			reader_pool_startup_identity_mode = -1;
+		}
+	};
+	PolarDB_SessionRouteState polardb_route_state;
+
+	struct PolarDB_NoticeQueueState {
+		PtrSizeArray* pending = nullptr;
+
+		bool empty() const {
+			return pending == nullptr || pending->len == 0;
+		}
+
+		unsigned int len() const {
+			return pending ? pending->len : 0;
+		}
+
+		void clear(bool free_buffers);
+		void add(unsigned char* pkt, unsigned int size);
+	};
+
+	// NoticeResponse packets captured from a wrapped consistency read, flushed to
+	// the client just ahead of the user result so the client sees the same
+	// warning-before-result ordering it would without wrapping.
+	// See doc/polardb-arch/10-SESSION-INTEGRATION.md section 6.3.
+	PolarDB_NoticeQueueState polardb_notices;
 #endif // POLARDB_PROXY
 
 	// Describe mode state for \d tablename meta command
@@ -786,11 +906,17 @@ public:
 	 * @brief Collect all routing inputs for one query into an immutable snapshot.
 	 *
 	 * Reads session, HostGroups_Manager, and thread state into @p route_ctx, which
-	 * polardb_plan() then decides from. One side effect: if the replication group's
-	 * writer scope changed since this session last collected, it first clears the
-	 * session's now-stale LSN targets and sticky flags before copying them in.
+	 * polardb_plan() then decides from. Call polardb_observe_route_inputs() first
+	 * so durable session state is already reconciled before the snapshot is copied.
 	 */
-	void polardb_collect(PolarDB_Query_RouteCtx& route_ctx, int current_hg, int qpo_replica_eligible, bool qpo_force_primary_hint);
+	void polardb_collect(PolarDB_Query_RouteCtx& route_ctx, int current_hg, int qpo_replica_eligible, bool qpo_force_primary_hint) const;
+	/**
+	 * @brief Apply durable session observations needed before building a route snapshot.
+	 *
+	 * Updates request writer scope, writer-epoch-scoped session LSN state, and
+	 * transaction reader-wait safety flags from the current query text.
+	 */
+	void polardb_observe_route_inputs(int current_hg);
 	/**
 	 * @brief Decide the route for one query from the collected snapshot.
 	 *
@@ -798,7 +924,8 @@ public:
 	 * LSN consistency feature applies to autocommit, simple-query reads only;
 	 * multi-statement and extended-protocol queries are routed to the writer.
 	 * Explicit transactions stay on the writer unless the transaction-split policy
-	 * and primary RFQ evidence allow one read to borrow a replica backend.
+	 * and primary RFQ evidence allow one read to take a replica connection from
+	 * the pool and return it after that read.
 	 */
 	PolarDB_Query_RoutePlan polardb_plan(const PolarDB_Query_RouteCtx& route_ctx);
 	/** @brief Update counters and emit the rate-limited log for a produced route plan. */
@@ -806,6 +933,8 @@ public:
 		const PolarDB_Query_RouteCtx& route_ctx);
 	/** @brief Count a manual query-rule/sticky-hostgroup route that bypassed the planner. */
 	void polardb_account_manual_route(int effective_hg, bool forced_writer);
+	/** @brief Apply writer routing required after a transaction reader failure. */
+	bool polardb_apply_reader_failure_writer_route(const char* stage);
 	/**
 	 * @brief Apply the route plan's side effects and stage wait state if needed.
 	 *
@@ -813,7 +942,7 @@ public:
 	 * the per-query wait state and snapshots the original query text; the wrapped
 	 * query itself is not built here but later, once, by
 	 * finalize_wait_timeout_injection() at ASYNC_IDLE. For a transaction split
-	 * read it prepares the borrowed replica backend immediately and preserves the
+	 * read it prepares the temporary replica backend immediately and preserves the
 	 * primary backend for the open transaction.
 	 */
 	PolarDB_Query_ExecuteResult polardb_execute(const PolarDB_Query_RoutePlan& plan,
@@ -846,7 +975,7 @@ public:
 	 * The wait is injected as SQL text, which cannot be safely spliced into an
 	 * extended-protocol stream, so this is routing only. Manual destination rules
 	 * are left untouched. An automatic replica-eligible read may use a reader only
-	 * when the session has no wait target; otherwise it is pinned to the writer.
+	 * when the session has no wait target; otherwise it stays on the writer.
 	 */
 	void polardb_apply_extended_route();
 	/**
@@ -885,6 +1014,16 @@ public:
 	 */
 	void polardb_process_result(PgSQL_Data_Stream* myds, const char* query_text,
 		PGSQL_QUERY_command query_cmd);
+	/**
+	 * @brief Decide the PolarDB LSN to append to a client ReadyForQuery packet.
+	 *
+	 * Called from the backend connection result path after libpq consumed the
+	 * backend RFQ, but before RequestEnd() updates response-side session state.
+	 * It preserves raw backend RFQ values for no-wait replica responses, while
+	 * translating writer or successful-wait responses to a confirmed frontend target
+	 * when the selected backend's local RFQ value is lower. It never fabricates an
+	 * LSN when the backend RFQ payload is absent.
+	 */
 	bool polardb_client_ready_lsn(PgSQL_Connection* conn,
 		bool backend_payload_present, uint64_t backend_lsn,
 		uint64_t* client_lsn);
@@ -899,7 +1038,7 @@ public:
 	void polardb_observe_transaction_split(PgSQL_Connection* conn,
 		uint64_t primary_lsn, bool split_enabled, bool primary_source);
 	/**
-	 * @brief Release any borrowed split backend and clear transaction-split state.
+	 * @brief Release any temporary split backend and clear transaction-split state.
 	 *
 	 * Used when split observation is disabled, a transaction closes, or the
 	 * writer scope changes. The reason is trace-only.
@@ -926,7 +1065,7 @@ public:
 	/** @brief Mark primary-only transaction-local state for pre-write reads. */
 	void polardb_note_txn_local_state_change(const char* reason);
 	/** @brief True when the tracked transaction isolation is READ COMMITTED. */
-	bool polardb_txn_reader_wait_isolation_read_committed();
+	bool polardb_txn_reader_wait_isolation_read_committed() const;
 
 	// ---- PolarDB wait wrapping and notices ----
 
@@ -936,11 +1075,11 @@ public:
 	}
 	/** @brief Whether the current query is running as a transaction split read. */
 	inline bool polardb_txn_split_read_active() const {
-		return polardb_txn_split_active;
+		return polardb_txn_reader.split_active;
 	}
 	/** @brief Whether mybe is temporarily swapped to a transaction reader. */
 	inline bool polardb_txn_reader_read_active() const {
-		return polardb_txn_split_active || polardb_txn_wait_read_active;
+		return polardb_txn_reader.active();
 	}
 	/**
 	 * @brief Return the `SET polar_consistency_mode = '...'` statement for a wait mode.
@@ -963,10 +1102,11 @@ public:
 	 * @param prefix The consistency-mode SET statement to place first, from
 	 *               build_polar_consistency_mode_set(). The timeout and wait SETs
 	 *               are appended after it, then the user query.
+	 * @return Number of wrapper SET results to skip, or 0 if no wrapper was built.
 	 */
-	bool append_wrapped_wait_query(const char* orig_query, size_t orig_len,
+	uint32_t append_wrapped_wait_query(const char* orig_query, size_t orig_len,
 		const PolarDB_Query_WaitState& wait_state, const std::string& prefix, std::string& out);
-	void build_wrapped_wait_query(const char* orig_query, size_t orig_len,
+	uint32_t build_wrapped_wait_query(const char* orig_query, size_t orig_len,
 		const PolarDB_Query_WaitState& wait_state, const std::string& prefix, std::string& out);
 	/**
 	 * @brief Build the wrapped wait query and install it into the outgoing packet.
@@ -991,19 +1131,16 @@ public:
 	/**
 	 * @brief Advance the selected reader's cached LSN after a successful wait.
 	 *
-	 * A finalized LSN wait proves that this backend reached the target before
+	 * A finalized LSN wait shows that this backend reached the target before
 	 * executing the user query. Recording that target in the reader cache lets
 	 * later reads bypass the wait wrapper when the same freshness/epoch checks
 	 * still hold. Failure paths and structured wait timeouts are ignored.
 	 */
 	void polardb_note_successful_wait_target(PgSQL_Data_Stream* myds, bool called_on_failure);
-	void polardb_note_reader_affinity(PgSQL_SrvC* srv, uint64_t reached_lsn,
-		const PolarDB_WriterScope& writer_scope);
-	void polardb_clear_reader_affinity(bool count_failure);
 	/**
-	 * @brief Count one proven PolarDB wait timeout and its elapsed latency.
+	 * @brief Count one confirmed PolarDB wait timeout and its elapsed latency.
 	 *
-	 * Precondition: the caller has already proven the backend event is a PolarDB
+	 * Precondition: the caller has already confirmed the backend event is a PolarDB
 	 * proxy wait timeout (for example by matching the timeout detail marker).
 	 * Consumes the wait start timer through record_wait_latency(), so a repeated
 	 * observation of the same event does not double-count. Returns false (no count)
@@ -1011,7 +1148,7 @@ public:
 	 */
 	bool polardb_account_wait_timeout(const char* source);
 	/**
-	 * @brief Count one proven transaction-split LSN wait timeout.
+	 * @brief Count one confirmed transaction-split LSN wait timeout.
 	 *
 	 * Used from the common NoticeResponse handler after it has matched the
 	 * structured PolarDB wait-timeout detail marker. Split waits keep separate
@@ -1068,41 +1205,85 @@ public:
 
 private:
 #if POLARDB_PROXY
+	struct PolarDB_ResultProcessContext {
+		PgSQL_Data_Stream* myds = nullptr;
+		const char* query_digest_text = nullptr;
+		uint64_t lsn = 0;
+		bool is_write = false;
+		PgSQL_SrvC* backend_srv = nullptr;
+		int backend_hg = -1;
+		bool backend_is_polar_hg = false;
+		int backend_writer_hg = -1;
+		uint64_t backend_writer_epoch = 0;
+		bool lsn_consistency_mode = false;
+		bool split_observation_enabled = false;
+	};
+
+	void polardb_clear_session_state_for_reset();
+	void polardb_clear_request_state_for_query_end(
+		PgSQL_Data_Stream* myds, bool called_on_failure);
+	bool polardb_process_positioned_rfq_lsn(
+		PolarDB_ResultProcessContext& ctx);
+	void polardb_process_zero_rfq_lsn(
+		PolarDB_ResultProcessContext& ctx);
+	void polardb_process_missing_rfq_lsn(
+		PolarDB_ResultProcessContext& ctx);
 	/**
 	 * @brief Backend used by the request currently being processed.
 	 *
-	 * Split execution temporarily swaps mybe to the borrowed replica backend, so
+	 * Split execution temporarily swaps mybe to the temporary replica backend, so
 	 * the active backend is still mybe. Keeping this accessor centralizes later
 	 * full-retry/failure work.
 	 */
 	PgSQL_Backend* active_backend() const { return mybe; }
 	/** @brief Prepare one transaction split read on a replica backend. */
 	bool polardb_prepare_txn_split_read(const PolarDB_Query_RoutePlan& plan,
-		PtrSize_t& pkt);
+		const PolarDB_WriterScope& writer_scope, PtrSize_t& pkt);
 	/** @brief Prepare one pre-write transaction consistency read on a replica backend. */
 	bool polardb_prepare_txn_wait_read(const PolarDB_Query_RoutePlan& plan,
 		const PolarDB_Query_RouteCtx& route_ctx, PtrSize_t& pkt);
+	/** @brief Start using a reader backend for one transaction reader request. */
+	void polardb_begin_txn_reader_read(PgSQL_Backend* reader_backend,
+		PgSQL_Data_Stream* reader_myds,
+		const PolarDB_WriterScope& writer_scope);
+	/** @brief Install the packet for one pre-write transaction wait read. */
+	void polardb_begin_txn_wait_read(PgSQL_Backend* reader_backend,
+		PgSQL_Data_Stream* reader_myds, PtrSize_t& pkt,
+		const PolarDB_WriterScope& writer_scope);
+	/** @brief Install the wrapper for one transaction split read. */
+	void polardb_begin_txn_split_read(PgSQL_Backend* reader_backend,
+		PgSQL_Data_Stream* reader_myds, PtrSize_t& pkt,
+		std::string&& wrapped_query, const PolarDB_WaitSpec& wait_spec,
+		const PolarDB_Query_ReaderPlan& reader_plan,
+		const PolarDB_WriterScope& writer_scope,
+		uint32_t wrapper_stmts, bool wait_bypassed);
 	/** @brief Complete a successful split read and restore the primary backend. */
 	void polardb_complete_txn_split_read();
 	/** @brief Complete a successful pre-write transaction wait read. */
 	void polardb_complete_txn_wait_read();
 	/** @brief Abort a failed split read and keep later reads on the primary. */
 	void polardb_abort_txn_split_read(const char* reason);
+	/** @brief Finish a transaction reader request and restore normal session state. */
+	void polardb_finish_txn_reader_read(bool split_success,
+		bool split_error, const char* reason,
+		bool record_split_error_counter, bool mark_reader_not_reusable);
 	/** @brief Release a failed pre-write transaction wait read and restore primary. */
 	void polardb_release_txn_wait_read(bool want_reuse);
 	/** @brief Reconcile a terminal txn-wait reader path and restore primary. */
 	void polardb_reconcile_txn_wait_read_end(
 		const char* reason, bool want_reuse);
+	/** @brief Restore primary if a previous request still owns a txn-wait reader. */
+	void polardb_reconcile_txn_wait_read_request_entry(const char* reason);
 	/** @brief Clear temporary split-read buffers and restore mybe. */
 	void polardb_reset_txn_split_read();
-	/** @brief Return/destroy the borrowed split replica connection. */
+	/** @brief Return/destroy the temporary split replica connection. */
 	void polardb_release_txn_split_backend(bool want_reuse);
 	/** @brief Add the current split read's elapsed time to split latency counters. */
 	void polardb_record_txn_split_latency();
 	/** @brief Add the current split wait wrapper's elapsed time to wait buckets. */
 	void polardb_record_txn_split_wait_latency();
 	/** @brief Snapshot the failed backend before normal rc==-1 handling mutates it. */
-	PolarDB_RequestOutcome polardb_capture_outcome(PgSQL_Backend* backend, bool ok);
+	PolarDB_RequestOutcome polardb_capture_outcome(PgSQL_Backend* backend);
 	/** @brief Handle a PolarDB rc==-1 replica-reader failure before generic retries. */
 	PolarDB_FailureAction polardb_on_failure(const PolarDB_RequestOutcome& outcome);
 
@@ -1134,6 +1315,7 @@ private:
 		PtrSize_t retry_pkt{0, nullptr};
 		PolarDB_Query_ReaderPlan reader_plan;
 		PolarDB_WaitSpec wait_spec;
+		PolarDB_WriterScope writer_scope;
 		std::string txn_xids;
 		std::string retry_query;
 		PGSQL_ERROR_CODES backend_error_code =
@@ -1147,7 +1329,7 @@ private:
 			PolarDB_ReaderFailureKind::REUSABLE_ERROR;
 		PolarDB_ReaderAction action = PolarDB_ReaderAction::FORWARD;
 		PolarDB_RetryTarget retry_target = PolarDB_RetryTarget::WRITER;
-		PolarDB_RoutePin route_pin = PolarDB_RoutePin::NONE;
+		PolarDB_ReaderFailureRoute reader_failure_route = PolarDB_ReaderFailureRoute::NONE;
 	};
 
 	/** @brief Build the private reader-failure view from a captured outcome. */
@@ -1168,12 +1350,13 @@ private:
 	/** @brief Pick retry/forward/terminate policy for this failure class. */
 	PolarDB_ReaderFailureDecision polardb_reader_decision_for(
 		const PolarDB_ReaderFailure& failure);
-	/** @brief Apply a transaction-scoped route pin selected by failure policy. */
-	void polardb_apply_reader_failure_route_pin(
-		PolarDB_RoutePin pin, int writer_hg,
+	/** @brief Apply transaction-scoped routing selected by failure policy. */
+	void polardb_apply_reader_failure_route_state(
+		PolarDB_ReaderFailureRoute route, int writer_hg,
 		const PolarDB_ReaderFailure* failure = nullptr);
 	/** @brief Honor a session hostgroup lock by skipping automatic PolarDB routing. */
-	bool polardb_apply_locked_hostgroup_route(const char* stage);
+	bool polardb_apply_locked_hostgroup_route(
+		const char* stage, bool require_current_match = false);
 	/** @brief Redispatch the original client query on an existing live writer. */
 	bool polardb_try_redispatch_to_writer(PolarDB_ReaderFailure& failure,
 		int writer_hg, PgSQL_Backend* writer_backend);
@@ -1191,13 +1374,12 @@ private:
 	void polardb_release_wait_reader(PgSQL_Data_Stream* failed_myds,
 		bool can_return_to_pool);
 	/** @brief Build the XID + strict LSN wait wrapper for transaction split. */
-	bool polardb_build_txn_split_wrapped_query(const PtrSize_t& pkt,
+	uint32_t polardb_build_txn_split_wrapped_query(const PtrSize_t& pkt,
 		const PolarDB_WaitSpec& wait_spec, std::string_view txn_xids,
-		std::string& wrapped_query);
-	/** @brief Forward the reader error and mark the client transaction failed. */
+		bool bypass_wait, std::string& wrapped_query);
+	/** @brief Forward captured reader error and keep the transaction on writer. */
 	PolarDB_FailureAction polardb_forward_and_continue(
 		PolarDB_ReaderFailure& failure);
-	void polardb_end_writer_transaction_after_reader_error();
 	/** @brief Emit ErrorResponse plus ReadyForQuery with explicit txn status. */
 	void polardb_forward_reader_error(const PolarDB_ReaderFailure& failure,
 		char rfq);
@@ -1205,7 +1387,7 @@ private:
 	PolarDB_FailureAction polardb_terminate_reader(
 		PolarDB_ReaderFailure& failure);
 	/** @brief Split-read state teardown for handled reader failure. */
-	void polardb_finish_reader_failure_split_op(PolarDB_ReaderFailure& failure);
+	void polardb_finish_reader_failure_split_op();
 	/** @brief Error accounting and dead-reader marking for handled failures. */
 	void polardb_record_reader_failure_status(
 		const PolarDB_ReaderFailure& failure);
@@ -1218,10 +1400,10 @@ private:
 	/**
 	 * @brief Stop safely when the wait wrapper cannot be built or installed.
 	 *
-	 * Counts the abort, logs @p reason, sets polardb_wait_disabled so later
-	 * reads in this session go to the writer until RESET, and clears the half-built
-	 * wrapper and wait state. Always returns PolarDB_WrapFinalizeResult::FAILED; the
-	 * caller must stop before running the query and return a clean error.
+	 * Counts the abort, logs @p reason, records that later reads in this session
+	 * must use the writer until RESET, and clears the half-built wrapper and wait
+	 * state. Always returns PolarDB_WrapFinalizeResult::FAILED; the caller must
+	 * stop before running the query and return a clean error.
 	 */
 	PolarDB_WrapFinalizeResult fail_wait_wrap_finalize(const char* reason);
 	/** @brief Capture retry-relevant details from a failed wait-wrapped replica read. */

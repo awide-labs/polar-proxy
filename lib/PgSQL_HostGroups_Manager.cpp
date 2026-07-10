@@ -4,6 +4,7 @@ using json = nlohmann::json;
 
 #include "PgSQL_HostGroups_Manager.h"
 #include "PgSQL_PolarDB.h"
+#include "PgSQL_PolarDB_HGM_Internal.h"
 #include "ConnectionPoolDecision.h"
 #include "proxysql.h"
 #include "cpp.h"
@@ -16,6 +17,7 @@ using json = nlohmann::json;
 
 #include <memory>
 #include <algorithm>
+#include <chrono>
 #include <pthread.h>
 #include <cstdio>
 #include <cstdlib>
@@ -35,6 +37,9 @@ using json = nlohmann::json;
 
 #define char_malloc (char *)malloc
 
+#if POLARDB_PROXY
+#endif // POLARDB_PROXY
+
 #include "thread.h"
 #include "wqueue.h"
 
@@ -46,28 +51,9 @@ using json = nlohmann::json;
 
 using std::function;
 
-#if POLARDB_PROXY && POLARDB_DEBUG
-static bool polardb_debug_reader_acquire_fault(const char* fault_name) {
-	// One shared fault file is probed once per candidate fault name, so the clear
-	// is match-gated: a non-matching probe must leave the file intact for the
-	// matching probe that follows.
-	char buf[64] = {0};
-	bool matched = false;
-	if (polardb_debug_consume_fault_file(
-			"POLARDB_DEBUG_READER_ACQUIRE_FAULT_FILE", buf, sizeof(buf))) {
-		matched = (strcmp(buf, fault_name) == 0);
-	}
-
-	if (matched) {
-		polardb_debug_clear_fault_file("POLARDB_DEBUG_READER_ACQUIRE_FAULT_FILE");
-	}
-	return matched;
-}
-#endif // POLARDB_PROXY && POLARDB_DEBUG
-
 #if POLARDB_PROXY && POLARDB_PROFILE
 #define POLARDB_PROFILE_STATUS_COUNT(name, value) \
-	status.polardb_##name.fetch_add((value), std::memory_order_relaxed)
+	POLARDB_HGM_PROFILE_STATUS_COUNT(status, name, value)
 #define POLARDB_PROFILE_STATUS_COUNT_ONE(name) \
 	POLARDB_PROFILE_STATUS_COUNT(name, 1)
 #else
@@ -77,7 +63,7 @@ static bool polardb_debug_reader_acquire_fault(const char* fault_name) {
 
 #if POLARDB_PROXY
 #define POLARDB_STATUS_COUNT(name, value) \
-	status.polardb_##name.fetch_add((value), std::memory_order_relaxed)
+	POLARDB_HGM_STATUS_COUNT(status, name, value)
 #define POLARDB_STATUS_COUNT_ONE(name) \
 	POLARDB_STATUS_COUNT(name, 1)
 #endif // POLARDB_PROXY
@@ -127,7 +113,7 @@ static bool polardb_atomic_max_u64(
 
 #endif // POLARDB_PROXY
 
-static bool pgsql_connection_creation_throttled_locked(PgSQL_SrvC* mysrvc) {
+bool pgsql_connection_creation_throttled_locked(PgSQL_SrvC* mysrvc) {
 	unsigned long long curtime = monotonic_time();
 	curtime = curtime / 1000 / 1000; // convert to second
 	PgSQL_HGC* myhgc = mysrvc->myhgc;
@@ -150,7 +136,7 @@ static bool pgsql_connection_creation_throttled_locked(PgSQL_SrvC* mysrvc) {
 	return false;
 }
 
-static PgSQL_Connection* pgsql_create_backend_connection_locked(PgSQL_SrvC* mysrvc) {
+PgSQL_Connection* pgsql_create_backend_connection_locked(PgSQL_SrvC* mysrvc) {
 	PgSQL_Connection* conn = new PgSQL_Connection(false);
 	conn->parent = mysrvc;
 	// if attributes.multiplex == true , STATUS_PGSQL_CONNECTION_NO_MULTIPLEX_HG is set to false. And vice-versa
@@ -163,14 +149,20 @@ static PgSQL_Connection* pgsql_create_backend_connection_locked(PgSQL_SrvC* mysr
 	return conn;
 }
 
-#if POLARDB_PROXY
-static bool pgsql_srv_latency_allowed(const PgSQL_SrvC* mysrvc) {
-	unsigned int max_latency_us = mysrvc->max_latency_us
+unsigned int pgsql_srv_latency_limit_us(const PgSQL_SrvC* mysrvc) {
+	return mysrvc->max_latency_us
 		? mysrvc->max_latency_us
 		: pgsql_thread___default_max_latency_ms * 1000;
+}
+
+bool pgsql_srv_latency_allowed(const PgSQL_SrvC* mysrvc) {
+	unsigned int max_latency_us = pgsql_srv_latency_limit_us(mysrvc);
+	// ProxySQL uses 0 for max_latency_ms/default_max_latency_ms as no limit.
+	if (max_latency_us == 0) {
+		return true;
+	}
 	return mysrvc->current_latency_us < max_latency_us;
 }
-#endif
 
 /**
  * @brief Helper function used to try to extract a value from the JSON field 'servers_defaults'.
@@ -327,35 +319,277 @@ void PgSQL_Errors_stats::free_row(char** pta) {
 }
 
 PgSQL_Connection *PgSQL_SrvConnList::index(unsigned int _k) {
-	return (PgSQL_Connection *)conns->index(_k);
+#if POLARDB_PROXY
+	std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
+#endif // POLARDB_PROXY
+	return _k < conns->len
+		? static_cast<PgSQL_Connection*>(conns->index(_k))
+		: nullptr;
 }
+
+#if POLARDB_PROXY
+static void pgsql_polardb_drop_classic_free_locked(
+		PgSQL_SrvC* mysrvc, unsigned int count) {
+	while (mysrvc && count > 0 && mysrvc->ConnectionsFree &&
+			mysrvc->ConnectionsFree->conns_length() > 0) {
+		PgSQL_Connection* conn = mysrvc->ConnectionsFree->remove(0);
+		delete conn;
+		count--;
+	}
+}
+
+static bool pgsql_polardb_prepare_classic_create_locked(
+		PgSQL_SrvC* mysrvc, unsigned int preferred_classic_evict) {
+	if (!mysrvc || mysrvc->max_connections <= 0 || !mysrvc->ConnectionsFree) {
+		return false;
+	}
+	const unsigned int max_connections =
+		static_cast<unsigned int>(mysrvc->max_connections);
+	PolarDB_PoolConnStats capacity = mysrvc->polardb_pool_conn_stats();
+	if (capacity.active() >= max_connections) {
+		return false;
+	}
+
+	unsigned int required_free = 0;
+	if (capacity.total() >= max_connections) {
+		required_free = capacity.total() - max_connections + 1;
+	}
+	unsigned int classic_to_evict = preferred_classic_evict;
+	if (classic_to_evict < required_free) {
+		classic_to_evict = required_free;
+	}
+	const unsigned int classic_free =
+		mysrvc->ConnectionsFree->conns_length();
+	const unsigned int drop_classic =
+		classic_to_evict < classic_free ? classic_to_evict : classic_free;
+	pgsql_polardb_drop_classic_free_locked(mysrvc, drop_classic);
+
+	capacity = mysrvc->polardb_pool_conn_stats();
+
+	return capacity.active() < max_connections &&
+		capacity.total() < max_connections;
+}
+#endif // POLARDB_PROXY
+
+int PgSQL_SrvConnList::find_idx(PgSQL_Connection* conn) {
+	if (!conn) {
+		return -1;
+	}
+#if POLARDB_PROXY
+	const unsigned int position = conn->polardb_core_pool_position;
+	if (position < conns->len && conns->index(position) == conn) {
+		return static_cast<int>(position);
+	}
+#endif // POLARDB_PROXY
+	for (unsigned int index = 0; index < conns->len; index++) {
+		if (conns->index(index) == conn) {
+#if POLARDB_PROXY
+			conn->polardb_core_pool_position = index;
+#endif // POLARDB_PROXY
+			return static_cast<int>(index);
+		}
+	}
+#if POLARDB_PROXY
+	conn->polardb_core_pool_position = UINT32_MAX;
+#endif // POLARDB_PROXY
+	return -1;
+}
+
+#if POLARDB_PROXY
+void PgSQL_SrvConnList::unindex_unlocked(PgSQL_Connection* conn) {
+	auto reverse = match_key_by_connection.find(conn);
+	if (reverse == match_key_by_connection.end()) {
+		return;
+	}
+	auto indexed = matching_by_key.find(reverse->second);
+	if (indexed != matching_by_key.end()) {
+		auto& entries = indexed->second;
+		for (size_t i = 0; i < entries.size(); i++) {
+			if (entries[i] == conn) {
+				entries[i] = entries.back();
+				entries.pop_back();
+				break;
+			}
+		}
+		if (entries.empty()) {
+			matching_by_key.erase(indexed);
+		}
+	}
+	match_key_by_connection.erase(reverse);
+}
+#endif // POLARDB_PROXY
+
+void PgSQL_SrvConnList::add_unlocked(
+		PgSQL_Connection* conn, const PgSQL_PoolMatchKey* key) {
+#if POLARDB_PROXY
+	conn->polardb_core_pool_position = conns->len;
+#endif // POLARDB_PROXY
+	conns->add(conn);
+#if POLARDB_PROXY
+	if (used_list) {
+		mysrvc->pool_used_count.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		mysrvc->pool_free_count.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (key && !key->empty()) {
+		match_key_by_connection[conn] = *key;
+		if (!used_list) {
+			matching_by_key[*key].push_back(conn);
+		}
+	}
+#endif // POLARDB_PROXY
+}
+
+#if POLARDB_PROXY
+bool PgSQL_SrvConnList::match_key_unlocked(
+		PgSQL_Connection* conn, PgSQL_PoolMatchKey* key) const {
+	if (!conn || !key) {
+		return false;
+	}
+	auto found = match_key_by_connection.find(conn);
+	if (found == match_key_by_connection.end()) {
+		return false;
+	}
+	*key = found->second;
+	return true;
+}
+#endif // POLARDB_PROXY
+
+PgSQL_Connection* PgSQL_SrvConnList::remove_position_unlocked(
+		unsigned int index) {
+	if (index >= conns->len) {
+		return nullptr;
+	}
+	PgSQL_Connection* conn =
+		static_cast<PgSQL_Connection*>(conns->index(index));
+#if POLARDB_PROXY
+	PgSQL_Connection* last = static_cast<PgSQL_Connection*>(
+		conns->index(conns->len - 1));
+#endif // POLARDB_PROXY
+	conn = static_cast<PgSQL_Connection*>(
+		conns->remove_index_fast(index));
+#if POLARDB_PROXY
+	conn->polardb_core_pool_position = UINT32_MAX;
+	if (index < conns->len) {
+		last->polardb_core_pool_position = index;
+	}
+#endif // POLARDB_PROXY
+#if POLARDB_PROXY
+	std::atomic<unsigned int>& count = used_list
+		? mysrvc->pool_used_count : mysrvc->pool_free_count;
+	const unsigned int current = count.load(std::memory_order_relaxed);
+	if (current > 0) {
+		count.fetch_sub(1, std::memory_order_relaxed);
+	} else {
+		proxy_error(
+			"PostgreSQL core pool count underflow on %s:%u list=%s\n",
+			mysrvc->address ? mysrvc->address : "(null)", mysrvc->port,
+			used_list ? "USED" : "FREE");
+	}
+#endif // POLARDB_PROXY
+	return conn;
+}
+
+PgSQL_Connection* PgSQL_SrvConnList::remove_unlocked(unsigned int index) {
+	if (index >= conns->len) {
+		return nullptr;
+	}
+#if POLARDB_PROXY
+	PgSQL_Connection* conn =
+		static_cast<PgSQL_Connection*>(conns->index(index));
+	unindex_unlocked(conn);
+#endif // POLARDB_PROXY
+	return remove_position_unlocked(index);
+}
+
+#if POLARDB_PROXY
+PgSQL_Connection* PgSQL_SrvConnList::remove_matching_unlocked(
+		const PgSQL_PoolMatchKey& key) {
+	auto indexed = matching_by_key.find(key);
+	if (indexed == matching_by_key.end() || indexed->second.empty()) {
+		return nullptr;
+	}
+	PgSQL_Connection* conn = indexed->second.back();
+	const int index = find_idx(conn);
+	if (index < 0) {
+		// Repair an impossible stale index entry without returning a pointer
+		// that is not owned by this FREE list.
+		unindex_unlocked(conn);
+		return nullptr;
+	}
+	indexed->second.pop_back();
+	if (indexed->second.empty()) {
+		matching_by_key.erase(indexed);
+	}
+	match_key_by_connection.erase(conn);
+	return remove_position_unlocked(static_cast<unsigned int>(index));
+}
+#endif // POLARDB_PROXY
 
 PgSQL_Connection * PgSQL_SrvConnList::remove(int _k) {
-	return (PgSQL_Connection *)conns->remove_index_fast(_k);
+#if POLARDB_PROXY
+	std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
+#endif // POLARDB_PROXY
+	return _k >= 0 ? remove_unlocked(static_cast<unsigned int>(_k)) : nullptr;
 }
 
-PgSQL_SrvConnList::PgSQL_SrvConnList(PgSQL_SrvC *_mysrvc) {
+PgSQL_SrvConnList::PgSQL_SrvConnList(PgSQL_SrvC *_mysrvc, bool used) {
 	mysrvc=_mysrvc;
+	used_list=used;
 	conns=new PtrArray();
 }
 
 void PgSQL_SrvConnList::add(PgSQL_Connection *c) {
-	conns->add(c);
+#if POLARDB_PROXY
+	std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
+#endif // POLARDB_PROXY
+	add_unlocked(c);
+}
+
+void PgSQL_SrvConnList::remove(PgSQL_Connection* conn) {
+#if POLARDB_PROXY
+	std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
+#endif // POLARDB_PROXY
+	const int index = find_idx(conn);
+	if (index < 0) {
+		proxy_error(
+			"PostgreSQL core pool remove missed connection %p on %s:%u list=%s\n",
+			(void*)conn, mysrvc->address ? mysrvc->address : "(null)",
+			mysrvc->port, used_list ? "USED" : "FREE");
+		return;
+	}
+	(void)remove_unlocked(static_cast<unsigned int>(index));
+}
+
+unsigned int PgSQL_SrvConnList::conns_length() {
+#if POLARDB_PROXY
+	return used_list
+		? mysrvc->pool_used_count.load(std::memory_order_relaxed)
+		: mysrvc->pool_free_count.load(std::memory_order_relaxed);
+#else
+	return conns->len;
+#endif // POLARDB_PROXY
 }
 
 PgSQL_SrvConnList::~PgSQL_SrvConnList() {
-	mysrvc=NULL;
+#if POLARDB_PROXY
+	std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
+#endif // POLARDB_PROXY
 	while (conns_length()) {
-		PgSQL_Connection *conn=(PgSQL_Connection *)conns->remove_index_fast(0);
+		PgSQL_Connection *conn=remove_unlocked(0);
 		delete conn;
 	}
 	delete conns;
+	mysrvc=NULL;
 }
 
 void PgSQL_SrvConnList::drop_all_connections() {
+#if POLARDB_PROXY
+	std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
+#endif // POLARDB_PROXY
 	proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Dropping all connections (%u total) on PgSQL_SrvConnList %p for server %s:%d , hostgroup=%d , status=%d\n", conns_length(), this, mysrvc->address, mysrvc->port, mysrvc->myhgc->hid, mysrvc->status);
 	while (conns_length()) {
-		PgSQL_Connection *conn=(PgSQL_Connection *)conns->remove_index_fast(0);
+		PgSQL_Connection *conn=remove_unlocked(0);
 		delete conn;
 	}
 }
@@ -391,29 +625,258 @@ PgSQL_SrvC::PgSQL_SrvC(
 	//charset=_charset;
 	myhgc=NULL;
 	comment=strdup(_comment);
-	ConnectionsUsed=new PgSQL_SrvConnList(this);
-	ConnectionsFree=new PgSQL_SrvConnList(this);
+	ConnectionsUsed=new PgSQL_SrvConnList(this, /*used=*/true);
+	ConnectionsFree=new PgSQL_SrvConnList(this, /*used=*/false);
 #if POLARDB_PROXY
-	routing_status.store((int)_status, std::memory_order_relaxed);
+	polardb_fast_status.store((int)_status, std::memory_order_relaxed);
 #endif // POLARDB_PROXY
 }
 
-void PgSQL_SrvC::set_status(enum MySerStatus new_status) {
-	status = new_status;
 #if POLARDB_PROXY
-	routing_status.store((int)new_status, std::memory_order_release);
-#endif // POLARDB_PROXY
+PgSQL_Connection* PgSQL_SrvC::take_matching_connection(
+		const PgSQL_PoolMatchKey& key) {
+	std::lock_guard<std::recursive_mutex> pool_lock(pool_mutex);
+	if (status != MYSQL_SERVER_STATUS_ONLINE || !ConnectionsFree ||
+			!ConnectionsUsed) {
+		return nullptr;
+	}
+	PgSQL_Connection* conn =
+		ConnectionsFree->remove_matching_unlocked(key);
+	if (!conn) {
+		return nullptr;
+	}
+	ConnectionsUsed->add_unlocked(conn, &key);
+	return conn;
 }
 
-enum MySerStatus PgSQL_SrvC::status_for_routing() const {
+PgSQL_PoolGetResult PgSQL_SrvC::take_existing_connection(
+		PgSQL_Session* sess, const PgSQL_PoolMatchKey& key,
+		PgSQL_PoolGetMode mode, unsigned long long* lock_wait_us,
+		unsigned long long* lock_hold_us) {
+	PgSQL_PoolGetResult result;
+	if (lock_wait_us) {
+		*lock_wait_us = 0;
+	}
+	if (lock_hold_us) {
+		*lock_hold_us = 0;
+	}
+#if POLARDB_PROXY && POLARDB_PROFILE
+	const unsigned long long wait_started_at = monotonic_time();
+#endif // POLARDB_PROXY && POLARDB_PROFILE
+	std::unique_lock<std::recursive_mutex> pool_lock(pool_mutex);
+#if POLARDB_PROXY && POLARDB_PROFILE
+	const unsigned long long lock_acquired_at = monotonic_time();
+	if (lock_wait_us) {
+		*lock_wait_us = lock_acquired_at - wait_started_at;
+	}
+#endif // POLARDB_PROXY && POLARDB_PROFILE
+
+	if (status == MYSQL_SERVER_STATUS_ONLINE && ConnectionsFree &&
+			ConnectionsUsed) {
+		if (pgsql_pool_get_mode_has(mode,
+				PgSQL_PoolGetMode::ALLOW_EXACT_MATCH)) {
+			result.conn = ConnectionsFree->remove_matching_unlocked(key);
+			if (result.conn) {
+				ConnectionsUsed->add_unlocked(result.conn);
+				result.source = PgSQL_PoolGetSource::EXACT_MATCH;
+			}
+		}
+		if (!result.conn && pgsql_pool_get_mode_has(
+				mode, PgSQL_PoolGetMode::ALLOW_RESET)) {
+			// only_pooled=true is deliberate. This may take a connection for
+			// the same user and database that can be made ready by resetting it.
+			// It must not create or return the quality-0 random fallback.
+			result.conn =
+				ConnectionsFree->get_random_MyConn(sess, false, true);
+			if (result.conn) {
+				ConnectionsUsed->add_unlocked(result.conn);
+				result.source = PgSQL_PoolGetSource::RESET;
+			}
+		}
+	}
+
+#if POLARDB_PROXY && POLARDB_PROFILE
+	if (lock_hold_us) {
+		*lock_hold_us = monotonic_time() - lock_acquired_at;
+	}
+#endif // POLARDB_PROXY && POLARDB_PROFILE
+	return result;
+}
+#endif // POLARDB_PROXY
+
+PgSQL_Connection* PgSQL_SrvC::take_free_connection_for_ping(
+		PgSQL_Connection* conn, unsigned long long max_last_time_used) {
+	if (!conn) {
+		return nullptr;
+	}
 #if POLARDB_PROXY
-	return (enum MySerStatus)routing_status.load(std::memory_order_acquire);
+	std::lock_guard<std::recursive_mutex> pool_lock(pool_mutex);
+#endif // POLARDB_PROXY
+	if (status != MYSQL_SERVER_STATUS_ONLINE || !ConnectionsFree ||
+			!ConnectionsUsed) {
+		return nullptr;
+	}
+	const int index = ConnectionsFree->find_idx(conn);
+	if (index < 0 || !conn->last_time_used ||
+			conn->last_time_used >= max_last_time_used) {
+		return nullptr;
+	}
+#if POLARDB_PROXY
+	PgSQL_PoolMatchKey key;
+	const bool has_key = ConnectionsFree->match_key_unlocked(conn, &key);
+#endif // POLARDB_PROXY
+	PgSQL_Connection* selected = ConnectionsFree->remove_unlocked(
+		static_cast<unsigned int>(index));
+	if (!selected) {
+		return nullptr;
+	}
+#if POLARDB_PROXY
+	ConnectionsUsed->add_unlocked(selected, has_key ? &key : nullptr);
 #else
-	return status;
+	ConnectionsUsed->add_unlocked(selected);
 #endif // POLARDB_PROXY
+	return selected;
 }
 
 #if POLARDB_PROXY
+bool PgSQL_SrvC::add_matching_connection(
+		PgSQL_Connection* conn, const PgSQL_PoolMatchKey& key) {
+	if (!conn) {
+		return false;
+	}
+	std::lock_guard<std::recursive_mutex> pool_lock(pool_mutex);
+	if (status != MYSQL_SERVER_STATUS_ONLINE || !ConnectionsFree) {
+		return false;
+	}
+	ConnectionsFree->add_unlocked(conn, &key);
+	return true;
+}
+
+bool PgSQL_SrvC::add_used_matching_connection(
+		PgSQL_Connection* conn, const PgSQL_PoolMatchKey& key) {
+	if (!conn) {
+		return false;
+	}
+	std::lock_guard<std::recursive_mutex> pool_lock(pool_mutex);
+	if (status != MYSQL_SERVER_STATUS_ONLINE || !ConnectionsUsed) {
+		return false;
+	}
+	ConnectionsUsed->add_unlocked(conn, &key);
+	return true;
+}
+
+bool PgSQL_SrvC::return_matching_connection(
+		PgSQL_Connection* conn, const PgSQL_PoolMatchKey& key,
+		unsigned long long* lock_wait_us,
+		unsigned long long* lock_hold_us) {
+	if (!conn) {
+		return false;
+	}
+	if (lock_wait_us) {
+		*lock_wait_us = 0;
+	}
+	if (lock_hold_us) {
+		*lock_hold_us = 0;
+	}
+#if POLARDB_PROXY && POLARDB_PROFILE
+	const unsigned long long wait_started_at = monotonic_time();
+#endif // POLARDB_PROXY && POLARDB_PROFILE
+	std::unique_lock<std::recursive_mutex> pool_lock(pool_mutex);
+#if POLARDB_PROXY && POLARDB_PROFILE
+	const unsigned long long lock_acquired_at = monotonic_time();
+	if (lock_wait_us) {
+		*lock_wait_us = lock_acquired_at - wait_started_at;
+	}
+#endif // POLARDB_PROXY && POLARDB_PROFILE
+	const int index = ConnectionsUsed ? ConnectionsUsed->find_idx(conn) : -1;
+	if (index < 0) {
+#if POLARDB_PROXY && POLARDB_PROFILE
+		if (lock_hold_us) {
+			*lock_hold_us = monotonic_time() - lock_acquired_at;
+		}
+#endif // POLARDB_PROXY && POLARDB_PROFILE
+		proxy_error(
+			"PostgreSQL core could not return matching USED connection %p on %s:%u\n",
+			(void*)conn, address ? address : "(null)", port);
+		return false;
+	}
+	(void)ConnectionsUsed->remove_unlocked(static_cast<unsigned int>(index));
+	if (status != MYSQL_SERVER_STATUS_ONLINE) {
+#if POLARDB_PROXY && POLARDB_PROFILE
+		if (lock_hold_us) {
+			*lock_hold_us = monotonic_time() - lock_acquired_at;
+		}
+#endif // POLARDB_PROXY && POLARDB_PROFILE
+		return false;
+	}
+	ConnectionsFree->add_unlocked(conn, &key);
+#if POLARDB_PROXY && POLARDB_PROFILE
+	if (lock_hold_us) {
+		*lock_hold_us = monotonic_time() - lock_acquired_at;
+	}
+#endif // POLARDB_PROXY && POLARDB_PROFILE
+	return true;
+}
+
+bool PgSQL_SrvC::used_connection_match_key(
+		PgSQL_Connection* conn, PgSQL_PoolMatchKey* key) const {
+	std::lock_guard<std::recursive_mutex> pool_lock(pool_mutex);
+	return ConnectionsUsed &&
+		ConnectionsUsed->match_key_unlocked(conn, key);
+}
+
+unsigned int PgSQL_SrvC::matching_connection_count(
+		const PgSQL_PoolMatchKey& key) const {
+	std::lock_guard<std::recursive_mutex> pool_lock(pool_mutex);
+	if (!ConnectionsFree) {
+		return 0;
+	}
+	auto found = ConnectionsFree->matching_by_key.find(key);
+	return found == ConnectionsFree->matching_by_key.end()
+		? 0U : static_cast<unsigned int>(found->second.size());
+}
+
+bool PgSQL_SrvC::remove_used_connection(PgSQL_Connection* conn) {
+	if (!conn) {
+		return false;
+	}
+	std::lock_guard<std::recursive_mutex> pool_lock(pool_mutex);
+	const int index = ConnectionsUsed ? ConnectionsUsed->find_idx(conn) : -1;
+	if (index < 0) {
+		return false;
+	}
+	(void)ConnectionsUsed->remove_unlocked(static_cast<unsigned int>(index));
+	return true;
+}
+
+bool PgSQL_SrvC::remove_free_connection(PgSQL_Connection* conn) {
+	if (!conn) {
+		return false;
+	}
+	std::lock_guard<std::recursive_mutex> pool_lock(pool_mutex);
+	const int index = ConnectionsFree ? ConnectionsFree->find_idx(conn) : -1;
+	if (index < 0) {
+		return false;
+	}
+	(void)ConnectionsFree->remove_unlocked(static_cast<unsigned int>(index));
+	return true;
+}
+#endif // POLARDB_PROXY
+
+#if POLARDB_PROXY
+void PgSQL_SrvC::set_status(enum MySerStatus new_status) {
+	std::lock_guard<std::recursive_mutex> pool_lock(pool_mutex);
+	status = new_status;
+	polardb_fast_status.store((int)new_status, std::memory_order_release);
+	if (new_status == MYSQL_SERVER_STATUS_OFFLINE_HARD) {
+		ConnectionsFree->drop_all_connections();
+	}
+}
+
+enum MySerStatus PgSQL_SrvC::polardb_fast_status_value() const {
+	return (enum MySerStatus)polardb_fast_status.load(std::memory_order_acquire);
+}
+
 bool PgSQL_SrvC::polardb_advance_lsn(uint64_t lsn, uint64_t observed_at_us) {
 	if (lsn == 0) return false;
 
@@ -424,6 +887,120 @@ bool PgSQL_SrvC::polardb_advance_lsn(uint64_t lsn, uint64_t observed_at_us) {
 	return advanced;
 }
 #endif // POLARDB_PROXY
+
+#if !POLARDB_PROXY
+void PgSQL_SrvC::set_status(enum MySerStatus new_status) {
+	status = new_status;
+}
+#endif // !POLARDB_PROXY
+
+static unsigned int pgsql_pool_report_conn_used(PgSQL_SrvC* mysrvc) {
+	if (!mysrvc) {
+		return 0;
+	}
+#if POLARDB_PROXY
+	return mysrvc->polardb_pool_conn_stats().active();
+#else
+	return mysrvc->ConnectionsUsed ? mysrvc->ConnectionsUsed->conns_length() : 0;
+#endif // POLARDB_PROXY
+}
+
+static unsigned int pgsql_pool_report_conn_free(PgSQL_SrvC* mysrvc) {
+	if (!mysrvc) {
+		return 0;
+	}
+#if POLARDB_PROXY
+	return mysrvc->polardb_pool_conn_stats().idle();
+#else
+	return mysrvc->ConnectionsFree ? mysrvc->ConnectionsFree->conns_length() : 0;
+#endif // POLARDB_PROXY
+}
+
+static bool pgsql_pool_no_live_connections(PgSQL_SrvC* mysrvc) {
+	if (!mysrvc) {
+		return true;
+	}
+#if POLARDB_PROXY
+	// FREE and USED must be observed under the same server lock. A connection
+	// transfer changes the two counts separately while holding this lock; two
+	// unlocked reads could otherwise mistake that brief transfer for an empty
+	// server and allow topology cleanup to retire it.
+	std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
+#endif // POLARDB_PROXY
+	const bool core_empty =
+		(!mysrvc->ConnectionsUsed ||
+			mysrvc->ConnectionsUsed->conns_length() == 0) &&
+		(!mysrvc->ConnectionsFree ||
+			mysrvc->ConnectionsFree->conns_length() == 0);
+	return core_empty;
+}
+
+void pgsql_pool_status_count(
+	unsigned long* counter, unsigned long value
+) {
+	__sync_fetch_and_add(counter, value);
+}
+
+void pgsql_pool_status_count_get(
+	PgSQL_Thread* thread, unsigned long* fallback_counter, unsigned long value
+) {
+	if (thread) {
+		thread->status_variables.pgconnpoll_get += value;
+	} else {
+		pgsql_pool_status_count(fallback_counter, value);
+	}
+}
+
+void pgsql_pool_status_count_get_ok(
+	PgSQL_Thread* thread, unsigned long* fallback_counter, unsigned long value
+) {
+	if (thread) {
+		thread->status_variables.pgconnpoll_get_ok += value;
+	} else {
+		pgsql_pool_status_count(fallback_counter, value);
+	}
+}
+
+unsigned long pgsql_pool_status_read(unsigned long* counter) {
+	return __atomic_load_n(counter, __ATOMIC_RELAXED);
+}
+
+unsigned long pgsql_pool_status_read_get(unsigned long* fallback_counter) {
+	unsigned long long total =
+		__atomic_load_n(fallback_counter, __ATOMIC_RELAXED);
+	if (GloPTH) {
+		total += GloPTH->get_pgconnpoll_get();
+	}
+	return static_cast<unsigned long>(total);
+}
+
+unsigned long pgsql_pool_status_read_get_ok(unsigned long* fallback_counter) {
+	unsigned long long total =
+		__atomic_load_n(fallback_counter, __ATOMIC_RELAXED);
+	if (GloPTH) {
+		total += GloPTH->get_pgconnpoll_get_ok();
+	}
+	return static_cast<unsigned long>(total);
+}
+
+static void pgsql_pool_trim_idle_connections_to_max(PgSQL_SrvC* mysrvc) {
+	if (!mysrvc || !mysrvc->ConnectionsFree) {
+		return;
+	}
+#if POLARDB_PROXY
+	std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
+#endif // POLARDB_PROXY
+	const unsigned int max_connections =
+		mysrvc->max_connections > 0
+			? static_cast<unsigned int>(mysrvc->max_connections)
+			: 0;
+	while (mysrvc->ConnectionsFree->conns_length() &&
+			mysrvc->ConnectionsUsed->conns_length() +
+				mysrvc->ConnectionsFree->conns_length() > max_connections) {
+		PgSQL_Connection* conn = mysrvc->ConnectionsFree->remove(0);
+		delete conn;
+	}
+}
 
 void PgSQL_SrvC::connect_error(int err_num, bool get_mutex) {
 	// NOTE: this function operates without any mutex
@@ -1027,19 +1604,43 @@ PgSQL_HostGroups_Manager::PgSQL_HostGroups_Manager() {
 	init_prometheus_dyn_gauge_array<PgSQL_hg_metrics_map_idx, PgSQL_p_hg_dyn_gauge>(hg_metrics_map, this->status.p_dyn_gauge_array);
 
 	pthread_mutex_init(&pgsql_errors_mutex, NULL);
+#if POLARDB_PROXY
+	pthread_rwlock_init(&polardb_fast_topology_lock, NULL);
+	polardb_update_server_list_snapshot_locked();
+	polardb_reader_pool_.reset(new PgSQL_PolarDB_ReaderPool(this));
+#endif // POLARDB_PROXY
 }
 
 void PgSQL_HostGroups_Manager::init() {
-	// do nothing here
+#if POLARDB_PROXY
+	if (polardb_reader_pool_) {
+		polardb_reader_pool_->start();
+	}
+#endif // POLARDB_PROXY
 }
 
 void PgSQL_HostGroups_Manager::shutdown() {
+#if POLARDB_PROXY
+	shutdown_split_warmup_thread();
+#endif // POLARDB_PROXY
 	pthread_mutex_lock(&pgsql_errors_mutex);
 	pgsql_errors_umap.clear();
 	pthread_mutex_unlock(&pgsql_errors_mutex);
 }
 
 PgSQL_HostGroups_Manager::~PgSQL_HostGroups_Manager() {
+#if POLARDB_PROXY
+	shutdown_split_warmup_thread();
+	std::shared_ptr<const PolarDB_ServerListSnapshot> empty_server_snapshot;
+	std::atomic_store_explicit(&polardb_server_list_snapshot_,
+		empty_server_snapshot, std::memory_order_release);
+	polardb_retired_server_list_snapshots_.clear();
+	for (PolarDB_RetiredServer& retired : polardb_retired_servers_) {
+		delete retired.srv;
+		retired.srv = nullptr;
+	}
+	polardb_retired_servers_.clear();
+#endif // POLARDB_PROXY
 	while (MyHostGroups->len) {
 		PgSQL_HGC *myhgc=(PgSQL_HGC *)MyHostGroups->remove_index_fast(0);
 		delete myhgc;
@@ -1049,8 +1650,129 @@ PgSQL_HostGroups_Manager::~PgSQL_HostGroups_Manager() {
 	if (admindb) {
 		delete admindb;
 	}
+#if POLARDB_PROXY
+	pthread_rwlock_destroy(&polardb_fast_topology_lock);
+#endif // POLARDB_PROXY
 	pthread_mutex_destroy(&lock);
 }
+
+#if POLARDB_PROXY
+void PgSQL_HostGroups_Manager::polardb_fast_topology_wrlock() {
+	pthread_rwlock_wrlock(&polardb_fast_topology_lock);
+}
+
+void PgSQL_HostGroups_Manager::polardb_fast_topology_unlock() {
+	pthread_rwlock_unlock(&polardb_fast_topology_lock);
+}
+
+void PgSQL_HostGroups_Manager::shutdown_split_warmup_thread() {
+	if (polardb_reader_pool_) {
+		polardb_reader_pool_->shutdown();
+	}
+}
+
+std::shared_ptr<const PgSQL_HostGroups_Manager::PolarDB_ServerListSnapshot>
+PgSQL_HostGroups_Manager::get_polardb_server_list_snapshot() const {
+	const uint64_t generation =
+		polardb_server_list_generation_.load(std::memory_order_acquire);
+	static thread_local const PgSQL_HostGroups_Manager* cached_owner = nullptr;
+	static thread_local uint64_t cached_generation = UINT64_MAX;
+	static thread_local std::shared_ptr<const PolarDB_ServerListSnapshot>
+		cached_snapshot;
+
+	if (cached_owner != this) {
+		cached_owner = this;
+		cached_generation = UINT64_MAX;
+		cached_snapshot.reset();
+	}
+	if (cached_generation != generation) {
+		cached_snapshot = std::atomic_load_explicit(
+			&polardb_server_list_snapshot_, std::memory_order_acquire);
+		cached_generation = cached_snapshot
+			? cached_snapshot->generation : generation;
+	}
+	return cached_snapshot;
+}
+
+void PgSQL_HostGroups_Manager::polardb_cleanup_retired_servers_locked() {
+	uint64_t oldest_active_generation = UINT64_MAX;
+	for (auto it = polardb_retired_server_list_snapshots_.begin();
+			it != polardb_retired_server_list_snapshots_.end();) {
+		if (!*it || it->use_count() == 1) {
+			it = polardb_retired_server_list_snapshots_.erase(it);
+			continue;
+		}
+		oldest_active_generation =
+			std::min(oldest_active_generation, (*it)->generation);
+		++it;
+	}
+
+	const uint64_t delete_before_generation =
+		oldest_active_generation == UINT64_MAX
+			? polardb_server_list_generation_.load(std::memory_order_relaxed) + 1
+			: oldest_active_generation;
+	auto out = polardb_retired_servers_.begin();
+	for (auto it = polardb_retired_servers_.begin();
+			it != polardb_retired_servers_.end(); ++it) {
+		if (it->generation < delete_before_generation) {
+			delete it->srv;
+			it->srv = nullptr;
+			continue;
+		}
+		if (out != it) {
+			*out = *it;
+		}
+		++out;
+	}
+	polardb_retired_servers_.erase(out, polardb_retired_servers_.end());
+}
+
+void PgSQL_HostGroups_Manager::polardb_retire_server_locked(PgSQL_SrvC* srv) {
+	if (!srv) {
+		return;
+	}
+	polardb_retired_servers_.push_back(PolarDB_RetiredServer{
+		srv,
+		polardb_server_list_generation_.load(std::memory_order_acquire)});
+}
+
+void PgSQL_HostGroups_Manager::polardb_update_server_list_snapshot_locked() {
+	auto next = std::make_shared<PolarDB_ServerListSnapshot>();
+	next->generation =
+		polardb_server_list_generation_.load(std::memory_order_relaxed) + 1;
+
+	for (unsigned int i = 0; MyHostGroups && i < MyHostGroups->len; i++) {
+		PgSQL_HGC* myhgc = static_cast<PgSQL_HGC*>(MyHostGroups->index(i));
+		if (!myhgc || !myhgc->mysrvs) {
+			continue;
+		}
+		PolarDB_ServerListEntry& entry = next->by_hostgroup[myhgc->hid];
+		entry.selection_sequence = myhgc->polardb_reader_selection_sequence;
+		std::vector<PgSQL_SrvC*>& servers = entry.servers;
+		const unsigned int count = myhgc->mysrvs->cnt();
+		servers.reserve(count);
+		for (unsigned int j = 0; j < count; j++) {
+			PgSQL_SrvC* srv = myhgc->mysrvs->idx(j);
+			if (srv) {
+				servers.push_back(srv);
+			}
+		}
+	}
+
+	std::shared_ptr<const PolarDB_ServerListSnapshot> old_snapshot =
+		std::atomic_load_explicit(&polardb_server_list_snapshot_,
+			std::memory_order_acquire);
+	if (old_snapshot) {
+		polardb_retired_server_list_snapshots_.push_back(old_snapshot);
+	}
+	std::shared_ptr<const PolarDB_ServerListSnapshot> current = next;
+	std::atomic_store_explicit(&polardb_server_list_snapshot_, current,
+		std::memory_order_release);
+	polardb_server_list_generation_.store(next->generation,
+		std::memory_order_release);
+	polardb_cleanup_retired_servers_locked();
+}
+#endif // POLARDB_PROXY
 
 void PgSQL_HostGroups_Manager::p_update_pgsql_error_counter(p_pgsql_error_type err_type, unsigned int hid, char* address, uint16_t port, unsigned int code) {
 	PgSQL_p_hg_dyn_counter::metric metric = PgSQL_p_hg_dyn_counter::pgsql_error;
@@ -1778,7 +2500,7 @@ bool PgSQL_HostGroups_Manager::commit(
  * 
  * @details The runtime pgsql_servers is now considered as a distinct module and have a separate checksum calculation.
  *    This is because the records in the runtime module may differ from those in the admin pgsql_servers module, which
- *	  can cause synchronization issues within the cluster.
+ *	  can leave cluster members with inconsistent state.
  * 
  * @param runtime_pgsql_servers resultset of runtime pgsql_servers or can be a nullptr.
 */
@@ -1811,21 +2533,36 @@ uint64_t PgSQL_HostGroups_Manager::get_pgsql_servers_checksum(SQLite3_result* ru
 }
 
 void PgSQL_HostGroups_Manager::purge_pgsql_servers_table() {
+#if POLARDB_PROXY
+	polardb_fast_topology_wrlock();
+	bool polardb_server_list_changed = false;
+#endif // POLARDB_PROXY
 	for (unsigned int i=0; i<MyHostGroups->len; i++) {
 		PgSQL_HGC *myhgc=(PgSQL_HGC *)MyHostGroups->index(i);
 		PgSQL_SrvC *mysrvc=NULL;
 		for (unsigned int j=0; j<myhgc->mysrvs->servers->len; j++) {
 			mysrvc=myhgc->mysrvs->idx(j);
 			if (mysrvc->status==MYSQL_SERVER_STATUS_OFFLINE_HARD) {
-				if (mysrvc->ConnectionsUsed->conns_length()==0 && mysrvc->ConnectionsFree->conns_length()==0) {
+				if (pgsql_pool_no_live_connections(mysrvc)) {
 					// no more connections for OFFLINE_HARD server, removing it
 					mysrvc=(PgSQL_SrvC *)myhgc->mysrvs->servers->remove_index_fast(j);
 					j--;
+#if POLARDB_PROXY
+					polardb_retire_server_locked(mysrvc);
+					polardb_server_list_changed = true;
+#else
 					delete mysrvc;
+#endif // POLARDB_PROXY
 				}
 			}
 		}
 	}
+#if POLARDB_PROXY
+	if (polardb_server_list_changed) {
+		polardb_update_server_list_snapshot_locked();
+	}
+	polardb_fast_topology_unlock();
+#endif // POLARDB_PROXY
 }
 
 
@@ -1968,7 +2705,7 @@ static int current_global_polardb_consistency_mode() {
 	return polardb_consistency_mode_from_string(value, POLARDB_CONSISTENCY_OFF);
 }
 
-static int current_global_polardb_proxy_protocol() {
+int current_global_polardb_proxy_protocol() {
 	const char* value = GloPTH ? GloPTH->variables.polardb_proxy_protocol : nullptr;
 	return polardb_proxy_protocol_from_string(value, POLARDB_PROXY_PROTOCOL_V15);
 }
@@ -2144,9 +2881,9 @@ void PgSQL_HostGroups_Manager::generate_pgsql_replication_hostgroups_table() {
 
 	next_polardb_snapshot->generation =
 		polardb_topology_generation_.load(std::memory_order_relaxed) + 1;
-	std::shared_ptr<const PolarDB_TopologySnapshot> published_snapshot =
+	std::shared_ptr<const PolarDB_TopologySnapshot> current_snapshot =
 		next_polardb_snapshot;
-	std::atomic_store_explicit(&polardb_topology_snapshot_, published_snapshot,
+	std::atomic_store_explicit(&polardb_topology_snapshot_, current_snapshot,
 		std::memory_order_release);
 	polardb_topology_generation_.store(next_polardb_snapshot->generation,
 		std::memory_order_release);
@@ -2259,14 +2996,136 @@ void PgSQL_HostGroups_Manager::increase_reset_counter() {
 	status.pgconnpoll_reset++;
 	wrunlock();
 }
+bool PgSQL_HostGroups_Manager::return_connection_with_match_key(
+		PgSQL_Connection* conn) {
+#if !POLARDB_PROXY
+	(void)conn;
+	return false;
+#else
+	if (!conn || !conn->parent) {
+		return false;
+	}
+#if POLARDB_PROXY
+	std::shared_ptr<const void> selected_server_snapshot =
+		conn->polardb_selected_server_snapshot;
+	(void)selected_server_snapshot;
+#endif // POLARDB_PROXY
+	PgSQL_SrvC* srv = static_cast<PgSQL_SrvC*>(conn->parent);
+	PgSQL_PoolMatchKey previous_match_key;
+	bool had_match_key = false;
+#if POLARDB_PROXY
+	had_match_key = !conn->polardb_pool_key.empty() ||
+		selected_server_snapshot != nullptr;
+#endif // POLARDB_PROXY
+	if (!had_match_key) {
+		had_match_key =
+			srv->used_connection_match_key(conn, &previous_match_key);
+	}
+#if POLARDB_PROXY
+	// A keyless classic connection remains on the classic return path. Only a
+	// connection that previously carried PolarDB match data needs its exact key
+	// rebuilt after a core maintenance use such as an idle ping.
+	if (!had_match_key && conn->polardb_pool_key.empty()) {
+		return false;
+	}
+#endif // POLARDB_PROXY
+	conn->auto_increment_delay_token = 0;
+	PgSQL_PoolMatchKey current_match_key = previous_match_key;
+	bool can_return = GloPTH != nullptr &&
+		conn->async_state_machine == ASYNC_IDLE &&
+		conn->largest_query_length <=
+			static_cast<unsigned int>(GloPTH->variables.threshold_query_length) &&
+		conn->local_stmts->get_num_backend_stmts() <=
+			static_cast<unsigned int>(GloPTH->variables.max_stmts_per_connection);
+	bool has_current_match_key = had_match_key;
+#if POLARDB_PROXY
+	if (can_return && polardb_reader_pool_) {
+		has_current_match_key =
+			polardb_reader_pool_->connection_match_key_for_return(
+				conn, &current_match_key);
+	}
+#endif // POLARDB_PROXY
+	if (!had_match_key && !has_current_match_key) {
+		return false;
+	}
+	pgsql_pool_status_count(&status.pgconnpoll_push);
+	if (can_return && has_current_match_key) {
+#if POLARDB_PROXY
+		// Keep the local snapshot above alive until the return is complete, but
+		// clear the connection's old snapshot while this thread still owns it.
+		// Another worker can take the connection as soon as it reaches FREE.
+		conn->polardb_selected_server_snapshot.reset();
+#endif // POLARDB_PROXY
+#if POLARDB_PROFILE
+		unsigned long long lock_wait_us = 0;
+		unsigned long long lock_hold_us = 0;
+		POLARDB_PROFILE_STATUS_COUNT_ONE(reader_pool_shared_return_attempt);
+		const bool returned = srv->return_matching_connection(
+			conn, current_match_key, &lock_wait_us, &lock_hold_us);
+		POLARDB_PROFILE_STATUS_COUNT(
+			reader_pool_shared_return_lock_wait_sum_us, lock_wait_us);
+		POLARDB_PROFILE_STATUS_COUNT(
+			reader_pool_shared_return_lock_hold_sum_us, lock_hold_us);
+		if (returned) {
+			POLARDB_PROFILE_STATUS_COUNT_ONE(
+				reader_pool_shared_return_accepted);
+		} else {
+			POLARDB_PROFILE_STATUS_COUNT_ONE(
+				reader_pool_shared_return_rejected);
+		}
+#else
+		const bool returned =
+			srv->return_matching_connection(conn, current_match_key);
+#endif // POLARDB_PROFILE
+		if (!returned) {
+			(void)srv->remove_used_connection(conn);
+			delete conn;
+			return true;
+		}
+#if POLARDB_PROXY
+		status.polardb_reader_pool_return_to_core.fetch_add(
+			1, std::memory_order_relaxed);
+#endif // POLARDB_PROXY
+		return true;
+	}
+	(void)srv->remove_used_connection(conn);
+	delete conn;
+	return true;
+#endif // !POLARDB_PROXY
+}
+
+#if POLARDB_PROXY
+PolarDB_ReaderLocalReturn
+PgSQL_HostGroups_Manager::polardb_reader_local_return_decision(
+		PgSQL_Connection* conn) {
+	return polardb_reader_pool_
+		? polardb_reader_pool_->local_return_decision(conn)
+		: PolarDB_ReaderLocalReturn::USE_SHARED_POOL;
+}
+#endif // POLARDB_PROXY
+
 void PgSQL_HostGroups_Manager::push_MyConn_to_pool(PgSQL_Connection *c, bool _lock) {
 	assert(c->parent);
-	PgSQL_SrvC *mysrvc=NULL;
+#if POLARDB_PROXY
+	std::shared_ptr<const void> selected_server_snapshot =
+		c->polardb_selected_server_snapshot;
+	c->polardb_selected_server_snapshot.reset();
+	(void)selected_server_snapshot;
+#endif // POLARDB_PROXY
+	PgSQL_SrvC *mysrvc=(PgSQL_SrvC *)c->parent;
+	if (return_connection_with_match_key(c)) {
+		return;
+	}
 	if (_lock)
 		wrlock();
 	c->auto_increment_delay_token = 0;
 	status.pgconnpoll_push++;
-	mysrvc=(PgSQL_SrvC *)c->parent;
+	// The global HGM lock protects topology/status and the pool status
+	// counters.  The selected-server lock makes the USED -> FREE transfer
+	// indivisible while a matching connection is being taken.
+#if POLARDB_PROXY
+	std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
+#endif // POLARDB_PROXY
 	proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Returning PgSQL_Connection %p, server %s:%d with status %d\n", c, mysrvc->address, mysrvc->port, mysrvc->status);
 	mysrvc->ConnectionsUsed->remove(c);
 	if (GloPTH == NULL) { goto __exit_push_MyConn_to_pool; }
@@ -2332,6 +3191,27 @@ PgSQL_SrvC *PgSQL_HGC::get_random_MySrvC(char * gtid_uuid, uint64_t gtid_trxid, 
 	PgSQL_SrvC **mysrvcCandidates = mysrvcCandidates_static;
 	unsigned int num_candidates = 0;
 	bool max_connections_reached = false;
+	auto server_active_count = [](PgSQL_SrvC* srv) -> unsigned int {
+		if (!srv || !srv->ConnectionsUsed) {
+			return 0;
+		}
+#if POLARDB_PROXY
+		return srv->polardb_pool_active_count();
+#else
+		return srv->ConnectionsUsed->conns_length();
+#endif // POLARDB_PROXY
+	};
+	auto server_can_run_active = [](PgSQL_SrvC* srv) -> bool {
+		if (!srv || srv->max_connections <= 0 || !srv->ConnectionsUsed) {
+			return false;
+		}
+#if POLARDB_PROXY
+		return srv->polardb_pool_can_run_active();
+#else
+		return srv->ConnectionsUsed->conns_length() <
+			static_cast<unsigned int>(srv->max_connections);
+#endif // POLARDB_PROXY
+	};
 	if (l>32) {
 		mysrvcCandidates = (PgSQL_SrvC **)malloc(sizeof(PgSQL_SrvC *)*l);
 	}
@@ -2340,13 +3220,13 @@ PgSQL_SrvC *PgSQL_HGC::get_random_MySrvC(char * gtid_uuid, uint64_t gtid_trxid, 
 		for (j=0; j<l; j++) {
 			mysrvc=mysrvs->idx(j);
 			if (mysrvc->status==MYSQL_SERVER_STATUS_ONLINE) { // consider this server only if ONLINE
-				if (mysrvc->ConnectionsUsed->conns_length() < mysrvc->max_connections) { // consider this server only if didn't reach max_connections
+				if (server_can_run_active(mysrvc)) { // consider this server only if active capacity remains
 					if ( mysrvc->current_latency_us < ( mysrvc->max_latency_us ? mysrvc->max_latency_us : pgsql_thread___default_max_latency_ms *1000 ) ) { // consider the host only if not too far
 						if (gtid_trxid) {
 #if 0
 							if (PgHGM->gtid_exists(mysrvc, gtid_uuid, gtid_trxid)) {
 								sum+=mysrvc->weight;
-								TotalUsedConn+=mysrvc->ConnectionsUsed->conns_length();
+								TotalUsedConn+=server_active_count(mysrvc);
 								mysrvcCandidates[num_candidates]=mysrvc;
 								num_candidates++;
 							}
@@ -2355,7 +3235,7 @@ PgSQL_SrvC *PgSQL_HGC::get_random_MySrvC(char * gtid_uuid, uint64_t gtid_trxid, 
 							if (max_lag_ms >= 0) {
 								if ((unsigned int)max_lag_ms >= mysrvc->aws_aurora_current_lag_us/1000) {
 									sum+=mysrvc->weight;
-									TotalUsedConn+=mysrvc->ConnectionsUsed->conns_length();
+									TotalUsedConn+=server_active_count(mysrvc);
 									mysrvcCandidates[num_candidates]=mysrvc;
 									num_candidates++;
 								} else {
@@ -2363,7 +3243,7 @@ PgSQL_SrvC *PgSQL_HGC::get_random_MySrvC(char * gtid_uuid, uint64_t gtid_trxid, 
 								}
 							} else {
 								sum+=mysrvc->weight;
-								TotalUsedConn+=mysrvc->ConnectionsUsed->conns_length();
+								TotalUsedConn+=server_active_count(mysrvc);
 								mysrvcCandidates[num_candidates]=mysrvc;
 								num_candidates++;
 							}
@@ -2391,7 +3271,7 @@ PgSQL_SrvC *PgSQL_HGC::get_random_MySrvC(char * gtid_uuid, uint64_t gtid_trxid, 
 							if (
 								(mysrvc->shunned_and_kill_all_connections==false) // it is safe to bring it back online
 								||
-								(mysrvc->shunned_and_kill_all_connections==true && mysrvc->ConnectionsUsed->conns_length()==0 && mysrvc->ConnectionsFree->conns_length()==0) // if shunned_and_kill_all_connections is set, ensure all connections are already dropped
+								(mysrvc->shunned_and_kill_all_connections==true && pgsql_pool_no_live_connections(mysrvc)) // if shunned_and_kill_all_connections is set, ensure all connections are already dropped
 							) {
 #ifdef DEBUG
 								if (GloPTH->variables.hostgroup_manager_verbose >= 3) {
@@ -2416,7 +3296,7 @@ PgSQL_SrvC *PgSQL_HGC::get_random_MySrvC(char * gtid_uuid, uint64_t gtid_trxid, 
 #if 0
 										if (PgHGM->gtid_exists(mysrvc, gtid_uuid, gtid_trxid)) {
 											sum+=mysrvc->weight;
-											TotalUsedConn+=mysrvc->ConnectionsUsed->conns_length();
+											TotalUsedConn+=server_active_count(mysrvc);
 											mysrvcCandidates[num_candidates]=mysrvc;
 											num_candidates++;
 										}
@@ -2425,13 +3305,13 @@ PgSQL_SrvC *PgSQL_HGC::get_random_MySrvC(char * gtid_uuid, uint64_t gtid_trxid, 
 										if (max_lag_ms >= 0) {
 											if ((unsigned int)max_lag_ms >= mysrvc->aws_aurora_current_lag_us/1000) {
 												sum+=mysrvc->weight;
-												TotalUsedConn+=mysrvc->ConnectionsUsed->conns_length();
+												TotalUsedConn+=server_active_count(mysrvc);
 												mysrvcCandidates[num_candidates]=mysrvc;
 												num_candidates++;
 											}
 										} else {
 											sum+=mysrvc->weight;
-											TotalUsedConn+=mysrvc->ConnectionsUsed->conns_length();
+											TotalUsedConn+=server_active_count(mysrvc);
 											mysrvcCandidates[num_candidates]=mysrvc;
 											num_candidates++;
 										}
@@ -2458,7 +3338,7 @@ PgSQL_SrvC *PgSQL_HGC::get_random_MySrvC(char * gtid_uuid, uint64_t gtid_trxid, 
 							mysrvc = mysrvcCandidates[j];
 							if (mysrvc->aws_aurora_current_lag_us==0) {
 								sum-=mysrvc->weight;
-								TotalUsedConn-=mysrvc->ConnectionsUsed->conns_length();
+								TotalUsedConn-=server_active_count(mysrvc);
 								if (j < num_candidates-1) {
 									mysrvcCandidates[j]=mysrvcCandidates[num_candidates-1];
 								}
@@ -2503,7 +3383,7 @@ PgSQL_SrvC *PgSQL_HGC::get_random_MySrvC(char * gtid_uuid, uint64_t gtid_trxid, 
 #if 0
 								if (PgHGM->gtid_exists(mysrvc, gtid_uuid, gtid_trxid)) {
 									sum+=mysrvc->weight;
-									TotalUsedConn+=mysrvc->ConnectionsUsed->conns_length();
+									TotalUsedConn+=server_active_count(mysrvc);
 									mysrvcCandidates[num_candidates]=mysrvc;
 									num_candidates++;
 								}
@@ -2512,13 +3392,13 @@ PgSQL_SrvC *PgSQL_HGC::get_random_MySrvC(char * gtid_uuid, uint64_t gtid_trxid, 
 								if (max_lag_ms >= 0) {
 									if ((unsigned int)max_lag_ms >= mysrvc->aws_aurora_current_lag_us/1000) {
 										sum+=mysrvc->weight;
-										TotalUsedConn+=mysrvc->ConnectionsUsed->conns_length();
+										TotalUsedConn+=server_active_count(mysrvc);
 										mysrvcCandidates[num_candidates]=mysrvc;
 										num_candidates++;
 									}
 								} else {
 									sum+=mysrvc->weight;
-									TotalUsedConn+=mysrvc->ConnectionsUsed->conns_length();
+									TotalUsedConn+=server_active_count(mysrvc);
 									mysrvcCandidates[num_candidates]=mysrvc;
 									num_candidates++;
 								}
@@ -2724,6 +3604,9 @@ void PgSQL_SrvConnList::get_random_MyConn_inner_search(unsigned int start, unsig
 }
 
 PgSQL_Connection * PgSQL_SrvConnList::get_random_MyConn(PgSQL_Session *sess, bool ff, bool only_pooled) {
+#if POLARDB_PROXY
+	std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
+#endif // POLARDB_PROXY
 	PgSQL_Connection * conn=NULL;
 	unsigned int i;
 	unsigned int conn_found_idx = 0;
@@ -2752,6 +3635,9 @@ PgSQL_Connection * PgSQL_SrvConnList::get_random_MyConn(PgSQL_Session *sess, boo
 	unsigned int conns_used = mysrvc->ConnectionsUsed->conns_length();
 	if (connection_warming == true) {
 		unsigned int total_connections = conns_free + conns_used;
+#if POLARDB_PROXY
+		total_connections = mysrvc->polardb_pool_total_count();
+#endif // POLARDB_PROXY
 		unsigned int expected_warm_connections = (unsigned int)free_connections_pct * mysrvc->max_connections / 100;
 		if (total_connections < expected_warm_connections) {
 			needs_warming = true;
@@ -2774,21 +3660,22 @@ PgSQL_Connection * PgSQL_SrvConnList::get_random_MyConn(PgSQL_Session *sess, boo
 			// 1 : tracked options are OK , but RESETTING SESSION is required
 			// 2 : tracked options are OK , RESETTING SESSION is not required, but some SET statement or INIT_DB needs to be executed
 			switch (connection_quality_level) {
-				case 0: // not found any good connection, tracked options are not OK
+			case 0: // not found any good connection, tracked options are not OK
 					if (only_pooled) {
-						if (l > 0) {
-							conn=(PgSQL_Connection *)conns->remove_index_fast(rand_fast() % l);
-							proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7,
-								"Returning PostgreSQL pooled-only Connection %p, server %s:%d\n",
-								conn, conn->parent->address, conn->parent->port);
-							return conn;
-						}
+						// Quality zero means the hard user/database compatibility
+						// wall failed. PostgreSQL cannot repair that connection with
+						// DISCARD ALL or setting the requested session variables.
 						return NULL;
 					}
 					// we must check if connections need to be freed before
 					// creating a new connection
 					{
+						bool can_create = true;
 						if (decision.evict_connections) {
+#if POLARDB_PROXY
+							can_create = pgsql_polardb_prepare_classic_create_locked(
+								mysrvc, decision.num_to_evict);
+#else
 							unsigned int cur_free = conns_free;
 							unsigned int connections_to_free = decision.num_to_evict;
 							while (cur_free && connections_to_free) {
@@ -2798,9 +3685,18 @@ PgSQL_Connection * PgSQL_SrvConnList::get_random_MyConn(PgSQL_Session *sess, boo
 								cur_free = mysrvc->ConnectionsFree->conns_length();
 								connections_to_free -= 1;
 							}
+#endif // POLARDB_PROXY
+						} else {
+#if POLARDB_PROXY
+							can_create = pgsql_polardb_prepare_classic_create_locked(
+								mysrvc, 0);
+#endif // POLARDB_PROXY
 						}
 
 						// we must create a new connection
+						if (!can_create) {
+							return NULL;
+						}
 						conn = pgsql_create_backend_connection_locked(mysrvc);
 					}
 					break;
@@ -2808,20 +3704,26 @@ PgSQL_Connection * PgSQL_SrvConnList::get_random_MyConn(PgSQL_Session *sess, boo
 					// we may consider creating a new connection
 					{
 						if (only_pooled) {
-							conn=(PgSQL_Connection *)conns->remove_index_fast(conn_found_idx);
+							conn=remove_unlocked(conn_found_idx);
 							break;
 						}
 						if (decision.create_new_connection) {
+#if POLARDB_PROXY
+							if (!pgsql_polardb_prepare_classic_create_locked(
+									mysrvc, 0)) {
+								return NULL;
+							}
+#endif // POLARDB_PROXY
 							conn = pgsql_create_backend_connection_locked(mysrvc);
 						} else {
-							conn=(PgSQL_Connection *)conns->remove_index_fast(conn_found_idx);
+							conn=remove_unlocked(conn_found_idx);
 						}
 					}
 					break;
 				case 2: // tracked options are OK , RESETTING SESSION is not required, but some SET statement or INIT_DB needs to be executed
 				case 3: // tracked options are OK , RESETTING SESSION is not required, and it seems that SET statements or INIT_DB ARE not required
 					// here we return the best connection we have, no matter if connection_quality_level is 2 or 3
-					conn=(PgSQL_Connection *)conns->remove_index_fast(conn_found_idx);
+					conn=remove_unlocked(conn_found_idx);
 					break;
 				default: // this should never happen
 					// LCOV_EXCL_START
@@ -2830,24 +3732,25 @@ PgSQL_Connection * PgSQL_SrvConnList::get_random_MyConn(PgSQL_Session *sess, boo
 					// LCOV_EXCL_STOP
 			}
 		} else {
-			conn=(PgSQL_Connection *)conns->remove_index_fast(i);
+			conn=remove_unlocked(i);
 		}
 		proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Returning PostgreSQL Connection %p, server %s:%d\n", conn, conn->parent->address, conn->parent->port);
 		return conn;
 	} else {
 		if (only_pooled) {
-			if (l > 0) {
-				conn = (PgSQL_Connection *)conns->remove_index_fast(rand_fast() % l);
-				proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7,
-					"Returning PostgreSQL pooled-only Connection %p (fallback path), server %s:%d\n",
-					conn, conn->parent->address, conn->parent->port);
-				return conn;
-			}
+			// No compatibility search ran on this path (fast-forward,
+			// warming, or missing client context), so an arbitrary pooled
+			// connection cannot satisfy a pooled-only match.
 			return NULL;
 		}
 		if (pgsql_connection_creation_throttled_locked(mysrvc)) {
 			return NULL;
 		} else {
+#if POLARDB_PROXY
+			if (!pgsql_polardb_prepare_classic_create_locked(mysrvc, 0)) {
+				return NULL;
+			}
+#endif // POLARDB_PROXY
 			conn = pgsql_create_backend_connection_locked(mysrvc);
 			return  conn;
 		}
@@ -2890,7 +3793,7 @@ void PgSQL_HostGroups_Manager::unshun_server_all_hostgroups(const char * address
 						if (
 							(mysrvc->shunned_and_kill_all_connections==false) // it is safe to bring it back online
 							||
-							(mysrvc->shunned_and_kill_all_connections==true && mysrvc->ConnectionsUsed->conns_length()==0 && mysrvc->ConnectionsFree->conns_length()==0) // if shunned_and_kill_all_connections is set, ensure all connections are already dropped
+							(mysrvc->shunned_and_kill_all_connections==true && pgsql_pool_no_live_connections(mysrvc)) // if shunned_and_kill_all_connections is set, ensure all connections are already dropped
 						) {
 							if (GloPTH->variables.hostgroup_manager_verbose >= 3) {
 								proxy_info("Unshunning server %d:%s:%d . time_last_detected_error=%lu\n", mysrvc->myhgc->hid, address, port, mysrvc->time_last_detected_error);
@@ -2911,7 +3814,8 @@ void PgSQL_HostGroups_Manager::unshun_server_all_hostgroups(const char * address
 PgSQL_Connection * PgSQL_HostGroups_Manager::get_MyConn_from_pool(unsigned int _hid, PgSQL_Session *sess, bool ff, char * gtid_uuid, uint64_t gtid_trxid, int max_lag_ms, bool only_pooled) {
 	PgSQL_Connection * conn=NULL;
 	wrlock();
-	status.pgconnpoll_get++;
+	pgsql_pool_status_count_get(sess ? sess->thread : NULL,
+		&status.pgconnpoll_get);
 	PgSQL_HGC *myhgc=MyHGC_lookup(_hid);
 	PgSQL_SrvC *mysrvc = NULL;
 #ifdef TEST_AURORA
@@ -2919,10 +3823,16 @@ PgSQL_Connection * PgSQL_HostGroups_Manager::get_MyConn_from_pool(unsigned int _
 #endif // TEST_AURORA
 	mysrvc = myhgc->get_random_MySrvC(gtid_uuid, gtid_trxid, max_lag_ms, sess);
 	if (mysrvc) { // a PgSQL_SrvC exists. If not, we return NULL = no targets
+		// Legacy selection still runs under the global HGM lock.  Once the
+		// server is chosen, protect FREE -> USED as one server-local operation.
+#if POLARDB_PROXY
+		std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
+#endif // POLARDB_PROXY
 		conn=mysrvc->ConnectionsFree->get_random_MyConn(sess, ff, only_pooled);
 		if (conn) {
 			mysrvc->ConnectionsUsed->add(conn);
-			status.pgconnpoll_get_ok++;
+			pgsql_pool_status_count_get_ok(sess ? sess->thread : NULL,
+				&status.pgconnpoll_get_ok);
 			mysrvc->update_max_connections_used();
 		}
 	}
@@ -2930,6 +3840,98 @@ PgSQL_Connection * PgSQL_HostGroups_Manager::get_MyConn_from_pool(unsigned int _
 	proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Returning MySQL Connection %p, server %s:%d\n", conn, (conn ? conn->parent->address : "") , (conn ? conn->parent->port : 0 ));
 	return conn;
 }
+
+#if POLARDB_PROXY
+PgSQL_PoolGetResult
+PgSQL_HostGroups_Manager::get_connection_from_selected_server(
+		PgSQL_SrvC* srv, unsigned int expected_hostgroup_id,
+		const PgSQL_PoolMatchKey& match_key,
+		PgSQL_Session* sess, PgSQL_PoolGetMode mode) {
+	PgSQL_PoolGetResult result;
+	if (!srv) {
+		return result;
+	}
+
+	if (pgsql_pool_get_mode_has(mode,
+			PgSQL_PoolGetMode::ALLOW_EXACT_MATCH) ||
+			pgsql_pool_get_mode_has(mode, PgSQL_PoolGetMode::ALLOW_RESET)) {
+		unsigned long long lock_wait_us = 0;
+		unsigned long long lock_hold_us = 0;
+		POLARDB_PROFILE_STATUS_COUNT_ONE(reader_pool_shared_take_attempt);
+		result = srv->take_existing_connection(
+			sess, match_key, mode, &lock_wait_us, &lock_hold_us);
+		if (result.conn) {
+			POLARDB_PROFILE_STATUS_COUNT_ONE(
+				reader_pool_shared_take_hit);
+		} else {
+			POLARDB_PROFILE_STATUS_COUNT_ONE(
+				reader_pool_shared_take_miss);
+		}
+#if POLARDB_PROXY
+		POLARDB_PROFILE_THREAD_COUNT(
+			sess ? sess->thread : nullptr,
+			selected_server_pool_lock_wait_sum_us, lock_wait_us);
+		POLARDB_PROFILE_THREAD_COUNT_ONE(
+			sess ? sess->thread : nullptr,
+			selected_server_pool_lock_wait_count);
+		POLARDB_PROFILE_THREAD_COUNT(
+			sess ? sess->thread : nullptr,
+			selected_server_pool_lock_hold_sum_us, lock_hold_us);
+		POLARDB_PROFILE_THREAD_COUNT_ONE(
+			sess ? sess->thread : nullptr,
+			selected_server_pool_lock_hold_count);
+#endif // POLARDB_PROXY
+		if (result.conn) {
+			return result;
+		}
+	}
+	if (!pgsql_pool_get_mode_has(
+			mode, PgSQL_PoolGetMode::ALLOW_CREATE)) {
+		return result;
+	}
+
+	// Creating changes global limits, so check the selected server again while
+	// holding HGM. This function must not choose a different server.
+	wrlock();
+	if (srv->status != MYSQL_SERVER_STATUS_ONLINE || !srv->myhgc ||
+			srv->myhgc->hid != expected_hostgroup_id ||
+			srv->weight <= 0 || !pgsql_srv_latency_allowed(srv) ||
+			srv->max_connections <= 0 ||
+			pgsql_connection_creation_throttled_locked(srv)) {
+		wrunlock();
+		return result;
+	}
+	{
+		std::lock_guard<std::recursive_mutex> pool_lock(srv->pool_mutex);
+		const unsigned int max_connections =
+			static_cast<unsigned int>(srv->max_connections);
+		const unsigned int used = srv->pool_used_count_value();
+		const unsigned int free = srv->pool_free_count_value();
+		if (used < max_connections) {
+			const unsigned int total = used + free;
+			const unsigned int evict_count = total >= max_connections
+				? total - max_connections + 1 : 0;
+			if (evict_count <= free) {
+				for (unsigned int i = 0; i < evict_count; i++) {
+					delete srv->ConnectionsFree->remove(0);
+				}
+				result.conn = pgsql_create_backend_connection_locked(srv);
+				if (result.conn) {
+					if (srv->add_used_matching_connection(
+							result.conn, match_key)) {
+						result.source = PgSQL_PoolGetSource::CREATED;
+					} else {
+						delete result.conn;
+						result.conn = nullptr;
+					}
+				}
+			}
+		}
+	}
+	wrunlock();
+	return result;
+}
+#endif // POLARDB_PROXY
 
 void PgSQL_HostGroups_Manager::destroy_MyConn_from_pool(PgSQL_Connection *c, bool _lock) {
 	bool to_del=true; // the default, legacy behavior
@@ -2972,6 +3974,9 @@ void PgSQL_HostGroups_Manager::destroy_MyConn_from_pool(PgSQL_Connection *c, boo
 		}
 		proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Destroying PgSQL_Connection %p, server %s:%d Error %s\n", c, mysrvc->address, mysrvc->port,
 			c->get_error_code_with_message().c_str());
+#if POLARDB_PROXY
+		std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
+#endif // POLARDB_PROXY
 		mysrvc->ConnectionsUsed->remove(c);
 		status.pgconnpoll_destroy++;
         if (_lock) {
@@ -3044,7 +4049,14 @@ void PgSQL_HostGroups_Manager::add(PgSQL_SrvC *mysrvc, unsigned int _hid) {
 
 	PgSQL_HGC *myhgc=MyHGC_lookup(_hid);
 	update_hg_attrs_server_defaults(mysrvc, myhgc);
+#if POLARDB_PROXY
+	polardb_fast_topology_wrlock();
+#endif // POLARDB_PROXY
 	myhgc->mysrvs->add(mysrvc);
+#if POLARDB_PROXY
+	polardb_update_server_list_snapshot_locked();
+	polardb_fast_topology_unlock();
+#endif // POLARDB_PROXY
 }
 
 void PgSQL_HostGroups_Manager::replication_lag_action_inner(PgSQL_HGC *myhgc, const char *address, unsigned int port, int current_replication_lag) {
@@ -3144,17 +4156,17 @@ void PgSQL_HostGroups_Manager::drop_all_idle_connections() {
 		PgSQL_HGC *myhgc=(PgSQL_HGC *)MyHostGroups->index(i);
 		for (j=0; j<(int)myhgc->mysrvs->cnt(); j++) {
 			PgSQL_SrvC *mysrvc=(PgSQL_SrvC *)myhgc->mysrvs->servers->index(j);
+#if POLARDB_PROXY
+			std::lock_guard<std::recursive_mutex> pool_lock(
+				mysrvc->pool_mutex);
+#endif // POLARDB_PROXY
 			if (mysrvc->status!=MYSQL_SERVER_STATUS_ONLINE) {
 				proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5, "Server %s:%d is not online\n", mysrvc->address, mysrvc->port);
 				//__sync_fetch_and_sub(&status.server_connections_connected, mysrvc->ConnectionsFree->conns->len);
 				mysrvc->ConnectionsFree->drop_all_connections();
 			}
 
-			// Drop idle connections if beyond max_connection
-			while (mysrvc->ConnectionsFree->conns_length() && mysrvc->ConnectionsUsed->conns_length()+mysrvc->ConnectionsFree->conns_length() > mysrvc->max_connections) {
-				PgSQL_Connection *conn=mysrvc->ConnectionsFree->remove(0);
-				delete conn;
-			}
+			pgsql_pool_trim_idle_connections_to_max(mysrvc);
 
 			//PtrArray *pa=mysrvc->ConnectionsFree->conns;
 			PgSQL_SrvConnList *mscl=mysrvc->ConnectionsFree;
@@ -3203,108 +4215,88 @@ void PgSQL_HostGroups_Manager::drop_all_idle_connections() {
  *   dropped as well
  */
 int PgSQL_HostGroups_Manager::get_multiple_idle_connections(int _hid, unsigned long long _max_last_time_used, PgSQL_Connection **conn_list, int num_conn) {
+#if POLARDB_PROXY && POLARDB_PROFILE
+	const unsigned long long maintenance_started_at = monotonic_time();
+#endif // POLARDB_PROXY && POLARDB_PROFILE
 	wrlock();
+#if POLARDB_PROXY
+	// Every worker reaches this maintenance path periodically. Refreshing its
+	// thread-local snapshot here prevents an idle worker from retaining an old
+	// topology generation indefinitely. The same snapshot also keeps a server
+	// valid while an extracted connection is being pinged outside HGM.
+	const std::shared_ptr<const PolarDB_ServerListSnapshot> server_snapshot =
+		get_polardb_server_list_snapshot();
+#endif // POLARDB_PROXY
 	drop_all_idle_connections();
 	int num_conn_current=0;
-	int j,k;
-	PgSQL_HGC* myhgc = NULL;
-	// Multimap holding the required info for accesing the oldest idle connections found.
-	std::multimap<uint64_t,std::pair<PgSQL_SrvC*,int32_t>> oldest_idle_connections {};
-
-	for (int i=0; i<(int)MyHostGroups->len; i++) {
-		if (_hid == -1) {
-			// all hostgroups must be examined
-			// as of version 2.3.2 , this is always the case
-			myhgc=(PgSQL_HGC *)MyHostGroups->index(i);
-		} else {
-			// only one hostgroup is examined
-			// as of version 2.3.2 , this never happen
-			// but the code support this functionality
-			myhgc = MyHGC_find(_hid);
-			i = (int)MyHostGroups->len; // to exit from this "for" loop
-			if (myhgc == NULL)
-				continue; // immediately exit
-		}
-		if (_hid >= 0 && _hid!=(int)myhgc->hid) continue;
-		for (j=0; j<(int)myhgc->mysrvs->cnt(); j++) {
-			PgSQL_SrvC *mysrvc=(PgSQL_SrvC *)myhgc->mysrvs->servers->index(j);
-			//PtrArray *pa=mysrvc->ConnectionsFree->conns;
-			PgSQL_SrvConnList *mscl=mysrvc->ConnectionsFree;
-			for (k=0; k<(int)mscl->conns_length(); k++) {
-				PgSQL_Connection *mc=mscl->index(k);
-				// If the connection is idle ...
-				if (mc->last_time_used && mc->last_time_used < _max_last_time_used) {
-					if ((int)oldest_idle_connections.size() < num_conn) {
-						oldest_idle_connections.insert({mc->last_time_used, { mysrvc, k }});
-					} else if (num_conn != 0) {
-						auto last_elem_it = std::prev(oldest_idle_connections.end());
-
-						if (mc->last_time_used < last_elem_it->first) {
-							oldest_idle_connections.erase(last_elem_it);
-							oldest_idle_connections.insert({mc->last_time_used, { mysrvc, k }});
-						}
+	// Keep pointers rather than list indexes. Query threads can change a FREE
+	// list after its scan; each pointer is therefore looked up again under only
+	// its own server lock before it is moved. A missing or recently used
+	// connection is skipped.
+	std::multimap<uint64_t,
+		std::pair<PgSQL_SrvC*, PgSQL_Connection*>> oldest_idle_connections;
+	if (conn_list && num_conn > 0) {
+		for (unsigned int i = 0; i < MyHostGroups->len; i++) {
+			PgSQL_HGC* myhgc =
+				static_cast<PgSQL_HGC*>(MyHostGroups->index(i));
+			if (_hid >= 0 && _hid != static_cast<int>(myhgc->hid)) {
+				continue;
+			}
+			for (unsigned int j = 0; j < myhgc->mysrvs->cnt(); j++) {
+				PgSQL_SrvC* mysrvc = myhgc->mysrvs->idx(j);
+#if POLARDB_PROXY
+				std::lock_guard<std::recursive_mutex> pool_lock(
+					mysrvc->pool_mutex);
+#endif // POLARDB_PROXY
+				PgSQL_SrvConnList* free_connections =
+					mysrvc->ConnectionsFree;
+				for (unsigned int k = 0;
+						k < free_connections->conns_length(); k++) {
+					PgSQL_Connection* conn = free_connections->index(k);
+					if (!conn || !conn->last_time_used ||
+							conn->last_time_used >= _max_last_time_used) {
+						continue;
+					}
+					if (static_cast<int>(oldest_idle_connections.size()) <
+							num_conn) {
+						oldest_idle_connections.insert({conn->last_time_used,
+							{mysrvc, conn}});
+						continue;
+					}
+					auto newest = std::prev(oldest_idle_connections.end());
+					if (conn->last_time_used < newest->first) {
+						oldest_idle_connections.erase(newest);
+						oldest_idle_connections.insert({conn->last_time_used,
+							{mysrvc, conn}});
 					}
 				}
 			}
 		}
-	}
 
-	// In order to extract the found connections, the following actions must be performed:
-	//
-	// 1. Filter the found connections by 'PgSQL_SrvC'.
-	// 2. Order by indexes on 'ConnectionsFree' in desc order.
-	// 3. Move the conns from 'ConnectionsFree' into 'ConnectionsUsed'.
-	std::unordered_map<PgSQL_SrvC*,vector<int>> mysrvcs_conns_idxs {};
-
-	// 1. Filter the connections by 'PgSQL_SrvC'.
-	//
-	// We extract this for being able to later iterate through the obtained 'PgSQL_SrvC' using the conn indexes.
-	for (const auto& conn_info : oldest_idle_connections) {
-		PgSQL_SrvC* mysrvc = conn_info.second.first;
-		int32_t mc_idx = conn_info.second.second;
-		auto mysrcv_it = mysrvcs_conns_idxs.find(mysrvc);
-
-		if (mysrcv_it == mysrvcs_conns_idxs.end()) {
-			mysrvcs_conns_idxs.insert({ mysrvc, { mc_idx }});
-		} else {
-			mysrcv_it->second.push_back(mc_idx);
-		}
-	}
-
-	// 2. Order by indexes on FreeConns in desc order.
-	//
-	// Since the conns are stored in 'ConnectionsFree', which holds the conns in a 'PtrArray', and we plan
-	// to remove multiple connections using the pre-stored indexes. We need to reorder the indexes in 'desc'
-	// order, otherwise we could be trashing the array while consuming it. See 'PtrArray::remove_index_fast'.
-	for (auto& mysrvc_conns_idxs : mysrvcs_conns_idxs) {
-		std::sort(std::begin(mysrvc_conns_idxs.second), std::end(mysrvc_conns_idxs.second),  std::greater<int>());
-	}
-
-	// 3. Move the conns from 'ConnectionsFree' into 'ConnectionsUsed'.
-	for (auto& conn_info : mysrvcs_conns_idxs) {
-		PgSQL_SrvC* mysrvc = conn_info.first;
-
-		for (const int conn_idx : conn_info.second) {
-			PgSQL_SrvConnList* mscl = mysrvc->ConnectionsFree;
-			PgSQL_Connection* mc = mscl->remove(conn_idx);
-			mysrvc->ConnectionsUsed->add(mc);
-
-			conn_list[num_conn_current] = mc;
-			num_conn_current++;
-
-			// Left here as a safeguard
+		for (const auto& candidate : oldest_idle_connections) {
+			PgSQL_SrvC* mysrvc = candidate.second.first;
+			PgSQL_Connection* conn = mysrvc->take_free_connection_for_ping(
+				candidate.second.second, _max_last_time_used);
+			if (!conn) {
+				continue;
+			}
+#if POLARDB_PROXY
+			conn->polardb_selected_server_snapshot = server_snapshot;
+#endif // POLARDB_PROXY
+			conn_list[num_conn_current++] = conn;
 			if (num_conn_current >= num_conn) {
-				goto __exit_get_multiple_idle_connections;
+				break;
 			}
 		}
 	}
 
-__exit_get_multiple_idle_connections:
-	status.pgconnpoll_get_ping+=num_conn_current;
+	pgsql_pool_status_count(&status.pgconnpoll_get_ping, num_conn_current);
 	wrunlock();
-#if POLARDB_PROXY
-	warm_split_pools();
-#endif
+#if POLARDB_PROXY && POLARDB_PROFILE
+	POLARDB_PROFILE_STATUS_COUNT(idle_ping_pool_maintenance_sum_us,
+		monotonic_time() - maintenance_started_at);
+	POLARDB_PROFILE_STATUS_COUNT_ONE(idle_ping_pool_maintenance_count);
+#endif // POLARDB_PROXY && POLARDB_PROFILE
 	proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Returning %d idle connections\n", num_conn_current);
 	return num_conn_current;
 }
@@ -3386,16 +4378,15 @@ SQLite3_result * PgSQL_HostGroups_Manager::SQL3_Free_Connections() {
 		PgSQL_HGC *myhgc=(PgSQL_HGC *)MyHostGroups->index(i);
 		for (j=0; j<(int)myhgc->mysrvs->cnt(); j++) {
 			PgSQL_SrvC *mysrvc=(PgSQL_SrvC *)myhgc->mysrvs->servers->index(j);
+#if POLARDB_PROXY
+			std::lock_guard<std::recursive_mutex> pool_lock(
+				mysrvc->pool_mutex);
+#endif // POLARDB_PROXY
 			if (mysrvc->status!=MYSQL_SERVER_STATUS_ONLINE) {
 				proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5, "Server %s:%d is not online\n", mysrvc->address, mysrvc->port);
 				mysrvc->ConnectionsFree->drop_all_connections();
 			}
-			// drop idle connections if beyond max_connection
-			while (mysrvc->ConnectionsFree->conns_length() && mysrvc->ConnectionsUsed->conns_length()+mysrvc->ConnectionsFree->conns_length() > mysrvc->max_connections) {
-				//PgSQL_Connection *conn=(PgSQL_Connection *)mysrvc->ConnectionsFree->conns->remove_index_fast(0);
-				PgSQL_Connection *conn=mysrvc->ConnectionsFree->remove(0);
-				delete conn;
-			}
+			pgsql_pool_trim_idle_connections_to_max(mysrvc);
 			char buf[1024];
 			for (l=0; l < (int) mysrvc->ConnectionsFree->conns_length(); l++) {
 				char **pta=(char **)malloc(sizeof(char *)*colnum);
@@ -3560,13 +4551,13 @@ void PgSQL_HostGroups_Manager::p_update_connection_pool() {
 			std::map<std::string, std::string> pool_conn_free_labels = common_labels;
 			pool_conn_free_labels.insert({"status", "free"});
 			p_update_connection_pool_update_gauge(endpoint_id, pool_conn_free_labels,
-				status.p_connection_pool_conn_free_map, mysrvc->ConnectionsFree->conns_length(), PgSQL_p_hg_dyn_gauge::connection_pool_conn_free);
+				status.p_connection_pool_conn_free_map, pgsql_pool_report_conn_free(mysrvc), PgSQL_p_hg_dyn_gauge::connection_pool_conn_free);
 
 			// proxysql_connection_pool_conn_used metric
 			std::map<std::string, std::string> pool_conn_used_labels = common_labels;
 			pool_conn_used_labels.insert({"status", "used"});
 			p_update_connection_pool_update_gauge(endpoint_id, pool_conn_used_labels,
-				status.p_connection_pool_conn_used_map, mysrvc->ConnectionsUsed->conns_length(), PgSQL_p_hg_dyn_gauge::connection_pool_conn_used);
+				status.p_connection_pool_conn_used_map, pgsql_pool_report_conn_used(mysrvc), PgSQL_p_hg_dyn_gauge::connection_pool_conn_used);
 
 			// proxysql_connection_pool_latency_us metric
 			p_update_connection_pool_update_gauge(endpoint_id, common_labels,
@@ -3641,13 +4632,7 @@ SQLite3_result * PgSQL_HostGroups_Manager::SQL3_Connection_Pool(bool _reset, int
 					//__sync_fetch_and_sub(&status.server_connections_connected, mysrvc->ConnectionsFree->conns->len);
 					mysrvc->ConnectionsFree->drop_all_connections();
 				}
-				// drop idle connections if beyond max_connection
-				while (mysrvc->ConnectionsFree->conns_length() && mysrvc->ConnectionsUsed->conns_length()+mysrvc->ConnectionsFree->conns_length() > mysrvc->max_connections) {
-					//PgSQL_Connection *conn=(PgSQL_Connection *)mysrvc->ConnectionsFree->conns->remove_index_fast(0);
-					PgSQL_Connection *conn=mysrvc->ConnectionsFree->remove(0);
-					delete conn;
-					//__sync_fetch_and_sub(&status.server_connections_connected, 1);
-				}
+				pgsql_pool_trim_idle_connections_to_max(mysrvc);
 			} else {
 				if (*hid != (int)myhgc->hid) {
 					continue;
@@ -3682,9 +4667,9 @@ SQLite3_result * PgSQL_HostGroups_Manager::SQL3_Connection_Pool(bool _reset, int
 					break;
 					// LCOV_EXCL_STOP
 			}
-			sprintf(buf,"%u", mysrvc->ConnectionsUsed->conns_length());
+			sprintf(buf,"%u", pgsql_pool_report_conn_used(mysrvc));
 			pta[4]=strdup(buf);
-			sprintf(buf,"%u", mysrvc->ConnectionsFree->conns_length());
+			sprintf(buf,"%u", pgsql_pool_report_conn_free(mysrvc));
 			pta[5]=strdup(buf);
 			sprintf(buf,"%u", mysrvc->connect_OK);
 			pta[6]=strdup(buf);
@@ -4002,9 +4987,9 @@ void PgSQL_HostGroups_Manager::p_update_metrics() {
 	//p_update_counter(status.p_counter_array[PgSQL_p_hg_counter::com_frontend_use_db], status.frontend_use_db);
 
 	// Update *myconnpoll* related metrics
-	p_update_counter(status.p_counter_array[PgSQL_p_hg_counter::pghgm_pgconnpool_get], status.pgconnpoll_get);
-	p_update_counter(status.p_counter_array[PgSQL_p_hg_counter::pghgm_pgconnpool_get_ok], status.pgconnpoll_get_ok);
-	p_update_counter(status.p_counter_array[PgSQL_p_hg_counter::pghgm_pgconnpool_get_ping], status.pgconnpoll_get_ping);
+	p_update_counter(status.p_counter_array[PgSQL_p_hg_counter::pghgm_pgconnpool_get], pgsql_pool_status_read_get(&status.pgconnpoll_get));
+	p_update_counter(status.p_counter_array[PgSQL_p_hg_counter::pghgm_pgconnpool_get_ok], pgsql_pool_status_read_get_ok(&status.pgconnpoll_get_ok));
+	p_update_counter(status.p_counter_array[PgSQL_p_hg_counter::pghgm_pgconnpool_get_ping], pgsql_pool_status_read(&status.pgconnpoll_get_ping));
 	p_update_counter(status.p_counter_array[PgSQL_p_hg_counter::pghgm_pgconnpool_push], status.pgconnpoll_push);
 	p_update_counter(status.p_counter_array[PgSQL_p_hg_counter::pghgm_pgconnpool_reset], status.pgconnpoll_reset);
 	p_update_counter(status.p_counter_array[PgSQL_p_hg_counter::pghgm_pgconnpool_destroy], status.pgconnpoll_destroy);
@@ -4053,13 +5038,13 @@ SQLite3_result * PgSQL_HostGroups_Manager::SQL3_Get_ConnPool_Stats() {
 	// NOTE: as there is no string copy, we do NOT free pta[0] and pta[1]
     {
 		pta[0]=(char *)"PgHGM_pgconnpoll_get";
-		sprintf(buf,"%lu",status.pgconnpoll_get);
+		sprintf(buf,"%lu",pgsql_pool_status_read_get(&status.pgconnpoll_get));
 		pta[1]=buf;
 		result->add_row(pta);
 	}
     {
 		pta[0]=(char *)"PgHGM_pgconnpoll_get_ok";
-		sprintf(buf,"%lu",status.pgconnpoll_get_ok);
+		sprintf(buf,"%lu",pgsql_pool_status_read_get_ok(&status.pgconnpoll_get_ok));
 		pta[1]=buf;
 		result->add_row(pta);
 	}
@@ -4100,6 +5085,10 @@ unsigned long long PgSQL_HostGroups_Manager::Get_Memory_Stats() {
 			for (j=0; j<l; j++) {
 				intsize+=sizeof(PgSQL_SrvC);
 				mysrvc=myhgc->mysrvs->idx(j);
+#if POLARDB_PROXY
+				std::lock_guard<std::recursive_mutex> pool_lock(
+					mysrvc->pool_mutex);
+#endif // POLARDB_PROXY
 				intsize+=((mysrvc->ConnectionsUsed->conns_length())*sizeof(PgSQL_Connection *));
 				for (k=0; k<mysrvc->ConnectionsFree->conns_length(); k++) {
 					//PgSQL_Connection *myconn=(PgSQL_Connection *)mysrvc->ConnectionsFree->conns->index(k);
@@ -4701,7 +5690,14 @@ PgSQL_SrvC* PgSQL_HostGroups_Manager::HostGroup_Server_Mapping::insert_HGM(unsig
 		ret_srv = new PgSQL_SrvC(srv->address, srv->port, srv->weight, srv->status, srv->compression,
 			srv->max_connections, srv->max_replication_lag, srv->use_ssl, (srv->max_latency_us / 1000), srv->comment);
 
+#if POLARDB_PROXY
+		myHGM->polardb_fast_topology_wrlock();
+#endif // POLARDB_PROXY
 		myhgc->mysrvs->add(ret_srv);
+#if POLARDB_PROXY
+		myHGM->polardb_update_server_list_snapshot_locked();
+		myHGM->polardb_fast_topology_unlock();
+#endif // POLARDB_PROXY
 	}
 
 	return ret_srv;
@@ -4909,11 +5905,26 @@ PgSQL_HostGroups_Manager::find_polardb_hg_config(unsigned int hostgroup_id) {
 
 	const auto& snapshot = get_polardb_topology_snapshot_cached();
 	if (!snapshot) return nullptr;
-	auto it = snapshot->by_hostgroup.find(hostgroup_id);
-	if (it == snapshot->by_hostgroup.end()) {
-		return nullptr;
+
+	static thread_local const PgSQL_HostGroups_Manager* cached_owner = nullptr;
+	static thread_local uint64_t cached_generation = 0;
+	static thread_local unsigned int cached_hostgroup_id = 0;
+	static thread_local const PolarDB_HG_Config* cached_config = nullptr;
+
+	// The thread-local snapshot above owns the map containing cached_config.
+	// Both caches refresh on the same snapshot generation.
+	if (cached_owner == this &&
+			cached_generation == snapshot->generation &&
+			cached_hostgroup_id == hostgroup_id) {
+		return cached_config;
 	}
-	return &it->second;
+
+	auto it = snapshot->by_hostgroup.find(hostgroup_id);
+	cached_owner = this;
+	cached_generation = snapshot->generation;
+	cached_hostgroup_id = hostgroup_id;
+	cached_config = it != snapshot->by_hostgroup.end() ? &it->second : nullptr;
+	return cached_config;
 }
 
 PgSQL_HostGroups_Manager::PolarDB_HG_Config
@@ -4929,15 +5940,25 @@ PgSQL_HostGroups_Manager::PolarDB_HG_Policy PgSQL_HostGroups_Manager::get_polard
 	return found ? found->policy : policy;
 }
 
-bool PgSQL_HostGroups_Manager::polardb_hostgroup_requests_rfq_lsn(unsigned int hostgroup_id) {
+PgSQL_HGC* PgSQL_HostGroups_Manager::polardb_find_hostgroup(
+		unsigned int hostgroup_id) {
+	return MyHGC_find(hostgroup_id);
+}
+
+PolarDB_StartupProfile PgSQL_HostGroups_Manager::polardb_startup_profile_for_hostgroup(
+		unsigned int hostgroup_id) {
 	const PolarDB_HG_Config* config = find_polardb_hg_config(hostgroup_id);
 	if (!config || !config->is_polardb_hostgroup) {
-		return false;
+		return PolarDB_StartupProfile::from_protocol(PolarDB_ProxyProtocol::OFF);
 	}
 	const int protocol = config->policy.proxy_protocol >= 0 ?
 		config->policy.proxy_protocol : current_global_polardb_proxy_protocol();
 	return PolarDB_StartupProfile::from_protocol(
-		polardb_proxy_protocol_from_int(protocol)).has_rfq_lsn();
+		polardb_proxy_protocol_from_int(protocol));
+}
+
+bool PgSQL_HostGroups_Manager::polardb_hostgroup_requests_rfq_lsn(unsigned int hostgroup_id) {
+	return polardb_startup_profile_for_hostgroup(hostgroup_id).has_rfq_lsn();
 }
 
 void PgSQL_HostGroups_Manager::polardb_warn_config_mismatches() {
@@ -4988,10 +6009,11 @@ bool PgSQL_HostGroups_Manager::polardb_update_server_lsn(const char* hostname, u
 
 				bool advanced = srv->polardb_advance_lsn(lsn, now_us);
 
-				// Mirror onto the writer HGC's cached primary LSN for byte-lag
-				// checks. PolarDB has one primary for the writer HG; keep this
-				// mirror monotonic inside the current writer epoch. Entries that
-				// are not ONLINE are not routable and are skipped above.
+				// Mirror the latest trusted group LSN observation for
+				// GLOBAL_LSN and byte-lag planning. Monitor samples report
+				// pg_current_wal_lsn() on the primary and replay LSN on replicas;
+				// both are safe lower-bound observations for the writer epoch.
+				// This is not an exact "current primary tip" sample.
 				if (hgc->repl_config.configured) {
 					polardb_atomic_max_u64(hgc->repl_config.polardb_primary_lsn, lsn);
 				}
@@ -5052,10 +6074,16 @@ bool PgSQL_HostGroups_Manager::polardb_update_server_lsn(
 	// The connection using this parent is still in ConnectionsUsed while result processing
 	// runs, and OFFLINE_HARD deletion waits for both used and free lists to drain.
 	// Therefore the PgSQL_SrvC object is alive here. Only PgSQL_SrvC atomics are
-	// touched; topology and primary-LSN state come from the immutable snapshot.
-	// The epoch was checked immediately above. A writer change just after this
-	// point can only publish a monotonic LSN that future scope checks may ignore;
-	// it cannot make a later session wait target go backwards.
+	// touched; topology and the shared group-LSN observation come from the
+	// immutable snapshot. The epoch was checked immediately above. A writer change
+	// just after this point can only record a higher LSN that future scope
+	// checks may ignore; it cannot make a later session wait target go backwards.
+	//
+	// Direct RFQ payloads are scoped differently by server role: primary RFQ is a
+	// backend-session LSN, while replica RFQ is replay progress. Both are still
+	// valid lower-bound observations for this writer epoch. Keep the shared cell
+	// monotonic and use it as "latest trusted group LSN observed by ProxySQL", not
+	// as an exact current primary WAL tip.
 	const uint64_t now_us = monotonic_time();
 	bool advanced = srv->polardb_advance_lsn(lsn, now_us);
 	(void)advanced;
@@ -5084,1737 +6112,45 @@ uint64_t PgSQL_HostGroups_Manager::get_polardb_primary_lsn(unsigned int writer_h
 	return it->second.primary_lsn->load(std::memory_order_relaxed);
 }
 
-static bool polardb_session_startup_client_context(
-		PgSQL_Session* sess, PolarDB_StartupClientContext* startup_client) {
-	if (startup_client) {
-		*startup_client = PolarDB_StartupClientContext{};
-	}
-	if (!sess || !sess->client_myds || !startup_client) {
-		return false;
-	}
-
-	PgSQL_Data_Stream* client_myds = sess->client_myds;
-	PolarDB_StartupIdentity identity{
-		client_myds->addr.addr,
-		client_myds->addr.port,
-		PolarDB_StartupIdentitySource::CLIENT};
-	if (identity.valid(false)) {
-		startup_client->identity = std::move(identity);
-		return true;
-	}
-
-	if (polardb_startup_identity_from_sockaddr(
-			client_myds->client_addr,
-			&identity,
-			PolarDB_StartupIdentitySource::CLIENT)) {
-		startup_client->identity = std::move(identity);
-		return true;
-	}
-
-	return false;
-}
-
-static std::string polardb_split_warmup_key(
-		const PgSQL_SplitWarmupRequest& req) {
-	// The dedup key must mirror the configured reuse boundary. Password is not
-	// part of the boundary: PostgreSQL backends are reused only within the same
-	// database auth profile, and the warmup request still carries the password
-	// separately when opening the socket.
-	std::string key = std::to_string(req.hostgroup_id);
-	key.push_back('\x1f');
-	key.append(req.username);
-	key.push_back('\x1f');
-	key.append(req.dbname);
-	key.push_back('\x1f');
-	key.append(polardb_split_warmup_identity_name(req.identity_match));
-	// strict: user/db + client host/source/port.
-	// client_ip: user/db + client host/source, ignoring ephemeral source port.
-	// auth_profile: user/db only, unless SSL/session-id metadata forces strict.
-	if (req.identity_match == static_cast<int>(PolarDB_SplitWarmupIdentity::STRICT) ||
-			req.identity_match == static_cast<int>(PolarDB_SplitWarmupIdentity::CLIENT_IP) ||
-			req.startup_client.has_strict_metadata()) {
-		key.push_back('\x1f');
-		key.append(req.startup_client.identity.host);
-		key.push_back('\x1f');
-		key.append(std::to_string(
-			static_cast<int>(req.startup_client.identity.source)));
-	}
-	if (req.identity_match == static_cast<int>(PolarDB_SplitWarmupIdentity::STRICT) ||
-			req.startup_client.has_strict_metadata()) {
-		key.push_back('\x1f');
-		key.append(std::to_string(req.startup_client.identity.port));
-	}
-	key.push_back('\x1f');
-	key.append(req.startup_client.frontend_ssl ? "ssl" : "nossl");
-	key.push_back('\x1f');
-	key.append(req.startup_client.ssl_version);
-	key.push_back('\x1f');
-	key.append(req.startup_client.ssl_cipher);
-	key.push_back('\x1f');
-	key.append(req.startup_client.has_proxy_session ? "sid" : "nosid");
-	key.push_back('\x1f');
-	key.append(std::to_string(req.startup_client.proxy_session_id));
-	key.push_back('\x1f');
-	key.append(std::to_string(req.startup_client.proxy_cancel_key));
-	if (req.has_target_server()) {
-		key.push_back('\x1f');
-		key.append(req.target_address);
-		key.push_back('\x1f');
-		key.append(std::to_string(req.target_port));
-	}
-	return key;
-}
-
-static bool polardb_split_warmup_server_matches_target(
-		PgSQL_SrvC* mysrvc,
-		const PgSQL_SplitWarmupRequest& req) {
-	if (!req.has_target_server()) {
-		return true;
-	}
-	return mysrvc && mysrvc->address &&
-		req.target_port == mysrvc->port &&
-		req.target_address == mysrvc->address;
-}
-
-static bool polardb_split_warmup_server_has_compatible_free(
-		PgSQL_SrvC* mysrvc,
-		const PgSQL_SplitWarmupRequest& req) {
-	if (!mysrvc || !mysrvc->ConnectionsFree) {
-		return false;
-	}
-	for (unsigned int i = 0; i < mysrvc->ConnectionsFree->conns_length(); i++) {
-		PgSQL_Connection* candidate = mysrvc->ConnectionsFree->index(i);
-		if (!candidate || candidate->get_pg_connection() == nullptr ||
-				!candidate->polardb_startup_profile.has_rfq_lsn() ||
-				!candidate->polardb_startup_profile.has_rfq_xid() ||
-				!candidate->userinfo ||
-				!candidate->userinfo->username || !candidate->userinfo->dbname) {
-			continue;
-		}
-		if (strcmp(candidate->userinfo->username, req.username.c_str()) == 0 &&
-				strcmp(candidate->userinfo->dbname, req.dbname.c_str()) == 0 &&
-				polardb_startup_client_compatible_for_warmup(
-					candidate->polardb_startup_client,
-					req.startup_client,
-					req.identity_match)) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static bool polardb_split_warmup_server_can_accept(
-		PgSQL_SrvC* mysrvc,
-		bool check_throttle) {
-	// Targeted warmup requests are keyed and later resolved by server
-	// address:port. A malformed runtime server row without an address cannot
-	// be queued safely because the drain side would not be able to find the
-	// same target after the off-lock connect window.
-	if (!mysrvc || mysrvc->status != MYSQL_SERVER_STATUS_ONLINE ||
-			!mysrvc->address ||
-			mysrvc->weight <= 0 || !pgsql_srv_latency_allowed(mysrvc) ||
-			mysrvc->max_connections <= 0 || !mysrvc->ConnectionsUsed ||
-			!mysrvc->ConnectionsFree) {
-		return false;
-	}
-	const unsigned int total =
-		mysrvc->ConnectionsUsed->conns_length() +
-		mysrvc->ConnectionsFree->conns_length();
-	if (total >= static_cast<unsigned int>(mysrvc->max_connections)) {
-		return false;
-	}
-	return !check_throttle || !pgsql_connection_creation_throttled_locked(mysrvc);
-}
-
-static constexpr size_t SPLIT_WARMUP_QUEUE_LIMIT = 1024;
-static constexpr size_t SPLIT_WARMUP_DRAIN_LIMIT = 16;
-
+#if POLARDB_PROXY
 void PgSQL_HostGroups_Manager::request_split_warmup(
 		unsigned int reader_hostgroup_id,
 		const char* username,
 		const char* password,
 		const char* dbname,
-		const PolarDB_StartupClientContext& startup_client) {
-	if (!pgsql_thread___polardb_lazy_warmup_split) {
-		POLARDB_TRACE(
-			"PolarDB WARMUP: split lazy warmup disabled; skip request "
-			"reader_hg=%u user=%s db=%s\n",
-			reader_hostgroup_id, username ? username : "",
-			dbname ? dbname : "");
-		return;
+		const PolarDB_StartupClientContext& startup_client,
+		const PgSQL_Connection* client_conn) {
+	if (polardb_reader_pool_) {
+		polardb_reader_pool_->request_split_warmup(
+			reader_hostgroup_id, username, password, dbname, startup_client,
+			client_conn);
 	}
-	if (!status.polardb_active.load(std::memory_order_relaxed) ||
-			reader_hostgroup_id == 0 || !username || username[0] == '\0' ||
-			!startup_client.identity_valid_for_startup(false)) {
-		POLARDB_STATUS_COUNT_ONE(split_warmup_bad_request);
-		status.polardb_split_warmup_failed.fetch_add(1, std::memory_order_relaxed);
-		return;
-	}
-
-	const unsigned long long now_us = monotonic_time();
-	const int identity_match = pgsql_thread___polardb_split_warmup_identity;
-	PgSQL_SplitWarmupRequest base_request{
-		reader_hostgroup_id, username, password, dbname,
-		startup_client, identity_match, now_us};
-
-	bool wake_threads = false;
-	bool queued = false;
-	{
-		std::lock_guard<std::mutex> guard(split_warmup_mutex_);
-		const std::string request_key = polardb_split_warmup_key(base_request);
-		// Keep the request path cheap: it only dedups one identity-scoped
-		// warmup request. The worker-side drain expands it to specific readers.
-		if (split_warmup_queued_.find(request_key) != split_warmup_queued_.end()) {
-			POLARDB_STATUS_COUNT_ONE(split_warmup_dedup_queued);
-		} else if (split_warmup_inflight_.find(request_key) != split_warmup_inflight_.end()) {
-			POLARDB_STATUS_COUNT_ONE(split_warmup_dedup_inflight);
-		} else if (split_warmup_queue_.size() >= SPLIT_WARMUP_QUEUE_LIMIT) {
-			POLARDB_STATUS_COUNT_ONE(split_warmup_queue_full);
-			status.polardb_split_warmup_failed.fetch_add(
-				1, std::memory_order_relaxed);
-		} else {
-			// Only the first request after an empty queue wakes worker threads.
-			// More queued work is drained by the woken loop and normal
-			// maintenance, so repeated BEGIN/read misses do not create a
-			// pipe-write storm.
-			wake_threads = split_warmup_queue_.empty();
-			split_warmup_queued_.insert(request_key);
-			split_warmup_queue_.push(std::move(base_request));
-			queued = true;
-		}
-		status.polardb_warmup_pending.store(
-			split_warmup_queue_.size(), std::memory_order_relaxed);
-	}
-	if (!queued) {
-		return;
-	}
-	status.polardb_split_warmup_requested.fetch_add(
-		1, std::memory_order_relaxed);
-	POLARDB_TRACE(
-		"PolarDB WARMUP: queued split pool request reader_hg=%u "
-		"user=%s db=%s startup_client=%s:%d identity_match=%s\n",
-		reader_hostgroup_id, username, dbname ? dbname : "",
-		startup_client.identity.host.c_str(), startup_client.identity.port,
-		polardb_split_warmup_identity_name(identity_match));
-	if (wake_threads && GloPTH) {
-		// Wake once when the queue transitions from empty to non-empty. Duplicate
-		// transaction requests dedup above, so high transaction rates do not turn
-		// into one signal per BEGIN.
-		GloPTH->signal_all_threads(0);
-	}
-}
-
-void PgSQL_HostGroups_Manager::polardb_collect_split_warmup_targets_locked(
-		const PgSQL_SplitWarmupRequest& req,
-		std::vector<PgSQL_SplitWarmupRequest>& target_requests,
-		bool* found_hostgroup,
-		bool* saw_eligible_target,
-		bool* saw_compatible_free) {
-	if (found_hostgroup) {
-		*found_hostgroup = false;
-	}
-	if (saw_eligible_target) {
-		*saw_eligible_target = false;
-	}
-	if (saw_compatible_free) {
-		*saw_compatible_free = false;
-	}
-
-	PgSQL_HGC* myhgc = MyHGC_lookup(req.hostgroup_id);
-	if (!myhgc) {
-		return;
-	}
-	if (found_hostgroup) {
-		*found_hostgroup = true;
-	}
-	for (unsigned int i = 0; i < myhgc->mysrvs->cnt(); i++) {
-		PgSQL_SrvC* mysrvc = myhgc->mysrvs->idx(i);
-		if (!polardb_split_warmup_server_can_accept(
-				mysrvc, /*check_throttle=*/false)) {
-			continue;
-		}
-		if (saw_eligible_target) {
-			*saw_eligible_target = true;
-		}
-		if (polardb_split_warmup_server_has_compatible_free(mysrvc, req)) {
-			if (saw_compatible_free) {
-				*saw_compatible_free = true;
-			}
-			continue;
-		}
-		// The request path only queues one identity request. Fan it out here so
-		// each cold reader server can receive its own backend.
-		PgSQL_SplitWarmupRequest target_request = req;
-		target_request.target_address = mysrvc->address ? mysrvc->address : "";
-		target_request.target_port = mysrvc->port;
-		target_requests.push_back(std::move(target_request));
-	}
-}
-
-static bool polardb_connect_split_warmup_connection(PgSQL_Connection* conn) {
-	if (!conn) return false;
-
-	const int configured_timeout_ms =
-		pgsql_thread___connect_timeout_server_max > 0
-			? pgsql_thread___connect_timeout_server_max
-			: pgsql_thread___connect_timeout_server;
-	const int timeout_ms = configured_timeout_ms > 0 ? configured_timeout_ms : 10000;
-	const unsigned long long deadline_us =
-		monotonic_time() + (unsigned long long)timeout_ms * 1000ULL;
-
-	conn->connect_start();
-	if (conn->is_error_present() || conn->get_pg_connection() == nullptr) {
-		return false;
-	}
-
-	while (conn->async_exit_status != PG_EVENT_NONE) {
-		short events = 0;
-		if (conn->async_exit_status & PG_EVENT_READ) events |= POLLIN;
-		if (conn->async_exit_status & PG_EVENT_WRITE) events |= POLLOUT;
-
-		const int fd = conn->fd;
-		if (fd < 0 || events == 0) {
-			conn->set_error(
-				PGSQL_ERROR_CODES::ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
-				"PolarDB split warmup connection has no pollable backend socket",
-				true);
-			return false;
-		}
-
-		const unsigned long long now_us = monotonic_time();
-		if (now_us >= deadline_us) {
-			conn->set_error(
-				PGSQL_ERROR_CODES::ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
-				"PolarDB split warmup connection timed out",
-				true);
-			return false;
-		}
-
-		const int poll_timeout_ms =
-			(int)((deadline_us - now_us + 999ULL) / 1000ULL);
-		struct pollfd pfd;
-		pfd.fd = fd;
-		pfd.events = events;
-		pfd.revents = 0;
-
-		int rc = poll(&pfd, 1, poll_timeout_ms);
-		if (rc < 0) {
-			if (errno == EINTR) continue;
-			conn->set_error(
-				PGSQL_ERROR_CODES::ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
-				strerror(errno),
-				true);
-			return false;
-		}
-		if (rc == 0) {
-			conn->set_error(
-				PGSQL_ERROR_CODES::ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
-				"PolarDB split warmup connection timed out",
-				true);
-			return false;
-		}
-
-		conn->connect_cont(pfd.revents);
-		if (conn->is_error_present()) {
-			return false;
-		}
-	}
-
-	if (!conn->is_connected()) {
-		conn->set_error(
-			PGSQL_ERROR_CODES::ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
-			"PolarDB split warmup connection did not reach CONNECTION_OK",
-			true);
-		return false;
-	}
-
-	conn->async_state_machine = ASYNC_IDLE;
-	conn->fd = conn->get_pg_socket_fd();
-	conn->creation_time = monotonic_time();
-	conn->last_time_used = 0;
-	conn->reusable = true;
-	conn->init_startup_parameters_from_server();
-	conn->polardb_init_connection_tracking();
-	__sync_fetch_and_add(&PgHGM->status.server_connections_connected, 1);
-	__sync_fetch_and_add(&conn->parent->connect_OK, 1);
-	return true;
 }
 
 void PgSQL_HostGroups_Manager::warm_split_pools() {
-	std::vector<PgSQL_SplitWarmupRequest> requests;
-	{
-		std::lock_guard<std::mutex> guard(split_warmup_mutex_);
-		if (!pgsql_thread___polardb_lazy_warmup_split) {
-			const size_t dropped = split_warmup_queue_.size();
-			while (!split_warmup_queue_.empty()) {
-				split_warmup_queue_.pop();
-			}
-			split_warmup_queued_.clear();
-			split_warmup_inflight_.clear();
-			status.polardb_warmup_pending.store(0, std::memory_order_relaxed);
-			if (dropped > 0) {
-				POLARDB_TRACE(
-					"PolarDB WARMUP: split lazy warmup disabled; "
-					"dropped %zu queued requests\n",
-					dropped);
-			}
-			return;
-		}
-		size_t drained = 0;
-		while (!split_warmup_queue_.empty() &&
-				drained < SPLIT_WARMUP_DRAIN_LIMIT) {
-			PgSQL_SplitWarmupRequest request =
-				std::move(split_warmup_queue_.front());
-			split_warmup_queue_.pop();
-			split_warmup_queued_.erase(polardb_split_warmup_key(request));
-			requests.push_back(std::move(request));
-			++drained;
-		}
-		status.polardb_warmup_pending.store(
-			split_warmup_queue_.size(), std::memory_order_relaxed);
-		if (!split_warmup_queue_.empty()) {
-			POLARDB_TRACE(
-				"PolarDB WARMUP: deferred %zu queued split warmup requests "
-				"after draining %zu this pass\n",
-				split_warmup_queue_.size(), drained);
-		}
+	if (polardb_reader_pool_) {
+		polardb_reader_pool_->warm_split_pools();
 	}
-	if (requests.empty()) {
-		return;
+}
+
+void PgSQL_HostGroups_Manager::refresh_split_warmup_variables() {
+	if (polardb_reader_pool_) {
+		polardb_reader_pool_->refresh_split_warmup_variables();
 	}
-
-	std::unordered_set<std::string> seen;
-
-	auto process_target_request = [&](const PgSQL_SplitWarmupRequest& req,
-			bool register_inflight) {
-#if POLARDB_PROFILE
-		const unsigned long long drain_start_us = monotonic_time();
-		if (req.requested_at_us > 0) {
-			POLARDB_PROFILE_STATUS_COUNT(split_warmup_queue_delay_sum_us,
-				drain_start_us >= req.requested_at_us
-					? drain_start_us - req.requested_at_us : 0);
-			POLARDB_PROFILE_STATUS_COUNT_ONE(split_warmup_queue_delay_count);
-		}
-#endif // POLARDB_PROFILE
-		if (req.hostgroup_id == 0 || req.username.empty() ||
-				!req.startup_client.identity_valid_for_startup(false)) {
-			POLARDB_STATUS_COUNT_ONE(split_warmup_bad_request);
-			status.polardb_split_warmup_failed.fetch_add(1, std::memory_order_relaxed);
-			return;
-		}
-
-		const std::string req_key = polardb_split_warmup_key(req);
-		bool inflight_registered = false;
-		auto clear_inflight = [&]() {
-			if (!inflight_registered) return;
-			std::lock_guard<std::mutex> guard(split_warmup_mutex_);
-			split_warmup_inflight_.erase(req_key);
-			inflight_registered = false;
-		};
-		if (register_inflight) {
-			std::lock_guard<std::mutex> guard(split_warmup_mutex_);
-			if (!split_warmup_inflight_.insert(req_key).second) {
-				POLARDB_STATUS_COUNT_ONE(split_warmup_dedup_inflight);
-				return;
-			}
-			inflight_registered = true;
-		}
-
-		PgSQL_Connection* conn = nullptr;
-		PgSQL_SrvC* target = nullptr;
-		std::string target_address;
-		uint16_t target_port = 0;
-		bool skip_request = false;
-
-		wrlock();
-		PgSQL_HGC* myhgc = MyHGC_lookup(req.hostgroup_id);
-		if (!myhgc) {
-			wrunlock();
-			clear_inflight();
-			status.polardb_split_warmup_failed.fetch_add(1, std::memory_order_relaxed);
-			return;
-		}
-
-		for (unsigned int i = 0; i < myhgc->mysrvs->cnt(); i++) {
-			PgSQL_SrvC* mysrvc = myhgc->mysrvs->idx(i);
-			if (!polardb_split_warmup_server_matches_target(mysrvc, req)) {
-				continue;
-			}
-			if (polardb_split_warmup_server_has_compatible_free(
-					mysrvc, req)) {
-				// A racing session or earlier drain pass already seeded this
-				// exact reader/profile. Stop here for targeted requests; for
-				// legacy untargeted requests, keep looking for another cold
-				// reader rather than treating the whole hostgroup as warm.
-				if (req.has_target_server()) {
-					skip_request = true;
-					break;
-				}
-				continue;
-			}
-			if (!polardb_split_warmup_server_can_accept(
-					mysrvc, /*check_throttle=*/true)) {
-				continue;
-			}
-			target = mysrvc;
-			break;
-		}
-
-		if (skip_request) {
-			wrunlock();
-			clear_inflight();
-			POLARDB_STATUS_COUNT_ONE(split_warmup_already_warm);
-			return;
-		}
-
-		if (!target) {
-			wrunlock();
-			clear_inflight();
-			POLARDB_STATUS_COUNT_ONE(split_warmup_no_target);
-			status.polardb_split_warmup_failed.fetch_add(1, std::memory_order_relaxed);
-			return;
-		}
-
-		conn = pgsql_create_backend_connection_locked(target);
-		if (!conn || !conn->userinfo) {
-			delete conn;
-			wrunlock();
-			clear_inflight();
-			status.polardb_split_warmup_failed.fetch_add(1, std::memory_order_relaxed);
-			return;
-		}
-		conn->userinfo->set(
-			const_cast<char*>(req.username.c_str()),
-			const_cast<char*>(req.password.c_str()),
-			const_cast<char*>(req.dbname.c_str()),
-			nullptr);
-#if POLARDB_PROXY
-		// Split warmup is opened outside client dispatch, but it is still owned by
-		// the client identity that requested it. Force that identity through the
-		// normal conninfo builder; SSL/session-id placeholders remain default
-		// until those startup keys are wired.
-		conn->polardb_use_proxy_startup_identity = false;
-		conn->polardb_forced_startup_identity = req.startup_client.identity;
+}
 #endif // POLARDB_PROXY
-		target_address = target->address ? target->address : "";
-		target_port = target->port;
-		// Count the off-lock handshake against server capacity while it is
-		// in flight; this avoids a separate warmup over-cap setting.
-		target->ConnectionsUsed->add(conn);
-		target->update_max_connections_used();
-		POLARDB_TRACE(
-			"PolarDB WARMUP: reserved split pool connection "
-			"reader_hg=%u server=%s:%u user=%s db=%s startup_client=%s:%d\n",
-			req.hostgroup_id, target->address, target->port,
-			req.username.c_str(), req.dbname.c_str(),
-			req.startup_client.identity.host.c_str(),
-			req.startup_client.identity.port);
-		wrunlock();
-
-#if POLARDB_PROFILE
-		const unsigned long long connect_start_us = monotonic_time();
-#endif // POLARDB_PROFILE
-		const bool connected = polardb_connect_split_warmup_connection(conn);
-#if POLARDB_PROFILE
-		const unsigned long long connect_end_us = monotonic_time();
-		POLARDB_PROFILE_STATUS_COUNT(split_warmup_connect_sum_us,
-			connect_end_us >= connect_start_us
-				? connect_end_us - connect_start_us : 0);
-		POLARDB_PROFILE_STATUS_COUNT_ONE(split_warmup_connect_count);
-#endif // POLARDB_PROFILE
-
-#if POLARDB_PROFILE
-		const unsigned long long publish_start_us = monotonic_time();
-#endif // POLARDB_PROFILE
-		wrlock();
-		target = static_cast<PgSQL_SrvC*>(conn->parent);
-		if (target && target->ConnectionsUsed) {
-			target->ConnectionsUsed->remove(conn);
-		}
-
-		if (!connected) {
-			proxy_error("PolarDB split warmup: connection failed to %s:%u "
-				"for HG %u user=%s db=%s: %s\n",
-				target_address.c_str(), target_port, req.hostgroup_id,
-				req.username.c_str(), req.dbname.c_str(),
-				conn->get_error_message().c_str());
-			POLARDB_STATUS_COUNT_ONE(split_warmup_connect_failed);
-			if (target) {
-				PgHGM->p_update_pgsql_error_counter(
-					p_pgsql_error_type::pgsql, target->myhgc->hid,
-					target->address, target->port,
-					POLARDB_REPLICA_FAILURE_ERROR_CODE);
-				target->connect_error(POLARDB_REPLICA_FAILURE_ERROR_CODE, false);
-			}
-			delete conn;
-			wrunlock();
-			clear_inflight();
-			status.polardb_split_warmup_failed.fetch_add(1, std::memory_order_relaxed);
-			return;
-		}
-
-		PgSQL_SrvC* reserved_parent = target;
-		PgSQL_SrvC* resolved_target = nullptr;
-		PgSQL_HGC* current_hgc = MyHGC_lookup(req.hostgroup_id);
-		if (current_hgc) {
-			for (unsigned int i = 0; i < current_hgc->mysrvs->cnt(); i++) {
-				PgSQL_SrvC* mysrvc = current_hgc->mysrvs->idx(i);
-				if (mysrvc &&
-						mysrvc->port == target_port &&
-						mysrvc->address &&
-						target_address == mysrvc->address) {
-					resolved_target = mysrvc;
-					break;
-				}
-			}
-		}
-		target = resolved_target;
-
-		if (!target || target != reserved_parent ||
-				target->status != MYSQL_SERVER_STATUS_ONLINE ||
-				!target->ConnectionsFree || target->max_connections <= 0) {
-			proxy_warning(
-				"PolarDB split warmup: discarding connected backend for HG %u "
-				"user=%s db=%s because target server changed while connecting\n",
-				req.hostgroup_id, req.username.c_str(), req.dbname.c_str());
-			POLARDB_STATUS_COUNT_ONE(split_warmup_publish_failed);
-			delete conn;
-			wrunlock();
-			clear_inflight();
-			status.polardb_split_warmup_failed.fetch_add(1, std::memory_order_relaxed);
-			return;
-		}
-
-		const unsigned int publish_total =
-			target->ConnectionsUsed->conns_length() +
-			target->ConnectionsFree->conns_length();
-		if (publish_total >= static_cast<unsigned int>(target->max_connections)) {
-			proxy_warning(
-				"PolarDB split warmup: discarding connected backend for HG %u "
-				"server=%s:%u user=%s db=%s because capacity changed while connecting\n",
-				req.hostgroup_id, target->address, target->port,
-				req.username.c_str(), req.dbname.c_str());
-			POLARDB_STATUS_COUNT_ONE(split_warmup_publish_failed);
-			delete conn;
-			wrunlock();
-			clear_inflight();
-			status.polardb_split_warmup_failed.fetch_add(1, std::memory_order_relaxed);
-			return;
-		}
-
-		target->ConnectionsFree->add(conn);
-#if POLARDB_PROFILE
-		const unsigned long long publish_end_us = monotonic_time();
-		POLARDB_PROFILE_STATUS_COUNT(split_warmup_publish_sum_us,
-			publish_end_us >= publish_start_us
-				? publish_end_us - publish_start_us : 0);
-		POLARDB_PROFILE_STATUS_COUNT_ONE(split_warmup_publish_count);
-#endif // POLARDB_PROFILE
-		status.polardb_split_warmup_created.fetch_add(1, std::memory_order_relaxed);
-		const unsigned long long elapsed_us =
-			req.requested_at_us > 0 ? monotonic_time() - req.requested_at_us : 0;
-		status.polardb_split_warmup_sum_us.fetch_add(
-			elapsed_us, std::memory_order_relaxed);
-		status.polardb_split_warmup_count.fetch_add(
-			1, std::memory_order_relaxed);
-		POLARDB_TRACE(
-			"PolarDB WARMUP: added connected split pool connection "
-			"reader_hg=%u server=%s:%u user=%s db=%s startup_client=%s:%d "
-			"elapsed_us=%llu\n",
-			req.hostgroup_id, target->address, target->port,
-			req.username.c_str(), req.dbname.c_str(),
-			req.startup_client.identity.host.c_str(),
-			req.startup_client.identity.port, elapsed_us);
-		wrunlock();
-		clear_inflight();
-	};
-
-	for (const PgSQL_SplitWarmupRequest& req : requests) {
-		const std::string req_key = polardb_split_warmup_key(req);
-		if (!seen.insert(req_key).second) {
-			POLARDB_STATUS_COUNT_ONE(split_warmup_dedup_queued);
-			continue;
-		}
-		if (req.has_target_server()) {
-			process_target_request(req, /*register_inflight=*/true);
-			continue;
-		}
-
-		bool base_inflight_registered = false;
-		auto clear_base_inflight = [&]() {
-			if (!base_inflight_registered) return;
-			std::lock_guard<std::mutex> guard(split_warmup_mutex_);
-			split_warmup_inflight_.erase(req_key);
-			base_inflight_registered = false;
-		};
-		{
-			std::lock_guard<std::mutex> guard(split_warmup_mutex_);
-			if (!split_warmup_inflight_.insert(req_key).second) {
-				POLARDB_STATUS_COUNT_ONE(split_warmup_dedup_inflight);
-				continue;
-			}
-			base_inflight_registered = true;
-		}
-
-		std::vector<PgSQL_SplitWarmupRequest> target_requests;
-		bool found_hostgroup = false;
-		bool saw_eligible_target = false;
-		bool saw_compatible_free = false;
-
-		wrlock();
-		polardb_collect_split_warmup_targets_locked(
-			req, target_requests, &found_hostgroup,
-			&saw_eligible_target, &saw_compatible_free);
-		wrunlock();
-
-		if (!found_hostgroup) {
-			POLARDB_STATUS_COUNT_ONE(split_warmup_no_target);
-			status.polardb_split_warmup_failed.fetch_add(1, std::memory_order_relaxed);
-			clear_base_inflight();
-			continue;
-		}
-		if (target_requests.empty()) {
-			if (saw_compatible_free) {
-				POLARDB_STATUS_COUNT_ONE(split_warmup_already_warm);
-			} else if (!saw_eligible_target) {
-				POLARDB_STATUS_COUNT_ONE(split_warmup_no_target);
-			}
-			POLARDB_TRACE(
-				"PolarDB WARMUP: split pool already has compatible reader or no "
-				"eligible target reader_hg=%u user=%s db=%s identity_match=%s\n",
-				req.hostgroup_id, req.username.c_str(), req.dbname.c_str(),
-				polardb_split_warmup_identity_name(req.identity_match));
-			clear_base_inflight();
-			continue;
-		}
-
-		for (const PgSQL_SplitWarmupRequest& target_request : target_requests) {
-			process_target_request(target_request, /*register_inflight=*/false);
-		}
-		clear_base_inflight();
-	}
-}
-
-/**
- * @brief Get a connection to one reader server, honoring the RFQ-LSN profile.
- *
- * When there is no LSN target this is an ordinary free-connection fetch. When a
- * target is present the read needs a backend whose startup negotiated LSN
- * feedback in ReadyForQuery (RFQ), so this prefers a free connection with that
- * profile. If none is free and the caller allows creating connections, it may
- * evict just enough incompatible idle connections to make room for one new
- * RFQ-capable connection, respecting the server's max-connection limit and
- * creation throttle.
- *
- * Precondition: caller must hold the HostGroups_Manager write lock (it mutates
- * the server's connection lists).
- *
- * @param consistency_target_lsn            Target LSN, or 0 for no target.
- * @param startup_requests_rfq_lsn Whether this pair's protocol negotiates RFQ LSN.
- * @param only_pooled             If true, never create a connection.
- * @param[out] status             Set to the outcome (ACQUIRED, RFQ_UNAVAILABLE, ...).
- * @return A usable connection, or nullptr.
- */
-static PgSQL_Connection* polardb_get_rfq_profile_compatible_conn(
-		PgSQL_SrvC* mysrvc, PgSQL_Session* sess, uint64_t consistency_target_lsn,
-		bool startup_requests_rfq_lsn, bool only_pooled, PolarDB_ReaderStatus* status) {
-	if (status) {
-		*status = PolarDB_ReaderStatus::READER_BUSY;
-	}
-	// No LSN target: any free connection is fine, the profile does not matter.
-	if (consistency_target_lsn == 0) {
-		PgSQL_Connection* conn =
-			mysrvc->ConnectionsFree->get_random_MyConn(sess, false, only_pooled);
-		if (conn && status) {
-			*status = PolarDB_ReaderStatus::ACQUIRED;
-		}
-		return conn;
-	}
-
-	// A target exists but this pair's protocol does not negotiate RFQ LSN, so no
-	// connection here can confirm it reached the target. Report it as unavailable.
-	if (!startup_requests_rfq_lsn) {
-		if (status) {
-			*status = PolarDB_ReaderStatus::RFQ_UNAVAILABLE;
-		}
-		POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-			reader_target_rfq_unavailable);
-		POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-			reader_target_rfq_no_protocol);
-		return nullptr;
-	}
-
-	// Scan the free list for a connection that can carry an RFQ-LSN read.
-	// Pooled-only split reads require a connection that is already connected:
-	// they cannot pause a transaction to run a backend connect handshake. When
-	// creation is allowed, a not-yet-connected entry remains usable because the
-	// normal session connect path will negotiate the RFQ profile before dispatch.
-	// Among RFQ-capable entries, use the same reuse preference as the regular
-	// PostgreSQL pool path: same connection options first, then avoid RESET, then
-	// prefer the entry with more matching session variables/schema.
-	bool skipped_incompatible = false;
-	const unsigned int initial_free = mysrvc->ConnectionsFree->conns_length();
-	PgSQL_Connection* client_conn =
-		(sess && sess->client_myds && sess->client_myds->myconn &&
-		 sess->client_myds->myconn->userinfo)
-			? sess->client_myds->myconn
-			: nullptr;
-	PolarDB_StartupClientContext required_startup_client;
-	const bool has_required_startup_client =
-		polardb_session_startup_client_context(sess, &required_startup_client);
-	if (only_pooled && (!client_conn || !has_required_startup_client)) {
-		if (status) {
-			*status = PolarDB_ReaderStatus::RFQ_UNAVAILABLE;
-		}
-		POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-			reader_target_rfq_unavailable);
-		POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-			reader_target_rfq_no_client_context);
-		return nullptr;
-	}
-	bool found_compatible = false;
-	bool skipped_profile_mismatch = false;
-	bool skipped_identity_mismatch = false;
-	bool skipped_auth_mismatch = false;
-	PgSQL_Connection* best_conn = nullptr;
-	std::vector<PgSQL_Connection*> stale_profile_conns;
-	unsigned int best_quality = 0;
-	unsigned int best_matching_session_vars = 0;
-	for (unsigned int i = 0; i < initial_free; i++) {
-		PgSQL_Connection* candidate = mysrvc->ConnectionsFree->index(i);
-		if (!candidate) {
-			continue;
-		}
-		const bool disconnected = candidate->get_pg_connection() == nullptr;
-		const bool rfq_profile_compatible =
-			candidate->polardb_startup_profile.has_rfq_lsn() &&
-			(!only_pooled || candidate->polardb_startup_profile.has_rfq_xid());
-		if (disconnected && only_pooled) {
-			proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5,
-				"PolarDB route smart: skipped disconnected pooled connection %p from %s:%d for pooled-only split read\n",
-				candidate, mysrvc->address, mysrvc->port);
-			continue;
-		}
-		if (disconnected || rfq_profile_compatible) {
-			if (!client_conn) {
-				if (status) {
-					*status = PolarDB_ReaderStatus::ACQUIRED;
-				}
-				return mysrvc->ConnectionsFree->remove(i);
-			}
-
-			unsigned int quality = 0;
-			unsigned int matching_session_vars = 0;
-			if (candidate->has_same_connection_options(client_conn)) {
-				if (!disconnected) {
-					if (!has_required_startup_client ||
-							!polardb_startup_client_compatible_for_warmup(
-								candidate->polardb_startup_client,
-								required_startup_client,
-								pgsql_thread___polardb_split_warmup_identity)) {
-						skipped_incompatible = true;
-						if (!has_required_startup_client) {
-							POLARDB_PROFILE_THREAD_COUNT_ONE(
-								sess ? sess->thread : NULL,
-								reader_target_rfq_no_client_context);
-						} else {
-							skipped_identity_mismatch = true;
-							POLARDB_PROFILE_THREAD_COUNT_ONE(
-								sess ? sess->thread : NULL,
-								reader_target_rfq_candidate_identity_mismatch);
-						}
-						proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5,
-							"PolarDB route smart: skipped pooled connection %p from %s:%d because startup client identity differs\n",
-							candidate, mysrvc->address, mysrvc->port);
-						continue;
-					}
-				}
-				quality = 1;
-				if (!candidate->requires_RESETTING_CONNECTION(client_conn)) {
-					quality = 2;
-					unsigned int not_matching = 0;
-					matching_session_vars =
-						candidate->number_of_matching_session_variables(
-							client_conn, not_matching);
-					if (not_matching == 0) {
-						found_compatible = true;
-						best_conn = candidate;
-						best_quality = 3;
-						best_matching_session_vars = matching_session_vars;
-						continue;
-					}
-				}
-			} else {
-				skipped_incompatible = true;
-				skipped_auth_mismatch = true;
-				POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-					reader_target_rfq_candidate_auth_mismatch);
-				proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5,
-					"PolarDB route smart: skipped pooled connection %p from %s:%d because user or database differs\n",
-					candidate, mysrvc->address, mysrvc->port);
-				continue;
-			}
-
-			const bool better =
-				!found_compatible ||
-				quality > best_quality ||
-				(quality == best_quality && quality == 2 &&
-				 matching_session_vars > best_matching_session_vars);
-			if (better) {
-				found_compatible = true;
-				best_conn = candidate;
-				best_quality = quality;
-				best_matching_session_vars = matching_session_vars;
-			}
-			continue;
-		}
-		// Free, but its startup profile cannot satisfy the required RFQ
-		// contract. Targeted reads need RFQ-LSN; pooled-only split reads also
-		// need RFQ-XID because they cannot reconnect and renegotiate here.
-		skipped_incompatible = true;
-		skipped_profile_mismatch = true;
-		POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-			reader_target_rfq_candidate_profile_mismatch);
-		POLARDB_THREAD_COUNT_ONE(sess ? sess->thread : NULL, rfq_profile_skipped);
-		proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5,
-			"PolarDB route smart: skipped pooled connection %p from %s:%d because startup profile lacks required RFQ bits\n",
-			candidate, mysrvc->address, mysrvc->port);
-		// A connected backend's startup profile is fixed for its lifetime. If it
-		// was opened before RFQ-LSN was enabled for this hostgroup, it cannot be
-		// repaired with RESET, so drop it instead of re-counting the same stale
-		// idle connection on every target-LSN acquisition.
-		stale_profile_conns.push_back(candidate);
-	}
-	for (PgSQL_Connection* stale : stale_profile_conns) {
-		mysrvc->ConnectionsFree->remove(stale);
-		PgHGM->status.polardb_rfq_profile_evicted.fetch_add(
-			1, std::memory_order_relaxed);
-		proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5,
-			"PolarDB route smart: evicted pooled connection %p from %s:%d because startup profile lacks required RFQ bits\n",
-			stale, mysrvc->address, mysrvc->port);
-		delete stale;
-	}
-	if (found_compatible) {
-		if (status) {
-			*status = PolarDB_ReaderStatus::ACQUIRED;
-		}
-		mysrvc->ConnectionsFree->remove(best_conn);
-		return best_conn;
-	}
-
-	// only_pooled callers may not create a connection. If the sole reason we
-	// failed was incompatible idle connections, report that precisely so the
-	// caller can choose to fall back to the writer.
-	if (only_pooled) {
-		(void)skipped_profile_mismatch;
-		(void)skipped_identity_mismatch;
-		(void)skipped_auth_mismatch;
-		if (status && skipped_incompatible) {
-			*status = PolarDB_ReaderStatus::RFQ_UNAVAILABLE;
-			POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-				reader_target_rfq_unavailable);
-			if (skipped_profile_mismatch) {
-				POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-					reader_target_rfq_unavailable_profile_mismatch);
-			}
-			if (skipped_identity_mismatch) {
-				POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-					reader_target_rfq_unavailable_identity_mismatch);
-			}
-			if (skipped_auth_mismatch) {
-				POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-					reader_target_rfq_unavailable_auth_mismatch);
-			}
-			POLARDB_TRACE(
-				"PolarDB route smart: RFQ unavailable from pooled-only "
-				"incompatible idle connections profile=%d identity=%d auth=%d\n",
-				skipped_profile_mismatch ? 1 : 0,
-				skipped_identity_mismatch ? 1 : 0,
-				skipped_auth_mismatch ? 1 : 0);
-		}
-		return nullptr;
-	}
-
-	if (mysrvc->max_connections <= 0) {
-		return nullptr;
-	}
-
-	const unsigned int max_connections =
-		static_cast<unsigned int>(mysrvc->max_connections);
-	const unsigned int conns_free = mysrvc->ConnectionsFree->conns_length();
-	const unsigned int conns_used = mysrvc->ConnectionsUsed->conns_length();
-	if (conns_used >= max_connections) {
-		POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-			reader_target_pool_busy);
-		return nullptr;
-	}
-	// If the pool is already at capacity, we must free room for one new
-	// RFQ-capable connection. Evict only as many incompatible idle connections as
-	// it takes to get under the limit by one, and only if that many are free.
-	const unsigned int total_connections = conns_free + conns_used;
-	const unsigned int incompatible_to_evict =
-		total_connections >= max_connections
-			? total_connections - max_connections + 1
-			: 0;
-	if (incompatible_to_evict > conns_free) {
-		POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-			reader_target_pool_busy);
-		return nullptr;
-	}
-
-	if (pgsql_connection_creation_throttled_locked(mysrvc)) {
-		POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-			reader_target_pool_busy);
-		return nullptr;
-	}
-
-	// The scan above found no usable free connection, and the caller holds the
-	// write lock, so no compatible entry can appear before we create one. Evict
-	// the incompatible idle connections that block capacity, then create.
-	for (unsigned int i = 0; i < incompatible_to_evict; i++) {
-		PgSQL_Connection* evicted = mysrvc->ConnectionsFree->remove(0);
-		PgHGM->status.polardb_rfq_profile_evicted.fetch_add(1, std::memory_order_relaxed);
-		proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5,
-			"PolarDB route smart: evicted pooled connection %p from %s:%d because startup profile lacks required RFQ bits\n",
-			evicted, mysrvc->address, mysrvc->port);
-		delete evicted;
-	}
-
-	PgSQL_Connection* conn = pgsql_create_backend_connection_locked(mysrvc);
-	if (conn && status) {
-		*status = PolarDB_ReaderStatus::ACQUIRED;
-	}
-	return conn;
-}
-
-static PolarDB_ReaderStatus polardb_reader_status_prefer(
-		PolarDB_ReaderStatus current,
-		PolarDB_ReaderStatus next) {
-	auto priority = [](PolarDB_ReaderStatus status) -> int {
-		// Preserve the most actionable cause: RFQ policy first, then
-		// consistency-safety failures, then ordinary capacity/availability.
-		switch (status) {
-		case PolarDB_ReaderStatus::RFQ_UNAVAILABLE:
-			return 80;
-		case PolarDB_ReaderStatus::PRIMARY_LSN_UNKNOWN:
-			return 70;
-		case PolarDB_ReaderStatus::READER_LSN_UNKNOWN:
-			return 60;
-		case PolarDB_ReaderStatus::READER_LSN_STALE:
-			return 50;
-		case PolarDB_ReaderStatus::READER_LAG_EXCEEDED:
-			return 40;
-		case PolarDB_ReaderStatus::READER_BUSY:
-			return 30;
-		case PolarDB_ReaderStatus::READER_UNAVAILABLE:
-			return 10;
-		case PolarDB_ReaderStatus::ACQUIRED:
-			return 0;
-		}
-		return 0;
-	};
-	return priority(next) > priority(current) ? next : current;
-}
-
-/**
- * @brief Pick one reader from a candidate set by weighted random choice, then
- *        fall back to a linear scan.
- *
- * First chooses a candidate at random in proportion to server weight and tries
- * to get a connection from it. If that one cannot be used (another thread took
- * its last slot, or it had only profile-incompatible idle connections), the
- * fallback scan tries the remaining candidates in order. The accumulated
- * failure reason is the highest by polardb_reader_status_prefer().
- *
- * Precondition: caller must hold the HostGroups_Manager write lock.
- *
- * @return The acquired connection and ACQUIRED, or no connection and the best
- *         failure reason seen.
- */
-struct PolarDB_ReaderCandidate {
-	PgSQL_SrvC* srv;
-	uint64_t lsn;
-	unsigned int weight;
-	bool target_reached;
-	bool fresh_behind;
-	bool best_behind;
-};
-
-static PolarDB_ReaderResult polardb_try_weighted_rfq_candidates(
-		PolarDB_ReaderCandidate* candidates, unsigned int num_candidates,
-		unsigned int weight_sum, PgSQL_Session* sess, uint64_t consistency_target_lsn,
-		bool startup_requests_rfq_lsn, bool only_pooled) {
-	PolarDB_ReaderResult result;
-	if (num_candidates == 0 || weight_sum == 0) {
-		return result;
-	}
-
-	result.status = PolarDB_ReaderStatus::READER_BUSY;
-	// Weighted pick: land in [1, weight_sum] and walk the running weight total.
-	unsigned int k = rand_fast() % weight_sum;
-	k++;  // 1-based for comparison
-	unsigned int running_sum = 0;
-	int weighted_pick_idx = -1;
-
-	for (unsigned int j = 0; j < num_candidates; j++) {
-		PgSQL_SrvC* mysrvc = candidates[j].srv;
-		running_sum += candidates[j].weight;
-		if (k <= running_sum) {
-			weighted_pick_idx = (int)j;
-			PolarDB_ReaderStatus status =
-				PolarDB_ReaderStatus::READER_BUSY;
-			PgSQL_Connection* conn = polardb_get_rfq_profile_compatible_conn(
-				mysrvc, sess, consistency_target_lsn, startup_requests_rfq_lsn, only_pooled, &status);
-			if (conn) {
-				result.conn = conn;
-				result.srv = mysrvc;
-				result.status = PolarDB_ReaderStatus::ACQUIRED;
-				return result;
-			}
-			result.status = polardb_reader_status_prefer(result.status, status);
-			// The weighted pick did not yield a usable connection; fall through
-			// to the linear scan over the remaining candidates.
-			break;
-		}
-	}
-
-	// Second pass: try every other candidate in order. The caller holds the HGM
-	// write lock, so retrying the already-failed weighted pick immediately cannot
-	// reveal a new free slot; it only repeats free-list scans and throttle checks.
-	for (unsigned int j = 0; j < num_candidates; j++) {
-		if (weighted_pick_idx >= 0 && (int)j == weighted_pick_idx)
-			continue;
-		PgSQL_SrvC* mysrvc = candidates[j].srv;
-		PolarDB_ReaderStatus status =
-			PolarDB_ReaderStatus::READER_BUSY;
-		PgSQL_Connection* conn = polardb_get_rfq_profile_compatible_conn(
-			mysrvc, sess, consistency_target_lsn, startup_requests_rfq_lsn, only_pooled, &status);
-		if (conn) {
-			result.conn = conn;
-			result.srv = mysrvc;
-			result.status = PolarDB_ReaderStatus::ACQUIRED;
-			return result;
-		}
-		result.status = polardb_reader_status_prefer(result.status, status);
-	}
-
-	return result;
-}
-
-static PolarDB_ReaderResult polardb_try_session_reader_affinity(
-		PgSQL_HGC* myhgc, PgSQL_Session* sess,
-		const PolarDB_Query_ReaderPlan& reader_plan, uint64_t now_us,
-		bool startup_requests_rfq_lsn,
-		const char* exclude_address, int exclude_port) {
-	PolarDB_ReaderResult result;
-	if (!myhgc || !sess || !reader_plan.has_consistency_target_lsn() ||
-			pgsql_thread___polardb_reader_affinity_ttl_ms <= 0) {
-		return result;
-	}
-
-	PolarDB_ReaderAffinity& affinity = sess->polardb_reader_affinity;
-	if (!affinity.active()) {
-		return result;
-	}
-	if (affinity.valid_until_us < now_us || affinity.uses_left == 0) {
-		POLARDB_THREAD_COUNT_ONE(sess->thread, reader_affinity_miss_expired);
-		affinity.clear();
-		return result;
-	}
-	if (!affinity.writer_scope.matches(sess->polardb_query.request_writer_scope)) {
-		POLARDB_THREAD_COUNT_ONE(sess->thread, reader_affinity_miss_scope);
-		affinity.clear();
-		return result;
-	}
-	if (affinity.last_reached_lsn < reader_plan.consistency_target_lsn) {
-		POLARDB_THREAD_COUNT_ONE(sess->thread, reader_affinity_miss_not_ready);
-		affinity.clear();
-		return result;
-	}
-	if (affinity.reader_hg != (int)myhgc->hid) {
-		POLARDB_THREAD_COUNT_ONE(sess->thread, reader_affinity_miss_scope);
-		affinity.clear();
-		return result;
-	}
-
-	PgSQL_SrvC* target = nullptr;
-	for (unsigned int i = 0; i < myhgc->mysrvs->cnt(); i++) {
-		PgSQL_SrvC* mysrvc = myhgc->mysrvs->idx(i);
-		if (!mysrvc || !mysrvc->address ||
-				(int)mysrvc->port != affinity.port ||
-				affinity.address != mysrvc->address) {
-			continue;
-		}
-		target = mysrvc;
-		break;
-	}
-	if (!target || target->status != MYSQL_SERVER_STATUS_ONLINE ||
-			target->weight <= 0 || !pgsql_srv_latency_allowed(target) ||
-			target->max_connections <= 0 || !target->ConnectionsFree ||
-			!target->ConnectionsUsed) {
-		POLARDB_THREAD_COUNT_ONE(sess->thread, reader_affinity_miss_no_free);
-		affinity.clear();
-		return result;
-	}
-	if (exclude_address && exclude_address[0] && exclude_port >= 0 &&
-			strcmp(target->address, exclude_address) == 0 &&
-			(int)target->port == exclude_port) {
-		POLARDB_THREAD_COUNT_ONE(sess->thread, reader_affinity_miss_no_free);
-		affinity.clear();
-		return result;
-	}
-	if (target->ConnectionsFree->conns_length() == 0 ||
-			target->ConnectionsUsed->conns_length() >=
-				static_cast<unsigned int>(target->max_connections)) {
-		POLARDB_THREAD_COUNT_ONE(sess->thread, reader_affinity_miss_no_free);
-		return result;
-	}
-
-	PolarDB_ReaderStatus status = PolarDB_ReaderStatus::READER_BUSY;
-	PgSQL_Connection* conn = polardb_get_rfq_profile_compatible_conn(
-		target, sess, reader_plan.consistency_target_lsn,
-		startup_requests_rfq_lsn, /*only_pooled=*/true, &status);
-	if (!conn) {
-		if (status == PolarDB_ReaderStatus::RFQ_UNAVAILABLE) {
-			POLARDB_THREAD_COUNT_ONE(sess->thread,
-				reader_affinity_miss_profile);
-		} else {
-			POLARDB_THREAD_COUNT_ONE(sess->thread,
-				reader_affinity_miss_no_free);
-		}
-		return result;
-	}
-
-	affinity.uses_left--;
-	result.conn = conn;
-	result.srv = target;
-	result.status = PolarDB_ReaderStatus::ACQUIRED;
-	result.wait_bypass_allowed = true;
-	POLARDB_THREAD_COUNT_ONE(sess->thread, reader_affinity_hit);
-	POLARDB_THREAD_COUNT_ONE(sess->thread, reader_affinity_bypassed_wait);
-	POLARDB_TRACE(
-		"PolarDB affinity: hit reader=%s:%d target_lsn=%lu proven_lsn=%lu uses_left=%u\n",
-		target->address, (int)target->port,
-		(unsigned long)reader_plan.consistency_target_lsn,
-		(unsigned long)affinity.last_reached_lsn,
-		(unsigned int)affinity.uses_left);
-	return result;
-}
 
 PolarDB_ReaderResult PgSQL_HostGroups_Manager::get_MyConn_polardb_reader(unsigned int _hid, PgSQL_Session* sess,
-	const PolarDB_Query_ReaderPlan& reader_plan, bool only_pooled,
+	const PolarDB_Query_ReaderPlan& reader_plan,
+	const PolarDB_WaitSpec& wait_spec,
+	bool only_pooled,
 	const char* exclude_address, int exclude_port) {
-	const uint64_t consistency_target_lsn = reader_plan.consistency_target_lsn;
-	// A consistency target narrows preference to readers whose fresh cached LSN
-	// already reaches that target. It never rejects the original replica set
-	// unless a byte-lag cap is enabled; fallback readers still rely on the wait
-	// wrapper as the correctness gate.
-	PolarDB_ReaderResult result;
-#if POLARDB_PROFILE
-	const unsigned long long acquire_start_us = monotonic_time();
-	auto finish_unlocked = [&](PolarDB_ReaderResult out) {
-		const unsigned long long end_us = monotonic_time();
-		POLARDB_PROFILE_THREAD_COUNT(sess ? sess->thread : NULL, reader_acquire_sum_us,
-			end_us >= acquire_start_us ? end_us - acquire_start_us : 0);
-		POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL, reader_acquire_count);
-		return out;
-	};
-	const unsigned long long lock_wait_start_us = monotonic_time();
-#endif // POLARDB_PROFILE
-	wrlock();
-#if POLARDB_PROFILE
-	const unsigned long long lock_acquired_us = monotonic_time();
-	POLARDB_PROFILE_THREAD_COUNT(sess ? sess->thread : NULL, hgm_reader_lock_wait_sum_us,
-		lock_acquired_us >= lock_wait_start_us
-			? lock_acquired_us - lock_wait_start_us : 0);
-	POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL, hgm_reader_lock_wait_count);
-	auto unlock_and_finish = [&](PolarDB_ReaderResult out) {
-		const unsigned long long unlock_us = monotonic_time();
-		POLARDB_PROFILE_THREAD_COUNT(sess ? sess->thread : NULL, hgm_reader_lock_hold_sum_us,
-			unlock_us >= lock_acquired_us ? unlock_us - lock_acquired_us : 0);
-		POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL, hgm_reader_lock_hold_count);
-		wrunlock();
-		return finish_unlocked(out);
-	};
-#else
-	auto unlock_and_finish = [&](PolarDB_ReaderResult out) {
-		wrunlock();
-		return out;
-	};
-#endif // POLARDB_PROFILE
-	status.pgconnpoll_get++;
-
-	PgSQL_HGC* myhgc = MyHGC_lookup(_hid);
-	if (myhgc) {
-		const PgSQL_HostGroups_Manager::PolarDB_HG_Policy policy =
-			get_polardb_hg_policy(_hid);
-		const int protocol =
-			policy.proxy_protocol >= 0 ? policy.proxy_protocol : current_global_polardb_proxy_protocol();
-		const bool startup_requests_rfq_lsn =
-			PolarDB_StartupProfile::from_protocol(
-				polardb_proxy_protocol_from_int(protocol)).has_rfq_lsn();
-
-#if POLARDB_PROXY && POLARDB_DEBUG
-		PolarDB_ReaderStatus debug_status = PolarDB_ReaderStatus::ACQUIRED;
-		if (reader_plan.has_consistency_target_lsn()) {
-			if (polardb_debug_reader_acquire_fault("reader_busy")) {
-				debug_status = PolarDB_ReaderStatus::READER_BUSY;
-			} else if (polardb_debug_reader_acquire_fault("reader_lsn_unknown")) {
-				debug_status = PolarDB_ReaderStatus::READER_LSN_UNKNOWN;
-			}
-		}
-		if (debug_status != PolarDB_ReaderStatus::ACQUIRED) {
-			result.status = debug_status;
-			POLARDB_TRACE(
-				"PolarDB route smart: debug forced reader acquisition status=%s "
-				"(reader_hg=%u consistency_target_lsn=%lu)\n",
-				polardb_reader_status_name(result.status), _hid,
-				(unsigned long)reader_plan.consistency_target_lsn);
-			return unlock_and_finish(result);
-		}
-#endif // POLARDB_PROXY && POLARDB_DEBUG
-
-		if (reader_plan.lag_cap_enabled() && reader_plan.primary_lsn == 0) {
-			POLARDB_THREAD_COUNT_ONE(sess ? sess->thread : NULL, lsn_stale_count);
-			result.status = PolarDB_ReaderStatus::PRIMARY_LSN_UNKNOWN;
-			POLARDB_TRACE(
-				"PolarDB route smart: primary LSN unknown under lag cap "
-				"(reader_hg=%u max_lag_bytes=%d)\n",
-				_hid, reader_plan.max_lag_bytes);
-			return unlock_and_finish(result);
-		}
-
-		const bool has_consistency_target_lsn = reader_plan.has_consistency_target_lsn();
-		const bool lag_cap_enabled = reader_plan.lag_cap_enabled();
-		const uint64_t now_us = (has_consistency_target_lsn || lag_cap_enabled) ? monotonic_time() : 0;
-		bool freshness_clamped = false;
-		const uint32_t fresh_ms = polardb_effective_lsn_freshness_ms(
-			pgsql_thread___polardb_lsn_freshness_ms,
-			reader_plan.wait_timeout_ms,
-			reader_plan.max_lag_bytes,
-			pgsql_thread___polardb_lag_cap_freshness_ms,
-			&freshness_clamped);
-		if (freshness_clamped) {
-			POLARDB_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-				lag_cap_freshness_clamped);
-			POLARDB_TRACE(
-				"PolarDB LAG-CAP: effective freshness clamped to %u ms "
-				"(configured=%d wait_timeout_ms=%u max_lag_bytes=%d ceiling=%d)\n",
-				fresh_ms, pgsql_thread___polardb_lsn_freshness_ms,
-				reader_plan.wait_timeout_ms, reader_plan.max_lag_bytes,
-				pgsql_thread___polardb_lag_cap_freshness_ms);
-		}
-
-		if (has_consistency_target_lsn) {
-			PolarDB_ReaderResult affinity_result =
-				polardb_try_session_reader_affinity(
-					myhgc, sess, reader_plan, now_us,
-					startup_requests_rfq_lsn,
-					exclude_address, exclude_port);
-			if (affinity_result.acquired()) {
-				result = affinity_result;
-				result.srv->ConnectionsUsed->add(result.conn);
-				status.pgconnpoll_get_ok++;
-				result.srv->update_max_connections_used();
-				proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5,
-					"PolarDB route smart: got affinity connection from %s:%d "
-					"(target_lsn=%lu, only_pooled=%d)\n",
-					result.srv->address, result.srv->port,
-					(unsigned long)reader_plan.consistency_target_lsn,
-					only_pooled ? 1 : 0);
-				return unlock_and_finish(result);
-			}
-		}
-
-		// Stack-allocated array for small N (same pattern as get_random_MySrvC);
-		// falls back to heap allocation for larger deployments.
-		PolarDB_ReaderCandidate candidates_static[32];
-		PolarDB_ReaderCandidate* candidates = candidates_static;
-		PolarDB_ReaderCandidate best_fresh_behind_candidates_static[32];
-		PolarDB_ReaderCandidate* best_fresh_behind_candidates =
-			best_fresh_behind_candidates_static;
-		unsigned int num_candidates = 0;
-		unsigned int num_target_reached_candidates = 0;
-		unsigned int weight_sum = 0;
-		unsigned int target_reached_weight_sum = 0;
-		unsigned int num_best_fresh_behind_candidates = 0;
-		unsigned int best_fresh_behind_weight_sum = 0;
-		uint64_t best_fresh_behind_lsn = 0;
-		const int best_fresh_behind_lsn_range_bytes =
-			pgsql_thread___polardb_reader_lsn_lag_range_bytes > 0
-				? pgsql_thread___polardb_reader_lsn_lag_range_bytes : 0;
-		PolarDB_ReaderStatus filter_status =
-			PolarDB_ReaderStatus::READER_UNAVAILABLE;
-
-		unsigned int num_servers = myhgc->mysrvs->cnt();
-		if (num_servers > 32) {
-			candidates =
-				(PolarDB_ReaderCandidate*)malloc(
-					num_servers * sizeof(PolarDB_ReaderCandidate));
-			best_fresh_behind_candidates =
-				(PolarDB_ReaderCandidate*)malloc(
-					num_servers * sizeof(PolarDB_ReaderCandidate));
-		}
-		auto free_candidate_arrays = [&]() {
-			if (num_servers > 32) {
-				free(candidates);
-				free(best_fresh_behind_candidates);
-			}
-		};
-
-#if POLARDB_PROXY_TODO
-		// TODO: disabled in T13. pgsql-polardb_lag_ms is reserved until PgSQL
-		// has a real per-reader millisecond-lag producer. Do not use
-		// aws_aurora_current_lag_us here; that field is MySQL/Aurora state.
-		// Future implementation should estimate catch-up time from monitor LSN
-		// samples:
-		//
-		//     estimated_catchup_ms = byte_lag / recent_replay_bytes_per_ms
-		//
-		// Missing/stale/zero-rate samples under an enabled cap should reject
-		// the reader and let the caller use the writer.
-		int max_lag_ms = pgsql_thread___polardb_lag_ms;
-#endif
-
-		// === FILTER PHASE: single O(N) pass ===
-		for (unsigned int j = 0; j < num_servers; j++) {
-			PgSQL_SrvC* mysrvc = myhgc->mysrvs->idx(j);
-			if (!mysrvc) continue;
-
-			if (exclude_address && exclude_address[0] && exclude_port >= 0 &&
-					mysrvc->address &&
-					strcmp(mysrvc->address, exclude_address) == 0 &&
-					(int)mysrvc->port == exclude_port) {
-				POLARDB_TRACE(
-					"PolarDB route smart: excluded reader %s:%d "
-					"(reader_hg=%u)\n",
-					mysrvc->address, (int)mysrvc->port, _hid);
-				continue;
-			}
-
-			// Filter 1: must be ONLINE.
-			if (mysrvc->status != MYSQL_SERVER_STATUS_ONLINE)
-				continue;
-			if (mysrvc->weight <= 0)
-				continue;
-			// Keep PolarDB reader acquisition aligned with the regular PostgreSQL
-			// server selector: a reader whose monitor latency is above its limit
-			// is not a candidate for new traffic.
-			if (!pgsql_srv_latency_allowed(mysrvc))
-				continue;
-
-			// Filter 2: must have connection capacity.
-			if (mysrvc->max_connections <= 0 ||
-				mysrvc->ConnectionsUsed->conns_length() >=
-					static_cast<unsigned int>(mysrvc->max_connections)) {
-				filter_status = polardb_reader_status_prefer(
-					filter_status, PolarDB_ReaderStatus::READER_BUSY);
-				if (has_consistency_target_lsn) {
-					POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-						reader_target_pool_busy);
-				}
-				continue;
-			}
-
-			// Filter 3: pooled-only callers require an already-free backend.
-			if (only_pooled && mysrvc->ConnectionsFree->conns_length() == 0) {
-				filter_status = polardb_reader_status_prefer(
-					filter_status, PolarDB_ReaderStatus::READER_BUSY);
-				if (has_consistency_target_lsn) {
-					POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-						reader_target_pool_busy);
-				}
-				continue;
-			}
-
-#if POLARDB_PROXY_TODO
-			// Filter 4: future millisecond-lag safety. Disabled in T13 because
-			// PgSQL/PolarDB currently has no valid producer for max_lag_ms.
-			if (max_lag_ms > 0) {
-				uint64_t updated_us =
-					mysrvc->lsn_updated_at.load(std::memory_order_relaxed);
-				if (!polardb_lsn_cache_fresh(updated_us, now_us, (uint32_t)fresh_ms)) {
-					POLARDB_THREAD_COUNT_ONE(sess ? sess->thread : NULL, lsn_stale_count);
-					continue;  // stale under an enabled cap -> skip this reader
-				}
-				if (!polardb_lag_ms_within_cap(
-						mysrvc->aws_aurora_current_lag_us, max_lag_ms))
-					continue;
-			}
-#endif
-
-			bool reader_lsn_fresh = false;
-			uint64_t reader_lsn = 0;
-			if (has_consistency_target_lsn || lag_cap_enabled) {
-				uint64_t updated_us =
-					mysrvc->lsn_updated_at.load(std::memory_order_relaxed);
-				reader_lsn = mysrvc->polardb_current_lsn.load(std::memory_order_relaxed);
-				reader_lsn_fresh = polardb_lsn_cache_fresh(updated_us, now_us, (uint32_t)fresh_ms);
-			}
-
-			if (lag_cap_enabled) {
-				if (reader_lsn == 0) {
-					POLARDB_THREAD_COUNT_ONE(sess ? sess->thread : NULL, lsn_stale_count);
-					POLARDB_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-						lag_cap_lsn_unknown);
-					POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-						reader_target_lsn_unknown);
-					filter_status = polardb_reader_status_prefer(
-						filter_status,
-						PolarDB_ReaderStatus::READER_LSN_UNKNOWN);
-					continue;
-				}
-				if (!reader_lsn_fresh) {
-					POLARDB_THREAD_COUNT_ONE(sess ? sess->thread : NULL, lsn_stale_count);
-					POLARDB_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-						lag_cap_lsn_stale);
-					POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-						reader_target_lsn_stale);
-					filter_status = polardb_reader_status_prefer(
-						filter_status,
-						PolarDB_ReaderStatus::READER_LSN_STALE);
-					continue;
-				}
-				if (!reader_plan.within_byte_cap(reader_lsn)) {
-					POLARDB_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-						lag_cap_rejected);
-					POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-						reader_target_lag_cap_reject);
-					filter_status = polardb_reader_status_prefer(
-						filter_status,
-						PolarDB_ReaderStatus::READER_LAG_EXCEEDED);
-					continue;
-				}
-				POLARDB_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-					lag_cap_accepted);
-			}
-
-			// Target-reached means this reader's cached LSN sample is fresh and
-			// already at or beyond the consistency target. Keep those candidates
-			// as a contiguous prefix so selection can prove wrapper bypass safety
-			// only for a backend actually acquired from that prefix.
-			const bool reader_lsn_reaches_consistency_target =
-				reader_lsn_fresh &&
-				reader_plan.reader_lsn_reaches_consistency_target(reader_lsn);
-			bool reader_is_fresh_behind = false;
-			if (has_consistency_target_lsn) {
-				if (reader_lsn == 0) {
-					POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-						reader_target_lsn_unknown);
-				} else if (!reader_lsn_fresh) {
-					POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-						reader_target_lsn_stale);
-				} else if (!reader_lsn_reaches_consistency_target) {
-					POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-						reader_target_lsn_behind);
-					reader_is_fresh_behind = true;
-					if (best_fresh_behind_lsn == 0 ||
-							reader_lsn > best_fresh_behind_lsn) {
-						best_fresh_behind_lsn = reader_lsn;
-					}
-				}
-			}
-			candidates[num_candidates] = PolarDB_ReaderCandidate{
-				mysrvc,
-				reader_lsn,
-				static_cast<unsigned int>(mysrvc->weight),
-				reader_lsn_reaches_consistency_target,
-				reader_is_fresh_behind,
-				false};
-			num_candidates++;
-			weight_sum += static_cast<unsigned int>(mysrvc->weight);
-			if (reader_lsn_reaches_consistency_target) {
-				std::swap(candidates[num_target_reached_candidates],
-					candidates[num_candidates - 1]);
-				num_target_reached_candidates++;
-				target_reached_weight_sum += static_cast<unsigned int>(mysrvc->weight);
-				POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-					reader_target_ready_candidate);
-			}
-		}
-
-		if (has_consistency_target_lsn && best_fresh_behind_lsn > 0) {
-			// Build the best-behind set after the full scan. A lower-LSN reader
-			// may appear before the final best reader in configuration order; a
-			// post-pass keeps pgsql-polardb_reader_lsn_lag_range_bytes independent
-			// of that order. The wrapper wait remains the correctness gate.
-			for (unsigned int i = 0; i < num_candidates; i++) {
-				if (!candidates[i].fresh_behind) {
-					continue;
-				}
-				if (!polardb_reader_lsn_in_best_behind_range(
-						candidates[i].lsn, best_fresh_behind_lsn,
-						best_fresh_behind_lsn_range_bytes)) {
-					continue;
-				}
-				candidates[i].best_behind = true;
-				best_fresh_behind_candidates[
-					num_best_fresh_behind_candidates++] = candidates[i];
-				best_fresh_behind_weight_sum += candidates[i].weight;
-			}
-		}
-
-		if (has_consistency_target_lsn && num_target_reached_candidates == 0) {
-			POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-				reader_target_no_ready_candidate);
-		}
-
-		bool fallback_to_wait_set = false;
-		result.status = filter_status;
-
-		// === SELECTION PHASE: preferred weighted subset, then wait-capable set ===
-		// First try only the target-reached prefix, so a consistency-target read
-		// can use a reader already known to satisfy the target and skip the wait.
-		if (has_consistency_target_lsn && num_target_reached_candidates > 0 && target_reached_weight_sum > 0) {
-			PolarDB_ReaderResult preferred_result =
-				polardb_try_weighted_rfq_candidates(
-					candidates, num_target_reached_candidates, target_reached_weight_sum,
-					sess, consistency_target_lsn, startup_requests_rfq_lsn, only_pooled);
-			if (preferred_result.acquired()) {
-				result = preferred_result;
-				result.wait_bypass_allowed = true;
-				if (sess) {
-					sess->polardb_note_reader_affinity(
-						result.srv, consistency_target_lsn,
-						sess->polardb_query.request_writer_scope);
-				}
-				POLARDB_THREAD_COUNT_ONE(sess ? sess->thread : NULL, target_lsn_preferred);
-			} else {
-				result.status = polardb_reader_status_prefer(
-					result.status, preferred_result.status);
-			}
-		}
-
-		// If no reader is already known to satisfy the target, try the freshest
-		// behind readers before the generic weighted fallback. When several
-		// readers are equally close, choose by weight instead of always choosing
-		// the first configured server. The wrapper is still required; this only
-		// reduces expected backend wait duration.
-		bool best_fresh_behind_attempted = false;
-		if (!result.acquired() && has_consistency_target_lsn &&
-				num_best_fresh_behind_candidates > 0 &&
-				best_fresh_behind_weight_sum > 0) {
-			POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-				reader_target_best_behind_attempt);
-			best_fresh_behind_attempted = true;
-			PolarDB_ReaderResult best_behind_result =
-				polardb_try_weighted_rfq_candidates(
-					best_fresh_behind_candidates,
-					num_best_fresh_behind_candidates,
-					best_fresh_behind_weight_sum,
-					sess, consistency_target_lsn, startup_requests_rfq_lsn,
-					only_pooled);
-			if (best_behind_result.acquired()) {
-				result = best_behind_result;
-				fallback_to_wait_set = true;
-				POLARDB_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-					target_lsn_fallback_wait);
-				POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-					reader_target_best_behind_acquired);
-			} else {
-				result.status = polardb_reader_status_prefer(
-					result.status, best_behind_result.status);
-			}
-		}
-
-		// Nothing acquired from the preferred prefix (or there was none): fall
-		// back to the rest of the eligible set. These may be behind the target,
-		// which is safe here because the backend wait in the wrapped query is the
-		// real correctness gate; this only affects which replica is chosen.
-		if (!result.acquired()) {
-			const bool preferred_attempted =
-				has_consistency_target_lsn && num_target_reached_candidates > 0;
-			unsigned int fallback_candidates =
-				preferred_attempted
-					? num_candidates - num_target_reached_candidates : num_candidates;
-			unsigned int fallback_weight_sum =
-				preferred_attempted
-					? weight_sum - target_reached_weight_sum : weight_sum;
-			PolarDB_ReaderCandidate* fallback_set =
-				preferred_attempted
-					? candidates + num_target_reached_candidates : candidates;
-			PolarDB_ReaderCandidate fallback_excluding_best_static[32];
-			PolarDB_ReaderCandidate* fallback_excluding_best =
-				fallback_excluding_best_static;
-			if (num_servers > 32) {
-				fallback_excluding_best =
-					(PolarDB_ReaderCandidate*)malloc(
-						sizeof(PolarDB_ReaderCandidate) * num_servers);
-			}
-			if (best_fresh_behind_attempted &&
-					num_best_fresh_behind_candidates > 0) {
-				unsigned int compact_candidates = 0;
-				unsigned int compact_weight_sum = 0;
-				// The best-behind reader set was already tried above. Skip it
-				// by using the flag recorded on the candidate struct, instead
-				// of comparing every fallback candidate against every best-behind
-				// candidate while the HGM lock is held.
-				for (unsigned int i = 0; i < fallback_candidates; i++) {
-					if (fallback_set[i].best_behind) {
-						continue;
-					}
-					fallback_excluding_best[compact_candidates++] = fallback_set[i];
-					compact_weight_sum += fallback_set[i].weight;
-				}
-				fallback_set = fallback_excluding_best;
-				fallback_candidates = compact_candidates;
-				fallback_weight_sum = compact_weight_sum;
-			}
-			fallback_to_wait_set =
-				has_consistency_target_lsn && fallback_candidates > 0 && fallback_weight_sum > 0;
-			PolarDB_ReaderResult fallback_result =
-				polardb_try_weighted_rfq_candidates(
-					fallback_set, fallback_candidates, fallback_weight_sum,
-					sess, consistency_target_lsn, startup_requests_rfq_lsn, only_pooled);
-			if (fallback_result.acquired()) {
-				result = fallback_result;
-			} else {
-				result.status = polardb_reader_status_prefer(
-					result.status, fallback_result.status);
-			}
-			if (result.acquired() && fallback_to_wait_set) {
-				POLARDB_THREAD_COUNT_ONE(sess ? sess->thread : NULL, target_lsn_fallback_wait);
-			}
-			if (num_servers > 32) {
-				free(fallback_excluding_best);
-			}
-		}
-		if (result.acquired() && has_consistency_target_lsn &&
-				!result.wait_bypass_allowed) {
-			POLARDB_PROFILE_THREAD_COUNT_ONE(sess ? sess->thread : NULL,
-				reader_target_fallback_acquired);
-			const uint64_t selected_reader_lsn =
-				result.srv->polardb_current_lsn.load(std::memory_order_relaxed);
-			const uint64_t selected_lsn_updated_at =
-				result.srv->lsn_updated_at.load(std::memory_order_relaxed);
-			const bool selected_reader_lsn_fresh =
-				polardb_lsn_cache_fresh(
-					selected_lsn_updated_at, now_us, (uint32_t)fresh_ms);
-			polardb_count_reader_target_lsn_gap_bucket(
-				sess ? sess->thread : NULL,
-				consistency_target_lsn,
-				selected_reader_lsn,
-				selected_reader_lsn_fresh);
-		}
-
-		if (result.acquired()) {
-			result.srv->ConnectionsUsed->add(result.conn);
-			status.pgconnpoll_get_ok++;
-			result.srv->update_max_connections_used();
-			proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5,
-				"PolarDB route smart: got connection from %s:%d (LSN=%lu, consistency_target_lsn=%lu, target_preferred=%d, fallback_wait=%d, weight=%ld, only_pooled=%d)\n",
-				result.srv->address, result.srv->port,
-				(unsigned long)result.srv->polardb_current_lsn.load(std::memory_order_relaxed),
-				(unsigned long)consistency_target_lsn, result.wait_bypass_allowed ? 1 : 0,
-				fallback_to_wait_set ? 1 : 0,
-				result.srv->weight, only_pooled ? 1 : 0);
-			free_candidate_arrays();
-			return unlock_and_finish(result);
-		}
-
-		free_candidate_arrays();
+	if (!polardb_reader_pool_) {
+		return PolarDB_ReaderResult{};
 	}
-
-	return unlock_and_finish(result);
+	return polardb_reader_pool_->get_MyConn_polardb_reader(
+		_hid, sess, reader_plan, wait_spec, only_pooled,
+		exclude_address, exclude_port);
 }
+
 #endif // POLARDB_PROXY

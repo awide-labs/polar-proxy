@@ -10,7 +10,7 @@
  *
  * The split path has three terminal actions. RETRY re-dispatches the original
  * client query on the live writer backend, FORWARD emits the captured reader
- * error with ReadyForQuery('E') and marks the client transaction failed, and
+ * error with ReadyForQuery('T') and keeps the transaction on the writer, and
  * TERMINATE closes the client session if no safe writer state remains.
  */
 
@@ -37,7 +37,7 @@
 extern PgSQL_HostGroups_Manager* PgHGM;
 
 #if POLARDB_PROXY
-static constexpr uint8_t POLARDB_READER_RETRY_BUDGET = 1;
+static constexpr uint8_t POLARDB_READER_RETRY_LIMIT = 1;
 
 static std::string polardb_snapshot_error_message(const std::string& message) {
 	constexpr size_t kMaxSnapshotBytes = 512;
@@ -54,7 +54,12 @@ static void polardb_count_wait_retry_counter(
 	POLARDB_TRACE("PolarDB WAIT: retry counter=%s\n", name ? name : "");
 }
 
-static bool polardb_wait_reader_can_return_to_pool(PgSQL_Connection* conn);
+static bool polardb_reader_connection_pool_reusable(PgSQL_Connection* conn);
+
+static bool polardb_failed_connection_reusable(PgSQL_Connection* conn) {
+	return conn && conn->is_connected() && conn->is_error_present() &&
+		conn->is_connection_in_reusable_state();
+}
 
 static bool polardb_error_text_is_wait_timeout(const std::string& message) {
 	return message.find("LSN wait timeout") != std::string::npos ||
@@ -78,7 +83,7 @@ static const char* polardb_writer_state_name(PolarDB_WriterState state) {
 /**
  * @brief Consume a transaction-split reader-failure fault for TAP coverage.
  *
- * These faults are DEBUG-only and file-driven so tests can arm one exact
+ * These faults are DEBUG-only and file-driven so tests can enable one exact
  * split-failure branch after ProxySQL has started. The helper clears the file
  * only when the requested fault name matches, preserving the shared
  * match-limited semantics used by the other PolarDB debug fault files.
@@ -104,7 +109,7 @@ static bool polardb_debug_split_failure_fault_is(const char* fault_name) {
 	}
 	if (strcmp(fault_name, "death") == 0 &&
 			strcmp(buf, "death_twice") == 0) {
-		// Drive the reader-retry budget path: first death can retry another
+		// Drive the reader-retry limit path: first death can retry another
 		// reader, the second must fall back to the writer in the same statement.
 		if (death_twice_remaining.load(std::memory_order_relaxed) <= 0) {
 			death_twice_remaining.store(2, std::memory_order_relaxed);
@@ -130,9 +135,8 @@ static bool polardb_debug_split_failure_fault_is(const char* fault_name) {
 }
 
 PolarDB_RequestOutcome PgSQL_Session::polardb_capture_outcome(
-		PgSQL_Backend* backend, bool ok) {
+		PgSQL_Backend* backend) {
 	PolarDB_RequestOutcome outcome;
-	outcome.ok = ok;
 	outcome.backend = backend;
 	if (!backend) {
 		return outcome;
@@ -146,8 +150,7 @@ PolarDB_RequestOutcome PgSQL_Session::polardb_capture_outcome(
 
 	PgSQL_Connection* conn = backend->server_myds->myconn;
 	outcome.connected = conn->is_connected();
-	outcome.reusable = outcome.connected &&
-		conn->is_connection_in_reusable_state();
+	outcome.reusable = polardb_failed_connection_reusable(conn);
 	outcome.result_started = conn->query_result &&
 		conn->query_result->is_transfer_started();
 	outcome.timeout_error = polardb_query.wait.timeout_error ||
@@ -155,6 +158,15 @@ PolarDB_RequestOutcome PgSQL_Session::polardb_capture_outcome(
 	outcome.wrapper_set_failure =
 		conn->polardb_query_wrap_state.wrapper_set_failed() ||
 		conn->polardb_query_wrap_state.consuming_wrapper_set();
+	outcome.timeout_already_accounted =
+		outcome.timeout_error && polardb_query.wait.wait_started_at_us == 0;
+	if (outcome.wrapper_set_failure &&
+			polardb_txn_reader.split_active &&
+			backend == polardb_txn_reader.backend &&
+			polardb_txn_reader.wait_start_us == 0) {
+		outcome.timeout_error = true;
+		outcome.timeout_already_accounted = true;
+	}
 	outcome.backend_error_code = static_cast<int>(conn->get_error_code());
 	outcome.error_message = polardb_snapshot_error_message(conn->get_error_message());
 
@@ -197,27 +209,37 @@ PolarDB_FailureAction PgSQL_Session::polardb_on_failure(
 			POLARDB_THREAD_COUNT_ONE(thread, wait_error_connection_lost);
 		}
 		const bool txn_wait_reader_failed =
-			polardb_txn_wait_read_active &&
-			polardb_txn_split_backend &&
-			polardb_txn_split_backend->server_myds == outcome.backend_myds;
+			polardb_txn_reader.wait_read_active &&
+			polardb_txn_reader.backend &&
+			polardb_txn_reader.backend->server_myds == outcome.backend_myds;
 		if (txn_wait_reader_failed && !failure.wait_read) {
 			PgSQL_Connection* failed_conn =
 				outcome.backend_myds ? outcome.backend_myds->myconn : nullptr;
+			PgSQL_MyDS_real_query& failed_query =
+				outcome.backend_myds->pgsql_real_query;
+			if (failure.retry_query.empty() && failed_query.QueryPtr &&
+					failed_query.QuerySize > 0) {
+				size_t query_size = failed_query.QuerySize;
+				if (failed_query.QueryPtr[query_size - 1] == '\0') {
+					--query_size;
+				}
+				failure.retry_query.assign(failed_query.QueryPtr, query_size);
+			}
 			failure.wait_read = true;
 			failure.failed_myds = outcome.backend_myds;
 			failure.result_started = outcome.result_started;
 			failure.connected = outcome.connected;
 			failure.reusable = outcome.reusable;
 			failure.can_return_to_pool =
-				polardb_wait_reader_can_return_to_pool(failed_conn);
+				polardb_reader_connection_pool_reusable(failed_conn);
 			if (failure.fallback_writer_hg < 0) {
 				failure.fallback_writer_hg =
-					polardb_txn_writer_hg >= 0 ?
-					polardb_txn_writer_hg : polardb_writer_hgid();
+					polardb_txn_reader_failure.writer_hg >= 0 ?
+					polardb_txn_reader_failure.writer_hg : polardb_writer_hgid();
 			}
 			POLARDB_TRACE(
 				"PolarDB WAIT: txn-wait reader failure did not classify as "
-				"wait_read; forcing borrowed-reader unwind reader_hg=%d "
+				"wait_read; releasing temporary reader reader_hg=%d "
 				"writer_hg=%d\n",
 				failure.reader_hg, failure.fallback_writer_hg);
 		}
@@ -282,7 +304,6 @@ PolarDB_FailureAction PgSQL_Session::polardb_on_failure(
 		failure.result_started ? 1 : 0,
 		failure.backend_error_message.c_str());
 
-	POLARDB_THREAD_COUNT_ONE(thread, split_reads_error);
 	POLARDB_THREAD_COUNT_ONE(thread, split_error_query_failed);
 	if (!failure.connected) {
 		POLARDB_THREAD_COUNT_ONE(thread, split_error_connection_lost);
@@ -316,7 +337,7 @@ PolarDB_FailureAction PgSQL_Session::polardb_on_failure(
 		static_cast<void*>(writer_backend));
 
 	polardb_record_reader_failure_status(failure);
-	polardb_finish_reader_failure_split_op(failure);
+	polardb_finish_reader_failure_split_op();
 
 	if (writer_state == PolarDB_WriterState::LOST) {
 		POLARDB_TRACE(
@@ -327,12 +348,12 @@ PolarDB_FailureAction PgSQL_Session::polardb_on_failure(
 	const PolarDB_ReaderFailureDecision decision =
 		polardb_reader_decision_for(failure);
 	POLARDB_TRACE(
-		"PolarDB FAILURE: policy kind=%s action=%s target=%s pin=%s "
+		"PolarDB FAILURE: policy kind=%s action=%s target=%s followup_route=%s "
 		"timeout=%d reusable=%d result_started=%d\n",
 		polardb_reader_failure_kind_name(decision.kind),
 		polardb_reader_action_name(decision.action),
 		polardb_retry_target_name(decision.retry_target),
-		polardb_route_pin_name(decision.route_pin),
+		polardb_reader_failure_route_name(decision.reader_failure_route),
 		failure.timeout ? 1 : 0,
 		failure.reusable ? 1 : 0,
 		failure.result_started ? 1 : 0);
@@ -344,26 +365,21 @@ PolarDB_FailureAction PgSQL_Session::polardb_on_failure(
 			!failure.result_started) {
 		if (decision.retry_target == PolarDB_RetryTarget::OTHER_READER &&
 				polardb_try_redispatch_to_other_reader(failure)) {
-			polardb_apply_reader_failure_route_pin(
-				PolarDB_RoutePin::SHUN_READER, writer_hg, &failure);
+			polardb_apply_reader_failure_route_state(
+				PolarDB_ReaderFailureRoute::SKIP_READER, writer_hg, &failure);
 			return PolarDB_FailureAction::RETRY;
 		}
 		if (writer_state == PolarDB_WriterState::LIVE &&
 				polardb_try_redispatch_to_writer(
 					failure, writer_hg, writer_backend)) {
-			polardb_apply_reader_failure_route_pin(
-				PolarDB_RoutePin::FORCE_WRITER, writer_hg, &failure);
+			polardb_apply_reader_failure_route_state(
+				PolarDB_ReaderFailureRoute::FORCE_WRITER, writer_hg, &failure);
 			return PolarDB_FailureAction::RETRY;
 		}
 	}
-	if (failure.result_started) {
-		POLARDB_TRACE(
-			"PolarDB FAILURE: terminating because reader rows already reached client\n");
-		return polardb_terminate_reader(failure);
-	}
 
-	polardb_apply_reader_failure_route_pin(
-		PolarDB_RoutePin::FORCE_WRITER, writer_hg, &failure);
+	polardb_apply_reader_failure_route_state(
+		PolarDB_ReaderFailureRoute::FORCE_WRITER, writer_hg, &failure);
 	POLARDB_TRACE(
 		"PolarDB FAILURE: forwarding reader error after retry declined "
 		"(action=%s target=%s writer_state=%s result_started=%d)\n",
@@ -394,19 +410,20 @@ PgSQL_Session::polardb_reader_failure_view(
 			static_cast<PGSQL_ERROR_CODES>(outcome.backend_error_code);
 	}
 
-	failure.split_read = polardb_txn_split_active &&
-		failure.reader_backend == polardb_txn_split_backend;
+	failure.split_read = polardb_txn_reader.split_active &&
+		failure.reader_backend == polardb_txn_reader.backend;
 	if (failure.split_read) {
 		// Move the original client packet before split cleanup can free it.
 		// RETRY moves it to the next backend stream; FORWARD/TERMINATE free it.
 		// Reader-retry also needs the split wait target and XIDs because the
 		// active split wrapper is discarded during failure cleanup and rebuilt
 		// for the replacement reader.
-		failure.retry_pkt = polardb_txn_split_original_pkt;
-		polardb_txn_split_original_pkt.ptr = nullptr;
-		polardb_txn_split_original_pkt.size = 0;
+		failure.retry_pkt = polardb_txn_reader.original_pkt;
+		polardb_txn_reader.original_pkt.ptr = nullptr;
+		polardb_txn_reader.original_pkt.size = 0;
 		failure.reader_plan = polardb_query.reader_plan;
-		failure.wait_spec = polardb_txn_split_wait_spec;
+		failure.wait_spec = polardb_txn_reader.wait_spec;
+		failure.writer_scope = polardb_txn_reader.writer_scope;
 		failure.txn_xids = polardb_transaction_split.xids;
 		POLARDB_TRACE(
 			"PolarDB FAILURE: captured split retry packet size=%u "
@@ -494,6 +511,14 @@ PolarDB_WriterState PgSQL_Session::polardb_resolve_writer_state(
 	if (is_in_transaction()) {
 		writer_hg = polardb_writer_hgid();
 		writer_backend = nullptr;
+		if (writer_hg < 0 || writer_hg == failure.reader_hg) {
+			POLARDB_TRACE(
+				"PolarDB FAILURE: no safe writer hostgroup for reader failure "
+				"computed_writer_hg=%d reader_hg=%d\n",
+				writer_hg, failure.reader_hg);
+			writer_hg = -1;
+			return PolarDB_WriterState::LOST;
+		}
 		POLARDB_TRACE(
 			"PolarDB FAILURE: transaction has no started writer backend; "
 			"computed writer_hg=%d\n",
@@ -542,61 +567,58 @@ PgSQL_Session::polardb_reader_decision_for(
 	if (decision.action == PolarDB_ReaderAction::RETRY &&
 			failure.split_read &&
 			decision.kind == PolarDB_ReaderFailureKind::CONNECTION_LOST) {
-		if (polardb_query.reader_retry_attempts < POLARDB_READER_RETRY_BUDGET) {
+		if (polardb_query.reader_retry_attempts < POLARDB_READER_RETRY_LIMIT) {
 			// A dead split reader can be a local server failure. Try one other
 			// reader with the same XID/LSN wrapper before falling back to the
 			// writer. The one-attempt cap prevents a retry loop between readers when
-			// multiple readers flap during one client statement.
+			// multiple readers are disabled or disconnect during one client statement.
 			decision.retry_target = PolarDB_RetryTarget::OTHER_READER;
-			decision.route_pin = PolarDB_RoutePin::SHUN_READER;
+			decision.reader_failure_route = PolarDB_ReaderFailureRoute::SKIP_READER;
 		} else {
 			decision.retry_target = PolarDB_RetryTarget::WRITER;
-			decision.route_pin = PolarDB_RoutePin::FORCE_WRITER;
+			decision.reader_failure_route = PolarDB_ReaderFailureRoute::FORCE_WRITER;
 		}
 	} else {
 		decision.retry_target = PolarDB_RetryTarget::WRITER;
 		if (decision.action != PolarDB_ReaderAction::TERMINATE) {
-			decision.route_pin = PolarDB_RoutePin::FORCE_WRITER;
+			decision.reader_failure_route = PolarDB_ReaderFailureRoute::FORCE_WRITER;
 		}
 	}
 	return decision;
 }
 
-void PgSQL_Session::polardb_apply_reader_failure_route_pin(
-		PolarDB_RoutePin pin, int writer_hg,
+void PgSQL_Session::polardb_apply_reader_failure_route_state(
+		PolarDB_ReaderFailureRoute route, int writer_hg,
 		const PolarDB_ReaderFailure* failure) {
-	if (pin == PolarDB_RoutePin::NONE) {
+	if (route == PolarDB_ReaderFailureRoute::NONE) {
 		return;
 	}
-	if (pin == PolarDB_RoutePin::FORCE_WRITER) {
-		polardb_txn_reader_failure_pin = PolarDB_RoutePin::FORCE_WRITER;
-		polardb_txn_writer_hg = writer_hg;
-		polardb_txn_shunned_reader_hg = -1;
-		polardb_txn_shunned_reader_address.clear();
-		polardb_txn_shunned_reader_port = -1;
+	if (route == PolarDB_ReaderFailureRoute::FORCE_WRITER) {
+		polardb_txn_reader_failure.set_force_writer(writer_hg);
 		POLARDB_TRACE(
-			"PolarDB FAILURE: transaction route pin=%s writer_hg=%d "
+			"PolarDB FAILURE: transaction route=%s writer_hg=%d "
 			"after reader failure\n",
-			polardb_route_pin_name(pin), writer_hg);
+			polardb_reader_failure_route_name(route), writer_hg);
 		return;
 	}
 
 	if (failure && failure->reader_hg >= 0 &&
 			!failure->reader_address.empty() &&
 			failure->reader_port >= 0) {
-		polardb_txn_shunned_reader_hg = failure->reader_hg;
-		polardb_txn_shunned_reader_address = failure->reader_address;
-		polardb_txn_shunned_reader_port = failure->reader_port;
+		polardb_txn_reader_failure.set_reader_skip(
+			failure->reader_hg, failure->reader_address,
+			failure->reader_port);
+	} else {
+		polardb_txn_reader_failure.clear();
+		polardb_txn_reader_failure.route = route;
 	}
-	polardb_txn_reader_failure_pin = pin;
-	polardb_txn_writer_hg = -1;
 	POLARDB_TRACE(
-		"PolarDB FAILURE: transaction route pin=%s shunned_reader=%s:%d "
+		"PolarDB FAILURE: transaction route=%s skipped_reader=%s:%d "
 		"reader_hg=%d after reader failure\n",
-		polardb_route_pin_name(pin),
-		polardb_txn_shunned_reader_address.c_str(),
-		polardb_txn_shunned_reader_port,
-		polardb_txn_shunned_reader_hg);
+		polardb_reader_failure_route_name(route),
+		polardb_txn_reader_failure.reader_address.c_str(),
+		polardb_txn_reader_failure.reader_port,
+		polardb_txn_reader_failure.reader_hg);
 }
 
 void PgSQL_Session::polardb_free_retry_pkt_if_owned(
@@ -643,6 +665,26 @@ void PgSQL_Session::polardb_return_or_destroy_backend_stream(
 	if (!myds) {
 		return;
 	}
+#if POLARDB_PROXY
+#if POLARDB_DEBUG
+	PgSQL_Connection* dbg_conn = myds->myconn;
+	PgSQL_SrvC* dbg_srv = dbg_conn ? static_cast<PgSQL_SrvC*>(dbg_conn->parent) : nullptr;
+	POLARDB_TRACE(
+		"PolarDB FAILURE: cleanup backend stream myds=%p return_to_pool=%d "
+		"conn=%p hg=%d host=%s:%u state=%d connected=%d active_trx=%d "
+		"multiplex_disabled=%d "
+		"pipeline=%d dss=%d fd=%d\n",
+		(void*)myds, return_to_pool ? 1 : 0, (void*)dbg_conn,
+		dbg_srv && dbg_srv->myhgc ? dbg_srv->myhgc->hid : -1,
+		dbg_srv ? dbg_srv->address : "(null)", dbg_srv ? dbg_srv->port : 0,
+		dbg_conn ? (int)dbg_conn->async_state_machine : -1,
+		dbg_conn && dbg_conn->is_connected() ? 1 : 0,
+		dbg_conn && dbg_conn->IsActiveTransaction() ? 1 : 0,
+		dbg_conn && dbg_conn->MultiplexDisabled() ? 1 : 0,
+		dbg_conn && dbg_conn->is_pipeline_active() ? 1 : 0,
+		myds->DSS, myds->fd);
+#endif // POLARDB_DEBUG
+#endif // POLARDB_PROXY
 	if (return_to_pool) {
 		myds->return_MySQL_Connection_To_Pool();
 	} else {
@@ -677,7 +719,6 @@ void PgSQL_Session::polardb_forward_reader_error(
 
 void PgSQL_Session::polardb_record_reader_failure_status(
 		const PolarDB_ReaderFailure& failure) {
-	polardb_clear_reader_affinity(/*count_failure=*/true);
 	if (failure.reader_hg >= 0 && !failure.reader_address.empty()) {
 		POLARDB_TRACE(
 			"PolarDB FAILURE: recording reader failure status hg=%d endpoint=%s:%d\n",
@@ -697,16 +738,13 @@ void PgSQL_Session::polardb_record_reader_failure_status(
 	}
 }
 
-void PgSQL_Session::polardb_finish_reader_failure_split_op(
-		PolarDB_ReaderFailure& /*failure*/) {
+void PgSQL_Session::polardb_finish_reader_failure_split_op() {
 	POLARDB_TRACE(
 		"PolarDB FAILURE: finishing split read failure; transaction stage -> primary\n");
-	polardb_record_txn_split_wait_latency();
-	polardb_record_txn_split_latency();
-	polardb_reset_txn_split_read();
-	polardb_transaction_split.stage =
-		PolarDB_TransactionSplitStage::TXN_ON_PRIMARY;
-	polardb_transaction_split.blocked = true;
+	polardb_finish_txn_reader_read(
+		/*split_success=*/false, /*split_error=*/true, "reader_failure",
+		/*record_split_error_counter=*/true,
+		/*mark_reader_not_reusable=*/false);
 }
 
 void PgSQL_Session::polardb_release_reader_backend(
@@ -716,7 +754,7 @@ void PgSQL_Session::polardb_release_reader_backend(
 			"PolarDB FAILURE: no reader backend to release\n");
 		return;
 	}
-	if (reader_backend == polardb_txn_split_backend) {
+	if (reader_backend == polardb_txn_reader.backend) {
 		POLARDB_TRACE(
 			"PolarDB FAILURE: releasing split reader backend want_reuse=%d\n",
 			want_reuse ? 1 : 0);
@@ -739,13 +777,7 @@ void PgSQL_Session::polardb_release_reader_backend(
 	}
 	conn->async_free_result();
 	const bool reusable =
-		want_reuse &&
-		conn->reusable &&
-		conn->is_connected() &&
-		conn->is_connection_in_reusable_state() &&
-		!conn->IsActiveTransaction() &&
-		!conn->MultiplexDisabled() &&
-		!conn->is_pipeline_active();
+		want_reuse && polardb_reader_connection_pool_reusable(conn);
 	if (reusable) {
 		POLARDB_TRACE(
 			"PolarDB FAILURE: returning reader backend to pool\n");
@@ -823,6 +855,7 @@ bool PgSQL_Session::polardb_try_redispatch_to_writer(
 
 	polardb_release_reader_backend(
 		failure.reader_backend, failure.reusable);
+	failure.reader_backend = nullptr;
 	if (!polardb_move_retry_packet_to_writer(
 			writer_backend, writer_hg, failure.retry_pkt)) {
 		return false;
@@ -861,21 +894,20 @@ bool PgSQL_Session::polardb_try_redispatch_to_other_reader(
 			failure.reader_port);
 		return false;
 	}
-	if (!failure.wait_spec.has_wait() || failure.txn_xids.empty() ||
-			!failure.reader_plan.has_consistency_target_lsn()) {
+	if (!failure.wait_spec.has_wait() || failure.txn_xids.empty()) {
 		POLARDB_TRACE(
 			"PolarDB FAILURE: reader retry declined reason=missing_split_payload "
-			"target_lsn=%lu xids_len=%zu reader_plan_target=%lu\n",
+			"target_lsn=%lu xids_len=%zu\n",
 			(unsigned long)failure.wait_spec.target,
-			failure.txn_xids.size(),
-			(unsigned long)failure.reader_plan.consistency_target_lsn);
+			failure.txn_xids.size());
 		return false;
 	}
 
 	std::string wrapped_query;
-	if (!polardb_build_txn_split_wrapped_query(
+	const uint32_t wrapper_stmts = polardb_build_txn_split_wrapped_query(
 			failure.retry_pkt, failure.wait_spec,
-			failure.txn_xids, wrapped_query)) {
+			failure.txn_xids, false, wrapped_query);
+	if (wrapper_stmts == 0) {
 		POLARDB_TRACE(
 			"PolarDB FAILURE: reader retry declined reason=wrapper_build_failed\n");
 		return false;
@@ -905,7 +937,7 @@ bool PgSQL_Session::polardb_try_redispatch_to_other_reader(
 	PolarDB_ReaderResult reader_result =
 		PgHGM->get_MyConn_polardb_reader(
 			(unsigned int)failure.reader_hg, this,
-			failure.reader_plan, true,
+			failure.reader_plan, failure.wait_spec, true,
 			failure.reader_address.c_str(), failure.reader_port);
 	if (!reader_result.acquired()) {
 		POLARDB_TRACE(
@@ -928,47 +960,12 @@ bool PgSQL_Session::polardb_try_redispatch_to_other_reader(
 		return false;
 	}
 
-	PgSQL_Backend* writer_backend = mybe;
 	current_hostgroup = failure.reader_hg;
-	mybe = retry_backend;
-	polardb_txn_split_backend = retry_backend;
-	polardb_txn_split_saved_mybe = writer_backend;
-	polardb_txn_split_wrapped_query = std::move(wrapped_query);
-	polardb_txn_split_wait_spec = failure.wait_spec;
-	polardb_query.reader_plan = failure.reader_plan;
-	retry_myds->DSS = STATE_READY;
-	retry_myds->fd = retry_myds->myconn->fd;
-	retry_myds->free_pgsql_real_query();
-	assert(retry_myds->pgsql_real_query.pkt.ptr == nullptr);
-	assert(retry_myds->pgsql_real_query.pkt.size == 0);
-	assert(!polardb_txn_split_wrapped_query.empty());
-	// QueryPtr borrows the session-owned retry wrapper string. The split reset
-	// path clears this stream pointer before clearing the string storage.
-	retry_myds->pgsql_real_query.QueryPtr =
-		const_cast<char*>(polardb_txn_split_wrapped_query.c_str());
-	retry_myds->pgsql_real_query.QuerySize =
-		(unsigned int)polardb_txn_split_wrapped_query.size();
-	polardb_txn_split_original_pkt = failure.retry_pkt;
-	failure.retry_pkt.ptr = nullptr;
-	failure.retry_pkt.size = 0;
-	polardb_txn_split_active = true;
-	polardb_txn_split_read_start_us = monotonic_time();
-	polardb_txn_split_wait_start_us = polardb_txn_split_read_start_us;
+	polardb_begin_txn_split_read(retry_backend, retry_myds, failure.retry_pkt,
+		std::move(wrapped_query), failure.wait_spec, failure.reader_plan,
+		failure.writer_scope, wrapper_stmts, false);
 	polardb_query.reader_retry_attempts++;
 	polardb_transaction_split.blocked = false;
-	polardb_transaction_split.stage =
-		PolarDB_TransactionSplitStage::TXN_SPLIT_READ_ACTIVE;
-	polardb_transaction_split.was_splittable = true;
-	polardb_query.dispatch_wrapper_stmts = POLARDB_TXN_SPLIT_WRAPPER_SET_COUNT;
-	polardb_query.dispatch_wrapper_kind =
-		PolarDB_Query_WrapperKind::TXN_SPLIT_WAIT;
-	if (retry_myds->myconn) {
-		// Reader retry sends the same split-XID wrapper as the first split
-		// attempt. The physical connection must clear it before later non-split
-		// reuse, or the backend may keep stale XIDs.
-		retry_myds->myconn->polardb_txn_split_xids_dirty = true;
-		retry_myds->myconn->polardb_txn_split_xids_reset_consumed = false;
-	}
 
 	POLARDB_THREAD_COUNT_ONE(thread, split_reads_retried_on_reader);
 	POLARDB_TRACE(
@@ -976,38 +973,21 @@ bool PgSQL_Session::polardb_try_redispatch_to_other_reader(
 		"excluded=%s:%d target_lsn=%lu\n",
 		failure.reader_hg, failure.reader_address.c_str(),
 		failure.reader_port, (unsigned long)failure.wait_spec.target);
-	polardb_reset_current_query_from_packet(polardb_txn_split_original_pkt);
+	polardb_reset_current_query_from_packet(polardb_txn_reader.original_pkt);
 	return true;
 }
 
 PolarDB_FailureAction PgSQL_Session::polardb_forward_and_continue(
 		PolarDB_ReaderFailure& failure) {
+	polardb_forward_reader_error(failure, 'T');
+	POLARDB_THREAD_COUNT_ONE(thread, split_reads_forwarded);
+	POLARDB_TRACE(
+		"PolarDB FAILURE: forwarded reader error; transaction remains on writer_hg=%d\n",
+		polardb_txn_reader_failure.writer_hg);
 	polardb_release_reader_backend(
 		failure.reader_backend, failure.reusable);
 	polardb_free_retry_pkt_if_owned(failure);
-	polardb_end_writer_transaction_after_reader_error();
-	polardb_forward_reader_error(failure, 'E');
-	POLARDB_THREAD_COUNT_ONE(thread, split_reads_forwarded);
-	POLARDB_TRACE(
-		"PolarDB FAILURE: forwarded reader error; transaction marked failed\n");
 	return PolarDB_FailureAction::FORWARD;
-}
-
-void PgSQL_Session::polardb_end_writer_transaction_after_reader_error() {
-	if (mybe && mybe->server_myds) {
-		PgSQL_Data_Stream* writer_myds = mybe->server_myds;
-		if (writer_myds->myconn) {
-			writer_myds->destroy_MySQL_Connection_From_Pool(false);
-		}
-		writer_myds->fd = 0;
-		writer_myds->DSS = STATE_NOT_INITIALIZED;
-	}
-	polardb_clear_transaction_split_state(
-		"reader_error_transaction_failed", /*want_reuse=*/false);
-	if (!tx_poisoned) {
-		tx_poisoned = true;
-		thread->status_variables.tx_poisoned_total++;
-	}
 }
 
 PolarDB_FailureAction PgSQL_Session::polardb_terminate_reader(
@@ -1073,11 +1053,10 @@ static bool polardb_debug_once_enabled(const char* env_name) {
 #endif
 }
 
-static bool polardb_wait_reader_can_return_to_pool(PgSQL_Connection* conn) {
+static bool polardb_reader_connection_pool_reusable(PgSQL_Connection* conn) {
 	return conn &&
 		conn->reusable == true &&
-		conn->is_connected() &&
-		conn->is_connection_in_reusable_state() &&
+		polardb_failed_connection_reusable(conn) &&
 		conn->IsActiveTransaction() == false &&
 		conn->MultiplexDisabled() == false &&
 		conn->is_pipeline_active() == false;
@@ -1165,9 +1144,8 @@ PgSQL_Session::polardb_capture_wait_read_failure(PgSQL_Data_Stream* failed_myds)
 		failure.result_started = true;
 	}
 	failure.connected = failed_conn && failed_conn->is_connected();
-	failure.reusable = failure.connected &&
-		failed_conn->is_connection_in_reusable_state();
-	failure.can_return_to_pool = polardb_wait_reader_can_return_to_pool(failed_conn);
+	failure.reusable = polardb_failed_connection_reusable(failed_conn);
+	failure.can_return_to_pool = polardb_reader_connection_pool_reusable(failed_conn);
 	// Dispatch wrapper fields move from the session to the connection when the
 	// query starts. Capture must therefore use the connection-owned wrapper kind;
 	// the session fields have already been cleared by this point.
@@ -1224,10 +1202,10 @@ PolarDB_FailureAction PgSQL_Session::polardb_handle_failed_wait_read(
 	clear_pending_notices(/*free_buffers=*/true);
 
 	const bool txn_wait_read =
-		polardb_txn_wait_read_active &&
+		polardb_txn_reader.wait_read_active &&
 		failure.failed_myds &&
-		polardb_txn_split_backend &&
-		polardb_txn_split_backend->server_myds == failure.failed_myds;
+		polardb_txn_reader.backend &&
+		polardb_txn_reader.backend->server_myds == failure.failed_myds;
 	auto release_failed_wait_reader = [&](bool want_reuse) {
 		if (txn_wait_read) {
 			polardb_release_txn_wait_read(want_reuse);
@@ -1243,8 +1221,7 @@ PolarDB_FailureAction PgSQL_Session::polardb_handle_failed_wait_read(
 				"terminating session\n");
 			return PolarDB_FailureAction::TERMINATE;
 		}
-		polardb_end_writer_transaction_after_reader_error();
-		polardb_forward_reader_error(failure, 'E');
+		polardb_forward_reader_error(failure, 'T');
 		return PolarDB_FailureAction::FORWARD;
 	};
 
@@ -1292,11 +1269,13 @@ PolarDB_FailureAction PgSQL_Session::polardb_handle_failed_wait_read(
 		return PolarDB_FailureAction::PASSTHROUGH;
 	}
 
-	const bool recoverable_failure =
-		failure.timeout || !failure.reusable;
-	if (!recoverable_failure || failure.result_started ||
+	const bool retryable_wait_failure =
+		failure.timeout ||
+		!failure.reusable ||
+		decision.kind == PolarDB_ReaderFailureKind::REUSABLE_ERROR;
+	if (!retryable_wait_failure || failure.result_started ||
 		failure.fallback_writer_hg < 0 || failure.retry_query.empty()) {
-		if (!recoverable_failure) {
+		if (!retryable_wait_failure) {
 			polardb_count_wait_retry_counter(
 				PgHGM->status.polardb_wait_retry_declined_not_recoverable,
 				"not_recoverable");
@@ -1316,8 +1295,8 @@ PolarDB_FailureAction PgSQL_Session::polardb_handle_failed_wait_read(
 		POLARDB_TRACE(
 			"PolarDB WAIT: failed wait-read cleaned wrapper; "
 			"normal error path will not redispatch wrapped packet "
-			"recoverable=%d result_started=%d writer_hg=%d original_query=%d\n",
-			recoverable_failure ? 1 : 0, failure.result_started ? 1 : 0,
+			"retryable=%d result_started=%d writer_hg=%d original_query=%d\n",
+			retryable_wait_failure ? 1 : 0, failure.result_started ? 1 : 0,
 			failure.fallback_writer_hg, failure.retry_query.empty() ? 0 : 1);
 		if (txn_wait_read) {
 			return finish_txn_wait_with_error();
@@ -1359,7 +1338,7 @@ PolarDB_FailureAction PgSQL_Session::polardb_handle_failed_wait_read(
 	PgSQL_Data_Stream* writer_myds = writer_mybe->server_myds;
 	// Use a distinct writer stream. Reusing the failed reader stream would mix
 	// packet and connection state from the failed dispatch with the retry.
-	// Debug builds can force this branch after wrapper cleanup to prove that the
+	// Debug builds can force this branch after wrapper cleanup to show that the
 	// normal error path returns a clean client error without leaking wrapper SETs.
 	const bool writer_retry_declined_by_debug =
 		polardb_debug_once_enabled("POLARDB_DEBUG_WAIT_RETRY_WRITER_BUSY_ONCE");

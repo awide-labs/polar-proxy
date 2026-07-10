@@ -627,6 +627,7 @@ static bool polardb_startup_bool_is_true(const std::string& value) {
 	std::transform(lowered.begin(), lowered.end(), lowered.begin(), ::tolower);
 	return lowered == "true" || lowered == "1" || lowered == "on" || lowered == "yes";
 }
+
 #endif // POLARDB_PROXY
 
 bool PgSQL_Protocol::process_startup_packet(unsigned char* pkt, unsigned int len, bool& ssl_request) {
@@ -729,12 +730,14 @@ bool PgSQL_Protocol::process_startup_packet(unsigned char* pkt, unsigned int len
 				client_rfq_lsn_requested = true;
 			}
 			it = (*myds)->myconn->conn_params.connection_parameters.erase(it);
+		} else if (polardb_startup_parameter_consumed_by_proxy(key_lowercase)) {
+			it = (*myds)->myconn->conn_params.connection_parameters.erase(it);
 		} else {
 			++it;
 		}
 	}
 	if ((*myds)->sess) {
-		(*myds)->sess->polardb_client_rfq_lsn_requested = client_rfq_lsn_requested;
+		(*myds)->sess->polardb_route_state.client_rfq_lsn_requested = client_rfq_lsn_requested;
 	}
 #endif // POLARDB_PROXY
 
@@ -1331,6 +1334,11 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 					pgsql_variables.client_set_value(sess, idx, value_copy.c_str(), false);
 				}
 			} else {
+#if POLARDB_PROXY
+				if (polardb_startup_parameter_consumed_by_proxy(param_key)) {
+					continue;
+				}
+#endif
 				// parameter provided is not part of the tracked variables. Will lock on hostgroup on next query.
 				const char* val_cstr = param_val.c_str();
 				proxy_warning("Unrecognized connection parameter. Please report this as a bug for future enhancements:%s:%s\n", param_key.c_str(), val_cstr);
@@ -2629,11 +2637,24 @@ PgSQL_Query_Result::PgSQL_Query_Result() {
 	result_packet_type = PGSQL_QUERY_RESULT_NO_DATA;
 }
 
+static inline void pgsql_free_result_packet(PtrSize_t* pkt) {
+	if (!pkt || !pkt->ptr) return;
+	if (ptrsize_is_borrowed_owner(pkt)) {
+		free(pkt->owner ? pkt->owner : pkt->ptr);
+	} else {
+		l_free(pkt->size, pkt->ptr);
+	}
+	pkt->size = 0;
+	pkt->ptr = NULL;
+	pkt->flags = 0;
+	pkt->owner = NULL;
+}
+
 PgSQL_Query_Result::~PgSQL_Query_Result() {
 	PtrSize_t pkt;
 	while (PSarrayOUT.len) {
 		PSarrayOUT.remove_index_fast(0, &pkt);
-		l_free(pkt.size, pkt.ptr);
+		pgsql_free_result_packet(&pkt);
 	}
 
 	if (buffer) {
@@ -2680,6 +2701,40 @@ unsigned int PgSQL_Query_Result::add_row(const PSresult* result) {
 	const unsigned int res = proto->copy_buffer_to_PgSQL_Query_Result(false, this, result);
 	result_packet_type |= PGSQL_QUERY_RESULT_TUPLE; // temporary
 	return res;
+}
+
+unsigned int PgSQL_Query_Result::add_row_run(const void* data, unsigned int size, unsigned int frames) {
+	assert(data && size && frames);
+
+	bool alloced_new_buffer = false;
+	unsigned char* ptr = buffer_reserve_space(size);
+	if (ptr == NULL) {
+		ptr = (unsigned char*)l_alloc(size);
+		alloced_new_buffer = true;
+	}
+
+	memcpy(ptr, data, size);
+	resultset_size += size;
+	pkt_count += frames;
+	num_rows += frames;
+	if (alloced_new_buffer) {
+		PSarrayOUT.add(ptr, size);
+	}
+
+	result_packet_type |= PGSQL_QUERY_RESULT_TUPLE;
+	return size;
+}
+
+unsigned int PgSQL_Query_Result::add_row_run_borrowed(void* owner, const void* data, unsigned int size, unsigned int frames) {
+	assert(owner && data && size && frames);
+	buffer_to_PSarrayOut();
+	PSarrayOUT.add_borrowed_owner(const_cast<void*>(data), size, owner);
+	resultset_size += size;
+	pkt_count += frames;
+	num_rows += frames;
+
+	result_packet_type |= PGSQL_QUERY_RESULT_TUPLE;
+	return size;
 }
 
 unsigned int PgSQL_Query_Result::add_copy_out_response_start(const PGresult* result) {
@@ -2879,7 +2934,7 @@ void PgSQL_Query_Result::clear() {
 	PtrSize_t pkt;
 	while (PSarrayOUT.len) {
 		PSarrayOUT.remove_index_fast(0, &pkt);
-		l_free(pkt.size, pkt.ptr);
+		pgsql_free_result_packet(&pkt);
 	}
 	buffer_init();
 	reset();

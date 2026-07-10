@@ -856,10 +856,18 @@ struct __SQP_query_parser_t {
 	char *query_prefix;
 };
 
+#define PTRSIZE_FLAG_BORROWED_OWNER 0x00000001u
+
 struct _PtrSize_t {
   unsigned int size;
   void *ptr;
+  unsigned int flags;
+  void *owner;
 };
+
+static inline int ptrsize_is_borrowed_owner(const PtrSize_t *pkt) {
+	return pkt && (pkt->flags & PTRSIZE_FLAG_BORROWED_OWNER);
+}
 // struct for debugging module
 #ifdef DEBUG
 struct _debug_level {
@@ -1146,10 +1154,13 @@ __thread int pgsql_thread___polardb_lag_wait_ms;             // polar_xact_split
 __thread int pgsql_thread___polardb_lsn_freshness_ms;        // max age of a cached per-server LSN to trust
 __thread int pgsql_thread___polardb_lag_cap_freshness_ms;    // max LSN-cache age under byte-lag cap + finite wait; 0=wait-fraction only
 __thread int pgsql_thread___polardb_reader_lsn_lag_range_bytes; // 0=exact best-behind reader only
-__thread int pgsql_thread___polardb_reader_affinity_ttl_ms;  // 0=disabled; session-local reader affinity TTL
-__thread int pgsql_thread___polardb_reader_affinity_max_uses; // max reads per affinity window
+__thread int pgsql_thread___polardb_output_coalesce_bytes;   // 0=disabled; hold incomplete streaming output up to byte budget
+__thread int pgsql_thread___polardb_output_coalesce_packets; // 0=disabled; hold incomplete streaming output up to packet budget
 __thread bool pgsql_thread___polardb_monitor_lsn_updates;    // enable monitor LSN cache updates
 __thread bool pgsql_thread___polardb_lazy_warmup_split;      // demand-warm connected split-reader pool entries
+__thread bool pgsql_thread___polardb_writev_direct;           // enable plaintext PgSQL frontend direct scatter/gather sends
+__thread bool pgsql_thread___polardb_result_fast_forward;     // batch contiguous backend DataRow frames into one result copy
+__thread int pgsql_thread___polardb_split_warmup_max_connections_per_request; // max backend connections per warmup request
 __thread int pgsql_thread___polardb_wait_timeout_mode;       // best_effort=1, strict=2
 __thread int pgsql_thread___polardb_proxy_protocol;          // off=0, legacy=1, v15=2
 __thread int pgsql_thread___polardb_route_rfq_policy;        // best_effort=1, strict=2
@@ -1157,7 +1168,7 @@ __thread int pgsql_thread___polardb_session_lsn_baseline;    // observed=1, prim
 __thread int pgsql_thread___polardb_reader_death_action;     // retry=0, forward=1, terminate=2
 __thread int pgsql_thread___polardb_reader_timeout_action;   // retry=0, forward=1, terminate=2
 __thread int pgsql_thread___polardb_reader_error_action;     // retry=0, forward=1, terminate=2
-__thread int pgsql_thread___polardb_split_warmup_identity;   // strict=0, client_ip=1, auth_profile=2
+__thread int pgsql_thread___polardb_proxy_identity_mode;     // client=0, proxy=1
 __thread char* pgsql_thread___polardb_proxy_identity_host;   // empty or IP literal
 __thread int pgsql_thread___polardb_proxy_identity_port;     // 0..65535
 #endif // POLARDB_PROXY
@@ -1513,10 +1524,9 @@ extern __thread int pgsql_thread___polardb_lag_wait_ms;
 extern __thread int pgsql_thread___polardb_lsn_freshness_ms;
 extern __thread int pgsql_thread___polardb_lag_cap_freshness_ms;
 extern __thread int pgsql_thread___polardb_reader_lsn_lag_range_bytes;
-extern __thread int pgsql_thread___polardb_reader_affinity_ttl_ms;
-extern __thread int pgsql_thread___polardb_reader_affinity_max_uses;
 extern __thread bool pgsql_thread___polardb_monitor_lsn_updates;
 extern __thread bool pgsql_thread___polardb_lazy_warmup_split;
+extern __thread int pgsql_thread___polardb_split_warmup_max_connections_per_request;
 extern __thread int pgsql_thread___polardb_wait_timeout_mode;
 extern __thread int pgsql_thread___polardb_proxy_protocol;
 extern __thread int pgsql_thread___polardb_route_rfq_policy;
@@ -1524,7 +1534,11 @@ extern __thread int pgsql_thread___polardb_session_lsn_baseline;
 extern __thread int pgsql_thread___polardb_reader_death_action;
 extern __thread int pgsql_thread___polardb_reader_timeout_action;
 extern __thread int pgsql_thread___polardb_reader_error_action;
-extern __thread int pgsql_thread___polardb_split_warmup_identity;
+extern __thread int pgsql_thread___polardb_proxy_identity_mode;
+extern __thread int pgsql_thread___polardb_output_coalesce_bytes;
+extern __thread int pgsql_thread___polardb_output_coalesce_packets;
+extern __thread bool pgsql_thread___polardb_writev_direct;
+extern __thread bool pgsql_thread___polardb_result_fast_forward;
 extern __thread char* pgsql_thread___polardb_proxy_identity_host;
 extern __thread int pgsql_thread___polardb_proxy_identity_port;
 #endif // POLARDB_PROXY

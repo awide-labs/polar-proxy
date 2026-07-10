@@ -39,8 +39,7 @@ public:
 				assert(pkt.ptr==NULL);
 				assert(pkt.size==0);
 		*/
-		pkt.ptr = _pkt->ptr;
-		pkt.size = _pkt->size;
+		pkt = *_pkt;
 		QuerySize = pkt.size - 5;
 		if (QuerySize == 0) {
 			QueryPtr = const_cast<char*>("");
@@ -54,12 +53,16 @@ public:
 		pkt.size = 0;
 		QuerySize = 0;
 		pkt.ptr = NULL;
+		pkt.flags = 0;
+		pkt.owner = NULL;
 		QueryPtr = NULL;
 	}
 	void reset() {
 		pkt.size = 0;
 		QuerySize = 0;
 		pkt.ptr = NULL;
+		pkt.flags = 0;
+		pkt.owner = NULL;
 		QueryPtr = NULL;
 	}
 	void move_from(PgSQL_MyDS_real_query& other) {
@@ -86,6 +89,10 @@ private:
 	int buffer2array();
 	enum pgsql_sslstatus do_ssl_handshake();
 	void queue_encrypted_bytes(const char* buf, size_t len);
+#if POLARDB_PROXY
+	bool polardb_direct_write_batch_ready() const;
+	int polardb_writev_to_net_poll_ready(size_t byte_budget);
+#endif // POLARDB_PROXY
 public:
 	void* operator new(size_t);
 	void operator delete(void*);
@@ -197,6 +204,11 @@ public:
 	int read_from_net();
 	int write_to_net();
 	int write_to_net_poll();
+#if POLARDB_PROXY
+	bool polardb_can_writev_direct() const;
+	bool polardb_should_writev_direct() const;
+	int polardb_writev_to_net_poll(size_t byte_budget);
+#endif // POLARDB_PROXY
 	bool available_data_out();
 	void remove_pollout();
 	void set_pollout();
@@ -214,6 +226,10 @@ public:
 
 	void check_data_flow();
 	int assign_fd_from_pgsql_conn();
+
+#if POLARDB_PROXY
+	size_t polardb_write_head_partial;
+#endif // POLARDB_PROXY
 
 	static unsigned char* copy_array_to_buffer(PtrSizeArray* resultset, size_t resultset_length, bool del);
 	static void copy_buffer_to_resultset(PtrSizeArray* resultset, unsigned char* ptr, uint64_t size, 
@@ -256,6 +272,9 @@ public:
 	// safe way to detach a PgSQL Connection
 	void detach_connection() {
 		assert(myconn);
+#if POLARDB_PROXY
+		myconn->polardb_flush_parent_bytes(PolarDB_ParentBytesFlushReason::Detach);
+#endif
 		myconn->statuses.pgconnpoll_put++;
 		statuses.pgconnpoll_put++;
 		myconn->myds = NULL;

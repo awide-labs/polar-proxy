@@ -6,24 +6,9 @@
 #include "PgSQL_Error_Helper.h"
 #if POLARDB_PROXY
 #include "PgSQL_PolarDB.h"
+#include <atomic>
 #include <sstream>  // std::ostringstream for PolarDB startup params
 #include <string>
-#endif
-
-#if POLARDB_PROXY
-static inline PGTransactionStatusType polardb_client_rfq_transaction_status(
-		bool temporary_reader_active,
-		PGTransactionStatusType backend_status,
-		PGTransactionStatusType transaction_owner_status) {
-	if (!temporary_reader_active) {
-		return backend_status;
-	}
-	if (backend_status == PQTRANS_INERROR ||
-			transaction_owner_status == PQTRANS_INERROR) {
-		return PQTRANS_INERROR;
-	}
-	return PQTRANS_INTRANS;
-}
 #endif
 
 #ifndef PROXYJSON
@@ -50,6 +35,17 @@ class PgSQL_Bind_Info;
 #define STATUS_PGSQL_CONNECTION_HAS_SAVEPOINT        0x00000800
 //#define STATUS_PGSQL_CONNECTION_HAS_WARNINGS         0x00001000
 
+
+#if POLARDB_PROXY
+enum class PolarDB_ParentBytesFlushReason {
+	Manual,
+	ThresholdRecv,
+	ThresholdSent,
+	ThresholdQueries,
+	Detach,
+	Destructor,
+};
+#endif // POLARDB_PROXY
 
 enum PgSQL_Param_Name {
 	PG_HOST = 0,  // Name of host to connect to
@@ -500,6 +496,10 @@ public:
 	PGresult* get_result();
 	void next_multi_statement_result(PGresult* result);
 	bool set_single_row_mode();
+#if POLARDB_PROXY
+	void update_queries_sent();
+	void polardb_flush_parent_bytes(PolarDB_ParentBytesFlushReason reason = PolarDB_ParentBytesFlushReason::Manual);
+#endif
 	void update_bytes_recv(uint64_t bytes_recv);
 	void update_bytes_sent(uint64_t bytes_sent);
 	void ProcessQueryAndSetStatusFlags(const char* query_digest_text, int savepoint_count);
@@ -671,6 +671,10 @@ public:
 	bool processing_multi_statement;
 
 #if POLARDB_PROXY
+	uint64_t polardb_parent_bytes_recv_pending;
+	uint64_t polardb_parent_bytes_sent_pending;
+	uint64_t polardb_parent_queries_sent_pending;
+	uint32_t polardb_row_run_last_bytes = 0;
 	// ---- PolarDB wrapped-wait result filtering ----
 	// A wrapped LSN-wait read prepends N SET statements ahead of the user query
 	// (see PgSQL_PolarDB_Wrap.cpp). The connection layer is the sole owner of SET
@@ -774,11 +778,11 @@ public:
 	struct PolarDB_Query_WrapState {
 		bool was_wrapped{false};   // sticky: this query was sent wrapped (survives consumption)
 		bool stmt_failed{false};   // sticky: a wrapper statement failed before the user result
+		bool stmt_succeeded{false}; // sticky: every wrapper statement completed successfully
 		uint32_t stmt_total{0};    // wrapper statements in the wrapped query (set once by begin)
 		uint32_t stmt_pending{0};  // wrapper statements whose result set is still to consume
 		PolarDB_Query_WrapperKind wrapper_kind{PolarDB_Query_WrapperKind::NONE};
 		bool txn_split_xids_reset_pending{false}; // true only for the first wrapper SET
-		PolarDB_WaitCompletion wait_completion;
 
 		bool has_pending() const { return stmt_pending > 0; }  // still consuming wrapper result sets
 		bool consuming_wrapper_set() const { return stmt_pending > 0; }
@@ -786,6 +790,7 @@ public:
 			return txn_split_xids_reset_pending && stmt_pending == stmt_total;
 		}
 		bool wrapper_set_failed() const { return stmt_failed; }
+		bool wrapper_set_succeeded() const { return stmt_succeeded; }
 		bool is_consistency_wait() const {
 			return wrapper_kind == PolarDB_Query_WrapperKind::CONSISTENCY_WAIT;
 		}
@@ -803,32 +808,36 @@ public:
 				bool txn_xids_reset = false) {
 			was_wrapped = (n > 0);
 			stmt_failed = false;
+			stmt_succeeded = false;
 			stmt_total = n;
 			stmt_pending = n;
 			wrapper_kind = (n > 0) ? kind : PolarDB_Query_WrapperKind::NONE;
 			txn_split_xids_reset_pending = (n > 0) && txn_xids_reset;
-			wait_completion.begin(n > 0 && is_consistency_wait());
 		}
 		void mark_wrapper_set_failed() {
 			stmt_failed = true;
+			stmt_succeeded = false;
 			stmt_pending = 0;
 			txn_split_xids_reset_pending = false;
-			wait_completion.mark_failed();
+		}
+		void consume_successful_wrapper_set() {
+			assert(stmt_pending > 0);
+			stmt_pending--;
+			if (stmt_pending == 0) {
+				stmt_succeeded = true;
+			}
 		}
 		void clear() {
 			was_wrapped = false;
 			stmt_failed = false;
+			stmt_succeeded = false;
 			stmt_total = 0;
 			stmt_pending = 0;
 			wrapper_kind = PolarDB_Query_WrapperKind::NONE;
 			txn_split_xids_reset_pending = false;
-			wait_completion.reset();
 		}
 	};
 	PolarDB_Query_WrapState polardb_query_wrap_state;
-
-	uint64_t polardb_ready_sequence_at_dispatch{0};
-	PolarDB_PendingReadyResult polardb_pending_ready_result;
 
 	/**
 	 * @brief Backend connection may retain polar_xact_split_xids after split use.
@@ -845,31 +854,23 @@ public:
 	/**
 	 * @brief PolarDB startup profile requested on this backend connection.
 	 *
-	 * It records only what ProxySQL asked for in the startup packet; it is not proof
-	 * the backend returned RFQ payloads. When picking a pooled reader for an
+	 * It records only what ProxySQL asked for in the startup packet; it does not show
+	 * whether the backend returned RFQ payloads. When picking a pooled reader for an
 	 * LSN-targeted read, the connection pool checks has_rfq_lsn() on this profile to
 	 * confirm the backend was asked to append the RFQ LSN.
 	 */
 	PolarDB_StartupProfile polardb_startup_profile;
-
-	/**
-	 * @brief Prefer ProxySQL's own endpoint for PolarDB startup identity.
-	 *
-	 * Used only by non-client/internal connections that deliberately should not
-	 * advertise a frontend socket. Split warmup must not use this mode: warmed
-	 * replica connections are reusable only for the same real startup client
-	 * identity that was captured by the session that requested warmup.
-	 */
-	bool polardb_use_proxy_startup_identity;
+	uint32_t polardb_startup_profile_generation;
+	int polardb_startup_identity_mode;
 
 	/**
 	 * @brief Explicit endpoint to advertise in PolarDB startup params.
 	 *
-	 * Used when the caller has already resolved the startup client identity but
-	 * the connection is opened outside that client dispatch path. Split warmup
-	 * uses this to send the original client identity, not the ProxySQL listener.
+	 * Used when the caller has already resolved the startup identity but the
+	 * connection is opened outside that client dispatch path.
 	 */
 	PolarDB_StartupIdentity polardb_forced_startup_identity;
+	bool polardb_forced_startup_parameters;
 
 	/**
 	 * @brief Startup-client metadata actually used by this backend.
@@ -880,6 +881,16 @@ public:
 	 * not forgotten when they become active.
 	 */
 	PolarDB_StartupClientContext polardb_startup_client;
+
+	PolarDB_PoolKey polardb_pool_key;
+	uint32_t polardb_core_pool_position{UINT32_MAX};
+
+	/**
+	 * Keeps the selected server alive while this backend is in use. Server-list
+	 * snapshots own retired server objects until every selected connection has
+	 * been returned or destroyed.
+	 */
+	std::shared_ptr<const void> polardb_selected_server_snapshot;
 #endif // POLARDB_PROXY
 
 	bool multiplex_delayed;
@@ -933,10 +944,6 @@ public:
 	 * not collapse "present zero" into "missing payload".
 	 */
 	bool has_polardb_lsn_payload();
-	bool polardb_has_new_ready_message() const;
-	void polardb_remember_pending_ready_result(const char* query_text,
-		enum PGSQL_QUERY_command query_cmd,
-		const PolarDB_WriterScope& writer_scope);
 
 	/**
 	 * @brief Read the transaction XID list carried by the last ReadyForQuery.

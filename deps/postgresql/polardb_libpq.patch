@@ -1,6 +1,6 @@
 --- src/interfaces/libpq/exports.txt
 +++ src/interfaces/libpq/exports.txt
-@@ -187,3 +187,12 @@
+@@ -187,3 +187,15 @@
  PQmblenBounded            185
  PQsendFlushRequest        186
  PQconnectionUsedGSSAPI    187
@@ -12,7 +12,10 @@
 +PQisXactSplittable        192
 +PQisXactWalPending        193
 +PQsetPolarSendXact        194
-+PQgetReadyForQuerySequence 195
++PSpeekRowRun              195
++PSrowRunPending           196
++PSadvanceInput            197
++PSdetachRowRun            198
 --- src/interfaces/libpq/fe-connect.c
 +++ src/interfaces/libpq/fe-connect.c
 @@ -361,6 +361,62 @@
@@ -128,7 +131,7 @@
  	termPQExpBuffer(&conn->errorMessage);
  	termPQExpBuffer(&conn->workBuffer);
  
-@@ -7810,3 +7902,83 @@
+@@ -7810,3 +7902,74 @@
  
  	return prev;
  }
@@ -162,15 +165,6 @@
 +	if (!conn)
 +		return;
 +	conn->polar_proxy_send_lsn = (enable != 0);
-+}
-+
-+/* PQgetReadyForQuerySequence - count of parsed ReadyForQuery messages */
-+uint64_t
-+PQgetReadyForQuerySequence(const PGconn *conn)
-+{
-+	if (!conn)
-+		return 0;
-+	return conn->polar_ready_sequence;
 +}
 +
 +/*
@@ -212,9 +206,42 @@
 +		return;
 +	conn->polar_proxy_send_xact = (enable != 0);
 +}
+--- src/interfaces/libpq/fe-exec.c
++++ src/interfaces/libpq/fe-exec.c
+@@ -4558,6 +4558,30 @@
+     return psHandleRowData(conn, is_first_packet, result);
+ }
+ 
++int PSpeekRowRun(PGconn *conn, const char **data, size_t *len, int *nframes, size_t budget) {
++	if (!conn || !data || !len || !nframes)
++		return 1;
++	return psPeekRowRun(conn, data, len, nframes, budget);
++}
++
++int PSrowRunPending(PGconn *conn) {
++	if (!conn)
++		return 0;
++	return psRowRunPending(conn);
++}
++
++void PSadvanceInput(PGconn *conn, size_t nbytes) {
++	if (!conn || nbytes == 0)
++		return;
++	psAdvanceInput(conn, nbytes);
++}
++
++int PSdetachRowRun(PGconn *conn, char **owned_buf, const char **data, size_t *len, int *nframes, size_t budget) {
++	if (!conn || !owned_buf || !data || !len || !nframes)
++		return 1;
++	return psDetachRowRun(conn, owned_buf, data, len, nframes, budget);
++}
++
+ int
+ PQsendPipelineSync(PGconn *conn)
+ {
 --- src/interfaces/libpq/fe-protocol3.c
 +++ src/interfaces/libpq/fe-protocol3.c
-@@ -1655,6 +1655,93 @@
+@@ -1655,6 +1655,91 @@
  			break;
  	}
  
@@ -303,12 +330,10 @@
 +
 +#undef MSG_REMAINING
 +
-+	conn->polar_ready_sequence++;
-+
  	return 0;
  }
  
-@@ -2340,6 +2427,39 @@
+@@ -2340,6 +2425,39 @@
  		}
  	}
  
@@ -348,11 +373,254 @@
  	/* Add trailing terminator */
  	if (packet)
  		packet[packet_len] = '\0';
-@@ -2452,4 +2572,3 @@
- 	}
+@@ -2453,3 +2571,247 @@
  	return 1;
  }
--
+ 
++static int
++psDataRowFrameLenAt(PGconn *conn, int start, int *frame_len)
++{
++	int			msgLength;
++	int			frameEnd;
++	uint32		netlen;
++
++	if (start + 5 > conn->inEnd)
++		return EOF;
++	if (conn->inBuffer[start] != 'D')
++		return 1;
++
++	memcpy(&netlen, conn->inBuffer + start + 1, sizeof(netlen));
++	msgLength = (int) pg_ntoh32(netlen);
++	if (msgLength < 4)
++		return 1;
++	if (msgLength > 30000 && !VALID_LONG_MESSAGE_TYPE('D'))
++		return 1;
++
++	*frame_len = msgLength + 1;
++	frameEnd = start + *frame_len;
++	if (frameEnd > conn->inEnd)
++	{
++		if (frameEnd <= conn->inBufSize)
++			return EOF;
++		return 1;
++	}
++
++	return 0;
++}
++
++#ifdef POLARDB_LIBPQ_ROW_RUN_VALIDATE
++static int
++psValidateDataRowPayloadAt(PGconn *conn, int start, int frame_len)
++{
++	int			bodyStart;
++	int			frameEnd;
++	PGresult   *res;
++	int			nfields;
++	int			tupnfields;
++	int			pos;
++	int			i;
++	uint32		netlen;
++
++	if (conn->result == NULL ||
++		conn->result->resultStatus != PGRES_TUPLES_OK)
++		return 1;
++
++	res = conn->result;
++	nfields = res->numAttributes;
++	bodyStart = start + 5;
++	frameEnd = start + frame_len;
++	pos = bodyStart;
++	if (pos + 2 > frameEnd)
++		return 1;
++
++	tupnfields = (unsigned char) conn->inBuffer[pos] << 8 |
++		(unsigned char) conn->inBuffer[pos + 1];
++	pos += 2;
++	if (tupnfields != nfields)
++		return 1;
++
++	for (i = 0; i < nfields; i++)
++	{
++		int			vlen;
++
++		if (pos + 4 > frameEnd)
++			return 1;
++		memcpy(&netlen, conn->inBuffer + pos, sizeof(netlen));
++		vlen = (int) pg_ntoh32(netlen);
++		pos += 4;
++		if (vlen == -1)
++			continue;
++		if (vlen < 0)
++			return 1;
++		if (pos + vlen > frameEnd)
++			return 1;
++		pos += vlen;
++	}
++
++	return (pos == frameEnd) ? 0 : 1;
++}
++#endif
++
++static int
++psRowRunFrameAt(PGconn *conn, int start, int *frame_len)
++{
++	int			rc;
++
++	rc = psDataRowFrameLenAt(conn, start, frame_len);
++	if (rc != 0)
++		return rc;
++
++#ifdef POLARDB_LIBPQ_ROW_RUN_VALIDATE
++	return psValidateDataRowPayloadAt(conn, start, *frame_len);
++#else
++	return 0;
++#endif
++}
++
++/*
++ * psRowRunPending: cheap precheck for row-run detach.
++ *
++ * This does not validate the frame or prove that a full run is available. It
++ * only tells the caller that libpq is currently positioned at a DataRow frame,
++ * so the heavier peek/detach parser has useful work to do.
++ */
++int
++psRowRunPending(PGconn *conn)
++{
++	if (conn->asyncStatus != PGASYNC_BUSY)
++		return 0;
++	if (conn->result == NULL ||
++		conn->result->resultStatus != PGRES_TUPLES_OK)
++		return 0;
++	if (conn->inStart >= conn->inEnd)
++		return 0;
++	return conn->inBuffer[conn->inStart] == 'D';
++}
++
++/*
++ * psPeekRowRun: expose a contiguous run of complete DataRow ('D') frames.
++ * Release builds validate only the trusted PG frame envelope. Define
++ * POLARDB_LIBPQ_ROW_RUN_VALIDATE in diagnostic builds to also walk the DataRow
++ * payload and check field-count/value boundaries.
++ *
++ * Control frames stay on libpq's normal path, preserving command completion,
++ * ReadyForQuery, PolarDB RFQ LSN parsing, notices, and errors.
++ */
++int
++psPeekRowRun(PGconn *conn, const char **data, size_t *len, int *nframes, size_t budget)
++{
++	int			cur;
++	int			frames;
++	int			rc;
++
++	*data = NULL;
++	*len = 0;
++	*nframes = 0;
++
++	if (conn->asyncStatus != PGASYNC_BUSY)
++		return 1;
++	if (conn->result == NULL ||
++		conn->result->resultStatus != PGRES_TUPLES_OK)
++		return 1;
++
++	cur = conn->inStart;
++	frames = 0;
++	while (cur < conn->inEnd)
++	{
++		int			frame_len = 0;
++		size_t		next_len;
++
++		rc = psRowRunFrameAt(conn, cur, &frame_len);
++		if (rc != 0)
++			break;
++
++		next_len = (size_t) (cur + frame_len - conn->inStart);
++		if (budget > 0 && frames > 0 && next_len > budget)
++			break;
++
++		cur += frame_len;
++		frames++;
++	}
++
++	if (frames == 0)
++	{
++		if (conn->inStart < conn->inEnd && conn->inBuffer[conn->inStart] == 'D')
++		{
++			int			frame_len = 0;
++
++			rc = psRowRunFrameAt(conn, conn->inStart, &frame_len);
++			if (rc == EOF)
++				return EOF;
++		}
++		return 1;
++	}
++
++	*data = conn->inBuffer + conn->inStart;
++	*len = (size_t) (cur - conn->inStart);
++	*nframes = frames;
++	return 0;
++}
++
++void
++psAdvanceInput(PGconn *conn, size_t nbytes)
++{
++	int			avail;
++
++	if (nbytes == 0)
++		return;
++	avail = conn->inEnd - conn->inStart;
++	if (nbytes > (size_t) avail)
++		nbytes = (size_t) avail;
++	conn->inStart += (int) nbytes;
++	conn->inCursor = conn->inStart;
++}
++
++int
++psDetachRowRun(PGconn *conn, char **owned_buf, const char **data, size_t *len, int *nframes, size_t budget)
++{
++	const char *view = NULL;
++	size_t		view_len = 0;
++	int			frames = 0;
++	int			rc;
++	int			run_start;
++	int			run_end;
++	int			tail_len;
++	char	   *old_buf;
++	char	   *fresh_buf;
++
++	*owned_buf = NULL;
++	*data = NULL;
++	*len = 0;
++	*nframes = 0;
++
++	rc = psPeekRowRun(conn, &view, &view_len, &frames, budget);
++	if (rc != 0)
++		return rc;
++
++	run_start = conn->inStart;
++	run_end = run_start + (int) view_len;
++	tail_len = conn->inEnd - run_end;
++	if (tail_len < 0)
++		return 1;
++
++	fresh_buf = (char *) malloc(conn->inBufSize);
++	if (fresh_buf == NULL)
++		return 1;
++	if (tail_len > 0)
++		memcpy(fresh_buf, conn->inBuffer + run_end, tail_len);
++
++	old_buf = conn->inBuffer;
++	conn->inBuffer = fresh_buf;
++	conn->inStart = 0;
++	conn->inCursor = 0;
++	conn->inEnd = tail_len;
++
++	*owned_buf = old_buf;
++	*data = old_buf + run_start;
++	*len = view_len;
++	*nframes = frames;
++	return 0;
++}
 --- src/interfaces/libpq/libpq-fe.h
 +++ src/interfaces/libpq/libpq-fe.h
 @@ -27,7 +27,7 @@
@@ -364,17 +632,24 @@
  /*
   * These symbols may be used in compile-time #ifdef tests for the availability
   * of newer libpq features.
-@@ -688,6 +688,22 @@
- /* ProxySQL special handler function */
- extern int PShandleRowData(PGconn *conn, bool is_first_packet, PSresult* result);
+@@ -685,8 +685,27 @@
+ /* Get PGresult directly from PGconn. WARNING: DO NOT RELEASE THIS RESULT */
+ extern const PGresult *PQgetResultFromPGconn(PGconn *conn);
  
+-/* ProxySQL special handler function */
++/* ProxySQL special handler functions */
+ extern int PShandleRowData(PGconn *conn, bool is_first_packet, PSresult* result);
++extern int PSpeekRowRun(PGconn *conn, const char **data, size_t *len, int *nframes, size_t budget);
++extern int PSrowRunPending(PGconn *conn);
++extern void PSadvanceInput(PGconn *conn, size_t nbytes);
++extern int PSdetachRowRun(PGconn *conn, char **owned_buf, const char **data, size_t *len, int *nframes, size_t budget);
++
 +/*
 + * PolarDB LSN API - for read-your-writes consistency
 + */
 +extern uint64_t PQgetLSN(const PGconn *conn);
 +extern int	PQhasLSN(const PGconn *conn);
 +extern void PQsetPolarSendLSN(PGconn *conn, int enable);
-+extern uint64_t PQgetReadyForQuerySequence(const PGconn *conn);
 +
 +/*
 + * PolarDB Transaction Split API - for routing reads within transactions
@@ -383,13 +658,12 @@
 +extern int	PQisXactSplittable(const PGconn *conn);
 +extern int	PQisXactWalPending(const PGconn *conn);
 +extern void PQsetPolarSendXact(PGconn *conn, int enable);
-+
+ 
  /* Send a pipeline sync message without flushing the send buffer */
  extern int	PQsendPipelineSync(PGconn *conn);
- 
 --- src/interfaces/libpq/libpq-int.h
 +++ src/interfaces/libpq/libpq-int.h
-@@ -493,6 +493,34 @@
+@@ -493,6 +493,33 @@
  								 * tried host */
  	bool		send_appname;	/* okay to send application_name? */
  
@@ -397,7 +671,6 @@
 +	bool		polar_proxy_send_lsn;	/* request LSN in ReadyForQuery? */
 +	uint64		polar_last_lsn;			/* LSN from last ReadyForQuery */
 +	bool		polar_has_lsn;			/* was LSN present in last RFQ? */
-+	uint64		polar_ready_sequence;		/* parsed ReadyForQuery count */
 +	bool		polar_proxy_send_xact;	/* request xact info in ReadyForQuery? */
 +	char	   *polar_xact_xids;		/* "cmdId,xid1,xid2,..." from RFQ */
 +	bool		polar_xact_splittable;	/* 'x' marker: WAL flushed, safe to split */
@@ -424,3 +697,16 @@
  	/* Miscellaneous stuff */
  	int			be_pid;			/* PID of backend --- needed for cancels */
  	int			be_key;			/* key of backend --- needed for cancels */
+@@ -731,7 +758,11 @@
+  /*
+   * ProxySQL light weight routines
+   */
+-extern int  psHandleRowData(PGconn *conn, bool is_first_packet, PSresult* result);								 
++extern int  psHandleRowData(PGconn *conn, bool is_first_packet, PSresult* result);
++extern int  psPeekRowRun(PGconn *conn, const char **data, size_t *len, int *nframes, size_t budget);
++extern int  psRowRunPending(PGconn *conn);
++extern void psAdvanceInput(PGconn *conn, size_t nbytes);
++extern int  psDetachRowRun(PGconn *conn, char **owned_buf, const char **data, size_t *len, int *nframes, size_t budget);
+ 
+ /* === in fe-misc.c === */
+ 

@@ -5,7 +5,26 @@
 #define POLARDB_PROFILE 0
 #endif
 
+#ifndef POLARDB_PERF_DEBUG
+#define POLARDB_PERF_DEBUG 0
+#endif
+
 #if POLARDB_PROXY
+
+#if POLARDB_PROFILE
+#define POLARDB_HGM_PROFILE_STATUS_COUNT(status_obj, name, value) \
+	(status_obj).polardb_##name.fetch_add((value), std::memory_order_relaxed)
+#define POLARDB_HGM_PROFILE_STATUS_COUNT_ONE(status_obj, name) \
+	POLARDB_HGM_PROFILE_STATUS_COUNT(status_obj, name, 1)
+#else
+#define POLARDB_HGM_PROFILE_STATUS_COUNT(status_obj, name, value) do { } while (0)
+#define POLARDB_HGM_PROFILE_STATUS_COUNT_ONE(status_obj, name) do { } while (0)
+#endif // POLARDB_PROFILE
+
+#define POLARDB_HGM_STATUS_COUNT(status_obj, name, value) \
+	(status_obj).polardb_##name.fetch_add((value), std::memory_order_relaxed)
+#define POLARDB_HGM_STATUS_COUNT_ONE(status_obj, name) \
+	POLARDB_HGM_STATUS_COUNT(status_obj, name, 1)
 
 #if POLARDB_PROFILE
 #define POLARDB_PROFILE_THREAD_COUNTER_LIST(T) \
@@ -27,18 +46,18 @@
 	T(reader_acquire_count, "PolarDB_Reader_Acquire_Count", \
 		"proxysql_polardb_reader_acquire_count_total", \
 		"RFQ-aware reader acquisition latency samples") \
-	T(hgm_reader_lock_wait_sum_us, "PolarDB_HGM_Reader_Lock_Wait_Sum_Us", \
-		"proxysql_polardb_hgm_reader_lock_wait_microseconds_total", \
-		"Total time spent waiting for the HostGroups_Manager reader-acquire lock") \
-	T(hgm_reader_lock_wait_count, "PolarDB_HGM_Reader_Lock_Wait_Count", \
-		"proxysql_polardb_hgm_reader_lock_wait_count_total", \
-		"HostGroups_Manager reader-acquire lock wait samples") \
-	T(hgm_reader_lock_hold_sum_us, "PolarDB_HGM_Reader_Lock_Hold_Sum_Us", \
-		"proxysql_polardb_hgm_reader_lock_hold_microseconds_total", \
-		"Total time the HostGroups_Manager reader-acquire lock was held") \
-	T(hgm_reader_lock_hold_count, "PolarDB_HGM_Reader_Lock_Hold_Count", \
-		"proxysql_polardb_hgm_reader_lock_hold_count_total", \
-		"HostGroups_Manager reader-acquire lock hold samples") \
+	T(selected_server_pool_lock_wait_sum_us, "PolarDB_Selected_Server_Pool_Lock_Wait_Sum_Us", \
+		"proxysql_polardb_selected_server_pool_lock_wait_microseconds_total", \
+		"Total time spent waiting for the selected server pool lock") \
+	T(selected_server_pool_lock_wait_count, "PolarDB_Selected_Server_Pool_Lock_Wait_Count", \
+		"proxysql_polardb_selected_server_pool_lock_wait_count_total", \
+		"Selected server pool lock wait samples") \
+	T(selected_server_pool_lock_hold_sum_us, "PolarDB_Selected_Server_Pool_Lock_Hold_Sum_Us", \
+		"proxysql_polardb_selected_server_pool_lock_hold_microseconds_total", \
+		"Total time the selected server pool lock was held") \
+	T(selected_server_pool_lock_hold_count, "PolarDB_Selected_Server_Pool_Lock_Hold_Count", \
+		"proxysql_polardb_selected_server_pool_lock_hold_count_total", \
+		"Selected server pool lock hold samples") \
 	T(reader_target_ready_candidate, "PolarDB_Reader_Target_Ready_Candidate", \
 		"proxysql_polardb_reader_target_ready_candidate_total", \
 		"Reader candidates whose fresh LSN cache already reached the wait target") \
@@ -90,18 +109,9 @@
 	T(rfq_requested_zero_payload, "PolarDB_RFQ_Requested_Zero_Payload", \
 		"proxysql_polardb_rfq_requested_zero_payload_total", \
 		"Results on RFQ-LSN startup-profile connections whose ReadyForQuery carried a zero LSN payload") \
-	T(reader_target_pool_busy, "PolarDB_Reader_Target_Pool_Busy", \
-		"proxysql_polardb_reader_target_pool_busy_total", \
-		"Targeted reader attempts rejected by capacity, free-list, or creation throttles") \
-	T(reader_target_best_behind_attempt, "PolarDB_Reader_Target_Best_Behind_Attempt", \
-		"proxysql_polardb_reader_target_best_behind_attempt_total", \
-		"Targeted reader acquisitions that first tried the freshest behind reader") \
-	T(reader_target_best_behind_acquired, "PolarDB_Reader_Target_Best_Behind_Acquired", \
-		"proxysql_polardb_reader_target_best_behind_acquired_total", \
-		"Targeted reader acquisitions served by the freshest behind reader") \
-	T(reader_target_fallback_acquired, "PolarDB_Reader_Target_Fallback_Acquired", \
-		"proxysql_polardb_reader_target_fallback_acquired_total", \
-		"Targeted reader acquisitions that require the backend wait wrapper") \
+	T(client_rfq_lsn_missing_with_target, "PolarDB_Client_RFQ_LSN_Missing_With_Target", \
+		"proxysql_polardb_client_rfq_lsn_missing_with_target_total", \
+		"Client RFQ-LSN requests where the backend RFQ had no LSN payload while the session or wait target was non-zero") \
 	T(wait_target_lsn_cache_advanced, "PolarDB_Wait_Target_LSN_Cache_Advanced", \
 		"proxysql_polardb_wait_target_lsn_cache_advanced_total", \
 		"Successful backend waits that advanced the selected reader LSN cache") \
@@ -128,6 +138,51 @@
 		"Transaction-split wrapper build latency samples")
 
 #define POLARDB_PROFILE_GLOBAL_COUNTER_LIST(G) \
+	G(reader_pool_shared_take_attempt, "PolarDB_Reader_Pool_Shared_Take_Attempt", \
+		"proxysql_polardb_reader_pool_shared_take_attempt_total", \
+		"Attempts to take a selected reader connection from its shared server pool") \
+	G(reader_pool_shared_take_hit, "PolarDB_Reader_Pool_Shared_Take_Hit", \
+		"proxysql_polardb_reader_pool_shared_take_hit_total", \
+		"Shared selected-server pool attempts that returned a connection") \
+	G(reader_pool_shared_take_miss, "PolarDB_Reader_Pool_Shared_Take_Miss", \
+		"proxysql_polardb_reader_pool_shared_take_miss_total", \
+		"Shared selected-server pool attempts that found no usable connection") \
+	G(reader_pool_shared_return_attempt, "PolarDB_Reader_Pool_Shared_Return_Attempt", \
+		"proxysql_polardb_reader_pool_shared_return_attempt_total", \
+		"Attempts to return a reader connection to its shared server pool") \
+	G(reader_pool_shared_return_accepted, "PolarDB_Reader_Pool_Shared_Return_Accepted", \
+		"proxysql_polardb_reader_pool_shared_return_accepted_total", \
+		"Reader connections accepted by their shared server pool") \
+	G(reader_pool_shared_return_rejected, "PolarDB_Reader_Pool_Shared_Return_Rejected", \
+		"proxysql_polardb_reader_pool_shared_return_rejected_total", \
+		"Reader connections rejected by their shared server pool") \
+	G(reader_pool_shared_return_lock_wait_sum_us, "PolarDB_Reader_Pool_Shared_Return_Lock_Wait_Sum_Us", \
+		"proxysql_polardb_reader_pool_shared_return_lock_wait_microseconds_total", \
+		"Total time spent waiting to return reader connections to shared server pools") \
+	G(reader_pool_shared_return_lock_hold_sum_us, "PolarDB_Reader_Pool_Shared_Return_Lock_Hold_Sum_Us", \
+		"proxysql_polardb_reader_pool_shared_return_lock_hold_microseconds_total", \
+		"Total time shared server pool locks were held while returning reader connections") \
+	G(reader_pool_local_take_attempt, "PolarDB_Reader_Pool_Local_Take_Attempt", \
+		"proxysql_polardb_reader_pool_local_take_attempt_total", \
+		"Attempts to reuse a reader connection held by the current worker") \
+	G(reader_pool_local_take_hit, "PolarDB_Reader_Pool_Local_Take_Hit", \
+		"proxysql_polardb_reader_pool_local_take_hit_total", \
+		"Worker-local reader reuse attempts that returned a connection") \
+	G(reader_pool_local_take_miss, "PolarDB_Reader_Pool_Local_Take_Miss", \
+		"proxysql_polardb_reader_pool_local_take_miss_total", \
+		"Worker-local reader reuse attempts that found no connection") \
+	G(reader_pool_local_store_attempt, "PolarDB_Reader_Pool_Local_Store_Attempt", \
+		"proxysql_polardb_reader_pool_local_store_attempt_total", \
+		"Attempts to keep a released reader connection with the current worker") \
+	G(reader_pool_local_store_accepted, "PolarDB_Reader_Pool_Local_Store_Accepted", \
+		"proxysql_polardb_reader_pool_local_store_accepted_total", \
+		"Released reader connections kept by the current worker") \
+	G(reader_pool_local_store_rejected, "PolarDB_Reader_Pool_Local_Store_Rejected", \
+		"proxysql_polardb_reader_pool_local_store_rejected_total", \
+		"Released reader connections not kept by the current worker") \
+	G(reader_pool_local_return_to_shared, "PolarDB_Reader_Pool_Local_Return_To_Shared", \
+		"proxysql_polardb_reader_pool_local_return_to_shared_total", \
+		"Worker-local reader connections returned to shared server pools") \
 	G(split_warmup_queue_delay_sum_us, "PolarDB_Split_Warmup_Queue_Delay_Sum_Us", \
 		"proxysql_polardb_split_warmup_queue_delay_microseconds_total", \
 		"Total time lazy split warmup requests spent queued before drain") \
@@ -140,16 +195,169 @@
 	G(split_warmup_connect_count, "PolarDB_Split_Warmup_Connect_Count", \
 		"proxysql_polardb_split_warmup_connect_count_total", \
 		"Lazy split warmup connect latency samples") \
-	G(split_warmup_publish_sum_us, "PolarDB_Split_Warmup_Publish_Sum_Us", \
-		"proxysql_polardb_split_warmup_publish_microseconds_total", \
-		"Total time spent publishing connected lazy split warmup backends into the pool") \
-	G(split_warmup_publish_count, "PolarDB_Split_Warmup_Publish_Count", \
-		"proxysql_polardb_split_warmup_publish_count_total", \
-		"Lazy split warmup publish latency samples")
+	G(split_warmup_add_sum_us, "PolarDB_Split_Warmup_Add_Sum_Us", \
+		"proxysql_polardb_split_warmup_add_microseconds_total", \
+		"Total time spent adding connected lazy split warmup backends to the pool") \
+	G(split_warmup_add_count, "PolarDB_Split_Warmup_Add_Count", \
+		"proxysql_polardb_split_warmup_add_count_total", \
+		"Lazy split warmup add-time samples") \
+	G(idle_ping_pool_maintenance_sum_us, "PolarDB_Idle_Ping_Pool_Maintenance_Sum_Us", \
+		"proxysql_polardb_idle_ping_pool_maintenance_microseconds_total", \
+		"Total time spent finding and preparing idle connections for ping") \
+	G(idle_ping_pool_maintenance_count, "PolarDB_Idle_Ping_Pool_Maintenance_Count", \
+		"proxysql_polardb_idle_ping_pool_maintenance_count_total", \
+		"Idle connection ping-pool maintenance samples")
 #else
 #define POLARDB_PROFILE_THREAD_COUNTER_LIST(T)
 #define POLARDB_PROFILE_GLOBAL_COUNTER_LIST(G)
 #endif // POLARDB_PROFILE
+
+#if POLARDB_PERF_DEBUG
+#define POLARDB_PERF_DEBUG_THREAD_COUNTER_LIST(T) \
+	T(perf_writev_skip_disabled, "PolarDB_Perf_WriteV_Skip_Disabled", \
+		"proxysql_polardb_perf_writev_skip_disabled_total", \
+		"Direct frontend write skipped because the runtime switch was disabled") \
+	T(perf_writev_skip_inactive, "PolarDB_Perf_WriteV_Skip_Inactive", \
+		"proxysql_polardb_perf_writev_skip_inactive_total", \
+		"Direct frontend write skipped because the stream, fd, or network state was unusable") \
+	T(perf_writev_skip_encrypted, "PolarDB_Perf_WriteV_Skip_Encrypted", \
+		"proxysql_polardb_perf_writev_skip_encrypted_total", \
+		"Direct plaintext frontend write skipped because the stream was encrypted") \
+	T(perf_writev_skip_not_frontend, "PolarDB_Perf_WriteV_Skip_Not_Frontend", \
+		"proxysql_polardb_perf_writev_skip_not_frontend_total", \
+		"Direct frontend write skipped because the stream was not a frontend stream") \
+	T(perf_writev_skip_state, "PolarDB_Perf_WriteV_Skip_State", \
+		"proxysql_polardb_perf_writev_skip_state_total", \
+		"Direct frontend write skipped because the data-stream state was not ready") \
+	T(perf_writev_skip_session, "PolarDB_Perf_WriteV_Skip_Session", \
+		"proxysql_polardb_perf_writev_skip_session_total", \
+		"Direct frontend write skipped because the session was missing or not PostgreSQL") \
+	T(perf_writev_skip_mirror, "PolarDB_Perf_WriteV_Skip_Mirror", \
+		"proxysql_polardb_perf_writev_skip_mirror_total", \
+		"Direct frontend write skipped for a mirrored session") \
+	T(perf_writev_skip_poll, "PolarDB_Perf_WriteV_Skip_Poll", \
+		"proxysql_polardb_perf_writev_skip_poll_total", \
+		"Direct frontend write skipped because poll state was missing") \
+	T(perf_writev_skip_no_packets, "PolarDB_Perf_WriteV_Skip_No_Packets", \
+		"proxysql_polardb_perf_writev_skip_no_packets_total", \
+		"Direct frontend write skipped because PSarrayOUT had no packets") \
+	T(perf_writev_skip_queue_pending, "PolarDB_Perf_WriteV_Skip_Queue_Pending", \
+		"proxysql_polardb_perf_writev_skip_queue_pending_total", \
+		"Direct frontend write skipped because queueOUT already had bytes") \
+	T(perf_writev_skip_queue_partial, "PolarDB_Perf_WriteV_Skip_Queue_Partial", \
+		"proxysql_polardb_perf_writev_skip_queue_partial_total", \
+		"Direct frontend write skipped because queueOUT had a partial packet") \
+	T(perf_writev_view_build_calls, "PolarDB_Perf_WriteV_View_Build_Calls", \
+		"proxysql_polardb_perf_writev_view_build_calls_total", \
+		"Direct frontend write view build attempts") \
+	T(perf_writev_view_build_packets, "PolarDB_Perf_WriteV_View_Build_Packets", \
+		"proxysql_polardb_perf_writev_view_build_packets_total", \
+		"Packets included in direct frontend write views") \
+	T(perf_write_bytes_le_512, "PolarDB_Perf_Write_Bytes_Le_512", \
+		"proxysql_polardb_perf_write_bytes_le_512_total", \
+		"Frontend socket writes of at most 512 bytes") \
+	T(perf_write_bytes_le_1k, "PolarDB_Perf_Write_Bytes_Le_1KB", \
+		"proxysql_polardb_perf_write_bytes_le_1kb_total", \
+		"Frontend socket writes of 513 bytes to 1KB") \
+	T(perf_write_bytes_le_2k, "PolarDB_Perf_Write_Bytes_Le_2KB", \
+		"proxysql_polardb_perf_write_bytes_le_2kb_total", \
+		"Frontend socket writes of more than 1KB to 2KB") \
+	T(perf_write_bytes_le_4k, "PolarDB_Perf_Write_Bytes_Le_4KB", \
+		"proxysql_polardb_perf_write_bytes_le_4kb_total", \
+		"Frontend socket writes of more than 2KB to 4KB") \
+	T(perf_write_bytes_le_8k, "PolarDB_Perf_Write_Bytes_Le_8KB", \
+		"proxysql_polardb_perf_write_bytes_le_8kb_total", \
+		"Frontend socket writes of more than 4KB to 8KB") \
+	T(perf_write_bytes_le_16k, "PolarDB_Perf_Write_Bytes_Le_16KB", \
+		"proxysql_polardb_perf_write_bytes_le_16kb_total", \
+		"Frontend socket writes of more than 8KB to 16KB") \
+	T(perf_write_bytes_le_32k, "PolarDB_Perf_Write_Bytes_Le_32KB", \
+		"proxysql_polardb_perf_write_bytes_le_32kb_total", \
+		"Frontend socket writes of more than 16KB to 32KB") \
+	T(perf_write_bytes_le_64k, "PolarDB_Perf_Write_Bytes_Le_64KB", \
+		"proxysql_polardb_perf_write_bytes_le_64kb_total", \
+		"Frontend socket writes of more than 32KB to 64KB") \
+	T(perf_write_bytes_gt_64k, "PolarDB_Perf_Write_Bytes_Gt_64KB", \
+		"proxysql_polardb_perf_write_bytes_gt_64kb_total", \
+		"Frontend socket writes larger than 64KB") \
+	T(perf_write_iov_1, "PolarDB_Perf_Write_Iov_1", \
+		"proxysql_polardb_perf_write_iov_1_total", \
+		"Direct frontend writes with one iovec") \
+	T(perf_write_iov_2, "PolarDB_Perf_Write_Iov_2", \
+		"proxysql_polardb_perf_write_iov_2_total", \
+		"Direct frontend writes with two iovecs") \
+	T(perf_write_iov_3_4, "PolarDB_Perf_Write_Iov_3_4", \
+		"proxysql_polardb_perf_write_iov_3_4_total", \
+		"Direct frontend writes with three or four iovecs") \
+	T(perf_write_iov_5_8, "PolarDB_Perf_Write_Iov_5_8", \
+		"proxysql_polardb_perf_write_iov_5_8_total", \
+		"Direct frontend writes with five to eight iovecs") \
+	T(perf_write_iov_9_16, "PolarDB_Perf_Write_Iov_9_16", \
+		"proxysql_polardb_perf_write_iov_9_16_total", \
+		"Direct frontend writes with nine to sixteen iovecs") \
+	T(perf_write_iov_17_32, "PolarDB_Perf_Write_Iov_17_32", \
+		"proxysql_polardb_perf_write_iov_17_32_total", \
+		"Direct frontend writes with seventeen to thirty-two iovecs") \
+	T(perf_write_iov_33_64, "PolarDB_Perf_Write_Iov_33_64", \
+		"proxysql_polardb_perf_write_iov_33_64_total", \
+		"Direct frontend writes with thirty-three to sixty-four iovecs") \
+	T(perf_packets_per_send_1, "PolarDB_Perf_Packets_Per_Send_1", \
+		"proxysql_polardb_perf_packets_per_send_1_total", \
+		"Direct frontend writes containing one protocol packet") \
+	T(perf_packets_per_send_2, "PolarDB_Perf_Packets_Per_Send_2", \
+		"proxysql_polardb_perf_packets_per_send_2_total", \
+		"Direct frontend writes containing two protocol packets") \
+	T(perf_packets_per_send_3_4, "PolarDB_Perf_Packets_Per_Send_3_4", \
+		"proxysql_polardb_perf_packets_per_send_3_4_total", \
+		"Direct frontend writes containing three or four protocol packets") \
+	T(perf_packets_per_send_5_8, "PolarDB_Perf_Packets_Per_Send_5_8", \
+		"proxysql_polardb_perf_packets_per_send_5_8_total", \
+		"Direct frontend writes containing five to eight protocol packets") \
+	T(perf_packets_per_send_9_16, "PolarDB_Perf_Packets_Per_Send_9_16", \
+		"proxysql_polardb_perf_packets_per_send_9_16_total", \
+		"Direct frontend writes containing nine to sixteen protocol packets") \
+	T(perf_packets_per_send_17_32, "PolarDB_Perf_Packets_Per_Send_17_32", \
+		"proxysql_polardb_perf_packets_per_send_17_32_total", \
+		"Direct frontend writes containing seventeen to thirty-two protocol packets") \
+	T(perf_packets_per_send_33_64, "PolarDB_Perf_Packets_Per_Send_33_64", \
+		"proxysql_polardb_perf_packets_per_send_33_64_total", \
+		"Direct frontend writes containing thirty-three to sixty-four protocol packets") \
+	T(perf_packet_bytes_le_512, "PolarDB_Perf_Packet_Bytes_Le_512", \
+		"proxysql_polardb_perf_packet_bytes_le_512_total", \
+		"Protocol packets in direct frontend writes of at most 512 bytes") \
+	T(perf_packet_bytes_le_1k, "PolarDB_Perf_Packet_Bytes_Le_1KB", \
+		"proxysql_polardb_perf_packet_bytes_le_1kb_total", \
+		"Protocol packets in direct frontend writes of 513 bytes to 1KB") \
+	T(perf_packet_bytes_le_2k, "PolarDB_Perf_Packet_Bytes_Le_2KB", \
+		"proxysql_polardb_perf_packet_bytes_le_2kb_total", \
+		"Protocol packets in direct frontend writes of more than 1KB to 2KB") \
+	T(perf_packet_bytes_le_4k, "PolarDB_Perf_Packet_Bytes_Le_4KB", \
+		"proxysql_polardb_perf_packet_bytes_le_4kb_total", \
+		"Protocol packets in direct frontend writes of more than 2KB to 4KB") \
+	T(perf_packet_bytes_le_8k, "PolarDB_Perf_Packet_Bytes_Le_8KB", \
+		"proxysql_polardb_perf_packet_bytes_le_8kb_total", \
+		"Protocol packets in direct frontend writes of more than 4KB to 8KB") \
+	T(perf_packet_bytes_le_16k, "PolarDB_Perf_Packet_Bytes_Le_16KB", \
+		"proxysql_polardb_perf_packet_bytes_le_16kb_total", \
+		"Protocol packets in direct frontend writes of more than 8KB to 16KB") \
+	T(perf_packet_bytes_le_32k, "PolarDB_Perf_Packet_Bytes_Le_32KB", \
+		"proxysql_polardb_perf_packet_bytes_le_32kb_total", \
+		"Protocol packets in direct frontend writes of more than 16KB to 32KB") \
+	T(perf_packet_bytes_le_64k, "PolarDB_Perf_Packet_Bytes_Le_64KB", \
+		"proxysql_polardb_perf_packet_bytes_le_64kb_total", \
+		"Protocol packets in direct frontend writes of more than 32KB to 64KB") \
+	T(perf_packet_bytes_gt_64k, "PolarDB_Perf_Packet_Bytes_Gt_64KB", \
+		"proxysql_polardb_perf_packet_bytes_gt_64kb_total", \
+		"Protocol packets in direct frontend writes larger than 64KB") \
+	T(perf_plain_send_calls, "PolarDB_Perf_Plain_Send_Calls", \
+		"proxysql_polardb_perf_plain_send_calls_total", \
+		"Plaintext frontend sends through the buffered path") \
+	T(perf_plain_send_bytes, "PolarDB_Perf_Plain_Send_Bytes", \
+		"proxysql_polardb_perf_plain_send_bytes_total", \
+		"Plaintext frontend bytes sent through the buffered path")
+#else
+#define POLARDB_PERF_DEBUG_THREAD_COUNTER_LIST(T)
+#endif // POLARDB_PERF_DEBUG
 
 // PolarDB counter metadata is intentionally shared by the SQL stats export,
 // per-thread counter entries, worker-total merges, and Prometheus registration.
@@ -192,6 +400,15 @@
 	T(read_missing_lsn, "PolarDB_Read_Missing_LSN", \
 		"proxysql_polardb_read_missing_lsn_total", \
 		"Reader queries whose RFQ did not include an LSN") \
+	T(client_rfq_lsn_raised_to_target, "PolarDB_Client_RFQ_LSN_Raised_To_Target", \
+		"proxysql_polardb_client_rfq_lsn_raised_to_target_total", \
+		"Client ReadyForQuery LSN payloads raised from backend RFQ value to a confirmed session or wait target") \
+	T(client_rfq_lsn_raised_by_writer, "PolarDB_Client_RFQ_LSN_Raised_By_Writer", \
+		"proxysql_polardb_client_rfq_lsn_raised_by_writer_total", \
+		"Client ReadyForQuery LSN payloads raised because the response came from the current writer hostgroup") \
+	T(client_rfq_lsn_raised_by_wait, "PolarDB_Client_RFQ_LSN_Raised_By_Wait", \
+		"proxysql_polardb_client_rfq_lsn_raised_by_wait_total", \
+		"Client ReadyForQuery LSN payloads raised because the query completed a successful LSN wait") \
 	T(primary_lsn_unknown, "PolarDB_Primary_LSN_Unknown", \
 		"proxysql_polardb_primary_lsn_unknown_total", \
 		"Primary-baseline reads that could not use a known primary LSN") \
@@ -236,7 +453,7 @@
 		"Wait-read retries declined because the configured retry target is not the writer") \
 	G(wait_retry_declined_not_recoverable, "PolarDB_Wait_Retry_Declined_Not_Recoverable", \
 		"proxysql_polardb_wait_retry_declined_not_recoverable_total", \
-		"Wait-read retries declined because the failure is not timeout or connection loss") \
+		"Wait-read retries declined because the failure class is not retryable") \
 	G(wait_retry_declined_result_started, "PolarDB_Wait_Retry_Declined_Result_Started", \
 		"proxysql_polardb_wait_retry_declined_result_started_total", \
 		"Wait-read retries declined because user-result transfer had already started") \
@@ -267,42 +484,87 @@
 	G(rfq_profile_evicted, "PolarDB_RFQ_Profile_Evicted", \
 		"proxysql_polardb_rfq_profile_evicted_total", \
 		"Incompatible pooled backends evicted for RFQ-LSN-capable replacements") \
-	T(tl_cache_bypassed_for_target, "PolarDB_TL_Cache_Bypassed_For_Target", \
-		"proxysql_polardb_tl_cache_bypassed_for_target_total", \
-		"Thread-local cache bypasses for consistency-target RFQ-LSN reads") \
 	T(target_lsn_preferred, "PolarDB_Target_LSN_Preferred", \
 		"proxysql_polardb_target_lsn_preferred_total", \
 		"Reader choices that preferred a cached LSN already at or above target") \
 	T(target_lsn_fallback_wait, "PolarDB_Target_LSN_Fallback_Wait", \
 		"proxysql_polardb_target_lsn_fallback_wait_total", \
-		"Reader choices that kept the backend wait as the correctness gate") \
-	T(reader_affinity_set, "PolarDB_Reader_Affinity_Set", \
-		"proxysql_polardb_reader_affinity_set_total", \
-		"Session-local reader affinity hints refreshed after a proven wait") \
-	T(reader_affinity_hit, "PolarDB_Reader_Affinity_Hit", \
-		"proxysql_polardb_reader_affinity_hit_total", \
-		"Reader acquisitions served by a session-local reader affinity hint") \
-	T(reader_affinity_miss_expired, "PolarDB_Reader_Affinity_Miss_Expired", \
-		"proxysql_polardb_reader_affinity_miss_expired_total", \
-		"Reader affinity hints skipped because their TTL or use count expired") \
-	T(reader_affinity_miss_scope, "PolarDB_Reader_Affinity_Miss_Scope", \
-		"proxysql_polardb_reader_affinity_miss_scope_total", \
-		"Reader affinity hints skipped because the writer epoch changed") \
-	T(reader_affinity_miss_not_ready, "PolarDB_Reader_Affinity_Miss_Not_Ready", \
-		"proxysql_polardb_reader_affinity_miss_not_ready_total", \
-		"Reader affinity hints skipped because the proven LSN was below the new target") \
-	T(reader_affinity_miss_no_free, "PolarDB_Reader_Affinity_Miss_No_Free", \
-		"proxysql_polardb_reader_affinity_miss_no_free_total", \
-		"Reader affinity hints skipped because no compatible pooled connection was free") \
-	T(reader_affinity_miss_profile, "PolarDB_Reader_Affinity_Miss_Profile", \
-		"proxysql_polardb_reader_affinity_miss_profile_total", \
-		"Reader affinity hints skipped because pooled connections did not match RFQ or startup identity") \
-	T(reader_affinity_clear_failure, "PolarDB_Reader_Affinity_Clear_Failure", \
-		"proxysql_polardb_reader_affinity_clear_failure_total", \
-		"Reader affinity hints cleared after a reader failure") \
-	T(reader_affinity_bypassed_wait, "PolarDB_Reader_Affinity_Bypassed_Wait", \
-		"proxysql_polardb_reader_affinity_bypassed_wait_total", \
-		"Reader affinity hits that avoided sending an LSN wait wrapper") \
+		"Reader choices that kept the backend wait as the correctness check") \
+	T(reader_node_limit, "PolarDB_Reader_Node_Limit", \
+		"proxysql_polardb_reader_node_limit_total", \
+		"Eligible reader nodes skipped after the stack-only acquisition cap") \
+	T(reader_pool_hit, "PolarDB_Reader_Pool_Hit", \
+		"proxysql_polardb_reader_pool_hit_total", \
+		"Reader acquisitions served by the PolarDB reader pool") \
+	T(reader_pool_miss_empty, "PolarDB_Reader_Pool_Miss_Empty", \
+		"proxysql_polardb_reader_pool_miss_empty_total", \
+		"Reader pool lookups that found no usable pooled reader") \
+	T(reader_pool_return_to_core, "PolarDB_Reader_Pool_Return_To_Core", \
+		"proxysql_polardb_reader_pool_return_to_core_total", \
+		"Reusable reader connections returned to the selected server core FREE list") \
+	T(reader_pool_p2c_select, "PolarDB_Reader_Pool_P2C_Select", \
+		"proxysql_polardb_reader_pool_p2c_select_total", \
+		"Reader pool selections made with P2C") \
+	T(reader_pool_p2c_second, "PolarDB_Reader_Pool_P2C_Second", \
+		"proxysql_polardb_reader_pool_p2c_second_total", \
+		"P2C selected the second sampled reader") \
+	T(reader_pool_p2c_active_load, "PolarDB_Reader_Pool_P2C_Decide_Active_Load", \
+		"proxysql_polardb_reader_pool_p2c_active_load_total", \
+		"P2C decided by lower globally visible weight-normalized active load") \
+	T(reader_pool_p2c_random, "PolarDB_Reader_Pool_P2C_Decide_Random", \
+		"proxysql_polardb_reader_pool_p2c_random_total", \
+		"P2C where global load/free counts tied and random tie-break selected the reader") \
+	T(pool_capacity_active_block, "PolarDB_Pool_Capacity_Active_Block", \
+		"proxysql_polardb_pool_capacity_active_block_total", \
+		"Reader/backend choices rejected because active server capacity reached max_connections") \
+	T(pool_capacity_total_block, "PolarDB_Pool_Capacity_Total_Block", \
+		"proxysql_polardb_pool_capacity_total_block_total", \
+		"Backend socket creation rejected because total server sockets reached max_connections") \
+	T(reader_pool_drop_offline, "PolarDB_Reader_Pool_Drop_Offline", \
+		"proxysql_polardb_reader_pool_drop_offline_total", \
+		"Reader pool readers dropped because their server was no longer ONLINE") \
+	T(reader_pool_drop_unusable, "PolarDB_Reader_Pool_Drop_Ineligible", \
+		"proxysql_polardb_reader_pool_drop_unusable_total", \
+		"Reader pool readers dropped because they were no longer reusable") \
+	T(reader_pool_drop_client_identity, "PolarDB_Reader_Pool_Drop_Client_Identity", \
+		"proxysql_polardb_reader_pool_drop_client_identity_total", \
+		"Reader pool readers closed instead of pooled because backend startup identity is client-specific") \
+	T(reader_pool_lookup, "PolarDB_Reader_Pool_Lookup", \
+		"proxysql_polardb_reader_pool_lookup_total", \
+		"PolarDB reader-pool lookup attempts") \
+	T(reader_pool_server_considered, "PolarDB_Reader_Pool_Server_Considered", \
+		"proxysql_polardb_reader_pool_server_considered_total", \
+		"Reader servers examined by PolarDB policy selection") \
+	T(reader_pool_server_skip_unusable, "PolarDB_Reader_Pool_Server_Skip_Unusable", \
+		"proxysql_polardb_reader_pool_server_skip_unusable_total", \
+		"Reader pool reader servers skipped because status, weight, or latency made them unusable") \
+	T(reader_pool_match_attempt, "PolarDB_Reader_Pool_Match_Attempt", \
+		"proxysql_polardb_reader_pool_match_attempt_total", \
+		"Attempts to get a matching connection from an eligible reader") \
+	T(reader_pool_match_miss, "PolarDB_Reader_Pool_Match_Miss", \
+		"proxysql_polardb_reader_pool_match_miss_total", \
+		"Selected-server attempts that found no matching connection") \
+	T(reader_pool_conn_examined, "PolarDB_Reader_Pool_Conn_Examined", \
+		"proxysql_polardb_reader_pool_conn_examined_total", \
+		"Reader pool connections taken and checked") \
+	T(reader_pool_reject_bad_context, "PolarDB_Reader_Pool_Reject_Bad_Context", \
+		"proxysql_polardb_reader_pool_reject_bad_context_total", \
+		"Reader pool connections rejected because required session or connection context was missing") \
+	T(reader_pool_reject_profile, "PolarDB_Reader_Pool_Reject_Profile", \
+		"proxysql_polardb_reader_pool_reject_profile_total", \
+		"Reader pool connections rejected because their startup profile is incompatible with the hostgroup profile") \
+	T(reader_pool_reject_auth, "PolarDB_Reader_Pool_Reject_Auth", \
+		"proxysql_polardb_reader_pool_reject_auth_total", \
+		"Reader pool connections rejected because user or database differed") \
+	T(reader_pool_reject_identity, "PolarDB_Reader_Pool_Reject_Identity", \
+		"proxysql_polardb_reader_pool_reject_identity_total", \
+		"Reader pool connections rejected because PolarDB startup identity differed") \
+	T(reader_pool_reject_session_state, "PolarDB_Reader_Pool_Reject_Session_State", \
+		"proxysql_polardb_reader_pool_reject_session_state_total", \
+		"Reader pool connections rejected because session state did not match") \
+	T(reader_pool_key_full_check, "PolarDB_Reader_Pool_Key_Full_Check", \
+		"proxysql_polardb_reader_pool_key_full_check_total", \
+		"Reader pool reuse validations that needed core option/reset/session-variable checks") \
 	T(reader_target_selected_lsn_unknown, "PolarDB_Reader_Target_Selected_LSN_Unknown", \
 		"proxysql_polardb_reader_target_selected_lsn_unknown_total", \
 		"Reader acquisitions that still needed a wait and had no selected-reader LSN sample") \
@@ -330,6 +592,129 @@
 	G(session_target_epoch_reset, "PolarDB_Session_Target_Epoch_Reset", \
 		"proxysql_polardb_session_target_epoch_reset_total", \
 		"Session LSN targets cleared after writer epoch changes") \
+	T(query_parser_init, "PolarDB_Query_Parser_Init", \
+		"proxysql_polardb_query_parser_init_total", \
+		"PgSQL queries submitted to the query parser/digest initializer") \
+	T(query_parser_init_bytes, "PolarDB_Query_Parser_Init_Bytes", \
+		"proxysql_polardb_query_parser_init_bytes_total", \
+		"Query bytes submitted to the PgSQL parser/digest initializer") \
+	T(query_parser_init_digest_enabled, "PolarDB_Query_Parser_Init_Digest_Enabled", \
+		"proxysql_polardb_query_parser_init_digest_enabled_total", \
+		"PgSQL parser initializations made while query digest collection was enabled") \
+	T(query_parser_init_commands_enabled, "PolarDB_Query_Parser_Init_Commands_Enabled", \
+		"proxysql_polardb_query_parser_init_commands_enabled_total", \
+		"PgSQL parser initializations made while command statistics were enabled") \
+	T(query_parser_command_type, "PolarDB_Query_Parser_Command_Type", \
+		"proxysql_polardb_query_parser_command_type_total", \
+		"PgSQL command-type classifications requested from the parser") \
+	T(query_parser_update, "PolarDB_Query_Parser_Update", \
+		"proxysql_polardb_query_parser_update_total", \
+		"PgSQL query-parser statistic updates attempted at query end") \
+	T(query_parser_update_skipped_none, "PolarDB_Query_Parser_Update_Skipped_None", \
+		"proxysql_polardb_query_parser_update_skipped_none_total", \
+		"PgSQL query-parser statistic updates skipped because the query had no parser state") \
+	T(query_parser_update_skipped_uninitialized, "PolarDB_Query_Parser_Update_Skipped_Uninitialized", \
+		"proxysql_polardb_query_parser_update_skipped_uninitialized_total", \
+		"PgSQL query-parser statistic updates skipped because the parser command was still uninitialized") \
+	T(query_parser_update_with_digest, "PolarDB_Query_Parser_Update_With_Digest", \
+		"proxysql_polardb_query_parser_update_with_digest_total", \
+		"PgSQL query-parser statistic updates that carried a digest text") \
+	T(result_process, "PolarDB_Result_Process", \
+		"proxysql_polardb_result_process_total", \
+		"PolarDB result-processing observations run at query completion") \
+	T(result_process_write_classify, "PolarDB_Result_Process_Write_Classify", \
+		"proxysql_polardb_result_process_write_classify_total", \
+		"PolarDB result-processing calls that classified the completed query as read or write") \
+	T(result_process_write_classify_text, "PolarDB_Result_Process_Write_Classify_Text", \
+		"proxysql_polardb_result_process_write_classify_text_total", \
+		"PolarDB result-processing classifications that had query text available") \
+	T(parent_bytes_flush_threshold_recv, "PolarDB_Parent_Bytes_Flush_Threshold_Recv", \
+		"proxysql_polardb_parent_bytes_flush_threshold_recv_total", \
+		"Parent byte flushes caused by the backend recv-byte threshold") \
+	T(parent_bytes_flush_threshold_sent, "PolarDB_Parent_Bytes_Flush_Threshold_Sent", \
+		"proxysql_polardb_parent_bytes_flush_threshold_sent_total", \
+		"Parent byte flushes caused by the backend sent-byte threshold") \
+	T(parent_bytes_flush_detach, "PolarDB_Parent_Bytes_Flush_Detach", \
+		"proxysql_polardb_parent_bytes_flush_detach_total", \
+		"Parent byte flushes made before detaching a backend connection") \
+	T(parent_bytes_flush_destructor, "PolarDB_Parent_Bytes_Flush_Destructor", \
+		"proxysql_polardb_parent_bytes_flush_destructor_total", \
+		"Parent byte flushes made while destroying a backend connection") \
+	T(parent_bytes_flush_no_parent, "PolarDB_Parent_Bytes_Flush_No_Parent", \
+		"proxysql_polardb_parent_bytes_flush_no_parent_total", \
+		"Pending parent bytes dropped because no server container was attached") \
+	T(parent_bytes_flush_recv_atomic, "PolarDB_Parent_Bytes_Flush_Recv_Atomic", \
+		"proxysql_polardb_parent_bytes_flush_recv_atomic_total", \
+		"Shared parent recv-byte atomic updates after coalescing") \
+	T(parent_bytes_flush_sent_atomic, "PolarDB_Parent_Bytes_Flush_Sent_Atomic", \
+		"proxysql_polardb_parent_bytes_flush_sent_atomic_total", \
+		"Shared parent sent-byte atomic updates after coalescing") \
+	T(parent_bytes_flush_recv_bytes, "PolarDB_Parent_Bytes_Flush_Recv_Bytes", \
+		"proxysql_polardb_parent_bytes_flush_recv_bytes_total", \
+		"Recv bytes flushed to shared parent counters after coalescing") \
+	T(parent_bytes_flush_sent_bytes, "PolarDB_Parent_Bytes_Flush_Sent_Bytes", \
+		"proxysql_polardb_parent_bytes_flush_sent_bytes_total", \
+		"Sent bytes flushed to shared parent counters after coalescing") \
+	T(writev_attempts, "PolarDB_WriteV_Attempts", \
+		"proxysql_polardb_writev_attempts_total", \
+		"Plaintext PgSQL frontend direct scatter/gather send attempts") \
+	T(writev_bytes, "PolarDB_WriteV_Bytes", \
+		"proxysql_polardb_writev_bytes_total", \
+		"Bytes sent through the direct scatter/gather path") \
+	T(writev_packets, "PolarDB_WriteV_Packets", \
+		"proxysql_polardb_writev_packets_total", \
+		"Fully-sent packets consumed by the direct scatter/gather path") \
+	T(writev_short_writes, "PolarDB_WriteV_Short_Writes", \
+		"proxysql_polardb_writev_short_writes_total", \
+		"Direct scatter/gather sends that wrote less than the built view") \
+	T(writev_wouldblock, "PolarDB_WriteV_WouldBlock", \
+		"proxysql_polardb_writev_wouldblock_total", \
+		"Direct scatter/gather sends returning EAGAIN, EWOULDBLOCK, or EINTR") \
+	T(writev_errors, "PolarDB_WriteV_Errors", \
+		"proxysql_polardb_writev_errors_total", \
+		"Direct scatter/gather sends returning a hard error") \
+	T(writev_buffered_fallback, "PolarDB_WriteV_Buffered_Fallback", \
+		"proxysql_polardb_writev_buffered_fallback_total", \
+		"PgSQL frontend writes forced back to queueOUT buffering") \
+	T(writev_small_batch_fallback, "PolarDB_WriteV_Small_Batch_Fallback", \
+		"proxysql_polardb_writev_small_batch_fallback_total", \
+		"PgSQL frontend writes kept on the buffered path because they fit in one queue buffer") \
+	T(output_coalesce_hold, "PolarDB_Output_Coalesce_Hold", \
+		"proxysql_polardb_output_coalesce_hold_total", \
+		"Incomplete streaming frontend output flushes deferred") \
+	T(output_coalesce_flush_budget, "PolarDB_Output_Coalesce_Flush_Budget", \
+		"proxysql_polardb_output_coalesce_flush_budget_total", \
+		"Incomplete streaming output flushed after the coalesce budget") \
+	T(output_coalesce_flush_complete, "PolarDB_Output_Coalesce_Flush_Complete", \
+		"proxysql_polardb_output_coalesce_flush_complete_total", \
+		"Held streaming output flushed at result completion") \
+	T(output_coalesce_flush_backpressure, "PolarDB_Output_Coalesce_Flush_Backpressure", \
+		"proxysql_polardb_output_coalesce_flush_backpressure_total", \
+		"Coalesce skipped because output or socket state already had pending bytes") \
+	T(output_coalesce_disabled, "PolarDB_Output_Coalesce_Disabled", \
+		"proxysql_polardb_output_coalesce_disabled_total", \
+		"Coalesce disabled observations") \
+	T(result_row_run_attempts, "PolarDB_Result_Row_Run_Attempts", \
+		"proxysql_polardb_result_row_run_attempts_total", \
+		"Attempts to detach a pending backend DataRow run") \
+	T(result_row_run_used, "PolarDB_Result_Row_Run_Used", \
+		"proxysql_polardb_result_row_run_used_total", \
+		"Backend DataRow runs forwarded as one result packet") \
+	T(result_row_run_frames, "PolarDB_Result_Row_Run_Frames", \
+		"proxysql_polardb_result_row_run_frames_total", \
+		"DataRow frames forwarded through row-run fast-forward") \
+	T(result_row_run_bytes, "PolarDB_Result_Row_Run_Bytes", \
+		"proxysql_polardb_result_row_run_bytes_total", \
+		"Bytes forwarded through row-run fast-forward") \
+	T(result_row_run_unavailable, "PolarDB_Result_Row_Run_Unavailable", \
+		"proxysql_polardb_result_row_run_unavailable_total", \
+		"Row-run probes that fell back to normal result handling") \
+	T(result_row_run_partial, "PolarDB_Result_Row_Run_Partial", \
+		"proxysql_polardb_result_row_run_partial_total", \
+		"Row-run probes that saw an incomplete DataRow frame") \
+	T(result_row_run_not_candidate, "PolarDB_Result_Row_Run_Not_Candidate", \
+		"proxysql_polardb_result_row_run_not_candidate_total", \
+		"Row-run checks skipped because libpq was not positioned at a DataRow frame") \
 	T(session_lsn_routing, "PolarDB_Session_LSN_Routing", \
 		"proxysql_polardb_session_lsn_routing_total", \
 		"Reads routed to a reader with a session-LSN wait requirement") \
@@ -366,6 +751,9 @@
 	T(route_txn_wait_planned, "PolarDB_Route_Txn_Wait_Planned", \
 		"proxysql_polardb_route_txn_wait_planned_total", \
 		"Pre-write in-transaction reads planned for a temporary reader wait path") \
+	T(txn_wait_reader_reconciled, "PolarDB_Txn_Wait_Reader_Reconciled", \
+		"proxysql_polardb_txn_wait_reader_reconciled_total", \
+		"Temporary transaction wait reader ownership restored at request entry") \
 	T(route_manual_total, "PolarDB_Route_Manual_Total", \
 		"proxysql_polardb_route_manual_total", \
 		"Queries where a normal query rule or sticky hostgroup selected the route") \
@@ -380,7 +768,7 @@
 		"Manual-route queries whose effective hostgroup was not a known PolarDB reader or writer") \
 	T(route_manual_forced_writer, "PolarDB_Route_Manual_Forced_Writer", \
 		"proxysql_polardb_route_manual_forced_writer_total", \
-		"Manual-route queries overridden to the writer by a reader-failure safety pin") \
+		"Manual-route queries overridden to the writer by reader-failure safety handling") \
 	T(route_locked_hostgroup, "PolarDB_Route_Locked_Hostgroup", \
 		"proxysql_polardb_route_locked_hostgroup_total", \
 		"Queries where a session hostgroup lock skipped automatic PolarDB routing") \
@@ -577,6 +965,7 @@
 		"proxysql_polardb_split_conn_cleanup_recovered_total", \
 		"Previously non-idle split connections returned to the pool after cleanup") \
 	POLARDB_PROFILE_THREAD_COUNTER_LIST(T) \
+	POLARDB_PERF_DEBUG_THREAD_COUNTER_LIST(T) \
 	T(split_lsn_wait_count, "PolarDB_Split_LSN_Wait_Count", \
 		"proxysql_polardb_split_lsn_wait_count_total", \
 		"LSN wait wrappers prepared for transaction-split reads") \
@@ -628,12 +1017,18 @@
 	G(split_warmup_requested, "PolarDB_Split_Warmup_Requested", \
 		"proxysql_polardb_split_warmup_requested_total", \
 		"Lazy split pool warmup requests queued after a pool-empty split attempt") \
+	G(split_warmup_target_attempts, "PolarDB_Split_Warmup_Target_Attempts", \
+		"proxysql_polardb_split_warmup_target_attempts_total", \
+		"Backend connect attempts produced by split pool warmup requests") \
 	G(split_warmup_created, "PolarDB_Split_Warmup_Created", \
 		"proxysql_polardb_split_warmup_created_total", \
 		"Lazy split pool warmup connections added to replica pools") \
 	G(split_warmup_failed, "PolarDB_Split_Warmup_Failed", \
 		"proxysql_polardb_split_warmup_failed_total", \
-		"Lazy split pool warmup requests that could not create a connection") \
+		"Lazy split pool warmup base requests rejected or completed without a target") \
+	G(split_warmup_target_failed, "PolarDB_Split_Warmup_Target_Failed", \
+		"proxysql_polardb_split_warmup_target_failed_total", \
+		"Lazy split pool warmup target backends that failed before publication") \
 	G(split_warmup_already_warm, "PolarDB_Split_Warmup_Already_Warm", \
 		"proxysql_polardb_split_warmup_already_warm_total", \
 		"Lazy split pool warmup requests skipped because a compatible free backend already existed") \
@@ -652,11 +1047,14 @@
 	G(split_warmup_bad_request, "PolarDB_Split_Warmup_Bad_Request", \
 		"proxysql_polardb_split_warmup_bad_request_total", \
 		"Lazy split pool warmup requests rejected before queueing because required session identity was missing") \
+	G(split_warmup_rfq_unavailable, "PolarDB_Split_Warmup_RFQ_Unavailable", \
+		"proxysql_polardb_split_warmup_rfq_unavailable_total", \
+		"Lazy split pool warmup requests skipped because the reader hostgroup does not request RFQ LSN") \
 	G(split_warmup_connect_failed, "PolarDB_Split_Warmup_Connect_Failed", \
 		"proxysql_polardb_split_warmup_connect_failed_total", \
 		"Lazy split pool warmup backends whose connection handshake failed") \
-	G(split_warmup_publish_failed, "PolarDB_Split_Warmup_Publish_Failed", \
-		"proxysql_polardb_split_warmup_publish_failed_total", \
+	G(split_warmup_add_failed, "PolarDB_Split_Warmup_Add_Failed", \
+		"proxysql_polardb_split_warmup_add_failed_total", \
 		"Lazy split pool warmup backends discarded after connecting because the target changed or reached capacity") \
 	POLARDB_PROFILE_GLOBAL_COUNTER_LIST(G) \
 	G(split_warmup_sum_us, "PolarDB_Split_Warmup_Sum_Us", \

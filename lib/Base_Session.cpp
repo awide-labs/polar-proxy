@@ -220,6 +220,16 @@ void Base_Session<S,DS,B,T>::writeout() {
 		disable_throttle = true;
 	}
 
+	if (client_myds && thread->curtime >= client_myds->pause_until && mirror == false) {
+#if POLARDB_PROXY
+		if constexpr (std::is_same_v<S, PgSQL_Session>) {
+			const int retbytes = client_myds->polardb_writev_to_net_poll(0);
+			if (retbytes > 0) {
+				total_written += retbytes;
+			}
+		}
+#endif // POLARDB_PROXY
+	}
 	if (client_myds) client_myds->array2buffer_full();
 	if (mybe && mybe->server_myds && mybe->server_myds->myds_type == MYDS_BACKEND) {
 		if (session_type == _tmp_session_type_cmp1) {
@@ -242,7 +252,7 @@ void Base_Session<S,DS,B,T>::writeout() {
 			}
 			int retbytes=client_myds->write_to_net_poll();
 			total_written+=retbytes;
-			if (retbytes==QUEUE_T_DEFAULT_SIZE) { // optimization to solve memory bloat
+			if (retbytes>=QUEUE_T_DEFAULT_SIZE) { // optimization to solve memory bloat
 				runloop=true;
 			}
 			while (runloop && (disable_throttle || total_written < mwpl)) {
@@ -257,7 +267,7 @@ void Base_Session<S,DS,B,T>::writeout() {
 					if (fds.revents==POLLOUT) {
 						retbytes=client_myds->write_to_net_poll();
 						total_written+=retbytes;
-						if (retbytes==QUEUE_T_DEFAULT_SIZE) { // optimization to solve memory bloat
+						if (retbytes>=QUEUE_T_DEFAULT_SIZE) { // optimization to solve memory bloat
 							runloop=true;
 						}
 					}

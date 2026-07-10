@@ -204,12 +204,10 @@ void PtrSizeArray::expand(unsigned int more) {
 
 void PtrSizeArray::remove_index_fast(unsigned int i, PtrSize_t *ps) {
 	if (ps) {
-		ps->ptr=pdata[i].ptr;
-	    ps->size=pdata[i].size;
+		*ps=pdata[i];
 	}
     if (i != (len-1)) {
-    	pdata[i].ptr=pdata[len-1].ptr;
-    	pdata[i].size=pdata[len-1].size;
+		pdata[i]=pdata[len-1];
 	}
     len--;
 }
@@ -219,7 +217,7 @@ void PtrSizeArray::copy_add(PtrSizeArray *psa, unsigned int from, unsigned int c
 	PtrSize_t *psp;
 	for (i=from;i<from+cnt;i++) {
 		psp=psa->index(i);
-		add(psp->ptr,psp->size);
+		add_with_meta(psp->ptr,psp->size,psp->flags,psp->owner);
 	}
 }
 
