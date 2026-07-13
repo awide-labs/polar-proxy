@@ -3,7 +3,7 @@
  * @brief Unit tests for the PolarDB protocol/string parsing helpers.
  *
  * Domain: node-type name mapping and writer/reader classification, monitor-health
- * parse helpers (availability, LSN text, update gate), and simple-query
+ * parse helpers (availability, LSN text, update condition), and simple-query
  * multi-statement detection.
  */
 
@@ -71,11 +71,11 @@ static void test_monitor_health_parse_helpers() {
 		"LSN parser rejects partially parsed LSN text");
 
 	ok(!polardb_should_update_monitor_lsn(false, 500),
-		"monitor LSN update gate respects disabled monitor updates");
+		"monitor LSN update condition respects disabled monitor updates");
 	ok(!polardb_should_update_monitor_lsn(true, 0),
-		"monitor LSN update gate rejects zero LSN");
+		"monitor LSN update condition rejects zero LSN");
 	ok(polardb_should_update_monitor_lsn(true, 500),
-		"monitor LSN update gate accepts enabled positive LSN");
+		"monitor LSN update condition accepts enabled positive LSN");
 }
 
 // ---- multi-statement detection ----

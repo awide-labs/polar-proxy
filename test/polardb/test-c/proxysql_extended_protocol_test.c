@@ -14,7 +14,7 @@
  *   POLARDB_EXTENDED_SETUP_SQL2    Optional second setup SQL, also executed
  *                                  with PQexec() on the same connection. This
  *                                  is useful when the first setup query must
- *                                  finish and publish RFQ state before the
+ *                                  finish and record RFQ state before the
  *                                  second setup query runs.
  *   POLARDB_EXTENDED_REPORT_NOTICES=1
  *                                  Print setup/final notice counts.

@@ -12,18 +12,19 @@
 #   - mode=off and mode=primary
 #   - manual hostgroup routes bypass the PolarDB planner
 #   - explicit transaction routing to primary
+#   - transaction-split pre-write routing stays safe before split evidence exists
 #   - monitor_lsn_updates=off
 #   - admin query-rule replica_eligible save/load
 #   - lag-cap in-cap and stale-cache routing behavior
 #   - cold replica pool create-new for consistency waits
 #   - RFQ-vs-monitor LSN stat separation
-#   - freshness-gated lag cap fallback to primary
+#   - freshness-controlled lag cap fallback to primary
 #   - wrapper SET timeout/error attribution
 #   - extended protocol stays outside v1 PolarDB wait wrapping
-#   - debug fault injection proves wrapper-finalize failure stops before RunQuery
+#   - debug fault injection shows wrapper-finalize failure stops before RunQuery
 #
-# Requires a live local PolarDB primary/replica pair and a built POLARDB_PROXY=1
-# ProxySQL binary. All environment variables below are overridable.
+# Requires the writer and reader endpoints configured in `.env` and a built
+# POLARDB_PROXY=1 ProxySQL binary.
 #
 # Strict/best-effort timeout edge checks intentionally alter managed replay lag.
 # Enable them explicitly with POLARDB_TIMEOUT_EDGE_TESTS=1.
@@ -39,7 +40,7 @@ source "$SCRIPT_DIR/../lib/tap_core.sh"
 # shellcheck source=../lib/tap_polardb.sh
 source "$SCRIPT_DIR/../lib/tap_polardb.sh"
 PROXYSQL_WRAPPER="${PROXYSQL_WRAPPER:-$SCRIPT_DIR/../common/proxysql_lifecycle.sh}"
-PROXYSQL_DATA_DIR="${PROXYSQL_DATA_DIR:-/tmp/proxysql_lsn_session_consistency_tap}"
+PROXYSQL_DATA_DIR="${PROXYSQL_DATA_DIR:-$(polardb_proxy_sharded_data_dir "$POLARDB_RUNTIME_DIR/proxysql_lsn_session_consistency_tap")}"
 PROXYSQL_START_LOG="${PROXYSQL_DATA_DIR}.start.log"
 POLARDB_DEBUG_READER_ACQUIRE_FAULT_FILE="${POLARDB_DEBUG_READER_ACQUIRE_FAULT_FILE:-${PROXYSQL_DATA_DIR}.reader_acquire_fault}"
 POLARDB_DEBUG_MONITOR_HEALTH_FILE="${POLARDB_DEBUG_MONITOR_HEALTH_FILE:-${PROXYSQL_DATA_DIR}.monitor_health_fault}"
@@ -47,7 +48,8 @@ POLARDB_DEBUG_STARTUP_IDENTITY_FILE="${POLARDB_DEBUG_STARTUP_IDENTITY_FILE:-${PR
 POLARDB_DEBUG_WRAP_SET_ERROR_FILE="${POLARDB_DEBUG_WRAP_SET_ERROR_FILE:-${PROXYSQL_DATA_DIR}.wrap_set_error_fault}"
 PRIMARY_SERVER_PORT="${PRIMARY_SERVER_PORT:-}"
 REPLICA_SERVER_PORT="${REPLICA_SERVER_PORT:-}"
-TEST_TABLE="${TEST_TABLE:-polardb_lsn_session_consistency_tap}"
+REPLICA_SERVER_ENDPOINTS="${REPLICA_SERVER_ENDPOINTS:-}"
+TEST_TABLE="${TEST_TABLE:-$(polardb_test_identifier polardb_lsn_session_consistency_tap)}"
 EXTENDED_HELPER="${EXTENDED_HELPER:-$PROXYSQL_ROOT/test/polardb/bin/proxysql_extended_protocol_test}"
 EXTENDED_HELPER_RUNNER="${EXTENDED_HELPER_RUNNER:-$PROXYSQL_ROOT/test/polardb/test-c/run_helper.sh}"
 MONITOR_HEALTH_SUPPORTED=0
@@ -61,7 +63,7 @@ export POLARDB_DEBUG_FAIL_WRAP_FINALIZE_ONCE="${POLARDB_DEBUG_FAIL_WRAP_FINALIZE
 WRITER_HG="$POLARDB_WRITER_HG"
 READER_HG="$POLARDB_READER_HG"
 
-PLAN=68
+PLAN=70
 FAIL=0
 STARTED_PROXY=0
 TIMEOUT_EDGE_LAG_SET=0
@@ -164,6 +166,25 @@ set_hg_policy() {
     admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
 }
 
+insert_reader_servers() {
+    local reader_hg="$1"
+    local max_connections="${2:-100}"
+    local endpoint host port
+
+    for endpoint in $(polardb_each_replica_endpoint); do
+        host=$(polardb_endpoint_host "$endpoint")
+        port=$(polardb_endpoint_port "$endpoint")
+        admin_sql "INSERT INTO pgsql_servers (hostgroup_id, hostname, port, status, weight, max_connections) VALUES ($reader_hg, '$host', $port, 'ONLINE', 1000, $max_connections);" >/dev/null
+    done
+}
+
+insert_first_reader_server() {
+    local reader_hg="$1"
+    local max_connections="${2:-100}"
+
+    admin_sql "INSERT INTO pgsql_servers (hostgroup_id, hostname, port, status, weight, max_connections) VALUES ($reader_hg, '$REPLICA_HOST', $REPLICA_PORT, 'ONLINE', 1000, $max_connections);" >/dev/null
+}
+
 set_hg_pair_policy() {
     local writer_hg="$1"
     local reader_hg="$2"
@@ -175,9 +196,26 @@ set_hg_pair_policy() {
 
     admin_sql "DELETE FROM pgsql_servers WHERE hostgroup_id IN ($writer_hg,$reader_hg);" >/dev/null
     admin_sql "INSERT INTO pgsql_servers (hostgroup_id, hostname, port, status, weight, max_connections) VALUES ($writer_hg, '$PRIMARY_HOST', $PRIMARY_PORT, 'ONLINE', 1000, $max_connections);" >/dev/null
-    admin_sql "INSERT INTO pgsql_servers (hostgroup_id, hostname, port, status, weight, max_connections) VALUES ($reader_hg, '$REPLICA_HOST', $REPLICA_PORT, 'ONLINE', 1000, $max_connections);" >/dev/null
+    insert_reader_servers "$reader_hg" "$max_connections"
     admin_sql "DELETE FROM pgsql_replication_hostgroups WHERE writer_hostgroup=$writer_hg;" >/dev/null
     admin_sql "INSERT INTO pgsql_replication_hostgroups (writer_hostgroup, reader_hostgroup, check_type, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment) VALUES ($writer_hg, $reader_hg, 'polardb', '$mode', $max_lag_bytes, $timeout_ms, '$proxy_protocol', 'lsn_session_consistency_extra_pair');" >/dev/null
+    admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
+}
+
+set_hg_pair_policy_one_reader() {
+    local writer_hg="$1"
+    local reader_hg="$2"
+    local proxy_protocol="$3"
+    local mode="${4:-lsn}"
+    local max_lag_bytes="${5:--1}"
+    local timeout_ms="${6:-5000}"
+    local max_connections="${7:-100}"
+
+    admin_sql "DELETE FROM pgsql_servers WHERE hostgroup_id IN ($writer_hg,$reader_hg);" >/dev/null
+    admin_sql "INSERT INTO pgsql_servers (hostgroup_id, hostname, port, status, weight, max_connections) VALUES ($writer_hg, '$PRIMARY_HOST', $PRIMARY_PORT, 'ONLINE', 1000, $max_connections);" >/dev/null
+    insert_first_reader_server "$reader_hg" "$max_connections"
+    admin_sql "DELETE FROM pgsql_replication_hostgroups WHERE writer_hostgroup=$writer_hg;" >/dev/null
+    admin_sql "INSERT INTO pgsql_replication_hostgroups (writer_hostgroup, reader_hostgroup, check_type, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment) VALUES ($writer_hg, $reader_hg, 'polardb', '$mode', $max_lag_bytes, $timeout_ms, '$proxy_protocol', 'lsn_session_consistency_single_reader_pair');" >/dev/null
     admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
 }
 
@@ -238,6 +276,28 @@ set_debug_startup_identity_fault() {
 
 set_debug_wrap_set_error() {
     set_debug_fault_file POLARDB_DEBUG_WRAP_SET_ERROR_FILE 1
+}
+
+lsn_trace_log() {
+    printf '%s/proxysql.log\n' "$PROXYSQL_DATA_DIR"
+}
+
+lsn_trace_count() {
+    local pattern="$1"
+    tap_trace_count "$(lsn_trace_log)" "$pattern"
+}
+
+lsn_trace_delta() {
+    local pattern="$1"
+    local before="$2"
+    local after
+
+    if ! tap_trace_checks_enabled "$(lsn_trace_log)"; then
+        echo -1
+        return 0
+    fi
+    after=$(lsn_trace_count "$pattern")
+    echo $((after - before))
 }
 
 runtime_server_status() {
@@ -350,7 +410,7 @@ SQL
     bypass_delta=$(snapshot_counter_delta protocol_before protocol_after bypass)
     protect_delta=$(snapshot_protect_delta protocol_before protocol_after)
     result=$(last_endpoint_payload_from_output "$out")
-    if [ "$result" = "$REPLICA_SERVER_ENDPOINT|$marker" ] &&
+    if reader_payload_matches "$result" "$marker" &&
         [ "$query_lsn_delta" -ge 1 ] &&
         [ "$protect_delta" -ge 1 ]; then
         ok 0 "protocol $protocol: RFQ LSN supports protected reader read"
@@ -428,7 +488,7 @@ SQL
         label="protocol override: HG $hg_protocol overrides global $global_protocol for protected reader read"
     fi
 
-    if [ "$result" = "$REPLICA_SERVER_ENDPOINT|$marker" ] &&
+    if reader_payload_matches "$result" "$marker" &&
         [ "$query_lsn_delta" -ge 1 ] &&
         [ "$protect_delta" -ge 1 ]; then
         ok 0 "$label"
@@ -445,7 +505,7 @@ detect_topology() {
         topology_error_file="$(mktemp "${TMPDIR:-/tmp}/polardb-topology.XXXXXX")"
         if polardb_detect_topology 2>"$topology_error_file"; then
             rm -f "$topology_error_file"
-            diag "topology selected: writer=$PRIMARY_HOST:$PRIMARY_PORT reader=$REPLICA_HOST:$REPLICA_PORT"
+            diag "topology selected: writer=$PRIMARY_HOST:$PRIMARY_PORT readers=${POLARDB_REPLICA_ENDPOINTS:-$REPLICA_HOST:$REPLICA_PORT}"
             return 0
         fi
         topology_error="$(cat "$topology_error_file" 2>/dev/null || true)"
@@ -456,7 +516,7 @@ detect_topology() {
     fi
 
     if polardb_validate_manual_topology; then
-        diag "topology from env: writer=$PRIMARY_HOST:$PRIMARY_PORT reader=$REPLICA_HOST:$REPLICA_PORT"
+        diag "topology from env: writer=$PRIMARY_HOST:$PRIMARY_PORT readers=${POLARDB_REPLICA_ENDPOINTS:-$REPLICA_HOST:$REPLICA_PORT}"
         return 0
     fi
     diag "manual topology is incomplete or failed role validation"
@@ -464,19 +524,60 @@ detect_topology() {
 }
 detect_backend_ports() {
     if [ -n "$PRIMARY_SERVER_ENDPOINT" ] && [ -n "$REPLICA_SERVER_ENDPOINT" ]; then
-        diag "server-reported backend endpoints from env: writer=$PRIMARY_SERVER_ENDPOINT reader=$REPLICA_SERVER_ENDPOINT"
+        REPLICA_SERVER_ENDPOINTS="${REPLICA_SERVER_ENDPOINTS:-$REPLICA_SERVER_ENDPOINT}"
+        export REPLICA_SERVER_ENDPOINTS
+        diag "server-reported backend endpoints from env: writer=$PRIMARY_SERVER_ENDPOINT readers=$REPLICA_SERVER_ENDPOINTS"
         return 0
     fi
 
-    local primary_server_addr replica_server_addr
+    local primary_server_addr endpoint host port replica_server_addr replica_server_port replica_server_endpoint
     primary_server_addr=$(direct_sql "$PRIMARY_HOST" "$PRIMARY_PORT" "SELECT host(inet_server_addr());" 2>/dev/null | tr -d '[:space:]')
-    replica_server_addr=$(direct_sql "$REPLICA_HOST" "$REPLICA_PORT" "SELECT host(inet_server_addr());" 2>/dev/null | tr -d '[:space:]')
     PRIMARY_SERVER_PORT=$(direct_sql "$PRIMARY_HOST" "$PRIMARY_PORT" "SELECT inet_server_port();" 2>/dev/null | tr -d '[:space:]')
     REPLICA_SERVER_PORT=$(direct_sql "$REPLICA_HOST" "$REPLICA_PORT" "SELECT inet_server_port();" 2>/dev/null | tr -d '[:space:]')
     PRIMARY_SERVER_ENDPOINT="${primary_server_addr}:${PRIMARY_SERVER_PORT}"
-    REPLICA_SERVER_ENDPOINT="${replica_server_addr}:${REPLICA_SERVER_PORT}"
-    diag "server-reported backend endpoints: writer=$PRIMARY_SERVER_ENDPOINT reader=$REPLICA_SERVER_ENDPOINT"
-    [ -n "$primary_server_addr" ] && [ -n "$replica_server_addr" ] && [ -n "$PRIMARY_SERVER_PORT" ] && [ -n "$REPLICA_SERVER_PORT" ]
+    REPLICA_SERVER_ENDPOINTS=""
+    for endpoint in $(polardb_each_replica_endpoint); do
+        host=$(polardb_endpoint_host "$endpoint")
+        port=$(polardb_endpoint_port "$endpoint")
+        replica_server_addr=$(direct_sql "$host" "$port" "SELECT host(inet_server_addr());" 2>/dev/null | tr -d '[:space:]')
+        replica_server_port=$(direct_sql "$host" "$port" "SELECT inet_server_port();" 2>/dev/null | tr -d '[:space:]')
+        if [ -n "$replica_server_addr" ] && [ -n "$replica_server_port" ]; then
+            replica_server_endpoint="${replica_server_addr}:${replica_server_port}"
+            REPLICA_SERVER_ENDPOINTS=$(polardb_append_endpoint_once "$REPLICA_SERVER_ENDPOINTS" "$replica_server_endpoint")
+            if [ -z "$REPLICA_SERVER_ENDPOINT" ]; then
+                REPLICA_SERVER_ENDPOINT="$replica_server_endpoint"
+                REPLICA_SERVER_PORT="$replica_server_port"
+            fi
+        fi
+    done
+    export PRIMARY_SERVER_ENDPOINT REPLICA_SERVER_ENDPOINT REPLICA_SERVER_ENDPOINTS
+    diag "server-reported backend endpoints: writer=$PRIMARY_SERVER_ENDPOINT readers=$REPLICA_SERVER_ENDPOINTS"
+    [ -n "$primary_server_addr" ] && [ -n "$PRIMARY_SERVER_PORT" ] && [ -n "$REPLICA_SERVER_ENDPOINTS" ]
+}
+
+reader_endpoint_matches() {
+    local endpoint="$1"
+    local reader
+
+    for reader in $REPLICA_SERVER_ENDPOINTS; do
+        [ "$endpoint" = "$reader" ] && return 0
+    done
+    return 1
+}
+
+reader_payload_matches() {
+    local result="$1"
+    local payload="$2"
+    local reader
+
+    for reader in $REPLICA_SERVER_ENDPOINTS; do
+        [ "$result" = "$reader|$payload" ] && return 0
+    done
+    return 1
+}
+
+reader_expectation() {
+    printf '%s\n' "${REPLICA_SERVER_ENDPOINTS:-$REPLICA_SERVER_ENDPOINT}"
 }
 
 detect_monitor_health_support() {
@@ -504,7 +605,8 @@ start_proxy() {
         PROXYSQL_BINARY="$PROXYSQL_BINARY" "$PROXYSQL_WRAPPER" restart \
         --data-dir "$PROXYSQL_DATA_DIR" \
         --admin-port "$PROXYSQL_ADMIN_PORT" \
-        --proxy-port "$PROXYSQL_PORT" >"$PROXYSQL_START_LOG" 2>&1
+        --proxy-port "$PROXYSQL_PORT" \
+        --mysql-admin-port "$PROXYSQL_MYSQL_ADMIN_PORT" >"$PROXYSQL_START_LOG" 2>&1
     STARTED_PROXY=1
 }
 
@@ -542,7 +644,7 @@ trap cleanup EXIT
 configure_proxy() {
     admin_sql "DELETE FROM pgsql_servers;" >/dev/null
     admin_sql "INSERT INTO pgsql_servers (hostgroup_id, hostname, port, status, weight, max_connections) VALUES ($WRITER_HG, '$PRIMARY_HOST', $PRIMARY_PORT, 'ONLINE', 1000, 100);" >/dev/null
-    admin_sql "INSERT INTO pgsql_servers (hostgroup_id, hostname, port, status, weight, max_connections) VALUES ($READER_HG, '$REPLICA_HOST', $REPLICA_PORT, 'ONLINE', 1000, 100);" >/dev/null
+    insert_reader_servers "$READER_HG" 100
 
     admin_sql "DELETE FROM pgsql_replication_hostgroups;" >/dev/null
     admin_sql "INSERT INTO pgsql_replication_hostgroups (writer_hostgroup, reader_hostgroup, check_type, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, comment) VALUES ($WRITER_HG, $READER_HG, 'polardb', 'lsn', -1, 5000, 'lsn_session_consistency_tap');" >/dev/null
@@ -602,6 +704,8 @@ case_cf7_wrapper_finalize_fail() {
     set_lsn_mode lsn
     cf7_abort_before=$(counter PolarDB_Wait_Wrap_Safety_Abort)
     cf7_sent_before=$(counter PolarDB_Wait_LSN_Sent)
+    cf7_trace_pattern="PolarDB WRAP: finalize failed: debug fault injection"
+    cf7_trace_before=$(lsn_trace_count "$cf7_trace_pattern")
     cf7_marker="cf7_finalize_fail_$$"
     cf7_out=$(
         proxy_script 2>&1 <<SQL
@@ -614,16 +718,18 @@ SQL
     cf7_sent_after=$(counter PolarDB_Wait_LSN_Sent)
     cf7_abort_delta=$((cf7_abort_after - cf7_abort_before))
     cf7_sent_delta=$((cf7_sent_after - cf7_sent_before))
+    cf7_trace_delta=$(lsn_trace_delta "$cf7_trace_pattern" "$cf7_trace_before")
     if [ "$cf7_rc" -ne 0 ] &&
         [ "$cf7_abort_delta" -eq 1 ] &&
         [ "$cf7_sent_delta" -eq 0 ] &&
+        { [ "$cf7_trace_delta" -eq 1 ] || [ "$cf7_trace_delta" -eq -1 ]; } &&
         printf '%s\n' "$cf7_out" | grep -Fq "PolarDB LSN wait wrapper could not be built safely"; then
         ok 0 "CF-7: wrapper finalize failure returns internal error before backend dispatch"
     elif [ "$cf7_rc" -eq 0 ] && [ "$cf7_abort_delta" -eq 0 ]; then
         skip_ok "CF-7: wrapper finalize failure returns internal error before backend dispatch" "requires POLARDB_DEBUG binary with POLARDB_DEBUG_FAIL_WRAP_FINALIZE_ONCE=1"
     else
         diag "cf7 output: $cf7_out"
-        diag "cf7_rc=$cf7_rc safety_abort_delta=$cf7_abort_delta wait_sent_delta=$cf7_sent_delta"
+        diag "cf7_rc=$cf7_rc safety_abort_delta=$cf7_abort_delta wait_sent_delta=$cf7_sent_delta trace_delta=$cf7_trace_delta pattern='$cf7_trace_pattern' (-1 means trace unavailable)"
         ok 1 "CF-7: wrapper finalize failure returns internal error before backend dispatch"
     fi
 }
@@ -671,6 +777,60 @@ case_wrapper_filter() {
     fi
 }
 
+# The planner's wait spec is the only stored wait target. This full proxy-path
+# check makes sure backend reader selection still receives that target: the read
+# must return from a reader, must be protected by wait-or-bypass accounting, and
+# must move the target-specific selection counters.
+case_route_wait_spec_reader_selection() {
+    set_select_rule_auto
+    set_lsn_mode lsn
+    set_global_var_runtime "pgsql-polardb_proxy_protocol" "v15"
+    set_global_var_runtime "pgsql-polardb_route_rfq_policy" "strict"
+    set_global_var_runtime "pgsql-polardb_session_lsn_baseline" "observed"
+    set_hg_policy lsn -1 5000
+
+    snapshot_consistency_counters route_wait_before
+    route_no_wait_before=$(counter PolarDB_Route_No_Wait_Target)
+    preferred_before=$(counter PolarDB_Target_LSN_Preferred)
+    fallback_wait_before=$(counter PolarDB_Target_LSN_Fallback_Wait)
+
+    route_wait_marker="route_wait_spec_$$"
+    route_wait_out=$(
+        proxy_script 2>&1 <<SQL
+INSERT INTO $TEST_TABLE VALUES (9700, '$route_wait_marker') ON CONFLICT (id) DO UPDATE SET data='$route_wait_marker';
+SELECT host(inet_server_addr()) || ':' || inet_server_port() || '|' || data FROM $TEST_TABLE WHERE id=9700;
+SQL
+    )
+
+    snapshot_consistency_counters route_wait_after
+    route_no_wait_after=$(counter PolarDB_Route_No_Wait_Target)
+    preferred_after=$(counter PolarDB_Target_LSN_Preferred)
+    fallback_wait_after=$(counter PolarDB_Target_LSN_Fallback_Wait)
+
+    route_wait_result=$(last_endpoint_payload_from_output "$route_wait_out")
+    query_lsn_delta=$(snapshot_counter_delta route_wait_before route_wait_after query_lsn)
+    protect_delta=$(snapshot_protect_delta route_wait_before route_wait_after)
+    wrap_or_bypass_delta=$(snapshot_wrap_or_bypass_delta route_wait_before route_wait_after)
+    route_no_wait_delta=$((route_no_wait_after - route_no_wait_before))
+    target_select_delta=$((preferred_after - preferred_before + fallback_wait_after - fallback_wait_before))
+
+    if reader_payload_matches "$route_wait_result" "$route_wait_marker" &&
+        [ "$query_lsn_delta" -ge 1 ] &&
+        [ "$protect_delta" -ge 1 ] &&
+        [ "$wrap_or_bypass_delta" -ge 1 ] &&
+        [ "$route_no_wait_delta" -eq 0 ] &&
+        [ "$target_select_delta" -ge 1 ]; then
+        ok 0 "route wait spec reaches reader selection on live topology"
+    else
+        diag "route-wait output: $route_wait_out"
+        diag "result='$route_wait_result' expected_reader_payload='$(reader_expectation)|$route_wait_marker'"
+        diag "query_lsn_delta=$query_lsn_delta protect_delta=$protect_delta wrap_or_bypass_delta=$wrap_or_bypass_delta route_no_wait_delta=$route_no_wait_delta"
+        diag "target_select_delta=$target_select_delta"
+        diag "preferred_delta=$((preferred_after - preferred_before)) fallback_wait_delta=$((fallback_wait_after - fallback_wait_before))"
+        ok 1 "route wait spec reaches reader selection on live topology"
+    fi
+}
+
 # No prior write: the first read has no target yet, so it goes to a replica with no
 # wait. The LSN that read observes becomes the session's baseline, so every later
 # read is monotonic: it returns the same data or newer, never older.
@@ -678,7 +838,7 @@ case_no_write_read() {
     wait_before=$(counter PolarDB_Wait_LSN_Sent)
     endpoint=$(backend_endpoint)
     wait_after=$(counter PolarDB_Wait_LSN_Sent)
-    if [ "$endpoint" = "$REPLICA_SERVER_ENDPOINT" ] && [ "$wait_after" -eq "$wait_before" ]; then
+    if reader_endpoint_matches "$endpoint" && [ "$wait_after" -eq "$wait_before" ]; then
         ok 0 "no-write read: reader route without wait"
     else
         diag "endpoint=$endpoint expected_reader=$REPLICA_SERVER_ENDPOINT wait_delta=$((wait_after - wait_before))"
@@ -703,8 +863,8 @@ case_read_then_read_monotonic() {
     protect_delta=$(snapshot_protect_delta read_read_before read_read_after)
     wrap_or_bypass_delta=$(snapshot_wrap_or_bypass_delta read_read_before read_read_after)
     query_lsn_delta=$(snapshot_counter_delta read_read_before read_read_after query_lsn)
-    if [ "$first_endpoint" = "$REPLICA_SERVER_ENDPOINT" ] &&
-        [ "$second_endpoint" = "$REPLICA_SERVER_ENDPOINT" ] &&
+    if reader_endpoint_matches "$first_endpoint" &&
+        reader_endpoint_matches "$second_endpoint" &&
         [ "$wrap_or_bypass_delta" -ge 1 ] &&
         [ "$protect_delta" -ge 1 ] &&
         [ "$query_lsn_delta" -ge 1 ]; then
@@ -736,8 +896,8 @@ case_read_then_write_then_read() {
     protect_delta=$(snapshot_protect_delta transition_before transition_after)
     wrap_or_bypass_delta=$(snapshot_wrap_or_bypass_delta transition_before transition_after)
     query_lsn_delta=$(snapshot_counter_delta transition_before transition_after query_lsn)
-    if [ "$first_endpoint" = "$REPLICA_SERVER_ENDPOINT" ] &&
-        [ "$second_result" = "$REPLICA_SERVER_ENDPOINT|$transition_marker" ] &&
+    if reader_endpoint_matches "$first_endpoint" &&
+        reader_payload_matches "$second_result" "$transition_marker" &&
         [ "$wrap_or_bypass_delta" -ge 1 ] &&
         [ "$protect_delta" -ge 1 ] &&
         [ "$query_lsn_delta" -ge 1 ]; then
@@ -785,8 +945,8 @@ case_background_writes_read_only_session() {
     protect_delta=$(snapshot_protect_delta background_before background_after)
     wrap_or_bypass_delta=$(snapshot_wrap_or_bypass_delta background_before background_after)
     if [ "$bg_rc" -eq 0 ] &&
-        [ "$first_endpoint" = "$REPLICA_SERVER_ENDPOINT" ] &&
-        [ "$last_endpoint" = "$REPLICA_SERVER_ENDPOINT" ] &&
+        reader_endpoint_matches "$first_endpoint" &&
+        reader_endpoint_matches "$last_endpoint" &&
         [ "$wrap_or_bypass_delta" -ge 1 ] &&
         [ "$protect_delta" -ge 1 ]; then
         ok 0 "read-only session: background writes coexist with protected reader reads"
@@ -834,7 +994,7 @@ case_manual_rule_route() {
     wait_before=$(counter PolarDB_Wait_LSN_Sent)
     endpoint=$(backend_endpoint)
     wait_after=$(counter PolarDB_Wait_LSN_Sent)
-    if [ "$endpoint" = "$REPLICA_SERVER_ENDPOINT" ] && [ "$wait_after" -eq "$wait_before" ]; then
+    if reader_endpoint_matches "$endpoint" && [ "$wait_after" -eq "$wait_before" ]; then
         ok 0 "manual query-rule route: destination_hostgroup reader bypasses mode=primary without wait"
     else
         diag "endpoint=$endpoint expected_reader=$REPLICA_SERVER_ENDPOINT wait_delta=$((wait_after - wait_before))"
@@ -849,7 +1009,7 @@ case_manual_sql_hint() {
     wait_before=$(counter PolarDB_Wait_LSN_Sent)
     endpoint=$(proxy_sql "/* hostgroup=$READER_HG */ SELECT host(inet_server_addr()) || ':' || inet_server_port();" 2>/dev/null | tr -d '[:space:]')
     wait_after=$(counter PolarDB_Wait_LSN_Sent)
-    if [ "$endpoint" = "$REPLICA_SERVER_ENDPOINT" ] && [ "$wait_after" -eq "$wait_before" ]; then
+    if reader_endpoint_matches "$endpoint" && [ "$wait_after" -eq "$wait_before" ]; then
         ok 0 "manual SQL hostgroup hint: reader bypasses mode=primary without wait"
     else
         diag "endpoint=$endpoint expected_reader=$REPLICA_SERVER_ENDPOINT wait_delta=$((wait_after - wait_before))"
@@ -868,7 +1028,7 @@ case_cf3_extended_manual_reader() {
         wait_after=$(counter PolarDB_Wait_LSN_Sent)
         extended_endpoint=$(first_endpoint_from_output "$extended_out")
         if [ "$extended_rc" -eq 0 ] &&
-            [ "$extended_endpoint" = "$REPLICA_SERVER_ENDPOINT" ] &&
+            reader_endpoint_matches "$extended_endpoint" &&
             [ "$wait_after" -eq "$wait_before" ]; then
             ok 0 "CF-3: extended protocol follows manual reader route without wait wrapper"
         else
@@ -896,7 +1056,7 @@ case_cf3_extended_auto_no_write() {
         wait_after=$(counter PolarDB_Wait_LSN_Sent)
         extended_endpoint=$(first_endpoint_from_output "$extended_out")
         if [ "$extended_rc" -eq 0 ] &&
-            [ "$extended_endpoint" = "$REPLICA_SERVER_ENDPOINT" ] &&
+            reader_endpoint_matches "$extended_endpoint" &&
             [ $((prepared_after - prepared_before)) -eq 0 ] &&
             [ $((wait_after - wait_before)) -eq 0 ]; then
             ok 0 "CF-3: automatic extended protocol without prior write can use reader without wait wrapper"
@@ -965,6 +1125,44 @@ SQL
         diag "txn output: $txn_out"
         diag "txn_endpoint=$txn_endpoint expected_writer=$PRIMARY_SERVER_ENDPOINT wait_delta=$((wait_after - wait_before))"
         ok 1 "explicit transaction: SELECT stays on writer without wait"
+    fi
+}
+
+# Transaction split: before the first write in a transaction there are no XIDs to
+# export, so this is not a split read. The primary transaction backend stays open.
+# A suitable reader may handle the SELECT through the normal wait path, but a
+# cold or unavailable reader pool can safely leave it on the primary.
+case_txn_split_prewrite_uses_reader_wait() {
+    set_select_rule_auto
+    set_lsn_mode lsn
+    admin_sql "UPDATE pgsql_replication_hostgroups SET txn_split_enabled=1, proxy_protocol='v15' WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
+    admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
+
+    row_id=9801
+    marker="txn_prewrite_reader_wait"
+    prepared_before=$(counter PolarDB_Wait_Wrap_Prepared)
+    split_plan_out=$(
+        proxy_script 2>&1 <<SQL
+INSERT INTO $TEST_TABLE VALUES ($row_id, '$marker') ON CONFLICT (id) DO UPDATE SET data='$marker';
+BEGIN;
+SELECT host(inet_server_addr()) || ':' || inet_server_port() || '|' || data FROM $TEST_TABLE WHERE id=$row_id;
+COMMIT;
+SQL
+    )
+    prepared_after=$(counter PolarDB_Wait_Wrap_Prepared)
+    split_plan_result=$(last_endpoint_payload_from_output "$split_plan_out")
+
+    admin_sql "UPDATE pgsql_replication_hostgroups SET txn_split_enabled=0, proxy_protocol='default' WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
+    admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
+
+    if { reader_payload_matches "$split_plan_result" "$marker" &&
+            [ "$prepared_after" -gt "$prepared_before" ]; } ||
+        [ "$split_plan_result" = "$PRIMARY_SERVER_ENDPOINT|$marker" ]; then
+        ok 0 "transaction split: pre-write read is safe before first write"
+    else
+        diag "split pre-write output: $split_plan_out"
+        diag "result=$split_plan_result expected='$PRIMARY_SERVER_ENDPOINT|$marker or one of: $(reader_expectation)|$marker' prepared_delta=$((prepared_after - prepared_before))"
+        ok 1 "transaction split: pre-write read is safe before first write"
     fi
 }
 
@@ -1097,7 +1295,7 @@ case_rfq_strict_and_best_effort() {
     wait_after=$(counter PolarDB_Wait_LSN_Sent)
     rfq_best_endpoint=$(last_endpoint_from_output "$rfq_best_out")
     rfq_best_warning_count=$(printf '%s\n' "$rfq_best_out" | grep -c "PolarDB best_effort RFQ route has no enforceable LSN wait target" || true)
-    if [ "$rfq_best_endpoint" = "$REPLICA_SERVER_ENDPOINT" ] &&
+    if reader_endpoint_matches "$rfq_best_endpoint" &&
         [ $((degrade_after - degrade_before)) -eq 1 ] &&
         [ $((wait_after - wait_before)) -eq 0 ] &&
         [ "$rfq_best_warning_count" -eq 1 ]; then
@@ -1158,7 +1356,7 @@ SQL
     plan_degrade_endpoint=$(last_endpoint_from_output "$plan_degrade_out")
     plan_degrade_warning_count=$(printf '%s\n' "$plan_degrade_out" | grep -c "PolarDB best_effort RFQ route has no enforceable LSN wait target" || true)
     plan_degrade_detail_count=$(printf '%s\n' "$plan_degrade_out" | grep -c "reason=write_lsn_unknown" || true)
-    if [ "$plan_degrade_endpoint" = "$REPLICA_SERVER_ENDPOINT" ] &&
+    if reader_endpoint_matches "$plan_degrade_endpoint" &&
         [ $((write_missing_after - write_missing_before)) -ge 1 ] &&
         [ $((degrade_after - degrade_before)) -eq 1 ] &&
         [ $((wait_after - wait_before)) -eq 0 ] &&
@@ -1172,9 +1370,9 @@ SQL
     fi
 }
 
-# Missing primary RFQ LSN: a write with no RFQ LSN latches the session so a later
+# Missing primary RFQ LSN: a write with no RFQ LSN sets a sticky flag so a later
 # automatic read stays on the primary.
-case_missing_writer_rfq_latch() {
+case_missing_writer_rfq_state() {
     set_global_var_runtime "pgsql-polardb_monitor_lsn_updates" "1"
     set_session_lsn_baseline observed
     set_route_rfq_policy strict
@@ -1193,17 +1391,17 @@ SQL
     missing_write_endpoint=$(last_endpoint_from_output "$missing_write_out")
     if [ "$missing_write_endpoint" = "$PRIMARY_SERVER_ENDPOINT" ] &&
         [ $((write_missing_after - write_missing_before)) -ge 1 ]; then
-        ok 0 "missing writer RFQ LSN: write latch keeps later automatic read on writer"
+        ok 0 "missing writer RFQ LSN: write sticky flag keeps later automatic read on writer"
     else
         diag "missing-write output: $missing_write_out"
         diag "endpoint=$missing_write_endpoint expected_writer=$PRIMARY_SERVER_ENDPOINT write_missing_delta=$((write_missing_after - write_missing_before))"
-        ok 1 "missing writer RFQ LSN: write latch keeps later automatic read on writer"
+        ok 1 "missing writer RFQ LSN: write sticky flag keeps later automatic read on writer"
     fi
 }
 
-# Missing replica RFQ LSN: an observed replica read with no RFQ LSN latches the
+# Missing replica RFQ LSN: an observed replica read with no RFQ LSN sets a sticky flag on the
 # session so a later automatic read moves to the primary.
-case_missing_reader_rfq_latch() {
+case_missing_reader_rfq_state() {
     set_hg_pair_policy 25 26 off lsn -1 5000
     set_default_hostgroup 25
     read_missing_before=$(counter PolarDB_Read_Missing_LSN)
@@ -1216,18 +1414,18 @@ SQL
     read_missing_after=$(counter PolarDB_Read_Missing_LSN)
     missing_read_first=$(first_endpoint_from_output "$missing_read_out")
     missing_read_second=$(last_endpoint_from_output "$missing_read_out")
-    if [ "$missing_read_first" = "$REPLICA_SERVER_ENDPOINT" ] &&
+    if reader_endpoint_matches "$missing_read_first" &&
         [ "$missing_read_second" = "$PRIMARY_SERVER_ENDPOINT" ] &&
         [ $((read_missing_after - read_missing_before)) -ge 1 ]; then
-        ok 0 "missing reader RFQ LSN: observed latch keeps later automatic read on writer"
+        ok 0 "missing reader RFQ LSN: observed sticky flag keeps later automatic read on writer"
     else
         diag "missing-read output: $missing_read_out"
         diag "first=$missing_read_first expected_reader=$REPLICA_SERVER_ENDPOINT second=$missing_read_second expected_writer=$PRIMARY_SERVER_ENDPOINT read_missing_delta=$((read_missing_after - read_missing_before))"
-        ok 1 "missing reader RFQ LSN: observed latch keeps later automatic read on writer"
+        ok 1 "missing reader RFQ LSN: observed sticky flag keeps later automatic read on writer"
     fi
 }
 
-# route=primary hint: an eligible read carrying the hint is pinned to the primary
+# route=primary hint: an eligible read carrying the hint stays on the primary
 # with no wait.
 case_route_primary_hint() {
     set_default_hostgroup "$WRITER_HG"
@@ -1239,10 +1437,10 @@ case_route_primary_hint() {
     hint_endpoint=$(proxy_sql "/* route=primary */ SELECT host(inet_server_addr()) || ':' || inet_server_port();" 2>/dev/null | tr -d '[:space:]')
     wait_after=$(counter PolarDB_Wait_LSN_Sent)
     if [ "$hint_endpoint" = "$PRIMARY_SERVER_ENDPOINT" ] && [ "$wait_after" -eq "$wait_before" ]; then
-        ok 0 "route=primary hint: eligible read is pinned to writer without wait"
+        ok 0 "route=primary hint: eligible read stays on writer without wait"
     else
         diag "hint_endpoint=$hint_endpoint expected_writer=$PRIMARY_SERVER_ENDPOINT wait_delta=$((wait_after - wait_before))"
-        ok 1 "route=primary hint: eligible read is pinned to writer without wait"
+        ok 1 "route=primary hint: eligible read stays on writer without wait"
     fi
 }
 
@@ -1279,13 +1477,18 @@ case_session_consistency_override() {
     bypass_delta=$(snapshot_counter_delta override_before override_after bypass)
     protect_delta=$(snapshot_protect_delta override_before override_after)
     override_endpoints=$(endpoint_list_from_output "$override_out")
-    expected_override="$PRIMARY_SERVER_ENDPOINT $PRIMARY_SERVER_ENDPOINT $REPLICA_SERVER_ENDPOINT"
-    if [ "$override_endpoints" = "$expected_override" ] &&
+    set -- $override_endpoints
+    override_first="${1:-}"
+    override_second="${2:-}"
+    override_third="${3:-}"
+    if [ "$override_first" = "$PRIMARY_SERVER_ENDPOINT" ] &&
+        [ "$override_second" = "$PRIMARY_SERVER_ENDPOINT" ] &&
+        reader_endpoint_matches "$override_third" &&
         [ "$protect_delta" -ge 1 ]; then
         ok 0 "session consistency override: off and primary override global lsn until reset"
     else
         diag "override output: $override_out"
-        diag "endpoints='$override_endpoints' expected='$expected_override' wait_delta=$wait_delta bypass_delta=$bypass_delta"
+        diag "endpoints='$override_endpoints' expected='$PRIMARY_SERVER_ENDPOINT $PRIMARY_SERVER_ENDPOINT <one of: $(reader_expectation)>' wait_delta=$wait_delta bypass_delta=$bypass_delta"
         ok 1 "session consistency override: off and primary override global lsn until reset"
     fi
 }
@@ -1317,8 +1520,7 @@ case_session_enable_then_disable() {
     protect_delta=$(snapshot_protect_delta mode_toggle_before mode_toggle_after)
     wrap_or_bypass_delta=$(snapshot_wrap_or_bypass_delta mode_toggle_before mode_toggle_after)
     query_lsn_delta=$(snapshot_counter_delta mode_toggle_before mode_toggle_after query_lsn)
-    expected_protected="$REPLICA_SERVER_ENDPOINT|$mode_toggle_marker"
-    if [ "$protected_result" = "$expected_protected" ] &&
+    if reader_payload_matches "$protected_result" "$mode_toggle_marker" &&
         [ "$final_endpoint" = "$PRIMARY_SERVER_ENDPOINT" ] &&
         [ "$protect_delta" -eq 1 ] &&
         [ "$wrap_or_bypass_delta" -ge 1 ] &&
@@ -1326,7 +1528,7 @@ case_session_enable_then_disable() {
         ok 0 "session mode transition: lsn protects read and off disables later wait"
     else
         diag "mode-toggle output: $mode_toggle_out"
-        diag "protected_result='$protected_result' expected='$expected_protected' final_endpoint='$final_endpoint' expected_final='$PRIMARY_SERVER_ENDPOINT'"
+        diag "protected_result='$protected_result' expected_reader_payload='$(reader_expectation)|$mode_toggle_marker' final_endpoint='$final_endpoint' expected_final='$PRIMARY_SERVER_ENDPOINT'"
         diag "protect_delta=$protect_delta wrap_or_bypass_delta=$wrap_or_bypass_delta query_lsn_delta=$query_lsn_delta"
         ok 1 "session mode transition: lsn protects read and off disables later wait"
     fi
@@ -1406,13 +1608,12 @@ case_reset_all_preserves_lsn() {
     bypass_delta=$(snapshot_counter_delta reset_before reset_after bypass)
     protect_delta=$(snapshot_protect_delta reset_before reset_after)
     reset_result=$(last_endpoint_payload_from_output "$reset_out")
-    expected_reset="$REPLICA_SERVER_ENDPOINT|$reset_marker"
-    if [ "$reset_result" = "$expected_reset" ] &&
+    if reader_payload_matches "$reset_result" "$reset_marker" &&
         [ "$protect_delta" -ge 1 ]; then
         ok 0 "RESET ALL preserves session LSN evidence for the next protected read"
     else
         diag "reset output: $reset_out"
-        diag "reset_result='$reset_result' expected='$expected_reset' wait_delta=$wait_delta bypass_delta=$bypass_delta"
+        diag "reset_result='$reset_result' expected_reader_payload='$(reader_expectation)|$reset_marker' wait_delta=$wait_delta bypass_delta=$bypass_delta"
         ok 1 "RESET ALL preserves session LSN evidence for the next protected read"
     fi
 }
@@ -1433,14 +1634,13 @@ case_reader_acquire_faults() {
         clear_debug_reader_acquire_fault
         wait_after=$(counter PolarDB_Wait_LSN_Sent)
         reader_busy_result=$(last_endpoint_payload_from_output "$reader_busy_out")
-        expected_reader_busy="$REPLICA_SERVER_ENDPOINT|$reader_busy_marker"
-        if [ "$reader_busy_result" = "$expected_reader_busy" ] &&
+        if reader_payload_matches "$reader_busy_result" "$reader_busy_marker" &&
             [ $((wait_after - wait_before)) -ge 1 ] &&
             wait_for_trace "get_MyConn_polardb_reader status=reader_busy" 5; then
             ok 0 "debug reader-busy acquisition falls through to normal retry"
         else
             diag "reader-busy output: $reader_busy_out"
-            diag "reader_busy_result='$reader_busy_result' expected='$expected_reader_busy' wait_delta=$((wait_after - wait_before))"
+            diag "reader_busy_result='$reader_busy_result' expected_reader_payload='$(reader_expectation)|$reader_busy_marker' wait_delta=$((wait_after - wait_before))"
             ok 1 "debug reader-busy acquisition falls through to normal retry"
         fi
 
@@ -1622,7 +1822,7 @@ SQL
     fi
 }
 
-# Freshness-gated byte lag cap: with stale cached replica LSN, enabling the byte
+# Freshness-controlled byte lag cap: with stale cached replica LSN, enabling the byte
 # lag cap uses the primary instead of a stale replica and increments the writer-fallback counter.
 case_lag_cap_freshness() {
     # With monitor updates disabled and a tiny freshness window, cached replica LSN
@@ -1646,17 +1846,17 @@ SQL
     fallback_after=$(counter PolarDB_Consistency_Writer_Fallback)
     endpoint=$(first_endpoint_from_output "$cap_out")
     if [ "$endpoint" = "$PRIMARY_SERVER_ENDPOINT" ] && [ "$wait_after" -eq "$wait_before" ]; then
-        ok 0 "freshness-gated byte lag cap skips stale reader and forces writer"
+        ok 0 "freshness-controlled byte lag cap skips stale reader and forces writer"
     else
         diag "cap output: $cap_out"
         diag "endpoint=$endpoint expected_writer=$PRIMARY_SERVER_ENDPOINT wait_delta=$((wait_after - wait_before))"
-        ok 1 "freshness-gated byte lag cap skips stale reader and forces writer"
+        ok 1 "freshness-controlled byte lag cap skips stale reader and forces writer"
     fi
     if [ $((fallback_after - fallback_before)) -eq 1 ]; then
-        ok 0 "freshness-gated byte lag cap increments writer-fallback counter"
+        ok 0 "freshness-controlled byte lag cap increments writer-fallback counter"
     else
         diag "fallback_delta=$((fallback_after - fallback_before))"
-        ok 1 "freshness-gated byte lag cap increments writer-fallback counter"
+        ok 1 "freshness-controlled byte lag cap increments writer-fallback counter"
     fi
 }
 
@@ -1668,7 +1868,7 @@ case_reset_caps() {
     set_hg_policy lsn -1 5000
     sleep 2
     endpoint=$(backend_endpoint)
-    if [ "$endpoint" = "$REPLICA_SERVER_ENDPOINT" ]; then
+    if reader_endpoint_matches "$endpoint"; then
         ok 0 "reset caps: reader route restored after disabling byte lag cap"
     else
         diag "endpoint=$endpoint expected_reader=$REPLICA_SERVER_ENDPOINT"
@@ -1678,13 +1878,41 @@ case_reset_caps() {
 
 # CF-1: a replica inside the byte lag cap is allowed. If the selected replica
 # already reached the consistency target, the wait wrapper may be bypassed;
-# otherwise the backend wait remains the gate.
+# otherwise the backend wait remains the condition.
 case_cf1_in_cap() {
+    local cf1_lag_cap_freshness_saved
+
+    if [ "$MONITOR_HEALTH_SUPPORTED" -ne 1 ]; then
+        skip_ok "CF-1: byte lag cap allows in-cap protected reader" "PolarDB monitor health functions are unavailable"
+        skip_ok "CF-1: consistency-target reader selector records preferred or wait-capable selection" "PolarDB monitor health functions are unavailable"
+        return
+    fi
+
+    cf1_lag_cap_freshness_saved=$(admin_sql "SELECT variable_value FROM runtime_global_variables WHERE variable_name='pgsql-polardb_lag_cap_freshness_ms';" 2>/dev/null | tr -d '[:space:]')
+    set_default_hostgroup "$WRITER_HG"
+    remove_extra_hg_pairs
     set_select_rule_auto
     set_lsn_mode lsn
+    set_global_var_runtime "pgsql-polardb_proxy_protocol" "v15"
+    set_global_var_runtime "pgsql-polardb_monitor_lsn_updates" "1"
+    set_global_var_runtime "pgsql-polardb_lag_ms" "0"
+    set_global_var_runtime "pgsql-polardb_lag_bytes" "0"
     set_global_var_runtime "pgsql-polardb_lsn_freshness_ms" "5000"
+    set_global_var_runtime "pgsql-polardb_lag_cap_freshness_ms" "5000"
+    set_session_lsn_baseline observed
+    set_route_rfq_policy strict
     set_hg_policy lsn 2147483647 5000
+    cf1_monitor_before=$(counter PolarDB_LSN_Updates_From_Monitor)
+    direct_sql "$PRIMARY_HOST" "$PRIMARY_PORT" "INSERT INTO $TEST_TABLE VALUES (908, 'cf1_monitor_$$') ON CONFLICT (id) DO UPDATE SET data='cf1_monitor_$$';" >/dev/null 2>&1 || true
+    if ! wait_for_monitor_increment "$cf1_monitor_before" 20; then
+        diag "CF-1: monitor LSN counter did not increase from $cf1_monitor_before before byte-lag check"
+    fi
     snapshot_consistency_counters cf1_before
+    writer_fallback_before=$(counter PolarDB_Consistency_Writer_Fallback)
+    lag_unknown_before=$(counter PolarDB_Lag_Cap_LSN_Unknown)
+    lag_stale_before=$(counter PolarDB_Lag_Cap_LSN_Stale)
+    lag_rejected_before=$(counter PolarDB_Lag_Cap_Rejected)
+    lag_accepted_before=$(counter PolarDB_Lag_Cap_Accepted)
     preferred_before=$(counter PolarDB_Target_LSN_Preferred)
     fallback_wait_before=$(counter PolarDB_Target_LSN_Fallback_Wait)
     cf1_marker="cf1_in_cap_$$"
@@ -1698,15 +1926,21 @@ SQL
     wait_delta=$(snapshot_counter_delta cf1_before cf1_after wait)
     bypass_delta=$(snapshot_counter_delta cf1_before cf1_after bypass)
     protect_delta=$(snapshot_protect_delta cf1_before cf1_after)
+    writer_fallback_after=$(counter PolarDB_Consistency_Writer_Fallback)
+    lag_unknown_after=$(counter PolarDB_Lag_Cap_LSN_Unknown)
+    lag_stale_after=$(counter PolarDB_Lag_Cap_LSN_Stale)
+    lag_rejected_after=$(counter PolarDB_Lag_Cap_Rejected)
+    lag_accepted_after=$(counter PolarDB_Lag_Cap_Accepted)
     preferred_after=$(counter PolarDB_Target_LSN_Preferred)
     fallback_wait_after=$(counter PolarDB_Target_LSN_Fallback_Wait)
     cf1_endpoint=$(first_endpoint_from_output "$cf1_out")
-    if [ "$cf1_endpoint" = "$REPLICA_SERVER_ENDPOINT" ] &&
+    if reader_endpoint_matches "$cf1_endpoint" &&
         [ "$protect_delta" -ge 1 ]; then
         ok 0 "CF-1: byte lag cap allows in-cap protected reader"
     else
         diag "cf1 output: $cf1_out"
         diag "endpoint=$cf1_endpoint expected_reader=$REPLICA_SERVER_ENDPOINT wait_delta=$wait_delta bypass_delta=$bypass_delta"
+        diag "writer_fallback_delta=$((writer_fallback_after - writer_fallback_before)) lag_unknown_delta=$((lag_unknown_after - lag_unknown_before)) lag_stale_delta=$((lag_stale_after - lag_stale_before)) lag_rejected_delta=$((lag_rejected_after - lag_rejected_before)) lag_accepted_delta=$((lag_accepted_after - lag_accepted_before))"
         ok 1 "CF-1: byte lag cap allows in-cap protected reader"
     fi
     if [ $((preferred_after - preferred_before + fallback_wait_after - fallback_wait_before)) -ge 1 ]; then
@@ -1715,13 +1949,16 @@ SQL
         diag "preferred_delta=$((preferred_after - preferred_before)) fallback_wait_delta=$((fallback_wait_after - fallback_wait_before))"
         ok 1 "CF-1: consistency-target reader selector records preferred or wait-capable selection"
     fi
+    if [ -n "$cf1_lag_cap_freshness_saved" ]; then
+        set_global_var_runtime "pgsql-polardb_lag_cap_freshness_ms" "$cf1_lag_cap_freshness_saved"
+    fi
 }
 
 # CF-2: the smart selector creates a backend connection for a cold replica pool
 # during a consistency wait.
 case_cf2_cold_reader() {
     admin_sql "DELETE FROM pgsql_servers WHERE hostgroup_id=12;" >/dev/null
-    admin_sql "INSERT INTO pgsql_servers (hostgroup_id, hostname, port, status, weight, max_connections) VALUES (12, '$REPLICA_HOST', $REPLICA_PORT, 'ONLINE', 1000, 100);" >/dev/null
+    insert_reader_servers 12 100
     admin_sql "UPDATE pgsql_replication_hostgroups SET reader_hostgroup=12, consistency_mode='lsn', max_lag_bytes=-1, lsn_wait_timeout_ms=5000 WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
     admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
     sleep 1
@@ -1742,7 +1979,7 @@ SQL
     pool_ok_after=$(pool_value 12 ConnOK)
     pool_queries_after=$(pool_value 12 Queries)
     cf2_endpoint=$(first_endpoint_from_output "$cf2_out")
-    if [ "$cf2_endpoint" = "$REPLICA_SERVER_ENDPOINT" ] &&
+    if reader_endpoint_matches "$cf2_endpoint" &&
         [ "$protect_delta" -ge 1 ] &&
         { [ $((pool_ok_after - pool_ok_before)) -ge 1 ] || [ $((pool_queries_after - pool_queries_before)) -ge 1 ]; }; then
         ok 0 "CF-2: smart selector creates backend for cold reader pool"
@@ -1757,13 +1994,15 @@ SQL
     set_hg_policy lsn -1 5000
 }
 
-# RFQ profile mismatch: a pooled replica with an incompatible proxy-protocol profile
-# is skipped and replaced (eviction).
+# RFQ profile mismatch: a connection stored under the old profile key must not
+# be returned for the new profile. ReaderPool v2 finds only the requested key;
+# it does not scan or remove unrelated free connections.
 case_rfq_profile_mismatch() {
-    set_hg_pair_policy 29 30 off lsn -1 5000 1
+    set_hg_pair_policy_one_reader 29 30 off lsn -1 5000 1
     set_default_hostgroup 29
     rfq_mismatch_warm=$(proxy_sql "SELECT host(inet_server_addr()) || ':' || inet_server_port();" 2>&1)
     rfq_mismatch_warm_endpoint=$(last_endpoint_from_output "$rfq_mismatch_warm")
+    rfq_mismatch_free_before=$(pool_value 30 ConnFree)
     set_pair_proxy_protocol 29 v15
     rfq_skipped_before=$(counter PolarDB_RFQ_Profile_Skipped)
     rfq_evicted_before=$(counter PolarDB_RFQ_Profile_Evicted)
@@ -1781,29 +2020,36 @@ SQL
     protect_delta=$(snapshot_protect_delta rfq_mismatch_before rfq_mismatch_after)
     rfq_skipped_after=$(counter PolarDB_RFQ_Profile_Skipped)
     rfq_evicted_after=$(counter PolarDB_RFQ_Profile_Evicted)
+    rfq_mismatch_free_after=$(pool_value 30 ConnFree)
     rfq_mismatch_result=$(last_endpoint_payload_from_output "$rfq_mismatch_out")
-    if [ "$rfq_mismatch_warm_endpoint" = "$REPLICA_SERVER_ENDPOINT" ] &&
-        [ "$rfq_mismatch_result" = "$REPLICA_SERVER_ENDPOINT|$rfq_mismatch_marker" ] &&
+    if reader_endpoint_matches "$rfq_mismatch_warm_endpoint" &&
+        reader_payload_matches "$rfq_mismatch_result" "$rfq_mismatch_marker" &&
         [ "$protect_delta" -ge 1 ] &&
-        [ $((rfq_skipped_after - rfq_skipped_before)) -ge 1 ] &&
-        [ $((rfq_evicted_after - rfq_evicted_before)) -ge 1 ]; then
-        ok 0 "RFQ profile mismatch: incompatible pooled reader is skipped and replaced"
+        [ $((rfq_skipped_after - rfq_skipped_before)) -eq 0 ] &&
+        [ $((rfq_evicted_after - rfq_evicted_before)) -eq 0 ] &&
+        [ "$rfq_mismatch_free_after" -ge "$rfq_mismatch_free_before" ]; then
+        ok 0 "RFQ profile mismatch: new profile does not scan or remove old profile entries"
     else
         diag "rfq-mismatch warm output: $rfq_mismatch_warm"
         diag "rfq-mismatch output: $rfq_mismatch_out"
-        diag "warm_endpoint=$rfq_mismatch_warm_endpoint expected_reader=$REPLICA_SERVER_ENDPOINT result=$rfq_mismatch_result expected=$REPLICA_SERVER_ENDPOINT|$rfq_mismatch_marker wait_delta=$wait_delta bypass_delta=$bypass_delta skipped_delta=$((rfq_skipped_after - rfq_skipped_before)) evicted_delta=$((rfq_evicted_after - rfq_evicted_before))"
-        ok 1 "RFQ profile mismatch: incompatible pooled reader is skipped and replaced"
+        diag "warm_endpoint=$rfq_mismatch_warm_endpoint expected_reader=$REPLICA_SERVER_ENDPOINT result=$rfq_mismatch_result expected=$REPLICA_SERVER_ENDPOINT|$rfq_mismatch_marker wait_delta=$wait_delta bypass_delta=$bypass_delta free_before=$rfq_mismatch_free_before free_after=$rfq_mismatch_free_after skipped_delta=$((rfq_skipped_after - rfq_skipped_before)) evicted_delta=$((rfq_evicted_after - rfq_evicted_before))"
+        ok 1 "RFQ profile mismatch: new profile does not scan or remove old profile entries"
     fi
 }
 
 # RFQ profile match: a compatible pooled replica is reused without eviction.
 case_rfq_profile_reuse() {
+    set_hg_pair_policy_one_reader 31 32 v15 lsn -1 5000 1
+    set_default_hostgroup 31
     rfq_skipped_before=$(counter PolarDB_RFQ_Profile_Skipped)
     rfq_evicted_before=$(counter PolarDB_RFQ_Profile_Evicted)
     snapshot_consistency_counters rfq_reuse_before
     rfq_reuse_marker="rfq_profile_reuse_$$"
+    # RFQ reuse keys include the startup client identity, so warm and measure
+    # in one frontend session. Separate psql processes correctly force eviction.
     rfq_reuse_out=$(
         proxy_script 2>&1 <<SQL
+SELECT host(inet_server_addr()) || ':' || inet_server_port();
 INSERT INTO $TEST_TABLE VALUES (2902, '$rfq_reuse_marker') ON CONFLICT (id) DO UPDATE SET data='$rfq_reuse_marker';
 SELECT host(inet_server_addr()) || ':' || inet_server_port() || '|' || data FROM $TEST_TABLE WHERE id=2902;
 SQL
@@ -1814,15 +2060,17 @@ SQL
     protect_delta=$(snapshot_protect_delta rfq_reuse_before rfq_reuse_after)
     rfq_skipped_after=$(counter PolarDB_RFQ_Profile_Skipped)
     rfq_evicted_after=$(counter PolarDB_RFQ_Profile_Evicted)
+    rfq_reuse_warm_endpoint=$(first_endpoint_from_output "$rfq_reuse_out")
     rfq_reuse_result=$(last_endpoint_payload_from_output "$rfq_reuse_out")
-    if [ "$rfq_reuse_result" = "$REPLICA_SERVER_ENDPOINT|$rfq_reuse_marker" ] &&
+    if reader_endpoint_matches "$rfq_reuse_warm_endpoint" &&
+        reader_payload_matches "$rfq_reuse_result" "$rfq_reuse_marker" &&
         [ "$protect_delta" -ge 1 ] &&
         [ $((rfq_skipped_after - rfq_skipped_before)) -eq 0 ] &&
         [ $((rfq_evicted_after - rfq_evicted_before)) -eq 0 ]; then
         ok 0 "RFQ profile match: compatible pooled reader is reused without eviction"
     else
         diag "rfq-reuse output: $rfq_reuse_out"
-        diag "result=$rfq_reuse_result expected=$REPLICA_SERVER_ENDPOINT|$rfq_reuse_marker wait_delta=$wait_delta bypass_delta=$bypass_delta skipped_delta=$((rfq_skipped_after - rfq_skipped_before)) evicted_delta=$((rfq_evicted_after - rfq_evicted_before))"
+        diag "warm_endpoint=$rfq_reuse_warm_endpoint expected_reader=$REPLICA_SERVER_ENDPOINT result=$rfq_reuse_result expected=$REPLICA_SERVER_ENDPOINT|$rfq_reuse_marker wait_delta=$wait_delta bypass_delta=$bypass_delta skipped_delta=$((rfq_skipped_after - rfq_skipped_before)) evicted_delta=$((rfq_evicted_after - rfq_evicted_before))"
         ok 1 "RFQ profile match: compatible pooled reader is reused without eviction"
     fi
     set_default_hostgroup "$WRITER_HG"
@@ -1874,6 +2122,8 @@ case_wrapper_set_error() {
         lsn_timeout_before=$(counter PolarDB_Wait_Error_LSN_Wait_Timeout)
         retry_before=$(counter PolarDB_Wait_Reads_Retried_On_Writer)
         wait_before=$(counter PolarDB_Wait_LSN_Sent)
+        wrapper_set_error_trace_pattern="PolarDB WAIT WRAP: debug forced invalid wrapper SET"
+        wrapper_set_error_trace_before=$(lsn_trace_count "$wrapper_set_error_trace_pattern")
         set_debug_wrap_set_error
         wrapper_set_error_marker="wrapper_set_error_$$"
         wrapper_set_error_out=$(
@@ -1887,16 +2137,18 @@ SQL
         lsn_timeout_after=$(counter PolarDB_Wait_Error_LSN_Wait_Timeout)
         retry_after=$(counter PolarDB_Wait_Reads_Retried_On_Writer)
         wait_after=$(counter PolarDB_Wait_LSN_Sent)
+        wrapper_set_error_trace_delta=$(lsn_trace_delta "$wrapper_set_error_trace_pattern" "$wrapper_set_error_trace_before")
         if [ "$wrapper_set_error_rc" -ne 0 ] &&
             [ $((wait_after - wait_before)) -ge 1 ] &&
             [ $((timeout_after - timeout_before)) -eq 0 ] &&
             [ $((lsn_timeout_after - lsn_timeout_before)) -eq 0 ] &&
             [ $((retry_after - retry_before)) -eq 0 ] &&
+            { [ "$wrapper_set_error_trace_delta" -eq 1 ] || [ "$wrapper_set_error_trace_delta" -eq -1 ]; } &&
             printf '%s\n' "$wrapper_set_error_out" | grep -Eiq 'ERROR|not-a-lsn|invalid'; then
             ok 0 "debug wrapper SET error is not counted as wait timeout or retried"
         else
             diag "wrapper-set-error output: $wrapper_set_error_out"
-            diag "wrapper_set_error_rc=$wrapper_set_error_rc wait_delta=$((wait_after - wait_before)) timeout_delta=$((timeout_after - timeout_before)) lsn_timeout_delta=$((lsn_timeout_after - lsn_timeout_before)) retry_delta=$((retry_after - retry_before))"
+            diag "wrapper_set_error_rc=$wrapper_set_error_rc wait_delta=$((wait_after - wait_before)) timeout_delta=$((timeout_after - timeout_before)) lsn_timeout_delta=$((lsn_timeout_after - lsn_timeout_before)) retry_delta=$((retry_after - retry_before)) trace_delta=$wrapper_set_error_trace_delta pattern='$wrapper_set_error_trace_pattern' (-1 means trace unavailable)"
             ok 1 "debug wrapper SET error is not counted as wait timeout or retried"
         fi
     else
@@ -2124,7 +2376,7 @@ SQL
 }
 
 plan "$PLAN"
-diag "test profile: POLARDB_TEST_ENV=$POLARDB_TEST_ENV POLARDB_DCS_MODE=$POLARDB_DCS_MODE writer=${PRIMARY_HOST:-auto}:${PRIMARY_PORT:-auto} reader=${REPLICA_HOST:-auto}:${REPLICA_PORT:-auto}"
+diag "test profile: POLARDB_TEST_ENV=$POLARDB_TEST_ENV POLARDB_DCS_MODE=$POLARDB_DCS_MODE writer=${PRIMARY_HOST:-auto}:${PRIMARY_PORT:-auto} readers=${POLARDB_REPLICA_ENDPOINTS:-${REPLICA_HOST:-auto}:${REPLICA_PORT:-auto}}"
 polardb_require_proxysql_or_skip_all polardb
 polardb_require_command_or_skip_all psql psql
 
@@ -2187,6 +2439,7 @@ case_cf7_wrapper_finalize_fail
 # ==== RYW and basic routing modes ====
 case_ryw_write_read
 case_wrapper_filter
+case_route_wait_spec_reader_selection
 case_no_write_read
 case_read_then_read_monotonic
 case_read_then_write_then_read
@@ -2201,6 +2454,7 @@ case_cf3_extended_manual_reader
 case_cf3_extended_auto_no_write
 case_cf3_extended_auto_after_write
 case_explicit_txn_writer
+case_txn_split_prewrite_uses_reader_wait
 
 # ==== Proxy-protocol RFQ scope ====
 case_protocol_rfq_scope
@@ -2214,8 +2468,8 @@ case_startup_identity_configured
 case_rfq_strict_and_best_effort
 case_primary_baseline_unknown
 case_plan_stage_best_effort_degrade
-case_missing_writer_rfq_latch
-case_missing_reader_rfq_latch
+case_missing_writer_rfq_state
+case_missing_reader_rfq_state
 
 # ==== Route hints and session overrides ====
 case_route_primary_hint

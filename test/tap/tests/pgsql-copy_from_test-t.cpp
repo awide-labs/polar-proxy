@@ -834,10 +834,9 @@ void testSTDOUT_TEXT_FORMAT(PGconn* admin_conn, PGconn* conn, std::fstream& f_pr
 /**
  * @brief Tests that COPY commands with leading SQL comments still trigger fast-forward mode.
  *
- * When digest is available, leading comments are stripped, so the strncasecmp
+ * When digest is available, leading comments are stripped, so the statement
  * prefix check sees "COPY ..." and allows the RE2 match to proceed. This test
- * verifies that comment-prefixed COPY commands are not incorrectly rejected by
- * the fast-reject optimization.
+ * verifies that comment-prefixed COPY commands are not incorrectly rejected.
  *
  * @param admin_conn A pointer to the admin PGconn connection.
  * @param conn A pointer to the PGconn connection.
@@ -998,7 +997,7 @@ int main(int argc, char** argv) {
 		plan(59 * 4);
 	}
 
-    // query_digests ON: strncasecmp fast-reject path active
+    // query_digests ON: statement-prefix fast-reject path active
     execute_tests(true, false, true);
     execute_tests(false, false, true);
     // query_digests OFF: falls back to full RE2 match

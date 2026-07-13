@@ -24,10 +24,10 @@ static void test_degraded_rfq_notice_packet_helpers() {
 		"action reason helper names extended protocol");
 	ok(strcmp(polardb_route_action_reason_name(
 		PolarDB_Query_RoutePlan::RouteActionReason::IN_TRANSACTION), "in_transaction") == 0,
-		"action reason helper names transaction guard");
+		"action reason helper names transaction check");
 	ok(strcmp(polardb_route_action_reason_name(
 		PolarDB_Query_RoutePlan::RouteActionReason::MULTI_STATEMENT), "multi_statement") == 0,
-		"action reason helper names multi-statement guard");
+		"action reason helper names multi-statement check");
 	ok(strcmp(polardb_route_action_reason_name(
 		PolarDB_Query_RoutePlan::RouteActionReason::MODE_PRIMARY), "mode_primary") == 0,
 		"action reason helper names primary mode");
@@ -43,6 +43,30 @@ static void test_degraded_rfq_notice_packet_helpers() {
 	ok(strcmp(polardb_route_action_reason_name(
 		PolarDB_Query_RoutePlan::RouteActionReason::PRIMARY_LSN_UNKNOWN), "primary_lsn_unknown") == 0,
 		"action reason helper names missing primary mirror LSN");
+	ok(strcmp(polardb_route_action_reason_name(
+		PolarDB_Query_RoutePlan::RouteActionReason::READER_FAILURE_FORCE_WRITER), "reader_failure_force_writer") == 0,
+		"action reason helper names reader-failure writer route");
+	ok(strcmp(polardb_route_action_reason_name(
+		PolarDB_Query_RoutePlan::RouteActionReason::WAL_PENDING), "wal_pending") == 0,
+		"action reason helper names split WAL-pending veto");
+	ok(strcmp(polardb_route_action_reason_name(
+		PolarDB_Query_RoutePlan::RouteActionReason::SPLIT_BLOCKED), "split_blocked") == 0,
+		"action reason helper names split-blocked veto");
+	ok(strcmp(polardb_route_action_reason_name(
+		PolarDB_Query_RoutePlan::RouteActionReason::SPLIT_WRITE_LSN_UNKNOWN), "split_write_lsn_unknown") == 0,
+		"action reason helper names split write-LSN unknown veto");
+	ok(strcmp(polardb_route_action_reason_name(
+		PolarDB_Query_RoutePlan::RouteActionReason::SPLIT_OBSERVED_LSN_UNKNOWN), "split_observed_lsn_unknown") == 0,
+		"action reason helper names split observed-LSN unknown veto");
+	ok(strcmp(polardb_route_action_reason_name(
+		PolarDB_Query_RoutePlan::RouteActionReason::NO_TXN_LSN), "no_txn_lsn") == 0,
+		"action reason helper names missing transaction LSN");
+	ok(strcmp(polardb_route_action_reason_name(
+		PolarDB_Query_RoutePlan::RouteActionReason::INVARIANT_VIOLATION), "invariant_violation") == 0,
+		"action reason helper names invariant fallback");
+	ok(strcmp(polardb_route_action_reason_name(
+		PolarDB_Query_RoutePlan::RouteActionReason::HG_SPLIT_DISABLED), "hg_split_disabled") == 0,
+		"action reason helper names hostgroup split-disabled veto");
 
 	const char* severity = "WARNING";
 	const char* severity_nonlocalized = "WARNING";
@@ -70,6 +94,68 @@ static void test_degraded_rfq_notice_packet_helpers() {
 	ok(polardb_write_notice_response_packet(
 		pkt, 4, severity, sqlstate, message, detail) == 0,
 		"NoticeResponse helper rejects undersized output buffers");
+}
+
+static void test_failure_action_names() {
+	ok(strcmp(polardb_failure_action_name(
+			PolarDB_FailureAction::PASSTHROUGH), "passthrough") == 0,
+		"failure action helper names passthrough");
+	ok(strcmp(polardb_failure_action_name(
+			PolarDB_FailureAction::RETRY), "retry") == 0,
+		"failure action helper names retry");
+	ok(strcmp(polardb_failure_action_name(
+			PolarDB_FailureAction::FORWARD), "forward") == 0,
+		"failure action helper names forward");
+	ok(strcmp(polardb_failure_action_name(
+			PolarDB_FailureAction::TERMINATE), "terminate") == 0,
+		"failure action helper names terminate");
+}
+
+static void test_reader_action_policy_mapping() {
+	ok(polardb_reader_action_from_string("retry", -1) ==
+			static_cast<int>(PolarDB_ReaderAction::RETRY),
+		"reader action parser accepts retry");
+	ok(polardb_reader_action_from_string("forward", -1) ==
+			static_cast<int>(PolarDB_ReaderAction::FORWARD),
+		"reader action parser accepts forward");
+	ok(polardb_reader_action_from_string("terminate", -1) ==
+			static_cast<int>(PolarDB_ReaderAction::TERMINATE),
+		"reader action parser accepts terminate");
+	ok(polardb_reader_action_from_string("invalid", 7) == 7,
+		"reader action parser returns default for invalid value");
+	ok(strcmp(polardb_reader_action_name(
+			PolarDB_ReaderAction::RETRY), "retry") == 0,
+		"reader action name helper names retry");
+	ok(strcmp(polardb_reader_action_name(
+			PolarDB_ReaderAction::FORWARD), "forward") == 0,
+		"reader action name helper names forward");
+	ok(strcmp(polardb_reader_action_name(
+			PolarDB_ReaderAction::TERMINATE), "terminate") == 0,
+		"reader action name helper names terminate");
+	ok(strcmp(polardb_reader_failure_kind_name(
+			PolarDB_ReaderFailureKind::CONNECTION_LOST), "connection_lost") == 0,
+		"reader failure kind names connection_lost");
+	ok(strcmp(polardb_reader_failure_kind_name(
+			PolarDB_ReaderFailureKind::WAIT_TIMEOUT), "wait_timeout") == 0,
+		"reader failure kind names wait_timeout");
+	ok(strcmp(polardb_reader_failure_kind_name(
+			PolarDB_ReaderFailureKind::REUSABLE_ERROR), "reusable_error") == 0,
+		"reader failure kind names reusable_error");
+	ok(strcmp(polardb_retry_target_name(
+			PolarDB_RetryTarget::WRITER), "writer") == 0,
+		"retry target names writer");
+	ok(strcmp(polardb_retry_target_name(
+			PolarDB_RetryTarget::OTHER_READER), "other_reader") == 0,
+		"retry target names other_reader");
+	ok(strcmp(polardb_reader_failure_route_name(
+			PolarDB_ReaderFailureRoute::NONE), "none") == 0,
+		"reader-failure route names none");
+	ok(strcmp(polardb_reader_failure_route_name(
+			PolarDB_ReaderFailureRoute::FORCE_WRITER), "force_writer") == 0,
+		"reader-failure route names force_writer");
+	ok(strcmp(polardb_reader_failure_route_name(
+			PolarDB_ReaderFailureRoute::SKIP_READER), "skip_reader") == 0,
+		"reader-failure route names skip_reader");
 }
 
 // ---- reader-status names ----
@@ -125,6 +211,30 @@ static void test_reader_status_names() {
 	ok(polardb_reader_status_redirects_to_writer(
 			PolarDB_ReaderStatus::READER_LAG_EXCEEDED),
 		"reader lag cap excess redirects this consistency read to writer");
+	ok(!polardb_reader_status_split_warmup_can_help(
+			PolarDB_ReaderStatus::ACQUIRED),
+		"split warmup is not requested for an already acquired reader");
+	ok(polardb_reader_status_split_warmup_can_help(
+			PolarDB_ReaderStatus::READER_UNAVAILABLE),
+		"split warmup can help when no usable reader backend is available");
+	ok(polardb_reader_status_split_warmup_can_help(
+			PolarDB_ReaderStatus::READER_BUSY),
+		"split warmup can help when readers have no available pooled match");
+	ok(polardb_reader_status_split_warmup_can_help(
+			PolarDB_ReaderStatus::RFQ_UNAVAILABLE),
+		"split warmup can help when no RFQ-LSN-capable reader backend is available");
+	ok(!polardb_reader_status_split_warmup_can_help(
+			PolarDB_ReaderStatus::PRIMARY_LSN_UNKNOWN),
+		"split warmup cannot fix a missing primary LSN sample");
+	ok(!polardb_reader_status_split_warmup_can_help(
+			PolarDB_ReaderStatus::READER_LSN_UNKNOWN),
+		"split warmup cannot fix a missing reader LSN sample");
+	ok(!polardb_reader_status_split_warmup_can_help(
+			PolarDB_ReaderStatus::READER_LSN_STALE),
+		"split warmup cannot fix a stale reader LSN sample");
+	ok(!polardb_reader_status_split_warmup_can_help(
+			PolarDB_ReaderStatus::READER_LAG_EXCEEDED),
+		"split warmup cannot fix a reader rejected by byte-lag policy");
 }
 
 // ---- wrapper error accounting & server-LSN cache reset ----
@@ -144,7 +254,7 @@ static void test_wrapper_error_accounting_policy() {
 
 	accounting = polardb_wrapper_error_accounting(true, false, false, true);
 	ok(accounting.mark_wrapper_failed,
-		"wrapper error accounting marks wrapper failure when no wait is active");
+		"wrapper error accounting marks wrapper SET failure when no wait is active");
 	ok(!accounting.mark_timeout_error,
 		"wrapper error accounting (no active wait) does not mark timeout error");
 	ok(!accounting.account_wait_timeout,
@@ -152,11 +262,19 @@ static void test_wrapper_error_accounting_policy() {
 
 	accounting = polardb_wrapper_error_accounting(true, false, true, true);
 	ok(accounting.mark_wrapper_failed,
-		"wrapper error accounting marks wrapper failure even with timeout flag but no active wait");
-	ok(!accounting.mark_timeout_error,
-		"wrapper error accounting does not count timeout without active wait");
+		"wrapper error accounting marks wrapper SET failure with timeout flag but no active wait");
+	ok(accounting.mark_timeout_error,
+		"wrapper error accounting records timeout marker without active session wait");
 	ok(!accounting.account_wait_timeout,
 		"wrapper error accounting does not account wait timeout without active wait");
+
+	accounting = polardb_wrapper_error_accounting(true, false, false, false);
+	ok(!accounting.mark_wrapper_failed,
+		"wrapper error accounting leaves consumed user-query errors alone when no wait is active");
+	ok(!accounting.mark_timeout_error,
+		"wrapper error accounting consumed user-query errors without active wait are not timeouts");
+	ok(!accounting.account_wait_timeout,
+		"wrapper error accounting consumed user-query errors without active wait do not account wait timeout");
 
 	accounting = polardb_wrapper_error_accounting(true, true, false, false);
 	ok(!accounting.mark_wrapper_failed,
@@ -191,6 +309,46 @@ static void test_wrapper_error_accounting_policy() {
 		"wrapper error accounting counts strict timeout during wrapper SET consumption: wait-timeout accounting");
 }
 
+static void test_wait_timeout_result_policy() {
+	ok(polardb_should_handle_wait_timeout_result(
+			true, true, true, true, true, false),
+		"wait-timeout result policy handles ordinary finalized simple-query wait timeout");
+	ok(!polardb_should_handle_wait_timeout_result(
+			true, true, true, true, true, true),
+		"wait-timeout result policy refuses retry after user-result transfer started");
+	ok(!polardb_should_handle_wait_timeout_result(
+			true, true, false, true, true, false),
+		"wait-timeout result policy requires structured timeout marker");
+	ok(!polardb_should_handle_wait_timeout_result(
+			true, true, true, true, false, false),
+		"wait-timeout result policy requires consistency-wait wrapper kind");
+	ok(!polardb_should_handle_wait_timeout_result(
+			false, true, true, true, true, false),
+		"wait-timeout result policy is simple-query only");
+	ok(!polardb_should_handle_wait_timeout_result(
+			true, false, true, true, true, false),
+		"wait-timeout result policy requires active wait state");
+}
+
+static void test_effective_lsn_freshness_policy() {
+	bool clamped = true;
+	ok(polardb_effective_lsn_freshness_ms(5000, 1000, 0, 250, &clamped) == 5000 &&
+			!clamped,
+		"effective freshness uses configured value when byte-lag cap is disabled");
+	ok(polardb_effective_lsn_freshness_ms(5000, 0, 104857600, 250, &clamped) == 5000 &&
+			!clamped,
+		"effective freshness uses configured value for indefinite waits");
+	ok(polardb_effective_lsn_freshness_ms(5000, 1000, 104857600, 250, &clamped) == 250 &&
+			clamped,
+		"effective freshness clamps to wait-timeout fraction under byte-lag cap");
+	ok(polardb_effective_lsn_freshness_ms(5000, 4000, 104857600, 300, &clamped) == 300 &&
+			clamped,
+		"effective freshness applies configured lag-cap freshness ceiling");
+	ok(polardb_effective_lsn_freshness_ms(100, 1000, 104857600, 250, &clamped) == 100 &&
+			!clamped,
+		"effective freshness does not raise an already tighter configured freshness");
+}
+
 static void test_server_lsn_cache_reset_policy() {
 	std::atomic<uint64_t> current_lsn{900};
 	std::atomic<unsigned long long> updated_at{123456};
@@ -214,11 +372,15 @@ static void test_server_lsn_cache_reset_policy() {
 }
 
 int main() {
-	// 56 ok() in this file = 56.
-	plan(56);
+	// 102 ok() in this file = 102.
+	plan(105);
 	test_degraded_rfq_notice_packet_helpers();
+	test_failure_action_names();
+	test_reader_action_policy_mapping();
 	test_reader_status_names();
 	test_wrapper_error_accounting_policy();
+	test_wait_timeout_result_policy();
+	test_effective_lsn_freshness_policy();
 	test_server_lsn_cache_reset_policy();
 	return exit_status();
 }

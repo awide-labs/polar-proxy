@@ -4,6 +4,7 @@
  *
  * Header-only. Included by both:
  *   - libpq_lsn_test.c                 (direct-to-PolarDB LSN protocol smoke)
+ *   - libpq_xact_test.c                (direct-to-PolarDB xact RFQ smoke)
  *   - proxysql_extended_protocol_test.c (ProxySQL extended-protocol helper)
  *
  * It centralizes three things that used to be duplicated (and divergent)
@@ -14,7 +15,7 @@
  *                          previously byte-identical base/replica builders and
  *                          the repeated "<base> _polar_send_lsn=true" snprintfs.
  *   3. PROXY_IDENTITY    - the proxy-identity suffix PolarDB requires before it
- *                          will accept the _polar_send_lsn connection option.
+ *                          will accept PolarDB RFQ request options.
  *
  * No state is kept here; callers own their buffers.
  */
@@ -26,10 +27,10 @@
 #include <stdlib.h>
 
 /*
- * New-style proxy identity, required by PolarDB to accept _polar_send_lsn.
- * Appended (as a suffix) to a conninfo when exercising the LSN protocol.
+ * New-style proxy identity, required by PolarDB to accept proxy RFQ request
+ * options. Appended as a suffix when exercising the LSN or xact protocol.
  */
-#define PROXY_IDENTITY " _polar_proxy_client_host=10.0.0.1 _polar_proxy_client_port=54321"
+#define PROXY_IDENTITY " _polar_proxy_client_host=192.0.2.10 _polar_proxy_client_port=54321"
 
 /*
  * getenv_default() - return the value of environment variable `name`, or `def`
@@ -55,11 +56,10 @@ static inline const char* getenv_default(const char* name, const char* def) {
  * Produces:
  *   host=<host> port=<port> user=<user> password=<pass> dbname=<db> sslmode=disable<suffix>
  *
- * `suffix` is appended verbatim (pass "" for a plain base conninfo, or
- * " _polar_send_lsn=true" PROXY_IDENTITY to request the LSN protocol). This one
- * builder replaces the old build_conninfo_base()/build_conninfo_replica() pair
- * (which differed only in which env vars they read) and the repeated
- * "%s _polar_send_lsn=true" PROXY_IDENTITY snprintfs.
+ * `suffix` is appended verbatim (pass "" for a plain base conninfo, or a
+ * PolarDB RFQ request option plus PROXY_IDENTITY). This one builder replaces
+ * the old build_conninfo_base()/build_conninfo_replica() pair (which differed
+ * only in which env vars they read) and the repeated protocol-option snprintfs.
  *
  * Returns `buf` for convenient inline use.
  */

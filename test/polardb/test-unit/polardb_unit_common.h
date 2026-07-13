@@ -18,7 +18,7 @@
  *      writer-scope match-matrix helper) — ALWAYS available; depend only on
  *      <tap.h> + <PgSQL_PolarDB.h>.
  *
- *   2. Full-harness HGM fixtures — guarded by POLARDB_UNIT_FULL_HARNESS, which only
+ *   2. Full-harness HGM fixtures — protected by POLARDB_UNIT_FULL_HARNESS, which only
  *      the hgm test defines (after including the harness headers it needs) before
  *      including this file. These reference real ProxySQL HGM/connection types.
  */
@@ -93,7 +93,7 @@ static const uint64_t POLARDB_SCOPE_CHANGED_EPOCH = 8;  // epoch after a writer 
 /**
  * @brief Assert the PolarDB_WriterScope::matches() invariant matrix.
  *
- * Both the RFQ-result-update guard and the session-LSN scope guard accept new
+ * Both the RFQ-result-update check and the session-LSN scope check accept new
  * state only when the request scope matches the current writer scope. This
  * helper runs the shared 5-invariant matrix; @p label names the consuming domain
  * (e.g. "RFQ result update", "session LSN scope") so failures stay diagnosable.
@@ -132,13 +132,15 @@ static inline void check_writer_scope_match_matrix(const char* label) {
 /**
  * @brief Build a single-row pgsql_replication_hostgroups SQLite3_result.
  *
- * Column legend (8 columns):
+ * Column legend (9 columns):
  *   [0] writer_hostgroup  [1] reader_hostgroup  [2] check_type ("polardb")
- *   [3] consistency ("lsn")  [4] txn_split ("0")  [5] max_lag_ms ("1000")
- *   [6] proxy_protocol ("v15")  [7] comment
+ *   [3] txn_split ("0")  [4] consistency ("lsn")  [5] max_lag_bytes ("1000")
+ *   [6] lsn_wait_timeout_ms ("0")  [7] proxy_protocol ("v15")  [8] comment
  */
-static SQLite3_result *make_polardb_replication_row(int writer_hg, int reader_hg) {
-	SQLite3_result *result = new SQLite3_result(8);
+static SQLite3_result *make_polardb_replication_row_with_protocol(
+		int writer_hg, int reader_hg, const char* proxy_protocol,
+		const char* txn_split = "0") {
+	SQLite3_result *result = new SQLite3_result(9);
 	char writer_buf[16];   // holds an int formatted as decimal text
 	char reader_buf[16];
 	snprintf(writer_buf, sizeof(writer_buf), "%d", writer_hg);
@@ -148,14 +150,19 @@ static SQLite3_result *make_polardb_replication_row(int writer_hg, int reader_hg
 		writer_buf,
 		reader_buf,
 		(char*)"polardb",
+		(char*)(txn_split ? txn_split : "0"),
 		(char*)"lsn",
-		(char*)"0",
 		(char*)"1000",
-		(char*)"v15",
+		(char*)"0",
+		(char*)(proxy_protocol ? proxy_protocol : "v15"),
 		(char*)"writer epoch unit"
 	};
 	result->add_row(row);
 	return result;
+}
+
+static SQLite3_result *make_polardb_replication_row(int writer_hg, int reader_hg) {
+	return make_polardb_replication_row_with_protocol(writer_hg, reader_hg, "v15");
 }
 
 /**
@@ -212,6 +219,70 @@ static SQLite3_result *make_pgsql_servers_result(
 	return result;
 }
 
+static SQLite3_result *make_pgsql_servers_result_two_readers(
+		int writer_hg, const char *writer_addr, int writer_port,
+		int reader_hg,
+		const char *reader_addr1, int reader_port1,
+		const char *reader_addr2, int reader_port2) {
+	SQLite3_result *result = new SQLite3_result(11);
+	char writer_hg_buf[16];
+	char writer_port_buf[16];
+	char reader_hg_buf[16];
+	char reader_port1_buf[16];
+	char reader_port2_buf[16];
+	snprintf(writer_hg_buf, sizeof(writer_hg_buf), "%d", writer_hg);
+	snprintf(writer_port_buf, sizeof(writer_port_buf), "%d", writer_port);
+	snprintf(reader_hg_buf, sizeof(reader_hg_buf), "%d", reader_hg);
+	snprintf(reader_port1_buf, sizeof(reader_port1_buf), "%d", reader_port1);
+	snprintf(reader_port2_buf, sizeof(reader_port2_buf), "%d", reader_port2);
+
+	char *writer_row[] = {
+		writer_hg_buf,
+		(char*)writer_addr,
+		writer_port_buf,
+		(char*)"ONLINE",
+		(char*)"1",
+		(char*)"0",
+		(char*)"50",
+		(char*)"0",
+		(char*)"0",
+		(char*)"1000",
+		(char*)"polardb two-reader unit writer"
+	};
+	result->add_row(writer_row);
+
+	char *reader1_row[] = {
+		reader_hg_buf,
+		(char*)reader_addr1,
+		reader_port1_buf,
+		(char*)"ONLINE",
+		(char*)"1",
+		(char*)"0",
+		(char*)"50",
+		(char*)"0",
+		(char*)"0",
+		(char*)"1000",
+		(char*)"polardb two-reader unit reader1"
+	};
+	result->add_row(reader1_row);
+
+	char *reader2_row[] = {
+		reader_hg_buf,
+		(char*)reader_addr2,
+		reader_port2_buf,
+		(char*)"ONLINE",
+		(char*)"1",
+		(char*)"0",
+		(char*)"50",
+		(char*)"0",
+		(char*)"0",
+		(char*)"1000",
+		(char*)"polardb two-reader unit reader2"
+	};
+	result->add_row(reader2_row);
+	return result;
+}
+
 /// @brief Find a server in a hostgroup by literal address + port, or nullptr.
 static PgSQL_SrvC *find_pgsql_server(PgSQL_HGC *hgc, const char *addr, int port) {
 	if (!hgc || !hgc->mysrvs || !addr) return nullptr;
@@ -246,7 +317,27 @@ static bool find_prometheus_counter_value(const char *name, double *value) {
 	return false;
 }
 
-/// @brief Stamp a connection with the shared PolarDB unit-test user/db identity.
+/// @brief Read the first sample of a Prometheus gauge family by name.
+/// @return true and writes *value when the named family has at least one metric.
+static bool find_prometheus_gauge_value(const char *name, double *value) {
+	if (!GloVars.prometheus_registry || !name || !value) {
+		return false;
+	}
+	auto families = GloVars.prometheus_registry->Collect();
+	for (const auto& family : families) {
+		if (family.name != name) {
+			continue;
+		}
+		if (family.metric.empty()) {
+			return false;
+		}
+		*value = family.metric[0].gauge.value;
+		return true;
+	}
+	return false;
+}
+
+/// @brief Fill a connection with the shared PolarDB unit-test user/db identity.
 static void set_test_userinfo(PgSQL_Connection *conn) {
 	conn->userinfo->set(
 		(char*)"polardb_unit_user",
@@ -255,14 +346,37 @@ static void set_test_userinfo(PgSQL_Connection *conn) {
 		nullptr);
 }
 
+/// @brief Fill a connection with ProxySQL's default critical PostgreSQL variables.
+static void set_test_pgsql_defaults(PgSQL_Connection *conn) {
+	for (int idx = 0; idx < PGSQL_NAME_LAST_LOW_WM; idx++) {
+		const char *value = pgsql_tracked_variables[idx].default_value;
+		conn->var_hash[idx] = SpookyHash::Hash32(value, strlen(value), 10);
+		if (conn->variables[idx].value) {
+			free(conn->variables[idx].value);
+		}
+		conn->variables[idx].value = strdup(value);
+	}
+}
+
 /// @brief Build a reusable idle reader connection (V15 RFQ profile) on @p reader.
 static PgSQL_Connection *make_cached_reader_connection(PgSQL_SrvC *reader) {
 	PgSQL_Connection *conn = new PgSQL_Connection(false);
 	set_test_userinfo(conn);
+	set_test_pgsql_defaults(conn);
 	conn->parent = reader;
 	conn->async_state_machine = ASYNC_IDLE;
 	conn->reusable = true;
 	conn->polardb_startup_profile = make_v15_profile();
+	conn->polardb_startup_identity_mode =
+		static_cast<int>(PolarDB_ProxyIdentityMode::PROXY);
+	conn->polardb_startup_profile_generation =
+		conn->polardb_startup_profile.generation(
+			conn->polardb_startup_identity_mode);
+	conn->polardb_startup_client.identity =
+		PolarDB_StartupIdentity{
+			"127.0.0.10",
+			6033,
+			PolarDB_StartupIdentitySource::LISTENER_PROXY};
 	return conn;
 }
 
@@ -289,6 +403,42 @@ static inline void stage_polardb_topology(
 		"pgsql_replication_hostgroups");
 	ok(hgm->commit({}, {}, false, false),
 		"%s: topology commit succeeds", label);
+}
+
+static inline void stage_polardb_topology_with_txn_split(
+		PgSQL_HostGroups_Manager *hgm,
+		const char *label,
+		int writer_hg, const char *writer_addr, int writer_port,
+		int reader_hg, const char *reader_addr, int reader_port) {
+	ok(hgm->servers_add(make_pgsql_servers_result(
+			writer_hg, writer_addr, writer_port,
+			reader_hg, reader_addr, reader_port)) == 0,
+		"%s: writer and reader staged for commit", label);
+	hgm->save_incoming_pgsql_table(
+		make_polardb_replication_row_with_protocol(
+			writer_hg, reader_hg, "v15", "1"),
+		"pgsql_replication_hostgroups");
+	ok(hgm->commit({}, {}, false, false),
+		"%s: topology commit succeeds", label);
+}
+
+static inline void stage_polardb_topology_two_readers(
+		PgSQL_HostGroups_Manager *hgm,
+		const char *label,
+		int writer_hg, const char *writer_addr, int writer_port,
+		int reader_hg,
+		const char *reader_addr1, int reader_port1,
+		const char *reader_addr2, int reader_port2) {
+	ok(hgm->servers_add(make_pgsql_servers_result_two_readers(
+			writer_hg, writer_addr, writer_port,
+			reader_hg, reader_addr1, reader_port1,
+			reader_addr2, reader_port2)) == 0,
+		"%s: writer and two readers staged for commit", label);
+	hgm->save_incoming_pgsql_table(
+		make_polardb_replication_row(writer_hg, reader_hg),
+		"pgsql_replication_hostgroups");
+	ok(hgm->commit({}, {}, false, false),
+		"%s: two-reader topology commit succeeds", label);
 }
 
 #endif // POLARDB_UNIT_FULL_HARNESS

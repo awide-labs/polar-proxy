@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize gcov implementation coverage for PolarDB review gates."""
+"""Summarize gcov implementation coverage for PolarDB review controls."""
 
 import argparse
 import re

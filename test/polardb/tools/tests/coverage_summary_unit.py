@@ -79,7 +79,7 @@ class GcovTakenSummaryTest(unittest.TestCase):
             function, not_excluded))
 
     def test_parse_gcov_extracts_per_file_summary_metrics(self):
-        # parse_gcov() drives the --min-taken gate, so pin its top-level
+        # parse_gcov() drives the --min-taken condition, so keep its top-level
         # `File '...'` + `<Metric> executed:X%` extraction. Lines outside a
         # File block (no `current`) and unrecognized lines must be ignored.
         with tempfile.NamedTemporaryFile(
@@ -114,7 +114,7 @@ class GcovTakenSummaryTest(unittest.TestCase):
         flow = files["lib/PgSQL_PolarDB_Flow.cpp"]
         self.assertEqual(55.50, flow["Lines executed"])
         self.assertEqual(25.00, flow["Taken at least once"])
-        # Flow had no Branches/Calls lines: those keys stay absent (the gate
+        # Flow had no Branches/Calls lines: those keys stay absent (the condition
         # treats missing metrics as None / "n/a").
         self.assertNotIn("Branches executed", flow)
         self.assertNotIn("Calls executed", flow)
@@ -153,9 +153,9 @@ class GcovTakenSummaryTest(unittest.TestCase):
         self.assertEqual(1, function["calls"])
         self.assertEqual(1, function["calls_taken"])
 
-    def test_source_switch_gates_function_inclusion(self):
+    def test_source_switch_controls_function_inclusion(self):
         # A mid-file `-: 0:Source:OTHER.cpp` switch (inlined code from another
-        # translation unit) must gate subsequent functions: only functions
+        # translation unit) must condition subsequent functions: only functions
         # whose active source is in the requested source set are kept.
         with tempfile.TemporaryDirectory() as tmpdir:
             gcov_dir = Path(tmpdir)

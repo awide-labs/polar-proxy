@@ -12,6 +12,8 @@ Usage:
 
 Helpers:
   libpq_lsn          Direct PolarDB libpq RFQ-LSN smoke test.
+  libpq_xact         Direct PolarDB libpq RFQ-xact smoke test.
+  libpq_row_run      Offline libpq DataRow row-run API unit.
   extended_protocol ProxySQL extended-protocol helper.
 
 The runner loads test/polardb/.env (or POLARDB_ENV_FILE), builds the selected
@@ -35,13 +37,18 @@ shift
 
 polardb_prepare_direct_helper_env() {
     if [ "${POLARDB_AUTODETECT:-1}" = "1" ]; then
-        polardb_detect_topology >/dev/null 2>&1 || true
+        if ! polardb_detect_topology; then
+            echo "Cannot detect PolarDB direct topology for $helper; configure PRIMARY_/REPLICA_ endpoints or POLARDB_ENDPOINTS." >&2
+            return 1
+        fi
     fi
 
-    if [ -n "${PRIMARY_HOST:-}" ] && [ -n "${PRIMARY_PORT:-}" ]; then
-        export POLARDB_HOST="$PRIMARY_HOST"
-        export POLARDB_PORT="$PRIMARY_PORT"
+    if [ -z "${PRIMARY_HOST:-}" ] || [ -z "${PRIMARY_PORT:-}" ]; then
+        echo "PRIMARY_HOST/PRIMARY_PORT are required for direct PolarDB helper $helper." >&2
+        return 1
     fi
+    export POLARDB_HOST="$PRIMARY_HOST"
+    export POLARDB_PORT="$PRIMARY_PORT"
     if [ -n "${REPLICA_HOST:-}" ] && [ -n "${REPLICA_PORT:-}" ]; then
         export POLARDB_REPLICA_HOST="$REPLICA_HOST"
         export POLARDB_REPLICA_PORT="$REPLICA_PORT"
@@ -56,6 +63,15 @@ libpq_lsn | libpq-lsn)
     target="polardb/bin/libpq_lsn_test"
     binary="$PROXYSQL_ROOT/test/polardb/bin/libpq_lsn_test"
     polardb_prepare_direct_helper_env
+    ;;
+libpq_xact | libpq-xact)
+    target="polardb/bin/libpq_xact_test"
+    binary="$PROXYSQL_ROOT/test/polardb/bin/libpq_xact_test"
+    polardb_prepare_direct_helper_env
+    ;;
+libpq_row_run | libpq-row-run | row_run | row-run)
+    target="polardb/bin/libpq_row_run_test"
+    binary="$PROXYSQL_ROOT/test/polardb/bin/libpq_row_run_test"
     ;;
 extended_protocol | extended-protocol | extended)
     target="polardb/bin/proxysql_extended_protocol_test"

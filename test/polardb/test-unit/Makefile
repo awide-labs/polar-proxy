@@ -3,13 +3,16 @@
 # PolarDB-owned unit tests.
 #
 # These tests intentionally live outside the generic test/tap/tests/unit
-# registry so the PolarDB test target can evolve its own coverage gate without
+# registry so the PolarDB test target can evolve its own coverage condition without
 # adding product-specific cases to the shared upstream unit suite.
 
 PROXYSQL_PATH := $(shell while [ ! -f ./src/proxysql_global.cpp ]; do cd ..; done; pwd)
 
 include $(PROXYSQL_PATH)/include/makefiles_vars.mk
 include $(PROXYSQL_PATH)/include/makefiles_paths.mk
+
+POLARDB_PROXY ?= 1
+POLARDB_PROFILE ?= 0
 
 # Build products are kept out of this source directory:
 #   BINDIR (../bin)   compiled unit-test binaries
@@ -82,9 +85,11 @@ STATIC_LIBS := $(CITYHASH_LDIR)/libcityhash.a \
 			   $(LZ4_LDIR)/liblz4.a \
 			   $(ZSTD_LDIR)/libzstd.a
 
+ifeq ($(PROXYSQLCLICKHOUSE),1)
 ifneq ($(wildcard $(CLICKHOUSE_CPP_LDIR)/libclickhouse-cpp-lib.a),)
 	STATIC_LIBS += $(CLICKHOUSE_CPP_LDIR)/libclickhouse-cpp-lib.a \
 				   $(LZ4_LDIR)/liblz4.a $(ZSTD_LDIR)/libzstd.a
+endif
 endif
 
 ifeq ($(UNAME_S),Linux)
@@ -120,11 +125,22 @@ POLARDB_UNIT_DEBUG_FLAG :=
 ifneq ($(shell nm $(LIBPROXYSQLAR) 2>/dev/null | grep -cw 'init_debug_struct'),0)
 	POLARDB_UNIT_DEBUG_FLAG := -DDEBUG
 endif
+POLARDB_PROFILE ?= 0
+POLARDB_UNIT_PROFILE_FLAG :=
+ifeq ($(POLARDB_PROFILE),1)
+	POLARDB_UNIT_PROFILE_FLAG := -DPOLARDB_PROFILE=1
+endif
+POLARDB_PERF_DEBUG ?= 0
+POLARDB_UNIT_PERF_DEBUG_FLAG :=
+ifeq ($(POLARDB_PERF_DEBUG),1)
+	POLARDB_UNIT_PERF_DEBUG_FLAG := -DPOLARDB_PERF_DEBUG=1
+endif
 
 # Unit objects are compiled into BUILDDIR, so gcov runtime data follows the
 # matching .gcno files there without an explicit -fprofile-dir override.
 
-OPT := $(STDCPP) -O0 -ggdb -DPROXYSQLCLICKHOUSE -DPOLARDB_PROXY=1 $(POLARDB_UNIT_DEBUG_FLAG) \
+# Match the product PolarDB tier: POLARDB_PROXY=1 builds without ClickHouse.
+OPT := $(STDCPP) -O0 -ggdb -DPOLARDB_PROXY=1 $(POLARDB_UNIT_PROFILE_FLAG) $(POLARDB_UNIT_PERF_DEBUG_FLAG) $(POLARDB_UNIT_DEBUG_FLAG) \
 	   -DGITVERSION=\"$(GIT_VERSION)\" -DMYSQLX_TEST_BUILD $(NOJEM) \
 	   $(WGCOV) $(WASAN) -Wl,--no-as-needed -Wl,-rpath,$(TAP_LDIR)
 
@@ -133,14 +149,16 @@ TEST_HELPERS_OBJ := $(ODIR)/test_globals.o $(ODIR)/test_init.o $(ODIR)/tap.o
 # Header-only tests: compiled with just -DPOLARDB_PROXY=1 and linked against
 # tap.o alone. Each binary covers one focused PolarDB domain.
 POLARDB_HEADER_ONLY_TESTS := \
-	polardb_routing_lsn_unit-t \
 	polardb_protocol_parse_unit-t \
 	polardb_status_policy_unit-t \
 	polardb_query_state_unit-t \
-	polardb_startup_profile_unit-t
+	polardb_startup_profile_unit-t \
+	pgsql_status_variables_unit-t
 
-# Full-harness test: links the full libproxysql.a + TAP harness.
+# Full-harness tests: link the full libproxysql.a + TAP harness.
 POLARDB_FULL_HARNESS_TESTS := \
+	polardb_routing_lsn_unit-t \
+	polardb_client_rfq_unit-t \
 	polardb_hgm_lsn_unit-t
 
 POLARDB_UNIT_TESTS := \
@@ -187,32 +205,37 @@ $(ODIR)/test_init.o: $(TEST_HELPERS_DIR)/test_init.cpp $(PROXYSQL_TEST_HEADERS) 
 FORCE:
 
 $(LIBPROXYSQLAR): FORCE
-	$(MAKE) -C $(PROXYSQL_PATH)/lib libproxysql.a \
-		PROXYSQLCLICKHOUSE=1 \
-		POLARDB_PROXY=1 \
-		DEBUG="$(POLARDB_UNIT_DEBUG_FLAG)" \
-		PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) \
-		PROXYSQL40=$(PROXYSQL40) PROXYSQL31=$(PROXYSQL31) CC=$(CC) CXX=$(CXX)
+	$(MAKE) -B -C $(PROXYSQL_PATH)/lib libproxysql.a \
+			PROXYSQLCLICKHOUSE=0 \
+			POLARDB_PROXY=1 \
+			POLARDB_PROFILE=$(POLARDB_PROFILE) \
+			DEBUG="$(POLARDB_UNIT_DEBUG_FLAG)" \
+			PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) \
+			PROXYSQL40=$(PROXYSQL40) PROXYSQL31=$(PROXYSQL31) CC=$(CC) CXX=$(CXX)
 
 # Header-only test object (compiled into BUILDDIR so its .gcno/.gcda intermediates
 # stay out of the source tree) and its link step (binary into BINDIR).
 $(ODIR)/%.o: %.cpp polardb_unit_common.h | $(ODIR)
 	$(CXX) -c $(abspath $<) -I$(TAP_IDIR) -I$(PROXYSQL_PATH)/include \
-		-DPOLARDB_PROXY=1 $(STDCPP) -O0 -ggdb $(WGCOV) $(WASAN) -o $@
+		-DPOLARDB_PROXY=1 $(POLARDB_UNIT_PROFILE_FLAG) $(STDCPP) -O0 -ggdb $(WGCOV) $(WASAN) -o $@
+
+$(ODIR)/pgsql_status_variables_unit-t.o: pgsql_status_variables_unit-t.cpp $(PROXYSQL_TEST_HEADERS) | $(ODIR)
+	$(CXX) -c $(abspath $<) $(IDIRS) \
+		-DPOLARDB_PROXY=1 $(POLARDB_UNIT_PROFILE_FLAG) $(STDCPP) -O0 -ggdb $(WGCOV) $(WASAN) -o $@
 
 $(addprefix $(BINDIR)/,$(POLARDB_HEADER_ONLY_TESTS)): $(BINDIR)/%: $(ODIR)/%.o $(ODIR)/tap.o $(ODIR)/tap_noise_stubs.o | $(BINDIR)
 	$(CXX) $^ \
-		-DPOLARDB_PROXY=1 $(STDCPP) -O0 -ggdb $(WGCOV) $(LWGCOV) $(WASAN) \
+		-DPOLARDB_PROXY=1 $(POLARDB_UNIT_PROFILE_FLAG) $(STDCPP) -O0 -ggdb $(WGCOV) $(LWGCOV) $(WASAN) \
 		-lpthread $(POLARDB_UNIT_GCOV_LINK) -o $@
 
-# The HGM fixture links the full libproxysql.a + TAP harness and is built in two
+# Full-harness tests link the full libproxysql.a + TAP harness and are built in two
 # steps so its build products stay out of both the source dir and BINDIR:
 #   1. compile into BUILDDIR so .o/.gcno/.gcda land in build.
 #   2. link the object into BINDIR.
-$(ODIR)/polardb_hgm_lsn_unit-t.o: polardb_hgm_lsn_unit-t.cpp polardb_unit_common.h $(PROXYSQL_TEST_HEADERS) | $(ODIR)
+$(addprefix $(ODIR)/,$(addsuffix .o,$(POLARDB_FULL_HARNESS_TESTS))): $(ODIR)/%.o: %.cpp polardb_unit_common.h $(PROXYSQL_TEST_HEADERS) | $(ODIR)
 	$(CXX) -c $(abspath $<) $(IDIRS) $(OPT) -o $@
 
-$(BINDIR)/polardb_hgm_lsn_unit-t: $(ODIR)/polardb_hgm_lsn_unit-t.o $(TEST_HELPERS_OBJ) $(LIBPROXYSQLAR) | $(BINDIR)
-	$(CXX) $(ODIR)/polardb_hgm_lsn_unit-t.o $(TEST_HELPERS_OBJ) $(LDIRS) $(OPT) \
+$(addprefix $(BINDIR)/,$(POLARDB_FULL_HARNESS_TESTS)): $(BINDIR)/%: $(ODIR)/%.o $(TEST_HELPERS_OBJ) $(LIBPROXYSQLAR) | $(BINDIR)
+	$(CXX) $(ODIR)/$*.o $(TEST_HELPERS_OBJ) $(LDIRS) $(OPT) \
 		$(POLARDB_UNIT_LIBPROXYSQL) $(STATIC_LIBS) $(MYLIBS) $(POLARDB_UNIT_GCOV_LINK) \
 		-Wl,--allow-multiple-definition -o $@

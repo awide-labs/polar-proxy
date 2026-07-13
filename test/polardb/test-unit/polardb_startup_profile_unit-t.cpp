@@ -16,19 +16,24 @@ static void test_protocol_request_bits() {
 	ok(!off.has_rfq_lsn(), "off profile does not request RFQ LSN");
 	ok(!off.emits_startup_params(), "off profile emits no startup params");
 	ok(off.protocol == PolarDB_ProxyProtocol::OFF, "off profile records OFF protocol");
+	off.request_rfq_xid();
+	ok(!off.has_rfq_xid(), "off profile does not accept RFQ XID requests");
 
 	PolarDB_StartupProfile legacy =
 		PolarDB_StartupProfile::from_protocol(PolarDB_ProxyProtocol::LEGACY);
 	ok(legacy.has_rfq_lsn(), "legacy profile requests RFQ LSN");
+	ok(legacy.has_rfq_xid(), "legacy profile requests RFQ XID");
 	ok(legacy.emits_startup_params(), "legacy profile emits startup params");
 	ok(!legacy.requests(REQUEST_RFQ_CSN), "legacy profile does not request RFQ CSN");
-	ok(!legacy.requests(REQUEST_RFQ_XID), "legacy profile does not request RFQ XID");
 
 	PolarDB_StartupProfile v15 = make_v15_profile();
 	ok(v15.has_rfq_lsn(), "v15 profile requests RFQ LSN");
+	ok(v15.has_rfq_xid(), "v15 profile requests RFQ XID");
 	ok(v15.emits_startup_params(), "v15 profile emits startup params");
 	ok(!v15.requests(REQUEST_RFQ_CSN), "v15 profile does not request RFQ CSN");
-	ok(!v15.requests(REQUEST_RFQ_XID), "v15 profile does not request RFQ XID");
+	v15.request_rfq_xid();
+	ok(v15.has_rfq_lsn(), "v15 profile keeps RFQ LSN when RFQ XID is requested again");
+	ok(v15.has_rfq_xid(), "v15 profile keeps RFQ XID when requested again");
 
 	PolarDB_StartupProfile csn_only = make_v15_profile();
 	csn_only.request_bits = REQUEST_RFQ_CSN;
@@ -37,6 +42,8 @@ static void test_protocol_request_bits() {
 }
 
 static void test_profile_components_distinguish_protocol_and_bits() {
+	PolarDB_StartupProfile off =
+		PolarDB_StartupProfile::from_protocol(PolarDB_ProxyProtocol::OFF);
 	PolarDB_StartupProfile legacy =
 		PolarDB_StartupProfile::from_protocol(PolarDB_ProxyProtocol::LEGACY);
 	PolarDB_StartupProfile v15 =
@@ -49,6 +56,39 @@ static void test_profile_components_distinguish_protocol_and_bits() {
 	ok(lsn_only.request_bits != lsn_csn.request_bits,
 		"profile request bits distinguish RFQ payload requests");
 	ok(lsn_csn.requests(REQUEST_RFQ_CSN), "profile preserves RFQ CSN bit");
+	ok(v15.generation(static_cast<int>(PolarDB_ProxyIdentityMode::CLIENT)) !=
+			v15.generation(static_cast<int>(PolarDB_ProxyIdentityMode::PROXY)),
+		"profile generation distinguishes CLIENT and PROXY identity modes");
+	ok(off.generation(static_cast<int>(PolarDB_ProxyIdentityMode::CLIENT)) ==
+			off.generation(static_cast<int>(PolarDB_ProxyIdentityMode::PROXY)),
+		"off profile generation is identity-neutral");
+	ok(polardb_startup_profile_matches_request_generation(
+			v15,
+			v15.generation(static_cast<int>(PolarDB_ProxyIdentityMode::CLIENT)),
+			v15,
+			static_cast<int>(PolarDB_ProxyIdentityMode::CLIENT)),
+		"profile generation match uses the requested identity mode");
+}
+
+static void test_startup_parameters_consumed_by_proxy() {
+	ok(polardb_startup_parameter_consumed_by_proxy("_polar_send_lsn"),
+		"startup parameters: legacy LSN request is consumed by ProxySQL");
+	ok(polardb_startup_parameter_consumed_by_proxy("_polar_proxy_send_lsn"),
+		"startup parameters: v15 LSN request is consumed by ProxySQL");
+	ok(polardb_startup_parameter_consumed_by_proxy("_polar_send_xact"),
+		"startup parameters: legacy XID request is consumed by ProxySQL");
+	ok(polardb_startup_parameter_consumed_by_proxy("_polar_proxy_send_xact"),
+		"startup parameters: v15 XID request is consumed by ProxySQL");
+	ok(polardb_startup_parameter_consumed_by_proxy("_polar_origin_client_ip"),
+		"startup parameters: legacy client host is consumed by ProxySQL");
+	ok(polardb_startup_parameter_consumed_by_proxy("_polar_origin_client_port"),
+		"startup parameters: legacy client port is consumed by ProxySQL");
+	ok(polardb_startup_parameter_consumed_by_proxy("_polar_proxy_client_host"),
+		"startup parameters: v15 client host is consumed by ProxySQL");
+	ok(polardb_startup_parameter_consumed_by_proxy("_polar_proxy_client_port"),
+		"startup parameters: v15 client port is consumed by ProxySQL");
+	ok(!polardb_startup_parameter_consumed_by_proxy("application_name"),
+		"startup parameters: ordinary PostgreSQL parameter is not consumed by ProxySQL");
 }
 
 static void test_fallback_identity_validation() {
@@ -167,6 +207,42 @@ static void test_sockaddr_identity_resolution() {
 		"sockaddr identity clears output for unsupported address family");
 }
 
+static void test_startup_client_context_reuse_key() {
+	PolarDB_StartupClientContext base;
+	base.identity = PolarDB_StartupIdentity{
+		"192.0.2.10", 15432, PolarDB_StartupIdentitySource::CLIENT};
+	ok(base.identity_valid_for_startup(false),
+		"startup client context accepts real client identity");
+
+	PolarDB_StartupClientContext same = base;
+	ok(base.compatible_for_reuse(same),
+		"startup client context matches identical identity and placeholders");
+
+	PolarDB_StartupClientContext other_port = base;
+	other_port.identity.port++;
+	ok(!base.compatible_for_reuse(other_port),
+		"startup client context rejects a different client port");
+
+	PolarDB_StartupClientContext other_source = base;
+	other_source.identity.source = PolarDB_StartupIdentitySource::LISTENER_PROXY;
+	ok(!base.compatible_for_reuse(other_source),
+		"startup client context rejects a different identity source");
+
+	PolarDB_StartupClientContext ssl = base;
+	ssl.frontend_ssl = true;
+	ssl.ssl_version = "TLSv1.3";
+	ssl.ssl_cipher = "TLS_AES_256_GCM_SHA384";
+	ok(!base.compatible_for_reuse(ssl),
+		"startup client context reserves SSL fields for future reuse matching");
+
+	PolarDB_StartupClientContext sid = base;
+	sid.has_proxy_session = true;
+	sid.proxy_session_id = 10000001;
+	sid.proxy_cancel_key = 42;
+	ok(!base.compatible_for_reuse(sid),
+		"startup client context reserves proxy session fields for future reuse matching");
+}
+
 static void test_configured_fallback_identity_set_validation() {
 	ok(polardb_identity_config_valid("", 0, true),
 		"configured fallback accepts empty host and unset port");
@@ -211,6 +287,15 @@ static void test_string_converters() {
 	ok(polardb_consistency_mode_from_string("lsn", fallback) ==
 			static_cast<int>(PolarDB_ConsistencyMode::SESSION_LSN),
 		"consistency converter maps lsn");
+	ok(polardb_consistency_mode_from_string("global_lsn", fallback) ==
+			static_cast<int>(PolarDB_ConsistencyMode::GLOBAL_LSN),
+		"consistency converter maps global_lsn");
+	ok(polardb_consistency_mode_from_string("lsn_global", fallback) ==
+			static_cast<int>(PolarDB_ConsistencyMode::GLOBAL_LSN),
+		"consistency converter maps lsn_global alias");
+	ok(polardb_consistency_mode_from_string("global", fallback) ==
+			static_cast<int>(PolarDB_ConsistencyMode::GLOBAL_LSN),
+		"consistency converter maps global alias");
 	ok(polardb_consistency_mode_from_string("primary", fallback) ==
 			static_cast<int>(PolarDB_ConsistencyMode::PRIMARY_ONLY),
 		"consistency converter maps primary");
@@ -274,11 +359,13 @@ static void test_string_converters() {
 }
 
 int main() {
-	plan(92);
+	plan(116);
 	test_protocol_request_bits();
 	test_profile_components_distinguish_protocol_and_bits();
+	test_startup_parameters_consumed_by_proxy();
 	test_fallback_identity_validation();
 	test_sockaddr_identity_resolution();
+	test_startup_client_context_reuse_key();
 	test_configured_fallback_identity_set_validation();
 	test_string_converters();
 	return exit_status();
