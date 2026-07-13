@@ -67,7 +67,7 @@ Manager) plus **one request-stack-scoped pipeline**. Two leaf value types
 ║                            │             ║   ║ StartupIdentity ◆─[IdSource]  ║   ║   ◆─ map<hg,HG_Config      ║
 ║ SessionConsistency ◆─WriterScope(writer) ║   ║ DispatchState ◆─[WrapperKind] ║   ║         ◆─ HG_Policy>     ║
 ║   {write_lsn,observed_lsn,               ║   ║ WrapState     ◆─[WrapperKind] ║   ║ PgSQL_SrvC.polardb_*_lsn  ║
-║    write_unknown,observed_unknown}       ║   ╚═══════════════════════════════╝   ║ status.* (26 counters)   ║
+║    write_unknown,observed_unknown}       ║   ╚═══════════════════════════════╝   ║ status.* (227 counters)  ║
 ║                                          ║                                       ╚═══════════════════════════╝
 ║ QueryState ◆──WriterScope(request_scope) ║
 ║   ◆──ReaderPlan  ◆──WaitState◆WaitSpec   ║          PER-QUERY PIPELINE (transient, request-stack only)
@@ -180,9 +180,9 @@ PolarDB_Query_ReaderPlan  {consistency_target_lsn, primary_lsn, max_lag_bytes,
    reader_lsn_reaches_consistency_target(reader_lsn)  within_byte_cap(reader_lsn)
    │ embedded in (2): QueryState.reader_plan  (persisted)  +  RoutePlan.reader  (decision)
    ▼ consumed by
-PgSQL_HostGroups_Manager::get_MyConn_polardb_reader(hid, sess, ReaderPlan, only_pooled)
+PgSQL_HostGroups_Manager::get_MyConn_polardb_reader(hid, sess, ReaderPlan, WaitSpec, only_pooled)
    ▼ produces
-PolarDB_ReaderResult {conn, srv, status:[ReaderStatus(8 vals)], wait_bypass_allowed:bool}
+PolarDB_ReaderResult {conn, srv, selected_server_snapshot, status:[ReaderStatus(8 vals)], wait_bypass_allowed:bool}
    acquired()  →  redirects_to_writer?   wait_bypass_allowed → wrapper skipped?
 ```
 `ReaderPlan` owns its selection predicates (the lag/freshness methods) — selection policy
@@ -192,7 +192,7 @@ Selection keeps the readers whose fresh cached LSN already reaches the target as
 contiguous prefix; when a reader is acquired from that prefix, `ReaderResult.wait_bypass_allowed`
 is set so the session can clear the staged wait and skip the wrapper
 (`PolarDB_Wait_Wrap_Bypassed`). For any other reader the flag stays false and the wait
-wrapper remains the correctness gate.
+wrapper remains the correctness enforcement.
 
 ### 2.6 Connection sub-domain (startup identity + wrapper consumption)
 ```
@@ -225,7 +225,7 @@ PgSQL_HostGroups_Manager
  │         PolarDB_HG_Policy {consistency_mode, lsn_wait_timeout_ms, max_lag_bytes, proxy_protocol}
  ├─ PgSQL_SrvC.polardb_current_lsn : atomic<u64>          (per-server replica LSN)
  │   PgSQL_HGC.repl_config {polardb_primary_lsn, polardb_writer_epoch, polardb_writer_identity}  (writer-HGC policy snapshot)
- └─ status.* : 26 exported counters (PolarDB_* — the external metrics contract)
+ └─ status.* : 227 exported counters (PolarDB_* — the external metrics contract)
 ```
 `HG_Policy` (raw tri-state config) ◆ inside `HG_Config` (resolved topology) ◆ inside
 `TopologySnapshot` (the versioned bundle) is a clean 3-level nesting matching
@@ -284,7 +284,7 @@ normalization, not duplication.
    (HostGroups    ↳ per-status → reader | writer-   PgSQL_SrvC.polardb_current_lsn   wait_bypass_allowed}
     Manager)        redirect | degrade | retry                                      (status drives caller:
                   ↳ reader from target-reached prefix                               use / redirect_to_writer;
-                    (or tl-cache hit) → reset_wait();                               wait_bypass_allowed → skip wrap)
+                    (wait_bypass_allowed) → reset_wait();                           wait_bypass_allowed → skip wrap)
                     Wait_Wrap_Bypassed++
  ───────────────  ───────────────────────────────  ────────────────────────────  ───────────────────────────
  5 wrap           finalize_wait_timeout_injection() QueryState.wait (WaitState)  wrapped_query_buf;

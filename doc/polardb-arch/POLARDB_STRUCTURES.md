@@ -12,7 +12,7 @@ through the request path, read
 [POLARDB_STRUCTURE_DOMAIN_MAP.md](POLARDB_STRUCTURE_DOMAIN_MAP.md). If you want
 the routing decision rules, read [06-ROUTING-PIPELINE.md](06-ROUTING-PIPELINE.md).
 
-Everything PolarDB is gated behind one compile flag, `POLARDB_PROXY`. When
+Everything PolarDB is controlled behind one compile flag, `POLARDB_PROXY`. When
 `POLARDB_PROXY=0`, the whole surface compiles out (`include/PgSQL_PolarDB.h:82`,
 `:872`), and `lib/PgSQL_PolarDB_Stubs.cpp` is intentionally empty
 (`lib/PgSQL_PolarDB_Stubs.cpp:28`). So when the flag is off, ProxySQL behaves
@@ -24,7 +24,7 @@ exactly like upstream and none of the state below exists.
 
 Each term is defined once here and used the same way throughout. The project
 glossary in `README.md` is the authority for this docset; the curated Foundation
-Pack glossary lives at `doc/polardb-arch/34-DOCS-FOUNDATION-PACK.md` in the full implementation.
+The project glossary in `README.md` defines the terms used by this document.
 
 | Term | Plain meaning |
 |------|---------------|
@@ -34,7 +34,7 @@ Pack glossary lives at `doc/polardb-arch/34-DOCS-FOUNDATION-PACK.md` in the full
 | **HG** (hostgroup) | A ProxySQL group of backend servers. A "writer HG" holds the primary; a "reader HG" holds replicas. |
 | **RFQ** (ReadyForQuery) | The PostgreSQL wire message a backend sends when it is ready for the next query. A patched PolarDB backend, when asked, appends its current WAL LSN to RFQ. |
 | **Wrapper / wrap** | ProxySQL prepends `SET ...` statements in front of a user read so the replica waits for the needed LSN before answering. Each prepended `SET` returns its own result set that ProxySQL must silently drop. |
-| **Process result** | The response-side step that reads RFQ payloads, advances observed/write LSNs, maintains missing-LSN latches, and refreshes the per-server LSN cache. |
+| **Process result** | The response-side step that reads RFQ payloads, advances observed/write LSNs, maintains missing-LSN flags, and refreshes the per-server LSN cache. |
 | **Thread-confined** | A value touched by exactly one OS thread on the hot path, so it needs no lock. |
 | **Atomic** | A value read and written through `std::atomic` so two threads cannot tear it. |
 | **HGM** | The HostGroups Manager (`PgSQL_HostGroups_Manager`), the class that owns backend topology and the only PolarDB state shared across threads. |
@@ -62,8 +62,9 @@ the one bridge that crosses a class boundary (still on the same thread).
   │   polardb_config { is_polardb_enabled, session_consistency_mode }          │
   │   polardb_session_consistency.write_lsn         (own-write component)                  │
   │   polardb_session_consistency.observed_lsn      (monotonic-read component)             │
-  │   polardb_session_*_lsn_unknown     (missing-LSN latches)                  │
+  │   polardb_session_*_lsn_unknown     (missing-LSN flags)                  │
   │   polardb_session_consistency.writer_scope : WriterScope                                  │
+  │   polardb_transaction_split : reserved transaction-split State             │
   │   polardb_query.request_writer_scope : WriterScope      (per-query)              │
   │   polardb_query.reader_plan.consistency_target_lsn  (per-query reader target)       │
   │   polardb_query.wait      : WaitState      (in-flight wait runtime)        │
@@ -83,7 +84,7 @@ the one bridge that crosses a class boundary (still on the same thread).
   SHARED ACROSS THREADS (the ONLY PolarDB state that needs locks/atomics)
   ┌──────────────────────────────────────────────────────────────────────────┐
   │ PgSQL_HostGroups_Manager                                                  │
-  │   status.polardb_* : 26 exported counters + polardb_active atomic gate     │
+  │   status.polardb_* : 227 exported counters + polardb_active atomic condition    │
   │   polardb_writer_to_reader_ / polardb_reader_to_writer_ /                  │
   │   polardb_hostgroups_   (topology maps, under HGM wrlock())                │  PgSQL_HostGroups_Manager.h:1066-1068
   │ PgSQL_HGC::repl_config  (writer-HGC policy snapshot; per-HG)               │  PgSQL_HostGroups_Manager.h:284-294
@@ -112,14 +113,15 @@ the values, what each enum is for, and the exact line.
 | `PolarDB_SessionLsnBaseline` | `uint8_t` | OBSERVED=1, PRIMARY=2 | First-read SESSION_LSN baseline source | `:155` |
 | `PolarDB_ProxyProtocol` | `uint8_t` | OFF=0, LEGACY=1, V15=2 | Startup protocol for PolarDB proxy parameters | `:183` |
 | `PolarDB_StartupIdentitySource` | `uint8_t` | NONE=0, CLIENT=1, LISTENER_PROXY=2, CONFIGURED_FALLBACK=3 | Source of identity used in startup params | `:189` |
-| `PolarDB_Query_WrapperKind` | `uint8_t` | NONE=0, CONSISTENCY_WAIT=1 | Tags which kind of wrapper `SET`s precede a query | `:172` |
+| `PolarDB_Query_WrapperKind` | `uint8_t` | NONE=0, CONSISTENCY_WAIT=1, TXN_SPLIT_WAIT=2 | Tags which kind of wrapper `SET`s precede a query | `:172` |
 | `PolarDB_ConsistencyMode` | `uint8_t` | OFF=0, SESSION_LSN=1, PRIMARY_ONLY=3 | Resolved per-session routing mode. Values match the `POLARDB_CONSISTENCY_*` ints (see below) | `:184` |
 | `PolarDB_Query_ConsistencyRouteHint` | `uint8_t` | NONE=0, PRIMARY, REPLICA | Advisory hint from the wait planner. NOT the final route — the planner decides that | `:218` |
 | `PolarDB_WaitStage` | `uint8_t` | IDLE=0, WAITING=1 | Whether a wait is in flight; drives wrap-state filtering | `:227` |
 | `PolarDB_WrapFinalizeResult` | `uint8_t` | CONTINUE=0, FAILED=1 | Outcome of attaching the wrapper before dispatch | `:240` |
 | `PolarDB_ReaderStatus` | `uint8_t` | ACQUIRED=0, READER_UNAVAILABLE, READER_BUSY, RFQ_UNAVAILABLE, PRIMARY_LSN_UNKNOWN, READER_LSN_UNKNOWN, READER_LSN_STALE, READER_LAG_EXCEEDED | Outcome of acquiring a reader for an LSN-targeted query | `:167` |
-| `PolarDB_Query_RoutePlan::RouteAction` | `uint8_t` | PASSTHROUGH=0, REPLICA_WITH_WAIT, FORCE_PRIMARY | The routing decision | `:835` |
-| `PolarDB_Query_RoutePlan::RouteActionReason` | `uint8_t` | NONE=0, EXTENDED_PROTOCOL, IN_TRANSACTION, MULTI_STATEMENT, MODE_PRIMARY, HINT_PRIMARY, WRITE_LSN_UNKNOWN, OBSERVED_LSN_UNKNOWN, PRIMARY_LSN_UNKNOWN | Why the planner rejected or degraded a replica route | `:1253` |
+| `PolarDB_TransactionSplitStage` | `uint8_t` | NONE=0, TXN_ON_PRIMARY=1, TXN_SPLITTABLE=2, TXN_SPLIT_READ_ACTIVE=3 | Observed transaction-split lifecycle; the planner reads it and execution marks the active split read | header |
+| `PolarDB_Query_RoutePlan::RouteAction` | `uint8_t` | PASSTHROUGH=0, REPLICA_WITH_WAIT, FORCE_PRIMARY, REPLICA_TXN_SPLIT | The routing decision; split action dispatches one in-transaction read to a replica when RFQ evidence is complete | `:835` |
+| `PolarDB_Query_RoutePlan::RouteActionReason` | `uint8_t` | NONE=0, EXTENDED_PROTOCOL, IN_TRANSACTION, MULTI_STATEMENT, MODE_PRIMARY, HINT_PRIMARY, WRITE_LSN_UNKNOWN, OBSERVED_LSN_UNKNOWN, PRIMARY_LSN_UNKNOWN, READER_FAILURE_FORCE_WRITER, WAL_PENDING, SPLIT_BLOCKED, SPLIT_NOT_SELECT, SPLIT_LOCKING_READ, SPLIT_WRITE_LSN_UNKNOWN, SPLIT_OBSERVED_LSN_UNKNOWN, NO_TXN_LSN, INVARIANT_VIOLATION, HG_SPLIT_DISABLED | Why the planner rejected or degraded a replica route, including transaction split rejection reasons | `:1253` |
 
 ### Companion integer constants
 
@@ -165,8 +167,9 @@ local) — see the per-class tables in §5 to §8.
 | `PolarDB_WaitSpec` | `type` (PolarDB_WaitType), `target` (uint64_t), `timeout_ms` (uint32_t), `mode` (PolarDB_WaitMode); `has_wait()`, `reset()`, `lsn()` | Immutable wait payload shape. Embedded in WaitPlan, RoutePlan, and WaitState so the wait quartet is owned once. | header |
 | `PolarDB_Query_WaitPlan` | `spec` (PolarDB_WaitSpec), `route_hint`; `has_wait()`, `reset()`, `build_consistency()` | Consistency helper output inside `polardb_plan()`. `route_hint` is consumed by planning; `spec` is copied into `RoutePlan.wait_spec`. | header |
 | `PolarDB_Query_WaitState` | `spec` (PolarDB_WaitSpec), `wait_stage`, `wrapper_stmts`, `wait_started_at_us`, `wrapper_finalized`, `timeout_error` (bool, default false), `fallback_writer_hg` (int, default -1), `original_query`; `reset()`, `prepare_from_spec()` | The in-flight wait runtime for one wrapped read. Lives on the session as `polardb_query.wait`; the connection-side WrapState consumes wrapper results. | header |
+| `PolarDB_TransactionSplitState` | `stage` (PolarDB_TransactionSplitStage), `xids`, `primary_lsn`, `splittable`, `wal_pending`, `blocked`; `active()`, `has_backend_evidence()`, `observe_primary_rfq()`, `reset()` | Session-scoped transaction-split evidence and reset contract. Result processing updates it from accepted primary RFQs; the planner reads it to name split-readable routes, and execution marks active/blocked states. | header |
 | `PolarDB_Query_ReaderPlan` | `consistency_target_lsn`, `primary_lsn`, `max_lag_bytes`, `fallback_writer_hg`, `route_rfq_policy`, `allow_best_effort_degrade`; `reset()` | Query-scoped reader acquisition requirements. The planner fills it; `get_MyConn_polardb_reader()` consumes it when acquiring the actual reader connection. | `:1212` |
-| `PolarDB_ReaderResult` | `conn`, `srv`, `status`, `wait_bypass_allowed` (bool, default false); `acquired()` | Result of `get_MyConn_polardb_reader()`. Carries either the acquired connection/server or the exact `PolarDB_ReaderStatus` explaining why acquisition did not produce a usable reader. `wait_bypass_allowed` is set true only when the reader was acquired from the fresh target-reached prefix (its cached LSN already reaches the target); it lets the session clear the staged wait and skip the wrapper (`PolarDB_Wait_Wrap_Bypassed`). It stays false for any other reader, so the wrapper remains the RYW gate. | `:1233` |
+| `PolarDB_ReaderResult` | `conn`, `srv`, `selected_server_snapshot` (shared_ptr<const void>, keeps srv alive between selection and retrieval), `status`, `wait_bypass_allowed` (bool, default false); `acquired()` | Result of `get_MyConn_polardb_reader()`. Carries either the acquired connection/server or the exact `PolarDB_ReaderStatus` explaining why acquisition did not produce a usable reader. `wait_bypass_allowed` is set true only when the reader was acquired from the fresh target-reached prefix (its cached LSN already reaches the target); it lets the session clear the staged wait and skip the wrapper (`PolarDB_Wait_Wrap_Bypassed`). It stays false for any other reader, so the wrapper remains the RYW condition. | `:1233` |
 | `PolarDB_Query_RouteCtx` | see the field table in §9 | All routing inputs, filled once per query by `polardb_collect()`, immutable after. Request-stack scoped only. | `:811` |
 | `PolarDB_Query_RoutePlan` | `wait_spec` (PolarDB_WaitSpec), `reader` (`PolarDB_Query_ReaderPlan`), `target_hg` (int, =-1), `action` (RouteAction), `action_reason` (RouteActionReason), `degraded_rfq_route` (bool) | The routing decision from `polardb_plan()`, consumed by `polardb_execute()`. `reader` carries query-scoped backend acquisition requirements; `wait_spec` carries the wrapper payload; `degraded_rfq_route` marks best-effort reader routing without an enforceable RFQ target. Request-stack scoped only. | `:1244` |
 | `PolarDB_Query_ExecuteResult` | `final_target_hg` (int, =-1), `executed_action` (RouteAction) | The final HG after any execute-time fallback. Request-stack scoped only. | `:867` |
@@ -200,7 +203,7 @@ parameters and return a value:
 
 This shows the chain each enum travels: which function produces a value and which
 function acts on it. File:line references in this document are best-effort
-anchors for this branch and should be checked against the checkout
+anchors for this branch and should be checked against the current source
 when reviewing code.
 
 | Enum value source | Carried in | Consumed by |
@@ -210,7 +213,7 @@ when reviewing code.
 | `PolarDB_Query_ConsistencyRouteHint` ← `PolarDB_Query_WaitPlan::build_consistency()` (`:474-490`) | `PolarDB_Query_WaitPlan.route_hint` | `polardb_plan()` (advisory only — final route is `RouteAction`) |
 | `PolarDB_WaitType` ← `PolarDB_Query_WaitPlan::build_consistency()` (`LSN` when `session_lsn>0`) | `WaitPlan.spec.type` → `RoutePlan.wait_spec.type` → `WaitState.spec.type` (`prepare_from_spec`) | `PolarDB_Protocol::append_polar_wait_set()` (emits the `SET` only for `LSN`); timeout-subset counter |
 | `PolarDB_WaitMode` ← resolved `wait_timeout_mode` (`Flow.cpp:73`) | `WaitPlan.spec.mode` / `WaitState.spec.mode` / `RoutePlan.wait_spec.mode` | `build_polar_consistency_mode_set()` chooses `'strict'` vs `'best_effort'` (`Wrap.cpp:101-108`) |
-| `PolarDB_WaitStage` ← `polardb_execute()` sets `WAITING` (`Flow.cpp:722`) | `WaitState.wait_stage` | `polardb_wait_active()` gate (filters wrapper results, drives the WIRE path) |
+| `PolarDB_WaitStage` ← `polardb_execute()` sets `WAITING` (`Flow.cpp:722`) | `WaitState.wait_stage` | `polardb_wait_active()` condition (filters wrapper results, drives the WIRE path) |
 | `PolarDB_Query_WrapperKind` ← `finalize_wait_timeout_injection()` sets `CONSISTENCY_WAIT` (`Wrap.cpp:242`) | session `polardb_query.dispatch_wrapper_kind` → connection `dispatch_state.wrapper_kind` → `polardb_query_wrap_state.wrapper_kind` (`Connection.cpp:1725,1442`) | connection consume loop (`is_consistency_wait()`, `Connection.cpp` helpers) |
 | `RouteAction` ← `polardb_plan()` | `RoutePlan.action` → `ExecuteResult.executed_action` | `polardb_execute()` side effects; `Session.cpp` route block (`:2554-2558`) |
 | `RouteActionReason` ← `polardb_plan()` route decision branches | `RoutePlan.action_reason` | diagnostics / `POLARDB_TRACE` and degraded-route notices (records *why* a replica route was rejected or degraded) |
@@ -243,7 +246,7 @@ per-reset clearing is explicit.
 | `polardb_session_consistency.observed_lsn` | uint64_t (=0) | Monotonic-read LSN component from any positioned RFQ | Advanced (max) on any RFQ carrying LSN. **Deliberately NOT cleared on RESET** — it lives for the whole client session | R/W: process_result and plan | session-confined |
 | `polardb_session_consistency.write_unknown` | bool (=false) | A write completed without RFQ LSN; later SESSION_LSN reads need route-RFQ policy | Set on missing write RFQ LSN; cleared only by a primary-sourced positioned RFQ | R/W: process_result and plan | session-confined |
 | `polardb_session_consistency.observed_unknown` | bool (=false) | A tracked SESSION_LSN read completed without RFQ LSN; later SESSION_LSN reads need route-RFQ policy | Set on missing tracked read RFQ LSN; cleared only by a primary-sourced positioned RFQ | R/W: process_result and plan | session-confined |
-| `polardb_session_consistency.writer_scope` | `PolarDB_WriterScope` (`hg=-1`, `epoch=0`) | Writer hostgroup + writer-identity epoch attached to this session's LSN targets/latches; `valid() == false` means no scope is attached | Clean first PolarDB collect seeds it with the writer scope for the current replication group. Accepted result processing tags newly-created state with the request writer scope. Later writer-scope mismatches clear write/observed LSNs plus both missing-LSN latches; unscoped pre-scope state is also cleared. `PolarDB_Session_Target_Epoch_Reset` increments only if at least one target or latch was discarded. | R/W: collect, process_result | session-confined |
+| `polardb_session_consistency.writer_scope` | `PolarDB_WriterScope` (`hg=-1`, `epoch=0`) | Writer hostgroup + writer-identity epoch attached to this session's LSN targets/flags; `valid() == false` means no scope is attached | Clean first PolarDB collect seeds it with the writer scope for the current replication group. Accepted result processing tags newly-created state with the request writer scope. Later writer-scope mismatches clear write/observed LSNs plus both missing-LSN flags; unscoped pre-scope state is also cleared. `PolarDB_Session_Target_Epoch_Reset` increments only if at least one target or flag was discarded. | R/W: collect, process_result | session-confined |
 | `polardb_query.request_writer_scope` | `PolarDB_WriterScope` (`hg=-1`, `epoch=0`) | Writer hostgroup + writer-identity epoch captured for the in-flight request | Reset before each query and at cleanup. Set by collect, or by manual-route staging from the effective scope hostgroup (destination HG unless a transaction-persistent HG is already active). Result processing rejects RFQ session/cache updates if the backend resolves to a different writer scope. | R/W: route, collect, process_result | session-confined |
 | `polardb_query.reader_plan` | `PolarDB_Query_ReaderPlan` | Per-query reader acquisition requirements, including required LSN | Set in `polardb_execute()` from `plan.reader`; reset before routing and once backend acquisition consumes/degrades/redirects it | R: `Session.cpp` targeted-acquisition path; W: `Flow.cpp`, resets | session-confined |
 | `polardb_query.wait` | `PolarDB_Query_WaitState` | In-flight wait state; drives wrapper generation and latency accounting | `prepare_from_spec(plan.wait_spec)` then `wait_stage=WAITING` in execute; reset on new query, RESET, wrap-finalize failure, and cleanup | R: `polardb_wait_active()` checks `wait_stage`; W: `Flow.cpp`, `Wrap.cpp`, `Session.cpp` | session-confined |
@@ -252,7 +255,7 @@ per-reset clearing is explicit.
 | `polardb_consistency_mode_set_cache_mode` | int (=-1) | Which mode the cache string was built for | Set when the cache is rebuilt (`Wrap.cpp:103`) | R: `Wrap.cpp:101`; W: `Wrap.cpp:103` | session-confined |
 | `polardb_query.dispatch_wrapper_stmts` | uint32_t (=0) | How many wrapper `SET` results the connection must skip | Set after the wrap installs; copied to the connection's `dispatch_state` then zeroed; reset on each query reset | R: `Connection.cpp`; W: `Wrap.cpp`, resets | session-confined (handoff to connection) |
 | `polardb_query.dispatch_wrapper_kind` | `PolarDB_Query_WrapperKind` (=NONE) | Wrapper kind for the same handoff | Set by wrap finalize; copied then cleared by connection dispatch; reset on query reset | R: `Connection.cpp`; W: `Wrap.cpp`, resets | session-confined (handoff to connection) |
-| `polardb_wait_disabled` | bool (=false) | Safety latch: force the writer instead of an unwrapped replica read | Set true when the wrap build fails (`Wrap.cpp:192`); back to false on RESET (`Wrap.cpp:330`) | R: `polardb_plan()` (`Flow.cpp`); W: `Wrap.cpp:192,330` | session-confined |
+| `polardb_wait_disabled` | bool (=false) | Safety flag: force the writer instead of an unwrapped replica read | Set true when the wrap build fails (`Wrap.cpp:192`); back to false on RESET (`Wrap.cpp:330`) | R: `polardb_plan()` (`Flow.cpp`); W: `Wrap.cpp:192,330` | session-confined |
 | `pending_notices` | `PtrSizeArray*` (=nullptr) | Notices captured from a wrapped read, forwarded with the user's result (for example a best-effort timeout WARNING) | Lazily `new`-ed on first capture (`Notices.cpp`); freed and nulled by `clear_pending_notices(true)` on reset/failure; forwarded then cleared with `free_buffers=false` after sending (`polardb_flush_pending_notices_to_client()`). The destructor calls `reset()`, and `reset()` frees it | R: `Session.cpp`, `Notices.cpp`; W: `Notices.cpp` | session-confined; heap-owned |
 
 ### 5.3 Per-query and per-reset clearing
@@ -273,7 +276,7 @@ There are two clearing points and one helper:
   place `session_consistency_mode` returns to -1.
 
 Note the asymmetry, by design: `polardb_session_consistency.write_lsn`,
-`polardb_session_consistency.observed_lsn`, and the missing-LSN latches survive ordinary
+`polardb_session_consistency.observed_lsn`, and the missing-LSN flags survive ordinary
 per-query cleanup; the effective wait target is
 `max(write_lsn, observed_lsn)`. A first-read `primary` baseline is handled at
 plan time from the primary mirror and is not persisted as session LSN state.
@@ -318,7 +321,7 @@ persistent PolarDB state fields** on the connection beyond these two.
 
 This is the **only** PolarDB state shared across threads, so thread-safety
 matters here. It comes in four groups: per-server LSN cache, per-HGC policy
-snapshot, internal topology maps, and the stat counters plus the master gate.
+snapshot, internal topology maps, and the stat counters plus the master condition.
 
 ### 7.1 Per-server LSN cache, on `PgSQL_SrvC` (`:227-228`)
 
@@ -335,11 +338,12 @@ see a consistent snapshot.
 
 | Field | Type (default) | Purpose | Lifecycle | Readers / Writers | Thread-safety |
 |-------|----------------|---------|-----------|-------------------|---------------|
-| `configured` | bool (=false) | True if this HG is in `pgsql_replication_hostgroups` | Set on commit (`HGM.cpp:1806,1836`) | R: `HGM.cpp:4498,4567,4594`; W: commit | HGM lock for map writes; atomic gate `polardb_active` |
+| `configured` | bool (=false) | True if this HG is in `pgsql_replication_hostgroups` | Set on commit (`HGM.cpp:1806,1836`) | R: `HGM.cpp:4498,4567,4594`; W: commit | HGM lock for map writes; atomic condition `polardb_active` |
 | `reader_hostgroup` | unsigned int (=0) | Paired reader HG | Set `HGM.cpp:1837` | **write-only** — topology lookups use the maps instead (see §7.3) | HGM lock |
 | `writer_hostgroup` | unsigned int (=0) | Paired writer HG | Set on commit | Used for diagnostics/future local policy; topology lookups use the snapshot/maps | HGM lock |
 | `max_lag_bytes` | int (=0) | Reader lag cap in bytes (0 = off) | Set `HGM.cpp:1841` | R: `HGM.cpp:4501`; W: commit | HGM lock |
 | `check_type` | std::string | e.g. "polardb" / "read_only" | Set `HGM.cpp:1838` | **write-only** (the enum is read, not this string) | HGM lock |
+| `txn_split_enabled` | bool (=false) | Transaction-split switch from the admin schema | Set on commit | Published into `PolarDB_HG_Config.policy`; the planner reads it to decide whether a split route may be named | HGM lock |
 | `consistency_mode` | std::string | Mode word (off/lsn/primary) | Set `HGM.cpp:1839` | **write-only** (only the parsed enum is read) | HGM lock |
 | `consistency_mode_enum` | int (=-1) | Parsed mode; -1 = use global | Set `HGM.cpp:1840` via `polardb_consistency_mode_from_string()` | R: `HGM.cpp:4499`; W: commit | HGM lock |
 | `lsn_wait_timeout_ms` | int (=0) | Per-HG wait timeout | Set `HGM.cpp:1842` | R: `HGM.cpp:4500`; W: commit | HGM lock |
@@ -367,13 +371,13 @@ topology/policy values plus two shared atomic cells in each `PolarDB_HG_Config`:
 `PgSQL_SrvC` raw pointers. `get_polardb_primary_lsn(writer_hg)` is a snapshot map
 lookup followed by `primary_lsn->load()`, with no HGM lock.
 
-### 7.4 Stat counters and the master gate, on `PgSQL_HostGroups_Manager::status`
+### 7.4 Stat counters and the master condition, on `PgSQL_HostGroups_Manager::status`
 
-There are **26 exported stat counters + 1 internal `polardb_active` gate**. The
+There are **227 exported stat counters + 1 internal `polardb_active` condition**. The
 external `PolarDB_*` names are stable SQL rows in `stats_pgsql_global`.
-Internally, 19 thread-backed counters are per-thread
+Internally, 190 thread-backed counters are per-thread
 `PgSQL_Thread::polardb_status_variables.stvar[]` slots plus a global counter;
-7 global-only counters remain global atomics. Worker teardown folds the per-thread
+37 global-only counters remain global atomics. Worker teardown folds the per-thread
 slots into the global counters before the worker object is freed. Full operator
 meaning is in
 [12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md); this
@@ -386,7 +390,7 @@ table is the data inventory.
 | `polardb_monitor_health_invalid_role` | `PolarDB_Monitor_Health_Invalid_Role` | atomic ull | monitor health row reported a role ProxySQL cannot route to | monitor result parsing |
 | `polardb_monitor_health_invalid_values` | `PolarDB_Monitor_Health_Invalid_Values` | atomic ull | monitor health row had invalid availability or invalid LSN text | monitor result parsing |
 | `polardb_lsn_stale_count` | `PolarDB_LSN_Stale_Count` | atomic ull | active stale-LSN counter for byte-lag enforcement. It increments when an enabled max_lag_bytes check finds missing or stale primary/reader LSN state | reader acquisition |
-| `polardb_write_missing_lsn` | `PolarDB_Write_Missing_LSN` | atomic ull | writer RFQ carried no LSN; automatic LSN-mode reads follow `route_rfq_policy` until a primary-sourced RFQ clears the latch | process_result |
+| `polardb_write_missing_lsn` | `PolarDB_Write_Missing_LSN` | atomic ull | writer RFQ carried no LSN; automatic LSN-mode reads follow `route_rfq_policy` until a primary-sourced RFQ clears the flag | process_result |
 | `polardb_read_missing_lsn` | `PolarDB_Read_Missing_LSN` | atomic ull | tracked SESSION_LSN read RFQ carried no LSN | process_result |
 | `polardb_primary_lsn_unknown` | `PolarDB_Primary_LSN_Unknown` | atomic ull | primary baseline requested but the primary mirror was empty | plan |
 | `polardb_rfq_best_effort_degraded_routes` | `PolarDB_RFQ_Best_Effort_Degraded_Routes` | atomic ull | best-effort policy allowed a degraded reader route without a wait target | plan |
@@ -394,10 +398,9 @@ table is the data inventory.
 | `polardb_wait_reads_retried_on_writer` | `PolarDB_Wait_Reads_Retried_On_Writer` | atomic ull | wait-wrapped reader query was retried once on the writer after strict wait timeout or reader connection loss, before any user result reached the client | session dispatch |
 | `polardb_rfq_profile_skipped` | `PolarDB_RFQ_Profile_Skipped` | atomic ull | pooled connection skipped because its startup profile did not request RFQ LSN | pool selection |
 | `polardb_rfq_profile_evicted` | `PolarDB_RFQ_Profile_Evicted` | atomic ull | incompatible free pooled connections evicted to make room for RFQ-LSN-capable replacements | pool selection |
-| `polardb_tl_cache_bypassed_for_target` | `PolarDB_TL_Cache_Bypassed_For_Target` | atomic ull | thread-local backend cache was bypassed because the query had an RFQ-LSN target | pool selection |
 | `polardb_target_lsn_preferred` | `PolarDB_Target_LSN_Preferred` | atomic ull | fresh cached reader at or beyond target was preferred and acquired | reader acquisition |
 | `polardb_target_lsn_fallback_wait` | `PolarDB_Target_LSN_Fallback_Wait` | atomic ull | reader acquisition fell back to the full weighted candidate set and relied on wait wrapper | reader acquisition |
-| `polardb_session_target_epoch_reset` | `PolarDB_Session_Target_Epoch_Reset` | atomic ull | collect or accepted result processing discarded at least one session LSN target or missing-LSN latch because the writer group or epoch changed | collect, process_result |
+| `polardb_session_target_epoch_reset` | `PolarDB_Session_Target_Epoch_Reset` | atomic ull | collect or accepted result processing discarded at least one session LSN target or missing-LSN flag because the writer group or epoch changed | collect, process_result |
 | `polardb_session_lsn_routing` | `PolarDB_Session_LSN_Routing` | atomic ull | reads route-planned to a reader with a session-LSN wait (the `REPLICA_WITH_WAIT` decision) | `Flow.cpp:433` |
 | `polardb_wait_wrap_prepared` | `PolarDB_Wait_Wrap_Prepared` | atomic ull | wait-wrapper intent prepared for that routed read | `Flow.cpp:451` |
 | `polardb_wait_wrap_bypassed` | `PolarDB_Wait_Wrap_Bypassed` | atomic ull | selected reader already reached the consistency target, so the staged wait was cleared before wrapping | backend acquisition |
@@ -409,11 +412,11 @@ table is the data inventory.
 | `polardb_wait_error_connection_lost` | `PolarDB_Wait_Error_Connection_Lost` | atomic ull | wait-wrapped reader lost its backend connection before any user result reached the client | session dispatch |
 | `polardb_active` | (not exported as a stat) | `atomic<bool>` (=false) | true when `polardb_hostgroups_` is non-empty | `HGM.cpp:1864` |
 
-`polardb_active` is the master gate. It is read by every HGM accessor (§7.3) and
+`polardb_active` is the master condition. It is read by every HGM accessor (§7.3) and
 by the session route block at `Session.cpp:2543` before any PolarDB routing runs.
 When false, the whole feature is bypassed.
 
-The same 26 counters surface in the admin SQL table `stats_pgsql_global` and in
+The same 227 counters surface in the admin SQL table `stats_pgsql_global` and in
 Prometheus as `proxysql_polardb_*_total`. Prometheus updates run only during
 metrics collection; query-path increments remain per-thread/global-counter only.
 
@@ -472,7 +475,7 @@ query, is never shared, and needs no locking. Declared at
 | `max_lag_bytes` | int (-1) | Reader byte-lag cap; -1 = use the thread default | `Flow.cpp:74` |
 | `is_polar_hg` | bool (false) | From the HGM cache (resolved once) | `polardb_collect()` (`Flow.cpp`) |
 | `replica_eligible` | bool (false) | From the query rules (`qpo->replica_eligible`) | `polardb_collect()` (`Flow.cpp`) |
-| `is_multi_statement` | bool (false) | Semicolon-scan safety guard | `polardb_collect()` (`Flow.cpp`) |
+| `is_multi_statement` | bool (false) | Semicolon-scan safety check | `polardb_collect()` (`Flow.cpp`) |
 | `is_extended_protocol` | bool (false) | Parse/Bind/Execute → no wait wrapper | `polardb_collect()` (`Flow.cpp`) |
 | `in_transaction` | bool (false) | Inside an explicit transaction | `Flow.cpp:103` |
 | `force_primary_hint` | bool (false) | `/* route=primary */` first-comment hint | `Flow.cpp:106` |
@@ -557,7 +560,7 @@ into a wrapped read, and how the LSN flows back on the response.
 
 ```
                           REQUEST PATH (forward)
-client read ─► get_pkts_from_client(), gated by PgHGM->status.polardb_active   Session.cpp:2543
+client read ─► get_pkts_from_client(), enabled by PgHGM->status.polardb_active   Session.cpp:2543
                   │
                   ▼  polardb_collect()                                          Flow.cpp:233
        reads: HGM topology + repl_config + polardb_session_consistency.write_lsn
@@ -567,7 +570,7 @@ client read ─► get_pkts_from_client(), gated by PgHGM->status.polardb_active
             PolarDB_Query_RouteCtx  (request-stack, immutable)                 PgSQL_PolarDB.h:811
                   │
                   ▼  polardb_plan()  (pure decision)                            Flow.cpp:410
-       calls PolarDB_Query_WaitPlan::build_consistency(), applies route gates
+       calls PolarDB_Query_WaitPlan::build_consistency(), applies route controls
                   │  produces
                   ▼
             PolarDB_Query_RoutePlan  { action, wait_spec, reader, ... }        PgSQL_PolarDB.h
@@ -579,7 +582,7 @@ client read ─► get_pkts_from_client(), gated by PgHGM->status.polardb_active
          polardb_query.wait.prepare_from_spec(plan.wait_spec); wait_stage = WAITING Flow.cpp
          Wait_Wrap_Prepared++                                                  Flow.cpp:451
                   │
-                  ├─ backend acquisition proves selected reader reached target:
+                  ├─ backend acquisition shows selected reader reached target:
                   │       reset_wait(); Wait_Wrap_Bypassed++                   Session.cpp
                   │
                   ▼  ASYNC_IDLE: finalize_wait_timeout_injection()             Session.cpp:3607 / Wrap.cpp:303
@@ -627,7 +630,7 @@ monitor health check reads each replica's LSN and calls the same
 | Request-stack | local to one query's call stack | not shared at all | `PolarDB_Query_RouteCtx`, `RoutePlan`, `ExecuteResult` |
 | HGM per-server / per-HGC LSN | `std::atomic` (relaxed) and shared atomic cells | read locklessly by the reader acquisition/snapshot, written by monitor/result processing | `polardb_current_lsn`, `lsn_updated_at`, `polardb_primary_lsn` |
 | HGM topology maps | HGM `wrlock()` | rebuilt only at config commit; read under lock | `polardb_*_to_*_`, `polardb_hostgroups_` |
-| HGM counters + gate | local per-thread `stvar[]` slots plus global counters for thread-backed rows; global atomics for global-only rows; `atomic<bool>` for the gate | worker-owned increments for thread-backed rows; atomic `fetch_add` / `load` for global-only and global-counter rows | 26 exported counters + `polardb_active` |
+| HGM counters + condition | local per-thread `stvar[]` slots plus global counters for thread-backed rows; global atomics for global-only rows; `atomic<bool>` for the condition | worker-owned increments for thread-backed rows; atomic `fetch_add` / `load` for global-only and global-counter rows | 227 exported counters + `polardb_active` |
 
 The two cross-class bridges (session → connection dispatch fields in §8; the
 notice callback that fills `pending_notices`) both run **on the same thread**, so
@@ -641,8 +644,9 @@ they need no lock either.
 |----------------------|-----------------------|---------------|-------------------|
 | `polardb_config` (session) | session construction (member initializers) | whole session | `is_polardb_enabled` never resets; `session_consistency_mode` → -1 on RESET (`Wrap.cpp:324`) |
 | `polardb_session_consistency.write_lsn` / `polardb_session_consistency.observed_lsn` | session construction (=0) | whole session | survive RESET; gone when the session is destroyed |
-| missing-LSN latches | session construction (=false) | until a primary-sourced positioned RFQ clears them | survive RESET; gone when the session is destroyed |
+| missing-LSN flags | session construction (=false) | until a primary-sourced positioned RFQ clears them | survive RESET; gone when the session is destroyed |
 | `polardb_session_consistency.writer_scope` | session construction (`hg=-1`, `epoch=0`) | whole session | seeded on clean first PolarDB collect; attached by accepted result processing; updated on writer group or epoch reset |
+| `polardb_transaction_split` | session construction (stage NONE, no RFQ evidence) | transaction-split state | `reset()` clears stage, xids, primary LSN, and flags; split execution uses separate temporary fields for the temporary replica backend |
 | `polardb_query.reader_plan` | session construction (reset defaults) | one query | reset before routing, after targeted acquisition is handled, at query cleanup, and on RESET |
 | `polardb_query.wait` | session construction | one query | `.reset()` per query, on RESET, on failure, and at cleanup |
 | `polardb_query.wrapped_query_buf` | filled at wrap time (`Wrap.cpp:225`) | one wrapped read | `.clear()` on wrap failure / RESET (`Wrap.cpp:193,328`) |
@@ -670,10 +674,11 @@ to [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md).
 |------|-------|--------|--------|
 | `repl_config.reader_hostgroup` | `PgSQL_HostGroups_Manager.h:286` | **WRITE-ONLY** | Set at commit (`HGM.cpp:1837`) but never read; topology lookups use `polardb_writer_to_reader_` instead. |
 | `repl_config.check_type` | `PgSQL_HostGroups_Manager.h:289` | **WRITE-ONLY** | Set at commit (`HGM.cpp:1838`) but never read on the routing path. |
+| `repl_config.txn_split_enabled` / `PolarDB_HG_Policy::txn_split_enabled` | `PgSQL_HostGroups_Manager.h` | **PLANNER ONLY** | Persisted and published as a policy value; enables RFQ XID request/observation and lets the planner name split-readable routes. Execution still keeps the read on the primary. |
 | `repl_config.consistency_mode` (string) | `PgSQL_HostGroups_Manager.h:290` | **WRITE-ONLY** | Set at commit (`HGM.cpp:1839`); routing reads only the parsed `consistency_mode_enum`. |
-| `pgsql-polardb_lag_ms` knob + `pgsql_thread___polardb_lag_ms` | `PgSQL_Thread.h:1008`, `proxysql_structs.h:1144` | **DEFERRED (inert)** | A millisecond reader-lag cap with **no PgSQL producer**. PgSQL/PolarDB does not yet produce a real per-reader time-lag value. Marked TODO in source (`PgSQL_Thread.h:1008`, `proxysql_structs.h:1144`, registered with a TODO at `PgSQL_Thread.cpp:2417`). Do not treat it as a working routing gate. |
+| `pgsql-polardb_lag_ms` knob + `pgsql_thread___polardb_lag_ms` | `PgSQL_Thread.h:1008`, `proxysql_structs.h:1144` | **DEFERRED (inert)** | A millisecond reader-lag cap with **no PgSQL producer**. PgSQL/PolarDB does not yet produce a real per-reader time-lag value. Marked TODO in source (`PgSQL_Thread.h:1008`, `proxysql_structs.h:1144`, registered with a TODO at `PgSQL_Thread.cpp:2417`). Do not treat it as a working routing condition. |
 | `PolarDB_LSN_Stale_Count` counter | `PgSQL_HostGroups_Manager.h:683`, exported `PgSQL_Thread.cpp:4533` | **ACTIVE for byte-lag; ms-lag remains deferred** | Byte-lag enforcement increments this counter when a required primary/reader LSN sample is missing or stale. The separate millisecond-lag branch remains inside `POLARDB_PROXY_TODO` and has no producer. |
-| `polardb_lag_ms_within_cap()` helper | `PgSQL_PolarDB.h:544` | **DEFERRED (unused predicate)** | Header-inline predicate for the future ms-lag cap. Carries an explicit TODO at `PgSQL_PolarDB.h:536`: wire only after a real ms-lag producer exists. The supported byte-lag gate is the `PolarDB_Query_ReaderPlan::within_byte_cap()` member (`:1604`). |
+| `polardb_lag_ms_within_cap()` helper | `PgSQL_PolarDB.h:544` | **DEFERRED (unused predicate)** | Header-inline predicate for the future ms-lag cap. Carries an explicit TODO at `PgSQL_PolarDB.h:536`: wire only after a real ms-lag producer exists. The supported byte-lag check is the `PolarDB_Query_ReaderPlan::within_byte_cap()` member (`:1604`). |
 
 In-code deferral notes found in the current branch (these belong in
 [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md)):
@@ -688,7 +693,7 @@ In-code deferral notes found in the current branch (these belong in
   `PgSQL_HostGroups_Manager.cpp` — consistency-target reader acquisition
   prefers fresh cached readers already at or beyond the required LSN, but never
   rejects the original replica set merely because cached LSN is below target or
-  stale. The wait wrapper remains the correctness gate.
+  stale. The wait wrapper remains the correctness enforcement.
 - `PgSQL_Thread.h:1008`, `proxysql_structs.h:1144`, `PgSQL_Thread.cpp:2417` —
   `polardb_lag_ms` deferred, no producer.
 - `PgSQL_PolarDB_Flow.cpp:363,442` — the actual query wrapping is deferred from
@@ -723,7 +728,7 @@ flowchart TB
     CW["polardb_query_wrap_state"]
   end
   subgraph HG["PgSQL_HostGroups_Manager (SHARED)"]
-    HC["status: 26 exported counters + polardb_active condition"]
+    HC["status: 227 exported counters + polardb_active condition"]
     HM["topology maps (HGM wrlock)\n:1066-1068"]
     HR["PgSQL_HGC::repl_config (writer HGC)\n:284-294"]
     HS["PgSQL_SrvC::polardb_current_lsn / lsn_updated_at\n:227-228"]
@@ -761,13 +766,13 @@ sequenceDiagram
   participant N as PgSQL_Connection
   participant H as HGM
   participant B as PolarDB backend
-  Note over S: gate PgHGM->status.polardb_active (Session.cpp:2543)
+  Note over S: condition PgHGM->status.polardb_active (Session.cpp:2543)
   C->>S: read query
   S->>S: polardb_collect → RouteCtx (Flow.cpp:233)
   S->>S: polardb_plan → RoutePlan (Flow.cpp:410)
   S->>S: polardb_execute: consistency_target_lsn, WaitState=WAITING (Flow.cpp:658)
-  S->>H: backend acquisition (tl-cache or get_MyConn_polardb_reader)
-  opt selected reader already at target (tl-cache hit or wait_bypass_allowed)
+  S->>H: backend acquisition (get_MyConn_polardb_reader)
+  opt selected reader already at target (wait_bypass_allowed, from target-reached prefix)
     S->>S: reset_wait(); Wait_Wrap_Bypassed++ — wrapper skipped, bare query sent
   end
   S->>S: finalize_wait_timeout_injection: build wrapped query, unless bypassed (Wrap.cpp:303)

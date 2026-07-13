@@ -59,10 +59,10 @@ These are described, framed as future work, in `15-LIMITATIONS-AND-ROADMAP.md` a
 | Non-goal | Why out of scope here |
 |---|---|
 | **CSN (Commit Sequence Number) / global consistency** | A different consistency unit (commit counter, not WAL byte position) for cross-session consistency. **Experimental and incomplete** even in the full implementation: it requires PolarDB backend support, applies only in global-consistency mode, and its wait behavior is not reliably verified. Not present in this branch at all. |
-| **Transaction-split read offload** | Offloading reads issued *inside* an open transaction to a replica. Needs a state machine and a second backend connection. Not present (`PgSQL_PolarDB_Split.cpp` exists only in the full implementation). |
-| **General reader-failure recovery / retry** | RETRY / FORWARD / writer-loss handling when a replica fails mid-read inside a transaction. Not present. This branch has only the narrow autocommit wait-read retry foundation in `PgSQL_PolarDB_Failure.cpp`. |
+| **Advanced transaction-split extensions** | The branch ships simple-query transaction split, split counters, lazy warmup, and the common reader-failure policy. Advanced split-mode ranking, CSN integration, and circuit-breaker reader quarantine remain future work. |
+| **Extended reader-failure policies** | RETRY / FORWARD / TERMINATE is implemented for autocommit wait reads and simple-query split reads. Per-error-class policy tables, retry budgets, and reader circuit-breakers remain future work. |
 | **Extended-protocol RYW** | Wrapping Parse/Bind/Execute reads. Such reads are routed to the writer instead of running as unprotected replica reads. |
-| **Millisecond lag cap** | A time-based (vs byte-based) lag gate. The knob exists but is inert — see [§12](#12-status-implemented-vs-deferred). |
+| **Millisecond lag cap** | A time-based (vs byte-based) lag check. The knob exists but is inert — see [§12](#12-status-implemented-vs-deferred). |
 
 ---
 
@@ -77,7 +77,7 @@ Full detail is in `01-BACKGROUND-AND-DESIGN.md`. The short version:
 - It can **append the current WAL LSN to every ReadyForQuery (RFQ) message**. With a patched libpq, ProxySQL reads that LSN for free after each query (`lib/PgSQL_Connection.cpp:1349-1359`). No extra round-trip.
 - It honors a server setting, `polar_xact_split_wait_lsn`. When a read on a replica is preceded by `SET polar_xact_split_wait_lsn = '<target>'`, the replica blocks until it has replayed up to that LSN before running the read.
 
-**The wait-on-replica gate.** ProxySQL records each session's highest write LSN (`polardb_session_consistency.write_lsn`, `include/PgSQL_Session.h:505`). When that session next issues a replica-eligible read, ProxySQL prefixes the read with the `SET` that makes the replica wait for that LSN. The wait — not any LSN comparison inside ProxySQL — is the actual consistency guarantee. Any LSN check ProxySQL does on its own is only a **safety** filter (see [§11](#11-correctness-summary)).
+**The wait-on-replica condition.** ProxySQL records each session's highest write LSN (`polardb_session_consistency.write_lsn`, `include/PgSQL_Session.h:505`). When that session next issues a replica-eligible read, ProxySQL prefixes the read with the `SET` that makes the replica wait for that LSN. The wait — not any LSN comparison inside ProxySQL — is the actual consistency guarantee. Any LSN check ProxySQL does on its own is only a **safety** filter (see [§11](#11-correctness-summary)).
 
 **Two timeout modes.** The replica's wait can time out (it never catches up in time). `polar_consistency_mode` chooses the outcome:
 
@@ -132,7 +132,13 @@ A **hostgroup (HG)** is a numbered group of backend servers. A PolarDB pair link
                                 ▼  result (+ any captured notice) returned to client
 ```
 
-Cross-thread state (per-server LSN cache, topology maps, counters) lives on the **HostGroups Manager (HGM)**, the single object `PgHGM` that owns backend topology. Everything else (session fields, connection fields) is driven by one thread at a time and needs no locking. `POLARDB_STRUCTURES.md` is the full ownership and thread-safety reference; `POLARDB_STRUCTURE_DOMAIN_MAP.md` is the expanded map of how the structs compose and flow through the request path.
+Cross-thread state has two owners. The **HostGroups Manager (HGM)** owns topology,
+configuration snapshots, and process-wide counters. Each `PgSQL_SrvC` owns its
+FREE/USED connection lists, exact-key index, counts, and one pool mutex. Session
+state remains driven by one worker at a time. A selected connection may be retained
+by that worker for the current event-loop pass, but only after the server has been
+chosen. `POLARDB_STRUCTURES.md` is the full ownership reference, and
+`51-READERPOOL-TRANSFER-AND-LOCKING.md` describes the transfer and lock order.
 
 ---
 
@@ -142,7 +148,10 @@ This section maps the feature two ways. First as **domains** — subsystems grou
 
 ### The domains (subsystems)
 
-The LSN-only feature is nine domains. Six run inside one client session and are driven by a single thread at a time, so they need no locking. One domain (Monitor & HGM LSN state) is shared across threads and is the only place that uses atomics and a lock. Two domains (admin schema, build) are set up once and then only read.
+The feature is grouped into nine documentation domains. Six run inside one client
+session and are driven by one worker at a time. Shared state uses two lock levels:
+the HGM read/write lock for topology and per-server pool mutexes for connection
+list transfers. Two domains (admin schema and build) are set up once and then read.
 
 ```
 ┌──────────── PgSQL_Session  (one client; one driving thread; no locks) ─────────────┐
@@ -176,7 +185,7 @@ The LSN-only feature is nine domains. Six run inside one client session and are 
    │ doc 11                                                                          │
    └─────────────────────────────────────────┬───────────────────────────────────────┘
                                              │
- ══════════════════ shared across threads (PgHGM): atomics + one rwlock ══════════════════
+ ═════════ shared across threads: HGM rwlock + per-server pool mutexes + atomics ═════════
    ┌─────────────────────────── 7 Monitor & HGM LSN state ───────────────────────────────┐
    │ polardb_active condition • per-server LSN cache • topology maps • lag inputs • counters  │
    │ doc 05                                                                              │
@@ -197,35 +206,43 @@ The LSN-only feature is nine domains. Six run inside one client session and are 
 | 4 | Result processing & write tracking | Read the backend RFQ LSN once. Advance `polardb_session_consistency.write_lsn` on a write. Refresh the per-server LSN cache. The write/read heuristic. | `lib/PgSQL_PolarDB_Flow.cpp` (polardb_process_result), `lib/PgSQL_PolarDB.cpp` | per-session | `09-PUBLISH-AND-WRITE-TRACKING.md` |
 | 5 | Session orchestration | The four hook points, the unconditional per-query reset, and every call site into domains 1–4. | `lib/PgSQL_Session.cpp`, `include/PgSQL_Session.h` | per-session | `10-SESSION-INTEGRATION.md` |
 | 6 | Connection & libpq | Ask the backend to report its LSN (conninfo + `PQsetPolarSendLSN`). The inline SET-result filter. Read the RFQ LSN. | `lib/PgSQL_Connection.cpp`, `include/PgSQL_Connection.h`, the libpq patch | per-session (backend side) | `11-CONNECTION-AND-LIBPQ.md` |
-| 7 | Monitor & HGM LSN state | The `polardb_active` gate. The per-server LSN cache. Topology maps. Lag inputs. The stat counters. | `lib/PgSQL_HostGroups_Manager.cpp`, `include/PgSQL_HostGroups_Manager.h`, `lib/PgSQL_Monitor.cpp` | **shared** (atomics + one rwlock) | `05-MONITOR-AND-HGM-LSN-STATE.md` |
+| 7 | Monitor, HGM, and server-pool state | The `polardb_active` condition, topology snapshots, per-server LSN cache, exact-key FREE/USED ownership, lag inputs, and counters. | `lib/PgSQL_HostGroups_Manager.cpp`, `include/PgSQL_HostGroups_Manager.h`, `lib/PgSQL_PolarDB_ReaderPool.cpp`, `lib/PgSQL_Monitor.cpp` | **shared** (atomics, HGM rwlock, per-server pool mutex) | `05-MONITOR-AND-HGM-LSN-STATE.md`, `51-READERPOOL-TRANSFER-AND-LOCKING.md`, `99-GLOBAL-PIPELINE-AND-LOCKING.md` |
 | 8 | Admin schema & policy | The `pgsql_replication_hostgroups` columns. Three-tier config resolution. The thread-vars. Load / save / sync / disk-upgrade. | `lib/ProxySQL_Admin.cpp`, `include/ProxySQL_Admin_Tables_Definitions.h`, `include/proxysql_structs.h`, `lib/PgSQL_Thread.cpp`, `ProxySQL_Cluster/Config/Disk_Upgrade` | process-wide (set once) | `04-ADMIN-SCHEMA-AND-CONFIG.md` |
-| 9 | Build & compatibility | The `POLARDB_PROXY` toggle. The empty stub TU. The libpq RFQ-LSN patch. Both-tier byte-equivalence. | `Makefile`s, `lib/PgSQL_PolarDB_Stubs.cpp`, `deps/postgresql/polardb_libpq.patch`, guards in `include/PgSQL_PolarDB.h` | build / link time | `02-BUILD-TOGGLE-AND-LIBPQ.md` |
+| 9 | Build & compatibility | The `POLARDB_PROXY` toggle. The empty stub TU. The libpq RFQ-LSN patch. Both-tier byte-equivalence. | `Makefile`s, `lib/PgSQL_PolarDB_Stubs.cpp`, `deps/postgresql/polardb_libpq.patch`, checks in `include/PgSQL_PolarDB.h` | build / link time | `02-BUILD-TOGGLE-AND-LIBPQ.md` |
 
 ### How the domains connect
 
 - **A read flows through the per-session domains in order.** Session orchestration (5) calls the routing pipeline (1). For a replica-with-wait read, the pipeline hands wait intent to query wrapping (2); the connection (6) sends the wrapped query and filters out the prepended SET results; wait & notices (3) handle a best_effort timeout; result processing (4) records the result LSN. Orchestration (5) ties them together at exactly four hooks (see section 5).
-- **Only one domain is shared across threads.** Monitor & HGM LSN state (7) lives on the single `PgHGM` object and is read and written by many threads, so it is the only domain that uses atomics and a lock. Every per-session domain (1–6) is driven by one thread at a time and needs no locking.
-- **The boundary back into shared state is narrow.** The per-session domains *read* topology and cached LSNs from HGM (7); the only per-session domain that *writes* back into shared state is result processing (4), refreshing the per-server LSN cache. Keeping that boundary small is what makes the feature safe to reason about.
+- **Shared ownership is explicit.** HGM protects topology changes. A selected
+  server protects only its own FREE/USED transfer. The legal nested order is HGM
+  then server; server then HGM is forbidden.
+- **The query path keeps the shared boundary narrow.** Routing reads immutable
+  topology plus atomic server signals without a mutex. After server selection,
+  exact local reuse needs no mutex; a shared take/return uses only that server's
+  mutex. Result processing also refreshes the per-server LSN cache atomically.
 - **Two domains are foundations.** Admin schema & policy (8) and Build & compatibility (9) are set up once — at config load and at compile time — and then only read by the domains above.
-- **The full implementation has more domains.** The complete PolarDB implementation adds a transaction-split engine and a connection-warmup path, and a heavier notices/health surface. None of those are in the LSN-only tree; they are described as future work in [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md) and docs 18–21.
+- **The full implementation has more domains.** This tree carries the LSN route/wait path, simple-query transaction split, lazy split warmup, split counters, and common reader-failure policy. Advanced split ranking, CSN, retry budgets, and reader circuit-breaker quarantine remain future work in [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md) and docs 18–21.
 
-### The 9 dedicated files
+### The 12 dedicated files
 
-The feature is **9 dedicated files** plus `#if POLARDB_PROXY` blocks in a set of core files. Line counts should be treated as current-branch review aids, not stable API.
+The feature is **12 dedicated files** plus `#if POLARDB_PROXY` blocks in a set of core files. Line counts should be treated as current-branch review aids, not stable API.
 
 | File | Lines | One-line responsibility |
 |---|---:|---|
-| `include/PgSQL_PolarDB.h` | 1926 | All PolarDB types, enums, structs, the `PolarDB_Protocol` static-helper class, the header-inline deterministic helpers (`PolarDB_Query_WaitPlan::build_consistency`, `polardb_resolve_*`, lag-cap predicates), and the `POLARDB_TRACE` macro. |
-| `include/PgSQL_PolarDB_Counters.h` | 127 | The shared counter-metadata X-macro (`POLARDB_COUNTER_LIST`): the single source of truth for the 26 exported counters (19 thread-backed `T(...)` + 7 global-only `G(...)`), driving the SQL stats export, the per-thread counter slots, teardown folding, and Prometheus registration. |
+| `include/PgSQL_PolarDB.h` | 2476 | All PolarDB types, enums, structs, the `PolarDB_Protocol` static-helper class, the header-inline deterministic helpers (`PolarDB_Query_WaitPlan::build_consistency`, `polardb_resolve_*`, lag-cap predicates), and the `POLARDB_TRACE` macro. |
+| `include/PgSQL_PolarDB_Counters.h` | 250 | The shared counter-metadata X-macro (`POLARDB_COUNTER_LIST`): the single source of truth for the exported counters (190 thread-backed `T(...)` + 37 global-only `G(...)`), driving the SQL stats export, the per-thread counter slots, teardown folding, and Prometheus registration. |
+| `include/PgSQL_PolarDB_ReaderPool.h` | 171 | Declares the PolarDB reader-pool coordinator (`PgSQL_PolarDB_ReaderPool`), `PolarDB_ReaderResult`, and the split-warmup thread hooks used by exact-key reader selection. |
 | `lib/PgSQL_PolarDB.cpp` | 111 | PolarDB health-check parse (`parse_polardb_full_health_check`, delegating to `PolarDB_Protocol::parse_node_type` / `parse_is_available` / `parse_lsn_string`) and the write-vs-read query heuristic `PolarDB_Protocol::is_write_query`. |
-| `lib/PgSQL_PolarDB_Flow.cpp` | 1030 | The four pipeline stages `polardb_collect` / `polardb_plan` / `polardb_execute` / `polardb_process_result`, plus `polardb_reader_lag_plan()`, which attaches byte-lag inputs to the per-query reader plan. |
-| `lib/PgSQL_PolarDB_Consistency.cpp` | 62 | Thin helpers: `polardb_resolve_wait_timeout_ms`, `polardb_set_session_override`, `is_polardb_hostgroup` (delegates to HGM). |
-| `lib/PgSQL_PolarDB_Wrap.cpp` | 449 | Builds and installs the wait wrapper SQL (`finalize_wait_timeout_injection`, the single wrap point), plus wait-latency/timeout accounting and RESET cleanup. |
-| `lib/PgSQL_PolarDB_Notices.cpp` | 293 | Captures the `best_effort` wait-timeout WARNING/NOTICE and queues it to be forwarded ahead of the user's result. |
-| `lib/PgSQL_PolarDB_Failure.cpp` | 322 | The narrow autocommit wait-read retry foundation: capture a wait-wrapped read failure (`polardb_capture_wait_read_failure`), retry the original read on the writer after a strict LSN-wait timeout or reader connection loss (`polardb_retry_wait_read_on_writer`), and redirect to the writer HG (`polardb_redirect_to_writer`). |
-| `lib/PgSQL_PolarDB_Stubs.cpp` | 34 | Intentionally empty under `#if !POLARDB_PROXY`. Every PolarDB declaration and call site is guarded, so a `POLARDB_PROXY=0` build needs no link-time stub today (`PgSQL_PolarDB_Stubs.cpp:10-23`). |
+| `lib/PgSQL_PolarDB_Flow.cpp` | 1259 | The four pipeline stages `polardb_collect` / `polardb_plan` / `polardb_execute` / `polardb_process_result`, plus `polardb_reader_lag_plan()`, which attaches byte-lag inputs to the per-query reader plan. |
+| `lib/PgSQL_PolarDB_Consistency.cpp` | 109 | Thin helpers: `polardb_resolve_wait_timeout_ms`, `polardb_set_session_override`, and pre-planning cache safety helpers. |
+| `lib/PgSQL_PolarDB_Wrap.cpp` | 447 | Builds and installs the wait wrapper SQL (`finalize_wait_timeout_injection`, the single wrap point), plus wait-latency/timeout accounting and RESET cleanup. |
+| `lib/PgSQL_PolarDB_Notices.cpp` | 318 | Captures the `best_effort` wait-timeout WARNING/NOTICE and queues it to be forwarded ahead of the user's result. |
+| `lib/PgSQL_PolarDB_Failure.cpp` | 1236 | Common reader-failure policy: capture wait-read or split-read failures, classify timeout/death/reusable-error, and choose retry, forward, or terminate. Split connection-loss retry can try another compatible reader before writer fallback. |
+| `lib/PgSQL_PolarDB_Split.cpp` | 386 | Simple-query transaction split: prepare the split wait wrapper, take a replica connection from the pool for one in-transaction read, return it, restore the writer backend, and expose packet/wrapper helpers used by reader retry. |
+| `lib/PgSQL_PolarDB_ReaderPool.cpp` | 2441 | ReaderPool v2: exact-key reader selection inside the core pool, `get_MyConn_polardb_reader`, and the split-warmup coordinator. |
+| `lib/PgSQL_PolarDB_Stubs.cpp` | 34 | Intentionally empty under `#if !POLARDB_PROXY`. Every PolarDB declaration and call site is protected, so a `POLARDB_PROXY=0` build needs no link-time stub today (`PgSQL_PolarDB_Stubs.cpp:10-23`). |
 
-All seven `.cpp` files are registered in `lib/Makefile`. Deep-dive: `03-TYPES-AND-ENUMS.md` (types), `06-ROUTING-PIPELINE.md` (Flow), `07-QUERY-WRAPPING.md` (Wrap), `08-WAIT-TIMEOUT-AND-NOTICES.md` (Notices), `02-BUILD-TOGGLE-AND-LIBPQ.md` (Stubs).
+All eight PolarDB implementation `.cpp` files plus the stub file are registered in `lib/Makefile`. Deep-dive: `03-TYPES-AND-ENUMS.md` (types), `06-ROUTING-PIPELINE.md` (Flow), `07-QUERY-WRAPPING.md` (Wrap), `08-WAIT-TIMEOUT-AND-NOTICES.md` (Notices), `19-FUTURE-TXN-SPLIT-DESIGN.md` (Split), `02-BUILD-TOGGLE-AND-LIBPQ.md` (Stubs).
 
 ### Core files carrying `#if POLARDB_PROXY` blocks (integration points)
 
@@ -233,7 +250,7 @@ All seven `.cpp` files are registered in `lib/Makefile`. Deep-dive: `03-TYPES-AN
 |---|---|
 | `include/PgSQL_Session.h` | PolarDB session members + method declarations (`:476-534`). |
 | `include/PgSQL_Connection.h` | Per-connection wrap-state + LSN members and the documented wire-sequence comment. |
-| `include/PgSQL_HostGroups_Manager.h` | `status.polardb_active` gate, per-HG and per-server LSN cache, the 26 stat counters. |
+| `include/PgSQL_HostGroups_Manager.h` | `status.polardb_active` condition, per-HG and per-server LSN cache, and the status fields fed by the generated PolarDB counter metadata. |
 | `include/PgSQL_Query_Processor.h` | `replica_eligible` and `force_primary_hint` query-rule/QPO fields. |
 | `include/ProxySQL_Admin_Tables_Definitions.h` | Schema for `pgsql_replication_hostgroups` (the `polardb` `check_type` and LSN columns) at `:308`. |
 | `include/proxysql_structs.h` | The twelve `pgsql_thread___polardb_*` thread-local config variables. |
@@ -282,12 +299,12 @@ Detail: `11-CONNECTION-AND-LIBPQ.md`, `02-BUILD-TOGGLE-AND-LIBPQ.md`.
 
 ### HOOK 2 — route pipeline
 
-In `PgSQL_Session::get_pkts_from_client()`, gated by `PgHGM->status.polardb_active`. It unconditionally resets the per-query LSN target, skips the pipeline for manual routing, then runs `collect → plan → execute` and overwrites `current_hostgroup`.
+In `PgSQL_Session::get_pkts_from_client()`, enabled by `PgHGM->status.polardb_active`. It unconditionally resets the per-query LSN target, skips the pipeline for manual routing, then runs `collect → plan → execute` and overwrites `current_hostgroup`.
 
 | Step | file:line |
 |---|---|
 | Per-query reset of `polardb_query.reader_plan.consistency_target_lsn` | `lib/PgSQL_Session.cpp:2532` |
-| Gate on `polardb_active` | `lib/PgSQL_Session.cpp:2543` |
+| condition on `polardb_active` | `lib/PgSQL_Session.cpp:2543` |
 | Manual-mode skip (`replica_eligible == -1` and a rule set a destination HG) | `lib/PgSQL_Session.cpp:2546-2551` |
 | `polardb_collect(...)` | `lib/PgSQL_Session.cpp:2554` |
 | `polardb_plan(...)` | `lib/PgSQL_Session.cpp:2556` |
@@ -314,7 +331,7 @@ In `PgSQL_Session::RequestEnd()` on the success path (`called_on_failure == fals
 
 | Step | file:line |
 |---|---|
-| Guard + call | `lib/PgSQL_Session.cpp` (call at `:6103`). |
+| check + call | `lib/PgSQL_Session.cpp` (call at `:6103`). |
 
 Detail: `09-PUBLISH-AND-WRITE-TRACKING.md`.
 
@@ -329,7 +346,7 @@ This is the core of the feature. There are four stages, all methods of `PgSQL_Se
 | collect | `polardb_collect()` `Flow.cpp:233` | May clear stale session LSN state after writer-epoch change | Snapshot every routing input into `PolarDB_Query_RouteCtx`. |
 | plan | `polardb_plan()` `Flow.cpp:410` | None (reads HGM only for the lag cap) | Decide PASSTHROUGH / FORCE_PRIMARY / REPLICA_WITH_WAIT into `PolarDB_Query_RoutePlan`. |
 | execute | `polardb_execute()` `Flow.cpp:658` | Yes — sets the target HG and prepares the wait state | Apply the decision. For REPLICA_WITH_WAIT, snapshot the query and prepare the wait. |
-| process_result | `polardb_process_result()` | Yes — advances session write/observed LSN state and latches | On a positioned RFQ, advance observed LSN; on a positioned write, advance write LSN; maintain missing-LSN latches; refresh the per-server LSN cache. |
+| process_result | `polardb_process_result()` | Yes — advances session write/observed LSN state and flags | On a positioned RFQ, advance observed LSN; on a positioned write, advance write LSN; maintain missing-LSN flags; refresh the per-server LSN cache. |
 
 ```
  REQUEST PATH                                                      RESPONSE PATH
@@ -382,7 +399,7 @@ Four common flows. Full step-by-step traces with the exact GUCs emitted and the 
 
 ### Flow A — no-PolarDB passthrough
 
-No PolarDB HG is configured, so the single atomic gate is false and the entire pipeline is skipped.
+No PolarDB HG is configured, so the single atomic condition is false and the entire pipeline is skipped.
 
 ```
 client 'Q' ──► get_pkts_from_client()
@@ -415,7 +432,7 @@ READ (replica_eligible, autocommit, simple query):
    execute()  → current_hostgroup = reader_hg
               → prepare wait state, snapshot query        Flow.cpp:714-728
    backend acquisition:
-     ├─ reader already at L (thread-local cache hit, or acquired from the
+     ├─ reader already at L (acquired from the
      │    target-reached prefix → wait_bypass_allowed):
      │      reset_wait(); Wait_Wrap_Bypassed++
      │      → wrapper SKIPPED, the bare <user SELECT> goes to the reader
@@ -481,20 +498,21 @@ Full detail in `04-ADMIN-SCHEMA-AND-CONFIG.md`. Two configuration surfaces feed 
 
 ### Per-hostgroup-pair: `pgsql_replication_hostgroups`
 
-The PolarDB build (`POLARDB_PROXY=1`) uses the LSN-only eight-column `V3_0_4` schema; it is wider than the upstream/non-PolarDB `V3_0_2` schema only because it adds the PolarDB LSN policy columns plus `proxy_protocol`.
+The PolarDB build (`POLARDB_PROXY=1`) uses the nine-column `V3_0_5` schema; it is wider than the upstream/non-PolarDB `V3_0_2` schema because it adds the PolarDB LSN policy columns, `proxy_protocol`, and a `txn_split_enabled` switch that requests/observes transaction XID RFQs for transaction split reads.
 
 | Column | Type / allowed values | Default | Meaning |
 |---|---|---|---|
 | `writer_hostgroup` | INT `>= 0`, PRIMARY KEY | — | Writer (primary) HG id. |
 | `reader_hostgroup` | INT `<> writer`, `>= 0`, UNIQUE | — | Reader (replica) HG id. |
 | `check_type` | VARCHAR in `('read_only','polardb')` | `'read_only'` | `'polardb'` turns the pair into a PolarDB pair; only then do the LSN columns apply. |
+| `txn_split_enabled` | INT in `(0,1)`, and `1` only for `check_type='polardb'` | `0` | Transaction-split switch; requests/observes RFQ XID data and allows one split-readable transaction read to take a replica connection from the pool. |
 | `consistency_mode` | VARCHAR in `('default','off','lsn','primary')` | `'default'` | Per-HG policy; `'default'` defers to the global knob. |
 | `max_lag_bytes` | INT | `-1` | Per-HG reader byte-lag cap; `-1` = inherit global, `0` = off, `> 0` = cap. |
 | `lsn_wait_timeout_ms` | INT | `-1` | Per-HG wait timeout (ms); `-1` = inherit global, `0` = wait indefinitely, `> 0` = explicit. |
 | `proxy_protocol` | VARCHAR in `('default','v15','legacy','off')` | `'default'` | Per-HG startup protocol; `'default'` inherits the global knob. |
 | `comment` | VARCHAR | `''` | Free text. |
 
-The full implementation's CSN/split schema items (`txn_split_enabled`, and the `csn`/`session`/`global` consistency values) are **not part of this feature's V3_0_4**. Reintroducing them requires a later coordinated schema version and migration, not a reinterpretation of V3_0_4 — see `04-ADMIN-SCHEMA-AND-CONFIG.md`.
+The full implementation's CSN consistency values (`csn`/`session`/`global`) are **not part of this feature's V3_0_5**. `txn_split_enabled` is stored, published, used for RFQ XID observation, and read by the planner; split-read dispatch remains future work — see `04-ADMIN-SCHEMA-AND-CONFIG.md`.
 
 ### Global: the `pgsql-polardb_*` admin variables
 
@@ -537,11 +555,11 @@ The wait timeout resolves in two tiers (per-HG, then global; no session tier) vi
 
 ## 9. Observability at a glance
 
-There are **26 exported stat counters + 1 internal `polardb_active` gate**. The
-gate is a boolean, not a counter. The exported counter names are stable SQL
-rows. Internally, 19 thread-backed counters use per-thread storage plus a global
+There are **227 exported stat counters + 1 internal `polardb_active` condition**. The
+condition is a boolean, not a counter. The exported counter names are stable SQL
+rows. Internally, 190 thread-backed counters use per-thread storage plus a global
 counter: a PolarDB-local `stvar[]` slot on `PgSQL_Thread` plus the matching
-`PgHGM->status.polardb_*` global counter. The 7 global-only counters remain global
+`PgHGM->status.polardb_*` global counter. The 37 global-only counters remain global
 atomics. Worker teardown folds the per-thread slots into the global counters so
 shutdown-time scrapes and any future worker lifecycle changes keep monotonic
 totals.
@@ -563,8 +581,8 @@ Full per-counter semantics, lockstep partners, and operator interpretation are i
 | `PolarDB_Wait_Error_Timeout` | `Wrap.cpp:298` | RYW waits are timing out (replicas can't catch up in time). |
 | `PolarDB_Wait_Error_LSN_Wait_Timeout` | `Wrap.cpp:300` | The LSN subset of the timeout total. Equals `Wait_Error_Timeout` in this implementation (LSN is the only wait type). |
 | `PolarDB_Wait_Error_Connection_Lost` | dispatch error handling | A wait-wrapped reader lost its backend connection before any user result reached the client. |
-| `PolarDB_LSN_Stale_Count` | reader acquisition | Active for byte-lag enforcement. It increments when an enabled `max_lag_bytes` check sees missing or stale primary/reader LSN state. The deferred millisecond-lag branch is still guarded by `POLARDB_PROXY_TODO`. |
-| `PolarDB_Write_Missing_LSN` | process_result | Writer query completed without RFQ LSN; later automatic LSN-mode reads in that session follow `route_rfq_policy` until a primary-sourced RFQ clears the latch. |
+| `PolarDB_LSN_Stale_Count` | reader acquisition | Active for byte-lag enforcement. It increments when an enabled `max_lag_bytes` check sees missing or stale primary/reader LSN state. The deferred millisecond-lag branch is still protected by `POLARDB_PROXY_TODO`. |
+| `PolarDB_Write_Missing_LSN` | process_result | Writer query completed without RFQ LSN; later automatic LSN-mode reads in that session follow `route_rfq_policy` until a primary-sourced RFQ clears the flag. |
 | `PolarDB_Read_Missing_LSN` | process_result | Tracked SESSION_LSN read completed without RFQ LSN. |
 | `PolarDB_Primary_LSN_Unknown` | plan | Primary baseline requested but the primary mirror had no LSN. |
 | `PolarDB_RFQ_Best_Effort_Degraded_Routes` | plan | Best-effort policy allowed a degraded reader route without a wait target. |
@@ -572,10 +590,9 @@ Full per-counter semantics, lockstep partners, and operator interpretation are i
 | `PolarDB_Wait_Reads_Retried_On_Writer` | dispatch error handling | A wait-wrapped reader query was retried once on the writer after strict wait timeout or reader connection loss, before any user result reached the client. |
 | `PolarDB_RFQ_Profile_Skipped` | pool selection | Pooled connection skipped because its startup profile did not request RFQ LSN. |
 | `PolarDB_RFQ_Profile_Evicted` | pool selection | Incompatible free pooled connections evicted to make room for RFQ-LSN-capable replacements. |
-| `PolarDB_TL_Cache_Bypassed_For_Target` | pool selection | Targeted read bypassed the thread-local backend cache so route-smart selection could enforce RFQ/profile requirements. |
 | `PolarDB_Target_LSN_Preferred` | reader acquisition | Fresh cached reader at or beyond the target was preferred and acquired. |
 | `PolarDB_Target_LSN_Fallback_Wait` | reader acquisition | Acquisition fell back to the full weighted candidate set and relied on the wait wrapper. |
-| `PolarDB_Session_Target_Epoch_Reset` | collect/process_result | At least one session LSN target or missing-LSN latch was discarded after the session writer group or epoch changed. |
+| `PolarDB_Session_Target_Epoch_Reset` | collect/process_result | At least one session LSN target or missing-LSN flag was discarded after the session writer group or epoch changed. |
 | `PolarDB_Monitor_Health_Invalid_Role` | `Monitor.cpp:838` | Monitor health rows reported a role ProxySQL cannot route to (including POLAR_UNKNOWN / POLAR_STANDALONE_DATAMAX); a topology or backend-config problem the monitor is rejecting. |
 | `PolarDB_Monitor_Health_Invalid_Values` | `Monitor.cpp:842` | Monitor health rows had an invalid availability or LSN text field; the monitor could not parse the health probe result. |
 
@@ -589,7 +606,7 @@ Full detail in `02-BUILD-TOGGLE-AND-LIBPQ.md`.
 
 ### The build toggle
 
-The whole feature is gated by one make variable, default ON:
+The whole feature is enabled by one make variable, default ON:
 
 ```
 POLARDB_PROXY ?= 1      # Makefile:149
@@ -600,7 +617,7 @@ Build with `make POLARDB_PROXY=0` to compile the feature out. The flag becomes t
 ### Both tiers stay equivalent
 
 - Every PolarDB declaration and every core call site is wrapped in `#if POLARDB_PROXY`. With `POLARDB_PROXY=0` the five feature translation units compile to empty objects.
-- `lib/PgSQL_PolarDB_Stubs.cpp` is the place for any link-time no-op stub, but it is intentionally empty today: because both declarations and call sites are guarded, the `POLARDB_PROXY=0` build has no unguarded symbol to stub (`lib/PgSQL_PolarDB_Stubs.cpp:10-23`).
+- `lib/PgSQL_PolarDB_Stubs.cpp` is the place for any link-time no-op stub, but it is intentionally empty today: because both declarations and call sites are protected, the `POLARDB_PROXY=0` build has no unguarded symbol to stub (`lib/PgSQL_PolarDB_Stubs.cpp:10-23`).
 - The schema and the table-load SELECT also branch on `POLARDB_PROXY`, so the non-PolarDB build keeps the exact upstream column shape.
 
 > Note: byte-equivalence of the `POLARDB_PROXY=0` build to upstream is the documented in-code contract (`PgSQL_PolarDB_Stubs.cpp:10-23`), grounded in source reading, not a build+diff performed for this doc.
@@ -615,17 +632,17 @@ What the patch adds:
 - New `struct pg_conn` runtime fields and a set of connection-string options, including `_polar_send_lsn`.
 - A change to `getReadyForQuery()` that, after the normal RFQ parse, reads a network-order 64-bit LSN if `polar_proxy_send_lsn` is set and at least 8 bytes remain, then skips any unparsed trailing bytes (`conn->inCursor = msg_end`). That boundary check is the documented fix for the extended-protocol length mismatch.
 
-**Deployment consequence:** RYW requires both a genuine PolarDB backend (that appends the LSN) and the patched libpq (that reads it). Without them the feature degrades safely: result processing cannot advance `polardb_session_consistency.write_lsn` / `.observed_lsn`, and missing-LSN events are handled by latches plus `route_rfq_policy`. See `17-OPERATOR-GUIDE.md`.
+**Deployment consequence:** RYW requires both a genuine PolarDB backend (that appends the LSN) and the patched libpq (that reads it). Without them the feature degrades safely: result processing cannot advance `polardb_session_consistency.write_lsn` / `.observed_lsn`, and missing-LSN events are handled by flags plus `route_rfq_policy`. See `17-OPERATOR-GUIDE.md`.
 
 ---
 
 ## 11. Correctness summary
 
-Full proofs and the failure-mode catalogue are in `14-INVARIANTS-AND-FAILURE-MODES.md`. The key points:
+Full checks and the failure-mode catalogue are in `14-INVARIANTS-AND-FAILURE-MODES.md`. The key points:
 
 **The RYW guarantee.** After a session writes (and the write's RFQ carried an LSN), every later autocommit, simple-query, replica-eligible read from that same session sees that write. It holds because the read is sent to the replica with `SET polar_xact_split_wait_lsn = '<polardb_session_consistency.target()>'`, and the replica blocks until it has replayed past that LSN before answering. **Preconditions:** a patched libpq and a genuine PolarDB backend.
 
-**The single most important point.** The wait `SET` — run on the replica — is the default consistency gate. ProxySQL may skip that `SET` only after backend acquisition binds the query to a specific reader whose fresh cached LSN is already at or beyond the same consistency target. Fallback readers still use the backend wait. The byte-lag cap remains a safety-only bound: it keeps reads off a replica that is so far behind the wait would likely time out.
+**The single most important point.** The wait `SET` — run on the replica — is the default consistency condition. ProxySQL may skip that `SET` only after backend acquisition binds the query to a specific reader whose fresh cached LSN is already at or beyond the same consistency target. Fallback readers still use the backend wait. The byte-lag cap remains a safety-only bound: it keeps reads off a replica that is so far behind the wait would likely time out.
 
 **Safe writer fallback.** When anything is uncertain, the read goes to the writer, which is always consistent, instead of risking a stale replica read. Every safe fallback path:
 
@@ -653,17 +670,17 @@ Full proofs and the failure-mode catalogue are in `14-INVARIANTS-AND-FAILURE-MOD
 |---|---|---|
 | LSN session RYW (autocommit, simple query) | **Implemented** | The core feature. `06`, `07`, `08`, `09`. |
 | `best_effort` / `strict` timeout modes | **Implemented** | Structured-marker detection. `08-WAIT-TIMEOUT-AND-NOTICES.md`. |
-| Byte-lag safety cap (`polardb_lag_bytes` / `max_lag_bytes`) | **Implemented** | Safety only, not the gate. `05`, `06`. |
+| Byte-lag safety cap (`polardb_lag_bytes` / `max_lag_bytes`) | **Implemented** | Safety only, not the condition. `05`, `06`. |
 | Per-server LSN cache (RFQ + monitor) | **Implemented** | `05-MONITOR-AND-HGM-LSN-STATE.md`. |
-| Consistency-target reader preference | **Implemented** | Readers with fresh cached LSN `>= consistency_target_lsn` are preferred first; fallback keeps the full weighted reader set and the wait wrapper remains the correctness gate. `06`, `12`. |
-| 26 stat counters + `polardb_active` gate | **Implemented** | SQL and Prometheus exposure; `polardb_active` is internal only. `12-THREADVARS-AND-OBSERVABILITY.md`. |
+| Consistency-target reader preference | **Implemented** | Readers with fresh cached LSN `>= consistency_target_lsn` are preferred first; fallback keeps the full weighted reader set and the wait wrapper remains the correctness enforcement. `06`, `12`. |
+| Generated PolarDB stat counters + `polardb_active` condition | **Implemented** | SQL and Prometheus exposure are driven by `include/PgSQL_PolarDB_Counters.h`; `polardb_active` is internal only. `12-THREADVARS-AND-OBSERVABILITY.md`. |
 | Compile toggle + libpq RFQ-LSN patch | **Implemented** | `02-BUILD-TOGGLE-AND-LIBPQ.md`. |
 | **Millisecond lag cap** (`polardb_lag_ms`) | **DEFERRED / inert** | Runtime accepts only `0`; no producer and no routing effect. The helper `polardb_lag_ms_within_cap()` is explicitly "wire only after a real producer exists" (`include/PgSQL_PolarDB.h:533-547`; header note `:504-507`; knob `include/PgSQL_Thread.h:1008`; per-server note `include/PgSQL_HostGroups_Manager.h:220-222`). |
 | **`PolarDB_LSN_Stale_Count`** | **ACTIVE for byte-lag; ms-lag deferred** | Increments when an enabled `max_lag_bytes` check cannot trust a primary or reader LSN sample. The millisecond-lag producer remains deferred. |
-| Hard caught-up reader-acquisition gate | **Not implemented by design** | ProxySQL does not reject the original reader set solely because cached LSN is below target; the wait SET is the gate. |
+| Hard caught-up reader-acquisition condition | **Not implemented by design** | ProxySQL does not reject the original reader set solely because cached LSN is below target; the wait SET is the condition. |
 | CSN / global consistency | **Future (not in branch)** | **Experimental, incomplete**; needs PolarDB backend support; global-mode only; wait behavior not reliably verified. `18-FUTURE-CSN-DESIGN.md`. |
-| Transaction-split read offload | **Future (not in branch)** | `19-FUTURE-TXN-SPLIT-DESIGN.md`. |
-| Reader-failure recovery / retry | **Future (not in branch)** | `20-FUTURE-READER-FAILURE-RETRY-DESIGN.md`. |
+| Transaction-split read offload | **Implemented** | Route/state, xact RFQ libpq surface, stored per-HG config, primary RFQ evidence collection, split-read dispatch, split counters, and lazy warmup exist. CSN integration and advanced split ranking remain future work. `19-FUTURE-TXN-SPLIT-DESIGN.md`. |
+| Reader-failure recovery / retry | **Implemented for wait reads and split reads** | Common policy chooses RETRY/FORWARD/TERMINATE. Wait reads retry on the writer. Split connection-loss retry first tries another compatible reader, then falls back to the writer; wait timeouts retry on the writer to avoid a second tail timeout. `20-FUTURE-READER-FAILURE-RETRY-DESIGN.md`. |
 | Extended-protocol RYW | **Future (not in branch)** | No wait wrapper in this implementation; manual reader routes are honored, automatic reads without a prior write LSN may use reader, and automatic reads after a known write/observed LSN target or unknown RFQ target use writer. |
 | Cancel-session metadata | **Not present** | Future PolarDB15 extension; this implementation keeps no inert session-id/cancel-key state. |
 
@@ -699,7 +716,7 @@ Key entry points to jump to:
 | Notice hook | `lib/PgSQL_Connection.cpp:2558-2563` → `lib/PgSQL_PolarDB_Notices.cpp:97` |
 | Process-result hook (HOOK 4) | `lib/PgSQL_Session.cpp` |
 | Connect/enable (HOOK 1) | `lib/PgSQL_Connection.cpp:1204-1221`, `:1325/:1335`; `lib/PgSQL_Session.cpp:5696/5710` |
-| `polardb_active` gate set | `lib/PgSQL_HostGroups_Manager.cpp:1864` |
+| `polardb_active` condition set | `lib/PgSQL_HostGroups_Manager.cpp:1864` |
 | Counters | `include/PgSQL_HostGroups_Manager.h:677-714` |
 | Schema | `include/ProxySQL_Admin_Tables_Definitions.h:308` |
 
@@ -719,7 +736,7 @@ The authoritative glossary is in `01-BACKGROUND-AND-DESIGN.md`. One term per con
 | **RYW (read-your-writes)** | After a session writes, its own later reads see that write, even on a replica. |
 | **RFQ (ReadyForQuery)** | The PostgreSQL message a backend sends after each command. Patched PolarDB libpq appends the WAL LSN to it. |
 | **wait wrapper** | The `SET` statements ProxySQL prepends to a replica-eligible read so the replica waits for the target LSN. The same concept; not called "wrap" elsewhere. |
-| **process_result** | The response-path step that reads the RFQ LSN, advances session write/observed LSNs, maintains missing-LSN latches, and refreshes per-server cache state. |
+| **process_result** | The response-path step that reads the RFQ LSN, advances session write/observed LSNs, maintains missing-LSN flags, and refreshes per-server cache state. |
 | **CSN (Commit Sequence Number)** | A future, experimental commit counter for cross-session consistency. Not in this branch. |
 | **GUC** | A PostgreSQL server setting changed with `SET name = value`. |
 
@@ -734,10 +751,10 @@ This document is the entry point. The set is organized as: three self-contained 
 | `POLARDB_STRUCTURES.md` | Every struct, enum, field, and counter: ownership, lifecycle, thread-safety. The data reference. |
 | `POLARDB_STRUCTURE_DOMAIN_MAP.md` | Structure relationships: ownership roots, shared leaf values, suffix vocabulary, per-query flow, and normalization audit. |
 | `01-BACKGROUND-AND-DESIGN.md` | The RYW problem, PolarDB's LSN mechanism, why LSN-only first, design principles, glossary. |
-| `02-BUILD-TOGGLE-AND-LIBPQ.md` | `POLARDB_PROXY` gating, the empty stub TU, the libpq RFQ-LSN patch surface. |
+| `02-BUILD-TOGGLE-AND-LIBPQ.md` | `POLARDB_PROXY` controlling, the empty stub TU, the libpq RFQ-LSN patch surface. |
 | `03-TYPES-AND-ENUMS.md` | All `PgSQL_PolarDB.h` enums, structs, and constants. |
 | `04-ADMIN-SCHEMA-AND-CONFIG.md` | The `pgsql_replication_hostgroups` schema, the knobs, the three-tier resolution. |
-| `05-MONITOR-AND-HGM-LSN-STATE.md` | Per-server LSN cache, topology maps, lag cap, freshness gate. |
+| `05-MONITOR-AND-HGM-LSN-STATE.md` | Per-server LSN cache, topology maps, lag cap, freshness condition. |
 | `06-ROUTING-PIPELINE.md` | The collect/plan/execute pipeline and the full decision matrix (the most important part). |
 | `07-QUERY-WRAPPING.md` | The wait-wrapper SQL, the single wrap point, the consume loop. |
 | `08-WAIT-TIMEOUT-AND-NOTICES.md` | best_effort WARNING vs strict ERROR, structured-marker detection, accounting de-dup. |
@@ -746,7 +763,7 @@ This document is the entry point. The set is organized as: three self-contained 
 | `11-CONNECTION-AND-LIBPQ.md` | conninfo, RFQ accessors, `dispatch_state`, the wrap-state filter, the notice receiver. |
 | `12-THREADVARS-AND-OBSERVABILITY.md` | Thread-local knobs + every counter with full semantics + stats exposure. |
 | `13-QUERY-LIFECYCLE-AND-TRACES.md` | Stage-by-stage trace + worked scenarios T1–T6 with state snapshots. |
-| `14-INVARIANTS-AND-FAILURE-MODES.md` | The RYW guarantee, safe fallback proofs, the failure catalogue. |
+| `14-INVARIANTS-AND-FAILURE-MODES.md` | The RYW guarantee, safe fallback checks, the failure catalogue. |
 | `15-LIMITATIONS-AND-ROADMAP.md` | Out-of-scope items, deferred knobs, the status matrix, the path to v2. |
 | `16-TESTING-AND-VALIDATION.md` | The libpq smoke test, the integration suite, the RYW invariants to assert, CI gaps. |
 | `17-OPERATOR-GUIDE.md` | Deployment requirements, config recipes, troubleshooting by counter/log. |
@@ -766,9 +783,9 @@ These render the same diagrams from the body, for viewers (e.g. GitHub) that sho
 ```mermaid
 flowchart TD
     C[Client] -->|'Q' query| GPC[get_pkts_from_client]
-    GPC --> GATE{polardb_active?<br/>Session.cpp:2563}
-    GATE -- no --> FB[find_or_create_backend<br/>normal routing]
-    GATE -- yes --> PIPE[Route pipeline HOOK 2<br/>collect -> plan -> execute<br/>Flow.cpp:233/410/658]
+    GPC --> condition{polardb_active?<br/>Session.cpp:2563}
+    condition -- no --> FB[find_or_create_backend<br/>normal routing]
+    condition -- yes --> PIPE[Route pipeline HOOK 2<br/>collect -> plan -> execute<br/>Flow.cpp:233/410/658]
     PIPE --> FB
     FB --> H1[Backend attach HOOK 1<br/>profile-driven startup params<br/>+ conditional PQsetPolarSendLSN<br/>when REQUEST_RFQ_LSN requested]
     H1 --> WRAP[ASYNC_IDLE: finalize_wait_timeout_injection<br/>single wrap point<br/>skipped when reader already at target<br/>Wait_Wrap_Bypassed<br/>Session.cpp:3607 -> Wrap.cpp:303]
@@ -834,7 +851,7 @@ flowchart TD
     W -- no --> PR[PASSTHROUGH reader, no wait]
     W -- yes --> RW[REPLICA_WITH_WAIT plan<br/>reader acquisition enforces cap/status]
     RW --> ACQ{reader acquired?}
-    ACQ -- yes --> AT{from target-reached<br/>prefix or tl-cache hit?}
+    ACQ -- yes --> AT{from target-reached<br/>prefix? (wait_bypass_allowed)}
     AT -- yes --> BYP[reader, wrapper bypassed<br/>Wait_Wrap_Bypassed]
     AT -- no --> SEND[reader + LSN wait<br/>Target_LSN_Fallback_Wait]
     ACQ -- safety status --> FP6[one-query writer fallback]
@@ -854,7 +871,7 @@ sequenceDiagram
     Note over Se: process_result: polardb_session_consistency.write_lsn = max(0,L) = L (Flow.cpp:944-949)
     Cl->>Se: READ (replica_eligible, autocommit)
     Note over Se: plan -> REPLICA_WITH_WAIT target=L (Flow.cpp:599-603)
-    alt acquired reader already at L (tl-cache hit or wait_bypass_allowed)
+    alt acquired reader already at L (wait_bypass_allowed, from target-reached prefix)
         Note over Se: reset_wait(); Wait_Wrap_Bypassed++ — wrapper skipped
         Se->>Rd: bare user SELECT (no SETs)
         Rd-->>Se: rows (reader already at L)
