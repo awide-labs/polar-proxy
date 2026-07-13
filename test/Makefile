@@ -38,7 +38,7 @@ POLARDB_SYSBENCH_POLAR_RFQ := $(POLARDB_HELPER_BIN_DIR)/sysbench-polar-rfq
 POLARDB_SYSBENCH_POLAR_RFQ_DIR := $(POLARDB_HELPER_BIN_DIR)/sysbench-polar-rfq.d
 POLARDB_SYSBENCH_POLAR_RFQ_SCRIPT := $(POLARDB_SYSBENCH_POLAR_RFQ_DIR)/sysbench_lsn_consistency.lua
 POLARDB_SYSBENCH_POLAR_RFQ_LUA_DIR := $(POLARDB_SYSBENCH_POLAR_RFQ_DIR)/lua
-POLARDB_SYSBENCH_POLAR_RFQ_SRC_DIR := ../deps/sysbench-polar-rfq
+POLARDB_SYSBENCH_POLAR_RFQ_SRC_DIR ?= ../deps/sysbench-polar-rfq
 DEPS_SYSBENCH_POLAR_RFQ := $(POLARDB_SYSBENCH_POLAR_RFQ_SRC_DIR)/src/sysbench
 POLARDB_C_HELPERS := \
 	$(POLARDB_HELPER_BIN_DIR)/libpq_lsn_test \
@@ -122,7 +122,13 @@ polardb-pgbench-polar-rfq: $(POLARDB_PGBENCH_POLAR_RFQ)
 	@nm "$(POLARDB_PGBENCH_POLAR_RFQ)" 2>/dev/null | grep -q ' PQgetLSN$$' || { echo "pgbench does not contain PQgetLSN"; exit 1; }
 
 $(DEPS_SYSBENCH_POLAR_RFQ): check-polardb-libpq
-	@test -d "$(POLARDB_SYSBENCH_POLAR_RFQ_SRC_DIR)" || { echo "Missing sysbench RFQ-LSN submodule: $(POLARDB_SYSBENCH_POLAR_RFQ_SRC_DIR)"; exit 1; }
+	@test -x "$(POLARDB_SYSBENCH_POLAR_RFQ_SRC_DIR)/autogen.sh" || { \
+		echo "Optional sysbench RFQ-LSN source is not initialized: $(POLARDB_SYSBENCH_POLAR_RFQ_SRC_DIR)"; \
+		echo "The ProxySQL and PolarDB builds do not require it."; \
+		echo "To build the optional sysbench tool, run from the repository root:"; \
+		echo "  git submodule update --init --checkout deps/sysbench-polar-rfq"; \
+		exit 1; \
+	}
 	cd "$(POLARDB_SYSBENCH_POLAR_RFQ_SRC_DIR)" && ./autogen.sh
 	cd "$(POLARDB_SYSBENCH_POLAR_RFQ_SRC_DIR)" && \
 		CPPFLAGS="-I$(POLARDB_LIBPQ_DIR) -I$(POLARDB_POSTGRESQL_SRC)/include $${CPPFLAGS:-}" \

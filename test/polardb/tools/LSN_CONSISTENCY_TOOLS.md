@@ -209,7 +209,16 @@ required. Pgbench custom workloads are ordinary SQL script files passed with
 
 ## sysbench Lua Check
 
-The sysbench check uses the `sysbench-polar-rfq` submodule binary by default.
+The sysbench check uses the optional `sysbench-polar-rfq` submodule binary by
+default. Normal ProxySQL builds, PolarDB builds, and test-helper builds do not
+require this submodule. It is skipped by default during recursive submodule
+initialization because its repository may not be available to every clone.
+
+Initialize it only when the native sysbench RFQ-LSN check is needed:
+
+```bash
+git submodule update --init --checkout deps/sysbench-polar-rfq
+```
 This native mode is required for repository validation. Set
 `SYSBENCH_RFQ_MODE=preload` only when diagnosing an unmodified system sysbench
 with `LD_PRELOAD` tracing.
