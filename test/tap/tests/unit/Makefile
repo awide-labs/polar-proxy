@@ -14,6 +14,11 @@ PROXYSQL_PATH := $(shell while [ ! -f ./src/proxysql_global.cpp ]; do cd ..; don
 include $(PROXYSQL_PATH)/include/makefiles_vars.mk
 include $(PROXYSQL_PATH)/include/makefiles_paths.mk
 
+POLARDB_PROXY ?= 1
+POLARDB_PROFILE ?= 0
+ifeq ($(POLARDB_PROXY),1)
+override PROXYSQLCLICKHOUSE := 0
+endif
 
 # ===========================================================================
 # Include directories — mirrors test/tap/tests/Makefile
@@ -150,9 +155,11 @@ STATIC_LIBS := $(CITYHASH_LDIR)/libcityhash.a \
 
 # ClickHouse library: auto-detect if built (always built in current builds)
 # Append LZ4/ZSTD again after ClickHouse to resolve its dependencies
+ifeq ($(PROXYSQLCLICKHOUSE),1)
 ifneq ($(wildcard $(CLICKHOUSE_CPP_LDIR)/libclickhouse-cpp-lib.a),)
 	STATIC_LIBS += $(CLICKHOUSE_CPP_LDIR)/libclickhouse-cpp-lib.a \
 				   $(LZ4_LDIR)/liblz4.a $(ZSTD_LDIR)/libzstd.a
+endif
 endif
 
 ifeq ($(UNAME_S),Linux)
@@ -247,9 +254,11 @@ endif
 # This ensures unit tests compile with the same flags the library was built with,
 # regardless of whether the environment variables are set during `make`.
 PSQLCH :=
+ifneq ($(POLARDB_PROXY),1)
 ifneq ($(shell nm $(LIBPROXYSQLAR) 2>/dev/null | grep -c ClickHouse_Server),0)
 	PROXYSQLCLICKHOUSE := 1
 	PSQLCH := -DPROXYSQLCLICKHOUSE
+endif
 endif
 PSQLGA :=
 PSQLFFTO :=
@@ -291,6 +300,13 @@ PSQLDEBUG :=
 ifneq ($(shell nm $(LIBPROXYSQLAR) 2>/dev/null | grep -cw 'init_debug_struct'),0)
 	PSQLDEBUG := -DDEBUG
 endif
+PSQLPOLAR :=
+ifeq ($(POLARDB_PROXY),1)
+	PSQLPOLAR := -DPOLARDB_PROXY
+endif
+ifeq ($(POLARDB_PROFILE),1)
+	PSQLPOLAR += -DPOLARDB_PROFILE=1
+endif
 
 # MYSQLX_TEST_BUILD enables the test-only methods (`*_for_test`) on the
 # mysqlx plugin's public classes (e.g. MysqlxSession::inject_identity_for_test).
@@ -299,12 +315,12 @@ endif
 # misused (most importantly identity-forgery setters), while tests that include
 # the plugin headers and link against the plugin sources still see the helpers
 # they need.
-OPT := $(STDCPP) -O0 -ggdb $(PSQLCH) $(PSQLGA) $(PSQL40) $(PSQL31) $(PSQLFFTO) $(PSQLTSDB) $(PSQLDEBUG) \
+OPT := $(STDCPP) -O0 -ggdb $(PSQLCH) $(PSQLGA) $(PSQL40) $(PSQL31) $(PSQLFFTO) $(PSQLTSDB) $(PSQLDEBUG) $(PSQLPOLAR) \
 	   -DGITVERSION=\"$(GIT_VERSION)\" -DMYSQLX_TEST_BUILD $(NOJEM) $(WGCOV) $(WASAN) \
 	   -Wl,--no-as-needed -Wl,-rpath,$(TAP_LDIR)
 
 ifeq ($(UNAME_S),Darwin)
-	OPT := $(STDCPP) -O0 -ggdb $(PSQLCH) $(PSQLGA) $(PSQL40) $(PSQL31) $(PSQLFFTO) $(PSQLTSDB) $(PSQLDEBUG) \
+	OPT := $(STDCPP) -O0 -ggdb $(PSQLCH) $(PSQLGA) $(PSQL40) $(PSQL31) $(PSQLFFTO) $(PSQLTSDB) $(PSQLDEBUG) $(PSQLPOLAR) \
 		   -DGITVERSION=\"$(GIT_VERSION)\" -DMYSQLX_TEST_BUILD $(NOJEM) $(WGCOV) $(WASAN)
 endif
 
@@ -367,9 +383,11 @@ FORCE:
 
 $(LIBPROXYSQLAR): FORCE
 	$(MAKE) -C $(PROXYSQL_PATH)/lib libproxysql.a \
-		PROXYSQLCLICKHOUSE=1 \
-		PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) \
-		PROXYSQL40=$(PROXYSQL40) PROXYSQL31=$(PROXYSQL31) CC=$(CC) CXX=$(CXX)
+			PROXYSQLCLICKHOUSE=$(PROXYSQLCLICKHOUSE) \
+			POLARDB_PROXY=$(POLARDB_PROXY) \
+			POLARDB_PROFILE=$(POLARDB_PROFILE) \
+			PROXYSQLFFTO=$(PROXYSQLFFTO) PROXYSQLTSDB=$(PROXYSQLTSDB) \
+			PROXYSQL40=$(PROXYSQL40) PROXYSQL31=$(PROXYSQL31) CC=$(CC) CXX=$(CXX)
 
 
 # ===========================================================================
@@ -380,6 +398,7 @@ UNIT_TESTS := smoke_test-t query_cache_unit-t query_processor_unit-t \
 	protocol_unit-t auth_unit-t connection_pool_unit-t \
 	rule_matching_unit-t hostgroups_unit-t monitor_health_unit-t \
 	pgsql_command_complete_unit-t \
+	base_session_unit-t \
 	ffto_protocol_unit-t \
 	server_selection_unit-t \
   hostgroup_routing_unit-t \

@@ -186,8 +186,11 @@ testaurora: aurora
 
 #build_test_deps: $(TAP_LDIR)/libtap.so $(TEST_MARIADB_LDIR)/libmariadbclient.a $(TEST_MYSQL_LDIR)/libmysqlclient.a
 
+# PgSQL-only TAP targets depend on the shared TAP library, not the optional
+# libmysql helper archives. Build libtap.so explicitly so missing vendored
+# MySQL connector trees do not break unrelated PgSQL test compilation.
 $(TAP_LDIR)/libtap.so:
-	cd $(TAP_PATH) && CC=${CC} CXX=${CXX} ${MAKE} 
+	cd $(TAP_PATH) && CC=${CC} CXX=${CXX} ${MAKE} libtap.so
 
 $(TEST_MARIADB_LDIR)/libmariadbclient.a:
 	cd $(TEST_DEPS_PATH) && CC=${CC} CXX=${CXX} ${MAKE} mariadb_client
