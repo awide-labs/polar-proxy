@@ -6,20 +6,29 @@
 
 | Test asset | Purpose | Backend needed? | ProxySQL needed? |
 |---|---|---:|---:|
-| `scripts/verify-polardb-libpq-lsn-patch.sh` | Verifies the LSN-only libpq patch applies cleanly after the upstream libpq patches and does not pull CSN/transaction-split tokens into the patch. | no | no |
+| `scripts/verify-polardb-libpq-lsn-patch.sh` | Verifies the PolarDB LSN/Xact libpq patch applies cleanly after the upstream libpq patches and rejects CSN symbols. | no | no |
 | `test/polardb/Makefile` | Discoverable entry point for C helpers, TAP tests, committed benchmarks, cleanup, and trace analysis. | target-dependent | target-dependent |
 | `test/polardb/test-c/libpq_lsn_test.c` | Standalone C smoke test for patched libpq RFQ-LSN API and the backend timeout detail marker. | optional; skips gracefully when no backend is reachable | no |
+| `test/polardb/test-c/libpq_xact_test.c` | Standalone C smoke test for staged RFQ transaction-split libpq accessors, plus strict probes for backend `w` RFQ marker and isolation `ParameterStatus` support; it does not enable ProxySQL split routing. | optional; strict probes require matching backend support | no |
 | `test/polardb/test-c/run_helper.sh` | Common C-helper runner; loads `.env`, builds the selected helper against vendored patched libpq, sets `LD_LIBRARY_PATH`, and executes it. | helper-dependent | helper-dependent |
 | `test/polardb/test-c/proxysql_extended_protocol_test.c` | Small libpq client that sends the final query through extended protocol. | no direct backend | yes |
+| `test/polardb/test-c/libpq_row_run_test.c` | Offline C unit test for the patched-libpq DataRow row-run API (`PSpeekRowRun` / `PSadvanceInput` / `PSdetachRowRun`); builds a minimal receive buffer and validates the accessors before ProxySQL consumes them. | no | no |
+| `test/polardb/test-c/polardb_lsn_trace.c` | Direct-to-PolarDB LSN trace shim (libpq preload) that reads `PQhasLSN()`/`PQgetLSN()` after each ReadyForQuery and prints one parseable, client-visible consistency verdict per request. | yes | no |
 | `test/polardb/test-tap/config_roundtrip_tap.sh` | ProxySQL config/admin round-trip TAP for `replica_eligible` and PolarDB hostgroup policy columns. | no | yes |
 | `test/polardb/test-tap/lsn_session_consistency_tap.sh` | Main end-to-end LSN session-consistency TAP. | yes | yes |
 | `test/polardb/test-tap/wait_timeout_cleanup_tap.sh` | Focused wait-timeout/notice/structured-marker TAP. | yes | yes |
-| `test/polardb/test-unit/polardb_routing_lsn_unit-t.cpp` | Monotonic-LSN routing core: SESSION_LSN monotonic target and wait-plan construction, first-read baseline seeding, RFQ-unavailable route policy, query-shape guards, and the positioned-RFQ source / writer-scope match matrix. | no | no |
+| `test/polardb/test-tap/global_lsn_consistency_tap.sh` | GLOBAL_LSN-mode end-to-end TAP: every automatic read waits on `max(session target, writer mirror LSN)`, a missing writer mirror fails closed to the writer, and non-READ COMMITTED transactions stay on the writer. | yes | yes |
+| `test/polardb/test-tap/rfq_lsn_lifecycle_tap.sh` | Focused RFQ-LSN capture lifecycle TAP: an RFQ payload of value 0 on setup statements is not collapsed into "payload absent", so the session is not poisoned as missing-LSN and later reads still offload. | yes | yes |
+| `test/polardb/test-tap/txn_split_tap.sh` | Transaction-split read routing TAP; a thin adapter over `lib/scenario_harness.sh`, which owns ProxySQL lifecycle, split SQL/WAL generation, pgbench execution, and routing evidence. | yes | yes |
+| `test/polardb/test-tap/txn_split_failure_policy_tap.sh` | Split reader-failure policy TAP driven by DEBUG-only fault injection: retry/forward/terminate classification, retry-decline cleanup, writer-state loss, and the writer route overriding a later manual reader route. | yes | yes |
+| `test/polardb/test-unit/polardb_routing_lsn_unit-t.cpp` | Monotonic-LSN routing core: SESSION_LSN monotonic target and wait-plan construction, first-read baseline seeding, RFQ-unavailable route policy, query-shape checks, and the positioned-RFQ source / writer-scope match matrix. | no | no |
 | `test/polardb/test-unit/polardb_protocol_parse_unit-t.cpp` | PolarDB protocol/string parsing helpers: node-type name mapping and writer/reader classification, monitor-health parse helpers, and simple-query multi-statement detection. | no | no |
 | `test/polardb/test-unit/polardb_query_state_unit-t.cpp` | `PolarDB_QueryState` named-reset semantics: scoped per-query reset helpers (reset_reader_target, reset_wait, reset_dispatch_wrapper, reset_for_new_query) and which fields each clears versus preserves. | no | no |
 | `test/polardb/test-unit/polardb_status_policy_unit-t.cpp` | Status-name and policy helpers: route-action-reason names and NoticeResponse helpers, reader-status names and writer-redirect policy, wrapper-error accounting policy, and server-LSN cache reset. | no | no |
 | `test/polardb/test-unit/polardb_startup_profile_unit-t.cpp` | PolarDB startup-profile request semantics: profile request bits and protocol mapping, fallback-identity validation, sockaddr identity resolution, and profile string converters. | no | no |
 | `test/polardb/test-unit/polardb_hgm_lsn_unit-t.cpp` | PolarDB HostGroups Manager LSN state: counter metadata and thread-counter aggregation, writer-epoch LSN-cache reset, and thread-local fresh-LSN reader targeting. | no | no |
+| `test/polardb/test-unit/pgsql_status_variables_unit-t.cpp` | PgSQL generic thread status-variable storage sizing: keeps PgSQL `stvar[]` sized to the shared `st_var` index range so high-index generic counters do not write past the array. | no | no |
+| `test/polardb/test-unit/polardb_client_rfq_unit-t.cpp` | Client-facing ReadyForQuery LSN packet building: the RFQ packet stays byte-for-byte unchanged unless the client opted in and the backend RFQ carried a PolarDB LSN, in which case one uint64 LSN is appended after the transaction-status byte. | no | no |
 | `test/polardb/lib/tap_core.sh` | Common TAP writer and prerequisite-skip helpers (clean SKIP output). | no | no |
 | `test/polardb/lib/tap_polardb.sh` | Shared PolarDB TAP primitives (admin/proxy SQL wrappers, stats-counter readers, query-rule and poller helpers). | no | yes |
 | `test/polardb/lib/bench_harness.sh` | Benchmark-only helpers for PolarDB scenarios. | yes for most scenarios | yes |
@@ -87,11 +96,11 @@ building ProxySQL:
 2. Apply the upstream libpq patches in the required order.
 3. Dry-run apply `deps/postgresql/polardb_libpq.patch` last.
 4. Reject fuzz, offset, failed hunks, and `.orig` residue.
-5. Grep the PolarDB patch for CSN/transaction-split tokens, allowing harmless
-   upstream context strings.
+5. Grep the PolarDB patch for required LSN/Xact symbols and reject CSN symbols.
 
-A passing run proves the libpq extension still applies cleanly as an LSN-only
-patch. It does not prove runtime RYW behavior.
+A passing run shows the libpq extension still applies cleanly as the staged
+LSN/Xact patch. It does not show runtime RYW behavior or transaction-split
+routing.
 
 ## 4. libpq LSN Smoke Test
 
@@ -205,8 +214,9 @@ The committed benchmark scripts are manual performance tools:
 These case scripts are committed under `test/polardb/test-bench/` (Makefile
 targets `test-case1`/`test-case2`/`test-case5`). The heavier stress/offload/lag
 benchmarks are committed as `bench1_lsn_stress.sh`, `bench2_lsn_offload.sh`,
-`bench3_replica_lag.sh`, and `bench4_loaded_primary.sh` under
-`test/polardb/test-bench/` (Makefile targets `bench1`..`bench4`); they are
+`bench3_replica_lag.sh`, `bench4_loaded_primary.sh`, and
+`bench5_consistency_shapes.sh` under
+`test/polardb/test-bench/` (Makefile targets `bench1`..`bench5`); they are
 postponed outside the committed PR surface until their scenario setup and
 assertions are cleaned up.
 
@@ -278,9 +288,9 @@ Use `make -C test/polardb coverage` for the repeatable run. Set
 is `POLARDB_COVERAGE_BUILD_TARGET=polardb-coverage-debug`; override it only when
 intentionally comparing another build mode.
 
-The coverage target reports coverage by default and keeps percentage gates
+The coverage target reports coverage by default and keeps percentage controls
 disabled unless the caller opts in. During development, this keeps the run useful
-even when known branches are still being staged. To turn the report into a gate,
+even when known branches are still being staged. To turn the report into a condition,
 set these variables explicitly:
 
 - `POLARDB_DEDICATED_TAKEN_MIN`: minimum "taken at least once" percentage for the
@@ -292,7 +302,7 @@ set these variables explicitly:
 
 `POLARDB_TAKEN_MIN` remains as a compatibility alias for the dedicated-file
 threshold. `POLARDB_FUNCTION_TAKEN_EXCLUDES` names staged scenarios to exempt
-when an opt-in function gate is enabled. The staged exceptions should shrink as
+when an opt-in function condition is enabled. The staged exceptions should shrink as
 their deterministic TAP or debug-injection tests are added. Do not apply one
 whole-file threshold to the shared files; their useful signal is the filtered
 function report, not the file-level percentage.
@@ -333,15 +343,15 @@ additional evidence in debug builds.
    is sent, and the writer-fallback counter increments once. True capacity
    contention remains a stress/manual case.
 
-3. **Missing-RFQ latches.**
+3. **Missing-RFQ flags.**
    The LSN TAP drives writer and tracked-reader results that complete without an
    RFQ LSN and asserts:
    - `PolarDB_Write_Missing_LSN` or `PolarDB_Read_Missing_LSN` increments.
-   - the session missing-LSN latch changes the next automatic protected read
+   - the session missing-LSN flag changes the next automatic protected read
      according to `pgsql-polardb_route_rfq_policy`.
 
    A focused check that a later positioned primary RFQ clears the missing-LSN
-   latch is still a useful extension.
+   flag is still a useful extension.
 
 4. **Route-transition reasons.**
    The suite covers:
@@ -372,7 +382,7 @@ additional evidence in debug builds.
 
 ### 7.3 Retry Negative Outcomes
 
-The wait-timeout TAP proves the main retry behavior and the most important
+The wait-timeout TAP shows the main retry behavior and the most important
 retry predicate false outcomes:
 
 1. strict wait timeout on a reusable reader -> return reader to pool and retry
@@ -403,7 +413,7 @@ Some useful branches need controlled faults or live topology changes and should
 not be part of the fast suite:
 
 1. real reader-capacity contention under concurrent load;
-2. stale writer-epoch guard across a real failover;
+2. stale writer-epoch check across a real failover;
 3. mid-stream reader death after rows have reached the client;
 4. allocation-failure paths in NoticeResponse construction;
 5. long-running replay-lag mutation tests that pause or delay a replica.
@@ -424,8 +434,8 @@ policy state through a live cluster:
   best-effort disabled for extended protocol.
 - `PolarDB_HG_Policy::parse_node_type()`: primary, master, replica, standby,
   null, and unknown strings.
-- monitor health parsing helpers: availability parsing, LSN parsing, and
-  monitor-LSN update gating.
+- monitor health parsing helpers: availability parsing, LSN parsing, and the
+  rules for accepting monitor LSN updates.
 - route-action-reason names and reader-status names for every enum value.
 
 ## 8. Backend Prerequisites

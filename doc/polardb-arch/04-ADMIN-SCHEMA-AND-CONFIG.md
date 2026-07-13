@@ -8,7 +8,7 @@
 
 This document describes how an operator configures the PolarDB read-your-writes (RYW) feature, and how that configuration flows from on-disk SQLite tables into the per-query routing decision.
 
-Term definitions used throughout (defined once here; the project glossary in `README.md` is the authority for this docset, and the curated prior design notes glossary lives at `doc/polardb-arch/34-DOCS-FOUNDATION-PACK.md` in the full implementation):
+Term definitions used throughout are defined once here; the project glossary in `README.md` is the authority for this documentation set:
 
 - **PolarDB** - an Alibaba PostgreSQL-compatible database with one primary (writer) node and read replicas.
 - **LSN (Log Sequence Number)** - a 64-bit position in PostgreSQL's write-ahead log (WAL). A larger LSN means "more recent". A replica that has replayed up to LSN X can serve any read whose data was committed at or before X.
@@ -39,7 +39,7 @@ Both feed resolution steps (Section 5) that produce the effective consistency mo
                                                                                   mode/timeout/cap
 ```
 
-The whole feature is gated by the compile flag `POLARDB_PROXY` (default `1`). When `POLARDB_PROXY=0`, the schema, knobs, and resolvers below are not compiled and the tables keep their plain upstream shape. The build toggle itself is covered in [02-BUILD-TOGGLE-AND-LIBPQ.md](02-BUILD-TOGGLE-AND-LIBPQ.md); this document only notes where each schema/knob branches on the flag.
+The whole feature is enabled by the compile flag `POLARDB_PROXY` (default `1`). When `POLARDB_PROXY=0`, the schema, knobs, and resolvers below are not compiled and the tables keep their plain upstream shape. The build toggle itself is covered in [02-BUILD-TOGGLE-AND-LIBPQ.md](02-BUILD-TOGGLE-AND-LIBPQ.md); this document only notes where each schema/knob branches on the flag.
 
 ---
 
@@ -47,19 +47,19 @@ The whole feature is gated by the compile flag `POLARDB_PROXY` (default `1`). Wh
 
 ### 2.1 Versioned table macros
 
-The writable admin table is built from a versioned C macro. The PolarDB build selects the V3_0_4 macro; the non-PolarDB build selects V3_0_2. The `runtime_pgsql_replication_hostgroups` mirror table is chosen the same way. The HostGroups Manager keeps its own internal copy of the V3_0_4 schema string that must stay in sync.
+The writable admin table is built from a versioned C macro. The PolarDB build selects the V3_0_5 macro; the non-PolarDB build selects V3_0_2. The `runtime_pgsql_replication_hostgroups` mirror table is chosen the same way. The HostGroups Manager keeps its own internal copy of the V3_0_5 schema string that must stay in sync.
 
 ```
 #if POLARDB_PROXY
-  ..._PGSQL_REPLICATION_HOSTGROUPS == ..._V3_0_4   (8 columns)
+  ..._PGSQL_REPLICATION_HOSTGROUPS == ..._V3_0_5   (9 columns)
 #else
   ..._PGSQL_REPLICATION_HOSTGROUPS == ..._V3_0_2   (4 columns, upstream)
 #endif
 ```
 
-This implementation settles on V3_0_4 as this LSN-only eight-column schema. Its RFQ startup-profile surface is the `proxy_protocol` column plus the `REQUEST_RFQ_LSN` request bit selected by `v15` and `legacy` profiles. `REQUEST_RFQ_CSN` and `REQUEST_RFQ_XID` are named request-bit vocabulary for future protocol payloads; they do not add columns or widen V3_0_4. Any future CSN, XID, or transaction-split schema expansion must use a later coordinated schema version and migration, for example V3_0_5 or the next available bump.
+This implementation settles on V3_0_5 as the LSN consistency schema plus one transaction-split switch. Its RFQ startup-profile surface is the `proxy_protocol` column plus `REQUEST_RFQ_LSN` selected by `v15` and `legacy` profiles. When `txn_split_enabled=1`, the same startup profile also requests `REQUEST_RFQ_XID` so result processing can observe transaction split evidence. `REQUEST_RFQ_CSN` remains reserved for later CSN behavior. None of these bits add active transaction-split routing by themselves.
 
-### 2.2 V3_0_4 columns (the PolarDB schema)
+### 2.2 V3_0_5 columns (the PolarDB schema)
 
 Full text is in `include/ProxySQL_Admin_Tables_Definitions.h` and mirrored in `include/PgSQL_HostGroups_Manager.h`.
 
@@ -68,7 +68,8 @@ Full text is in `include/ProxySQL_Admin_Tables_Definitions.h` and mirrored in `i
 | `writer_hostgroup` | `INT`, `>= 0`, PRIMARY KEY | (none) | writer (primary) hostgroup id |
 | `reader_hostgroup` | `INT`, `<> writer_hostgroup`, `>= 0`, UNIQUE | (none) | reader (replica) hostgroup id |
 | `check_type` | `VARCHAR` in `('read_only','polardb')` | `'read_only'` | `'polardb'` turns this pair into a PolarDB pair; only then do the three LSN columns below apply |
-| `consistency_mode` | `VARCHAR` in `('default','off','lsn','primary')` | `'default'` | per-hostgroup consistency policy; `'default'` defers to the global knob |
+| `txn_split_enabled` | `INT` in `(0,1)`, and `1` only when `check_type='polardb'` | `0` | enables RFQ XID request/observation and transaction split-read dispatch |
+| `consistency_mode` | `VARCHAR` in `('default','off','lsn','global_lsn','lsn_global','global','primary')` | `'default'` | per-hostgroup consistency policy; `'default'` defers to the global knob (`global_lsn` waits on max(session target, writer mirror LSN)). `'lsn_global'` and `'global'` are accepted aliases of `'global_lsn'` |
 | `max_lag_bytes` | `INT` | `-1` | per-hostgroup reader lag cap in bytes; `-1` = inherit global, `0` = off, `>0` = cap |
 | `lsn_wait_timeout_ms` | `INT` | `-1` | per-hostgroup wait timeout in ms; `-1` = inherit global, `0` = wait indefinitely, `>0` = explicit |
 | `proxy_protocol` | `VARCHAR` in `('default','v15','legacy','off')` | `'default'` | per-hostgroup startup protocol override; `'default'` inherits `pgsql-polardb_proxy_protocol` |
@@ -76,24 +77,24 @@ Full text is in `include/ProxySQL_Admin_Tables_Definitions.h` and mirrored in `i
 
 Notes:
 
-- `consistency_mode` is a SQLite `CHECK` constraint, so the table rejects any value outside the four allowed words at INSERT/UPDATE time.
+- `consistency_mode` is a SQLite `CHECK` constraint, so the table rejects any value outside the seven allowed words at INSERT/UPDATE time (`include/ProxySQL_Admin_Tables_Definitions.h`, V3_0_5). The distinct routing values are still `default`/`off`/`lsn`/`global_lsn`/`primary`: `'lsn_global'` and `'global'` are extra accepted spellings that the parser `polardb_consistency_mode_from_string()` maps to `GLOBAL_LSN` (`include/PgSQL_PolarDB.h:1200-1202`).
+- `txn_split_enabled=1` is a SQLite `CHECK` constraint requiring `check_type='polardb'`. The connection/result path uses it to request and observe RFQ XID data; the planner reads it before naming a split route.
 - The LSN/RFQ columns (`consistency_mode`, `max_lag_bytes`, `lsn_wait_timeout_ms`, `proxy_protocol`) are stored for every row regardless of `check_type`, but they only influence routing and startup when `check_type='polardb'` (Section 4.2).
-- `'lsn'` is the only mode that performs an RYW wait. `'primary'` forces all reads to the writer. `'off'` disables PolarDB routing (query rules decide). `'default'` means "not set at this tier, fall through to the global knob".
+- `'lsn'` and `'global_lsn'` perform an RYW wait: `'lsn'` waits on the session's own target, `'global_lsn'` waits on max(session target, writer mirror LSN). `'primary'` forces all reads to the writer. `'off'` disables PolarDB routing (query rules decide). `'default'` means "not set at this tier, fall through to the global knob".
 
 ### 2.3 The V3_0_2 fallback (non-PolarDB build)
 
 When `POLARDB_PROXY=0`, the table is V3_0_2 (`include/ProxySQL_Admin_Tables_Definitions.h:305`): four columns (`writer_hostgroup`, `reader_hostgroup`, `check_type`, `comment`), with `check_type` restricted to `('read_only')` only. This is byte-identical to upstream ProxySQL. No LSN columns exist in that build.
 
-### 2.4 Full-implementation fields not in this V3_0_4
+### 2.4 Full-implementation fields not in this V3_0_5
 
-The full implementation carries a larger schema for the complete PolarDB feature. This V3_0_4 deliberately excludes the parts that belong to features it does not ship.
+The full implementation carries a larger schema for the complete PolarDB feature. This V3_0_5 deliberately excludes the parts that belong to features it does not ship.
 
-| Future item | Form in the full implementation | Why it is not in this V3_0_4 |
+| Future item | Form in the full implementation | Why it is not in this V3_0_5 |
 |---|---|---|
-| `txn_split_enabled` column | `INT IN (0,1)`, allowed only when `check_type='polardb'`, default `0` | the transaction-split feature is not part of the LSN-only series (see [19-FUTURE-TXN-SPLIT-DESIGN.md](19-FUTURE-TXN-SPLIT-DESIGN.md)) |
-| `consistency_mode` values `'csn'`, `'session'`, `'global'` | full implementation allows `('default','off','lsn','csn','session','global')` | CSN (Commit Sequence Number) and the multi-LSN global/session modes are out of scope here; only `off` / `lsn` / `primary` remain (CSN is a future, experimental feature - see [18-FUTURE-CSN-DESIGN.md](18-FUTURE-CSN-DESIGN.md)) |
+| `consistency_mode` values `'csn'`, `'session'`, `'global'` | full implementation allows `('default','off','lsn','csn','session','global')` | CSN (Commit Sequence Number) and the multi-LSN global/session modes are out of scope here; only `off` / `lsn` / `global_lsn` / `primary` remain (CSN is a future, experimental feature - see [18-FUTURE-CSN-DESIGN.md](18-FUTURE-CSN-DESIGN.md)) |
 
-The LSN-only tree therefore has no `txn_split_enabled` writable/runtime column and no HGM/session runtime state for it. The integer-constant set also leaves a gap at value `2`, which is where the future CSN mode would sit (Section 3). These future items must not be retrofitted into V3_0_4; they need the next schema bump and disk-upgrade path.
+The current tree has a persisted `txn_split_enabled` column and published policy bit. When enabled, backend connections request RFQ XID payloads and result processing records the observed transaction-split state. The planner can emit `REPLICA_TXN_SPLIT` when that state is complete, and execution temporarily uses a compatible replica connection for that one split read before restoring the writer backend. Value `2` is `POLARDB_CONSISTENCY_GLOBAL_LSN`, the committed-state read-all-observed-writes mode; the modes off/lsn/global_lsn/primary are all live. Only the CSN word-modes remain out of scope (Section 2.4).
 
 > Caution for cross-tree readers: the full implementation's line numbers for these dropped items differ from this tree. Treat any full-implementation citation as directional only; do not map line numbers 1:1 between the two trees.
 
@@ -101,23 +102,23 @@ The LSN-only tree therefore has no `txn_split_enabled` writable/runtime column a
 
 ## 3. The global knobs
 
-The feature exposes twelve `pgsql-polardb_*` admin variables. They are the global (lowest) tier of resolution. The word-valued strings are validated on `SET` and parsed into integers for the hot path.
+The feature exposes twenty-four `pgsql-polardb_*` admin variables. They are the global (lowest) tier of resolution. The table below documents the twelve LSN-consistency knobs; the other twelve cover transaction-split warmup, reader-failure handling, and output batching. The word-valued strings are validated on `SET` and parsed into integers for the hot path.
 
 ### 3.1 Storage struct and registration
 
 - Storage: the fields live on `PgSQL_Thread::variables`.
-- Name registry (what `SHOW VARIABLES` lists): `lib/PgSQL_Thread.cpp:375-381`.
-- Defaults loaded at thread init: `lib/PgSQL_Thread.cpp:1123-1129`.
-- Integer ranges (the `make_tuple(ptr, min, max, ...)` registrations): `lib/PgSQL_Thread.cpp:2416-2419`.
-- Bool registration (`polardb_monitor_lsn_updates`): `lib/PgSQL_Thread.cpp:2254`.
+- Name registry (what `SHOW VARIABLES` lists): `lib/PgSQL_Thread.cpp:501-524`.
+- Defaults loaded at thread init: `lib/PgSQL_Thread.cpp:1266-1289`.
+- Integer ranges (the `make_tuple(ptr, min, max, ...)` registrations): `lib/PgSQL_Thread.cpp:2690-2698`.
+- Bool registrations (4 knobs incl. `polardb_monitor_lsn_updates`): `lib/PgSQL_Thread.cpp:2522-2525`.
 - Word-value validation on `SET`: `lib/PgSQL_Thread.cpp` rejects anything outside the listed words. Fallback startup identity validation also happens at `SET` time for the host/port pair.
-- Freed at shutdown (the two string knobs): `lib/PgSQL_Thread.cpp:2817-2818`.
+- Freed at shutdown (the ten string knobs): `lib/PgSQL_Thread.cpp:3096-3105`.
 
 ### 3.2 Knob table
 
 | Admin variable (`pgsql-...`) | Type | Range | Default | Meaning |
 |---|---|---|---|---|
-| `polardb_consistency_mode` | word | `off` \| `lsn` \| `primary` | `off` | global consistency policy (the lowest resolution tier) |
+| `polardb_consistency_mode` | word | `off` \| `lsn` \| `global_lsn` \| `primary` | `off` | global consistency policy (the lowest resolution tier) |
 | `polardb_wait_timeout_mode` | word | `best_effort` \| `strict` | `best_effort` | on a wait timeout: `best_effort` returns possibly-stale data with a WARNING; `strict` raises an ERROR |
 | `polardb_lag_bytes` | int | `0 .. INT_MAX` | `0` | global reader lag cap in bytes; `0` = off |
 | `polardb_lag_ms` | int | `0` only | `0` | Reserved in this implementation - runtime accepts only `0`; no PgSQL millisecond-lag producer exists (Section 7) |
@@ -134,7 +135,7 @@ The integer ranges are enforced by the variable registry. Word knobs reject unsu
 
 How `polardb_lsn_freshness_ms` is used: the reader acquisition treats a cached per-server LSN as trustworthy only if it was sampled within this window (`lib/PgSQL_HostGroups_Manager.cpp:4522-4523` and `:4640-4641`, via the `polardb_lsn_cache_fresh()` predicate at `include/PgSQL_PolarDB.h:525-531`). A value of `0` falls back to a compile-time default; see [05-MONITOR-AND-HGM-LSN-STATE.md](05-MONITOR-AND-HGM-LSN-STATE.md).
 
-How `polardb_lag_wait_ms` is used: it is the global fallback for the per-hostgroup `lsn_wait_timeout_ms` and feeds the `polar_xact_split_wait_lsn` wait gate (Section 5.3).
+How `polardb_lag_wait_ms` is used: it is the global fallback for the per-hostgroup `lsn_wait_timeout_ms` and feeds the `polar_xact_split_wait_lsn` wait condition (Section 5.3).
 
 ### 3.3 Thread-local copies (the values routing actually reads)
 
@@ -142,7 +143,7 @@ The hot path never reads `PgSQL_Thread::variables` directly. On each config comm
 
 | Thread-local variable | Type | Notes |
 |---|---|---|
-| `pgsql_thread___polardb_consistency_mode` | int | word parsed to int: `off`=0, `lsn`=1, `primary`=3 |
+| `pgsql_thread___polardb_consistency_mode` | int | word parsed to int: `off`=0, `lsn`=1, `global_lsn`=2, `primary`=3 |
 | `pgsql_thread___polardb_lag_bytes` | int | byte lag cap |
 | `pgsql_thread___polardb_lag_ms` | int | deferred (no producer); see Section 7 |
 | `pgsql_thread___polardb_lag_wait_ms` | int | global wait timeout fallback |
@@ -155,35 +156,36 @@ The hot path never reads `PgSQL_Thread::variables` directly. On each config comm
 | `pgsql_thread___polardb_proxy_identity_host` | char* | fallback identity host |
 | `pgsql_thread___polardb_proxy_identity_port` | int | fallback identity port |
 
-The refresh happens in `PgSQL_Thread::refresh_variables()` (`lib/PgSQL_Thread.cpp:4146`):
+The refresh happens in `PgSQL_Thread::refresh_variables()` (`lib/PgSQL_Thread.cpp:4375`):
 
-- The integer/bool knobs are copied directly (`lib/PgSQL_Thread.cpp:4072-4076`).
-- `polardb_consistency_mode` string is mapped to an int: `lsn`->1, `primary`->3, anything else->0 (`lib/PgSQL_Thread.cpp:4078-4087`).
-- `polardb_wait_timeout_mode` string is mapped to an int: `best_effort`->1, `strict`->2, anything else->best_effort (`lib/PgSQL_Thread.cpp:4088-4098`).
+- The integer/bool knobs are copied directly (`lib/PgSQL_Thread.cpp:4424-4441`).
+- `polardb_consistency_mode` string is mapped to an int via `polardb_consistency_mode_from_string`: `lsn`->1, `global_lsn`->2, `primary`->3, anything else->0 (`lib/PgSQL_Thread.cpp:4442-4446`).
+- `polardb_wait_timeout_mode` string is mapped to an int: `best_effort`->1, `strict`->2, anything else->best_effort (`lib/PgSQL_Thread.cpp:4448-4454`).
 - `polardb_proxy_protocol`, `polardb_route_rfq_policy`, and `polardb_session_lsn_baseline` are parsed into their hot-path integer enums.
 - `polardb_proxy_identity_host` is copied as a per-thread string and `polardb_proxy_identity_port` as an int.
 
 ```
 SET pgsql-polardb_consistency_mode='lsn'
         |
-        v  (validated at SET time, Thread.cpp:1749-1757)
+        v  (validated at SET time, Thread.cpp:1944-1952)
 variables.polardb_consistency_mode = "lsn"   (string on PgSQL_Thread::variables)
         |
-        v  LOAD PGSQL VARIABLES TO RUNTIME -> commit refresh (Thread.cpp:4078-4087)
+        v  LOAD PGSQL VARIABLES TO RUNTIME -> commit refresh (Thread.cpp:4442-4446)
 pgsql_thread___polardb_consistency_mode = 1   (int, per-thread, read on the hot path)
 ```
 
 ### 3.4 Mode integer constants and the typed enum
 
-The integer constants used wherever an `int` plus a `-1` "unset" sentinel is needed (thread variables, hostgroup policy, admin SQL parsing) are at `include/PgSQL_Thread.h:48-50`:
+The integer constants used wherever an `int` plus a `-1` "unset" sentinel is needed (thread variables, hostgroup policy, admin SQL parsing) are at `include/PgSQL_Thread.h:55-58`:
 
 ```
-POLARDB_CONSISTENCY_OFF     = 0
-POLARDB_CONSISTENCY_LSN     = 1
-POLARDB_CONSISTENCY_PRIMARY = 3
+POLARDB_CONSISTENCY_OFF        = 0
+POLARDB_CONSISTENCY_LSN        = 1
+POLARDB_CONSISTENCY_GLOBAL_LSN = 2
+POLARDB_CONSISTENCY_PRIMARY    = 3
 ```
 
-Value `2` is intentionally skipped - it is the gap left by the dropped CSN mode. The typed enum mirrors these exactly: `PolarDB_ConsistencyMode { OFF=0, SESSION_LSN=1, PRIMARY_ONLY=3 }` (`include/PgSQL_PolarDB.h:184-188`). Any unsupported integer maps to `OFF` via `polardb_consistency_from_int()` (`include/PgSQL_PolarDB.h:192-202`). The wait-mode enum is `PolarDB_WaitMode { BEST_EFFORT=1, STRICT=2 }` (`include/PgSQL_PolarDB.h:130-133`). Full enum reference is in [03-TYPES-AND-ENUMS.md](03-TYPES-AND-ENUMS.md).
+The typed enum mirrors these exactly: `PolarDB_ConsistencyMode { OFF=0, SESSION_LSN=1, GLOBAL_LSN=2, PRIMARY_ONLY=3 }` (`include/PgSQL_PolarDB.h:1162-1167`). Any unsupported integer maps to `OFF` via `polardb_consistency_from_int()` (`include/PgSQL_PolarDB.h:1172-1184`). The wait-mode enum is `PolarDB_WaitMode { BEST_EFFORT=1, STRICT=2 }` (`include/PgSQL_PolarDB.h:383-385`). Full enum reference is in [03-TYPES-AND-ENUMS.md](03-TYPES-AND-ENUMS.md).
 
 ---
 
@@ -193,22 +195,23 @@ When the admin layer commits `pgsql_replication_hostgroups`, the HostGroups Mana
 
 ### 4.1 The commit-time parse
 
-`generate_pgsql_replication_hostgroups_table()` reads the incoming result set, which carries the eight PolarDB columns in this fixed field order:
+`generate_pgsql_replication_hostgroups_table()` reads the incoming result set, which carries the nine PolarDB columns in this fixed field order:
 
 ```
 0 = writer_hostgroup
 1 = reader_hostgroup
 2 = check_type
-3 = consistency_mode
-4 = max_lag_bytes
-5 = lsn_wait_timeout_ms
-6 = proxy_protocol
-7 = comment
+3 = txn_split_enabled
+4 = consistency_mode
+5 = max_lag_bytes
+6 = lsn_wait_timeout_ms
+7 = proxy_protocol
+8 = comment
 ```
 
-The fields are parsed at `lib/PgSQL_HostGroups_Manager.cpp:1816-1821`.
+The fields are parsed at `lib/PgSQL_HostGroups_Manager.cpp:2674-2683`.
 
-### 4.2 The `polardb` gate
+### 4.2 The `polardb` condition
 
 A pair is treated as PolarDB only when `check_type` equals `polardb` (`lib/PgSQL_HostGroups_Manager.cpp:1824`). Only then are the writer and reader hostgroup ids inserted into the topology maps `polardb_hostgroups_`, `polardb_reader_to_writer_`, and `polardb_writer_to_reader_` (`lib/PgSQL_HostGroups_Manager.cpp:1825-1828`). A `read_only` row is mirrored into the table like upstream but adds nothing to the PolarDB caches.
 
@@ -229,17 +232,18 @@ The parsed values are cached on the **writer** hostgroup's config object (`PgSQL
 
 | repl_config field | Source field | Read by routing? |
 |---|---|---|
-| `configured` | (set true on commit) | yes - gates the policy read |
+| `configured` | (set true on commit) | yes - controls the policy read |
 | `reader_hostgroup` | field 1 | no (topology read via the maps) |
 | `check_type` | field 2 | no (string kept for reference) |
-| `consistency_mode` (string) | field 3 | no (only the parsed enum is read) |
-| `consistency_mode_enum` | parsed field 3 | yes |
-| `max_lag_bytes` | field 4 | yes |
-| `lsn_wait_timeout_ms` | field 5 | yes |
-| `proxy_protocol` (string) | field 6 | no (only parsed enum is read) |
-| `proxy_protocol_enum` | parsed field 6 | yes; `-1` inherits the global startup protocol |
+| `txn_split_enabled` | field 3 | published as a stored policy value; connection/result processing uses it for RFQ XID observation; the planner reads it for split-route decisions |
+| `consistency_mode` (string) | field 4 | no (only the parsed enum is read) |
+| `consistency_mode_enum` | parsed field 4 | yes |
+| `max_lag_bytes` | field 5 | yes |
+| `lsn_wait_timeout_ms` | field 6 | yes |
+| `proxy_protocol` (string) | field 7 | no (only parsed enum is read) |
+| `proxy_protocol_enum` | parsed field 7 | yes; `-1` inherits the global startup protocol |
 | `polardb_primary_lsn` (shared atomic cell) | runtime, not from schema | yes (primary baseline and lag calc); cell is preserved across reload and reset only on writer identity change |
-| `polardb_writer_epoch` (shared atomic cell) | runtime, not from schema | yes (session target/latch invalidation after writer identity change); cell is preserved across reload and increments only on writer identity change |
+| `polardb_writer_epoch` (shared atomic cell) | runtime, not from schema | yes (session target/flag invalidation after writer identity change); cell is preserved across reload and increments only on writer identity change |
 
 The routing pipeline reads these through `get_polardb_hg_config()`, which uses the generation-cached `PolarDB_TopologySnapshot` in the steady state instead of taking the HGM lock. The snapshot contains a small plain-value policy plus shared atomic cells for the writer's runtime LSN state (`include/PgSQL_HostGroups_Manager.h:1005-1021`, populated at `lib/PgSQL_HostGroups_Manager.cpp:1911-1939`):
 
@@ -343,7 +347,7 @@ int max_lag = (route_ctx.max_lag_bytes >= 0) ? route_ctx.max_lag_bytes
                                         : pgsql_thread___polardb_lag_bytes;
 ```
 
-`route_ctx.max_lag_bytes` is set from `policy.max_lag_bytes` in collect (`lib/PgSQL_PolarDB_Flow.cpp:74`). The cap is a **safety-only** byte bound on `primary_lsn - reader_lsn`. It is NOT the correctness gate; the actual RYW gate is the `polar_xact_split_wait_lsn` SET emitted onto the replica read (see [07-QUERY-WRAPPING.md](07-QUERY-WRAPPING.md)). When the cap is enabled (`>0`) and a reader exceeds it - or has a stale/missing LSN under an enabled cap - the read **uses the writer instead of that replica**. This is the safe writer fallback: when the proxy is unsure a replica is safe, it sends the read to the writer (always up to date) instead of risking a stale answer (`lib/PgSQL_PolarDB_Flow.cpp:145-178`). Section 6 of [06-ROUTING-PIPELINE.md](06-ROUTING-PIPELINE.md) covers the safe fallback cases.
+`route_ctx.max_lag_bytes` is set from `policy.max_lag_bytes` in collect (`lib/PgSQL_PolarDB_Flow.cpp:74`). The cap is a **safety-only** byte bound on `primary_lsn - reader_lsn`. It is NOT the correctness enforcement; the actual RYW condition is the `polar_xact_split_wait_lsn` SET emitted onto the replica read (see [07-QUERY-WRAPPING.md](07-QUERY-WRAPPING.md)). When the cap is enabled (`>0`) and a reader exceeds it - or has a stale/missing LSN under an enabled cap - the read **uses the writer instead of that replica**. This is the safe writer fallback: when the proxy is unsure a replica is safe, it sends the read to the writer (always up to date) instead of risking a stale answer (`lib/PgSQL_PolarDB_Flow.cpp:145-178`). Section 6 of [06-ROUTING-PIPELINE.md](06-ROUTING-PIPELINE.md) covers the safe fallback cases.
 
 ### 5.4 Wait timeout MODE (best_effort vs strict) - global only
 
@@ -411,24 +415,24 @@ When the admin runs `LOAD PGSQL SERVERS TO RUNTIME`, the HGM dumps the writable 
 
 ```
 #if POLARDB_PROXY
-  SELECT writer_hostgroup, reader_hostgroup, check_type, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment FROM pgsql_replication_hostgroups
+  SELECT writer_hostgroup, reader_hostgroup, check_type, txn_split_enabled, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment FROM pgsql_replication_hostgroups
 #else
   SELECT writer_hostgroup, reader_hostgroup, check_type, comment FROM pgsql_replication_hostgroups
 #endif
 ```
 
-The 8-column result set is exactly the field order Section 4.1 parses. The 4-column non-PolarDB form keeps the upstream shape.
+The 9-column result set is exactly the field order Section 4.1 parses. The 4-column non-PolarDB form keeps the upstream shape.
 
 ### 6.2 Writing runtime back to the admin tables (persist / dump)
 
-When the admin dumps runtime state back into the `runtime_` (and on save, the writable) tables, the replication-hostgroups dump branches on the flag. The PolarDB branch inserts all eight columns:
+When the admin dumps runtime state back into the `runtime_` (and on save, the writable) tables, the replication-hostgroups dump branches on the flag. The PolarDB branch inserts all nine columns:
 
 ```
-INSERT INTO [runtime_]pgsql_replication_hostgroups VALUES(%s,%s,'%s','%s',%s,%s,'%s','%s')
-   -- writer, reader, check_type, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment
+INSERT INTO [runtime_]pgsql_replication_hostgroups VALUES(%s,%s,'%s',%s,'%s',%s,%s,'%s','%s')
+   -- writer, reader, check_type, txn_split_enabled, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment
 ```
 
-The dump path restates the 0..7 field order. `check_type`, `consistency_mode`, `proxy_protocol`, and `comment` are escaped before being formatted in. The non-PolarDB branch inserts only the four upstream columns. Because the load SELECT (6.1) and the persist INSERT (6.2) use the same column set and order, a row survives a `LOAD ... TO RUNTIME` / `SAVE ... FROM RUNTIME` round-trip unchanged.
+The dump path restates the 0..8 field order. `check_type`, `consistency_mode`, `proxy_protocol`, and `comment` are escaped before being formatted in. The non-PolarDB branch inserts only the four upstream columns. Because the load SELECT (6.1) and the persist INSERT (6.2) use the same column set and order, a row survives a `LOAD ... TO RUNTIME` / `SAVE ... FROM RUNTIME` round-trip unchanged.
 
 ### 6.3 The `replica_eligible` query-rule column
 
@@ -437,17 +441,18 @@ A second PolarDB schema addition lives on `pgsql_query_rules`: the `replica_elig
 - Load to runtime (the SELECT that reads the rules): `lib/ProxySQL_Admin.cpp:8624-8628` - the PolarDB SELECT lists `replica_eligible` between `multiplex` and `log`.
 - Persist runtime back (the INSERT): `lib/ProxySQL_Admin.cpp:5120-5131` (statement) and `:5193-5198` (the field is emitted; `-1` is written as the literal `-1`, a real NOT NULL value, not SQL `NULL`). The field count differs by tier: 35 fields with PolarDB vs 34 without (`lib/ProxySQL_Admin.cpp:5136-5140`).
 
-The query-rule semantics of `replica_eligible` (how it gates the pipeline) are covered in [06-ROUTING-PIPELINE.md](06-ROUTING-PIPELINE.md); here we only document that it persists like any other rule column.
+The query-rule semantics of `replica_eligible` (how it controls the pipeline) are covered in [06-ROUTING-PIPELINE.md](06-ROUTING-PIPELINE.md); here we only document that it persists like any other rule column.
 
 ### 6.4 Online schema upgrade (disk upgrade)
 
-On startup ProxySQL upgrades an older on-disk `pgsql_replication_hostgroups` table to the current schema (`lib/ProxySQL_Admin_Disk_Upgrade.cpp:633-689`). There are two migration steps:
+On startup ProxySQL upgrades an older on-disk `pgsql_replication_hostgroups` table to the current schema (`lib/ProxySQL_Admin_Disk_Upgrade.cpp`). There are four migration steps:
 
 1. **pre-3.0.2 -> current** (always present): if the table matches the V3_0_1 shape, rename it aside and recreate it from the current macro, copying `writer_hostgroup`, `reader_hostgroup`, a forced `'read_only'` `check_type`, and `comment` (`lib/ProxySQL_Admin_Disk_Upgrade.cpp:636-660`).
 2. **V3_0_2 -> V3_0_3** (PolarDB build only): if the table matches V3_0_2, recreate it and copy the four old columns while defaulting the LSN columns to `consistency_mode='default'`, `max_lag_bytes=-1`, and `lsn_wait_timeout_ms=-1`.
 3. **V3_0_3 -> V3_0_4** (PolarDB build only): if the table matches V3_0_3, recreate it and copy the existing columns while defaulting `proxy_protocol='default'`.
+4. **V3_0_4 -> V3_0_5** (PolarDB build only): if the table matches V3_0_4, recreate it and copy the existing columns while defaulting `txn_split_enabled=0`.
 
-So an operator upgrading a non-PolarDB ProxySQL to a PolarDB build keeps all existing rows; the new LSN columns appear with safe "inherit/off" defaults, and no row becomes a PolarDB pair until `check_type` is set to `polardb`.
+So an operator upgrading a non-PolarDB ProxySQL to a PolarDB build keeps all existing rows; the new LSN columns appear with safe "inherit/off" defaults, `txn_split_enabled` appears disabled, and no row becomes a PolarDB pair until `check_type` is set to `polardb`.
 
 ### 6.5 Round-trip diagram
 
@@ -456,17 +461,17 @@ So an operator upgrading a non-PolarDB ProxySQL to a PolarDB build keeps all exi
    ===============                 =====================            ===========
    pgsql_replication_hostgroups
         |  startup
-        v  disk_upgrade (Disk_Upgrade.cpp:633)  -- migrate to V3_0_4
+       v  disk_upgrade (Disk_Upgrade.cpp:633)  -- migrate to V3_0_5
    pgsql_replication_hostgroups (current schema)
         |  LOAD ... TO RUNTIME
-        |  dump_table_pgsql SELECT  -- 8 cols
+        |  dump_table_pgsql SELECT  -- 9 cols
         v
    generate_pgsql_replication_hostgroups_table (HGM.cpp:1790)
-        |  parse fields 0..7, parse mode and proxy_protocol
+        |  parse fields 0..8, parse mode and proxy_protocol
         v
    repl_config + topology maps (HGM.cpp:1836-1842)
         ^  SAVE ... FROM RUNTIME
-        |  INSERT 8 cols
+        |  INSERT 9 cols
    runtime_pgsql_replication_hostgroups / pgsql_replication_hostgroups
 ```
 
@@ -489,12 +494,12 @@ CSN note: the `csn` consistency mode and the `'session'` / `'global'` modes are 
 
 ## 8. Notes for reviewers
 
-- **One gate decides "is this a PolarDB pair":** `check_type='polardb'` (`lib/PgSQL_HostGroups_Manager.cpp:1824`). The LSN columns exist on every row but are inert for a `read_only` pair.
+- **One condition decides "is this a PolarDB pair":** `check_type='polardb'` (`lib/PgSQL_HostGroups_Manager.cpp:1824`). The LSN columns exist on every row but are inert for a `read_only` pair.
 - **`-1` is the universal "not set" sentinel** at the session and per-hostgroup tiers, both in the schema defaults (`max_lag_bytes`, `lsn_wait_timeout_ms` default `-1`) and in the parsed `consistency_mode_enum`. The resolvers fall through on `-1` (or, for the timeout, distinguish `0` = wait forever from `-1` = inherit).
 - **The session tier exists only for consistency mode.** Wait timeout and lag cap have no session override; only mode does. This is deliberate (a client can pick its own consistency strictness, but cannot widen the operator's timeout/lag safety bounds).
 - **Word knobs are validated at `SET` time, not at refresh time.** `polardb_consistency_mode` and `polardb_wait_timeout_mode` reject unknown words immediately; the refresh mapping is total (any leftover unknown maps to the safe default), so a bad value can never reach routing. The configured fallback startup identity is also validated at `SET` time across host and port, with `port=0` allowed only as an incomplete host-before-port staging state.
-- **Schema strings must stay in sync in three places:** the writable macro, the runtime macro, and the HGM-internal copy. All three carry the same V3_0_4 column list and CHECKs.
-- **Counter terminology:** there are 26 exported stat counters plus the internal `polardb_active` gate; this document only touches the schema/knob surface. See [12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md).
+- **Schema strings must stay in sync in three places:** the writable macro, the runtime macro, and the HGM-internal copy. All three carry the same V3_0_5 column list and CHECKs.
+- **Counter terminology:** there are 227 exported stat counters (190 thread-backed + 37 global-only) plus the internal `polardb_active` condition; this document only touches the schema/knob surface. See [12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md).
 
 ---
 
@@ -502,16 +507,17 @@ CSN note: the `csn` consistency mode and the `'session'` / `'global'` modes are 
 
 | Capability | Status in this implementation | Notes |
 |---|---|---|
-| `check_type='polardb'` pairs | implemented | the gate for all LSN routing |
+| `check_type='polardb'` pairs | implemented | the condition for all LSN routing |
 | `consistency_mode` off/lsn/primary | implemented | per-HG, 3-tier resolved |
 | `max_lag_bytes` per-HG + global | implemented | safety-only byte cap |
 | `lsn_wait_timeout_ms` per-HG + global | implemented | `0` = wait forever |
-| 7 global knobs + thread-local mirror | implemented | validated at SET; refreshed on commit |
+| 24 global knobs + thread-local mirror | implemented | validated at SET; refreshed on commit |
 | session-tier mode override | implemented | `SET proxysql.polardb_consistency_mode` |
-| disk upgrade to V3_0_4 | implemented | PolarDB build only; older rows get `proxy_protocol='default'` |
+| disk upgrade to V3_0_5 | implemented | PolarDB build only; older rows get `proxy_protocol='default'` and `txn_split_enabled=0` |
 | `pgsql-polardb_lag_ms` | DEFERRED / inert | no producer (Section 7) |
+| `consistency_mode` global_lsn | implemented | committed-state read-all-observed-writes wait |
 | `consistency_mode` csn/session/global | not in this implementation | future, experimental CSN (Section 2.4, doc 18) |
-| `txn_split_enabled` column | not in this implementation | transaction split dropped (doc 19) |
+| `txn_split_enabled` column | implemented as stored config | persisted and published; enables RFQ XID observation and split-read dispatch (doc 19) |
 
 ---
 
@@ -534,8 +540,8 @@ flowchart TD
     RES["resolvers (per query, in polardb_collect)"]
     EFF["effective mode / wait timeout / lag cap"]
 
-    RHG -->|commit parse HGM.cpp:1816-1842| REPL
-    VARS -->|refresh Thread.cpp:4072-4098| TL
+    RHG -->|commit parse HGM.cpp:2674-2714| REPL
+    VARS -->|refresh Thread.cpp:4424-4446| TL
     CLIENT -->|polardb_set_session_override\nConsistency.cpp:49| SESS
 
     SESS -->|tier 1| RES
@@ -577,10 +583,10 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    DISK["disk: pgsql_replication_hostgroups"] -->|startup disk_upgrade\nDisk_Upgrade.cpp:633| MIG["migrate to V3_0_4"]
+    DISK["disk: pgsql_replication_hostgroups"] -->|startup disk_upgrade\nDisk_Upgrade.cpp:633| MIG["migrate to V3_0_5"]
     MIG -->|LOAD TO RUNTIME\ndump SELECT HGM.cpp:1935| PARSE["generate_pgsql_replication_hostgroups_table\nHGM.cpp:1790"]
-    PARSE -->|parse fields 0..7 + mode/protocol| RC["repl_config + topology maps"]
-    RC -->|SAVE FROM RUNTIME\nINSERT 8 cols| RT["runtime_/writable tables"]
+    PARSE -->|parse fields 0..8 + mode/protocol| RC["repl_config + topology maps"]
+    RC -->|SAVE FROM RUNTIME\nINSERT 9 cols| RT["runtime_/writable tables"]
 ```
 
 ---

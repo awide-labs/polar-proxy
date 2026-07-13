@@ -49,10 +49,9 @@ There must be no benchmark-local copies of `lib.sh`, `test_common.sh`, or
 ProxySQL lifecycle code. If a benchmark needs shared behavior, add it to
 `lib/bench_harness.sh` or `lib/scenario_harness.sh`.
 
-CSN and transaction-split helpers in `lib/scenario_harness.sh` are postponed
-scaffold.
-Do not enable `CONSISTENCY_MODE=2/4` or `XACT_SPLIT=1` in benchmark scripts until
-that feature round is restored and has matching assertions.
+CSN helpers in `lib/scenario_harness.sh` remain postponed scaffold. LSN
+transaction split is active and may be used by benchmark scripts when the script
+also verifies split routing and counters.
 
 ## Output
 
@@ -184,6 +183,75 @@ Useful knobs:
 - `BENCH4_REPLAY_LAG_BYTES`
 - `BENCH4_WAIT_MODE`
 - `BENCH4_WAIT_TIMEOUT_MS`
+
+### `bench5_consistency_shapes.sh`
+
+Synthetic scenario-shape benchmark. It validates the SQL shapes used to compare
+primary-only consistency, session-LSN offload, and transaction split before those
+shapes are moved to larger real datasets.
+
+Supported shapes:
+
+- `session-readonly`
+- `session-write-read`
+- `session-read-write-read`
+- `session-write-many-reads`
+- `session-mixed`
+- `txn-readonly`
+- `txn-write-read`
+- `txn-read-write-read`
+- `txn-write-many-reads`
+- `txn-locking`
+- `txn-mixed`
+
+Supported modes:
+
+- `primary`: writer-only consistency baseline.
+- `lsn`: session LSN consistency, transaction split disabled.
+- `split`: session LSN consistency, transaction split enabled.
+- `off`: eventual-consistency control with forced reader routing.
+
+Run one isolated case:
+
+```bash
+BENCH5_CASES="session-write-read:lsn" make -C test/polardb bench5
+```
+
+Run a small transaction-split comparison:
+
+```bash
+BENCH5_CASES="txn-write-read:primary txn-write-read:split" make -C test/polardb bench5
+```
+
+Useful knobs:
+
+- `BENCH5_CASES`
+- `BENCH5_CLIENTS`
+- `BENCH5_ITERS`
+- `BENCH5_PRIMARY_DELAY_US`
+- `BENCH5_REPLAY_LAG_BYTES`
+- `BENCH5_WAL_GENERATOR`
+- `BENCH5_MAX_LAG_BYTES`
+- `BENCH5_WAIT_MODE`
+- `BENCH5_WAIT_TIMEOUT_MS`
+- `BENCH5_LAZY_WARMUP_SPLIT`
+- `BENCH5_PROXY_IDENTITY_MODE`
+- `BENCH5_TXN_SPLIT_SELECT_WAIT_MS`
+- `BENCH5_SPLIT_WARMUP_WAIT_SEC`
+
+`BENCH5_WAL_GENERATOR=0` is the default. The success-path shape matrix should
+exercise the backend RFQ WAL-pending marker and per-session LSN behavior without
+background WAL movement. Set it to `1` only for deliberate lag/load experiments.
+`BENCH5_REPLAY_LAG_BYTES=0` is the default so shape comparisons start from a
+no-lag baseline. Set it explicitly when testing delayed replicas.
+`BENCH5_PROXY_IDENTITY_MODE` maps to
+`pgsql-polardb_proxy_identity_mode` and defaults to `proxy`. Use `client` only
+when the benchmark intentionally requires backend-visible per-client identity.
+`BENCH5_TXN_SPLIT_SELECT_WAIT_MS=0` and `BENCH5_SPLIT_WARMUP_WAIT_SEC=0` are
+the defaults so split performance runs do not inject benchmark-side waits.
+Set them only for targeted diagnostics. Do not use `BENCH5_WAIT_TIMEOUT_MS` for
+warmup timing: the LSN wait timeout should continue to expose replica lag or
+missing WAL movement.
 
 ## Promotion Rule
 

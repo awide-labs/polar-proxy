@@ -1,14 +1,12 @@
-# 19 — Future: In-Transaction Read Offload (Split FSM)
+# 19 — In-Transaction Read Offload (Split FSM)
 
-> Scope: the full implementation's transaction-split feature — its state machine, backend swap, eligibility rules, and structures, described as a delta from the LSN-only baseline of this implementation. | Audience: R/M/O/C | Status: stable | Prereqs: [06-ROUTING-PIPELINE.md](06-ROUTING-PIPELINE.md), [07-QUERY-WRAPPING.md](07-QUERY-WRAPPING.md), [09-PUBLISH-AND-WRITE-TRACKING.md](09-PUBLISH-AND-WRITE-TRACKING.md), [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md), [18-FUTURE-CSN-DESIGN.md](18-FUTURE-CSN-DESIGN.md) | Verified against: this branch
+> Scope: the active transaction-split feature plus remaining extensions such as CSN integration and optional split-mode ranking. | Audience: R/M/O/C | Status: stable | Prereqs: [06-ROUTING-PIPELINE.md](06-ROUTING-PIPELINE.md), [07-QUERY-WRAPPING.md](07-QUERY-WRAPPING.md), [09-PUBLISH-AND-WRITE-TRACKING.md](09-PUBLISH-AND-WRITE-TRACKING.md), [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md), [18-FUTURE-CSN-DESIGN.md](18-FUTURE-CSN-DESIGN.md) | Verified against: this branch
 
 ---
 
 ## 0. Read this first: what this document is and is not
 
-This document describes a **future** feature called **transaction split** (also called **in-transaction read offload**). It is **NOT in this implementation**. This branch does **not** contain this feature at all. The file that implements it, `lib/PgSQL_PolarDB_Split.cpp`, **does not exist** in this implementation (confirmed: the path is absent).
-
-Because the feature is not in this implementation, this document is grounded in a **different tree**: the full implementation. That tree is the only place the split code lives. Every code citation in this document that points at the split feature is tagged **(full implementation)** to make this clear. This implementation's own line numbers are different and are never used for split code.
+This branch implements transaction split: `txn_split_enabled`, RFQ XID observation, `REPLICA_TXN_SPLIT`, split-specific counters, demand pool warmup, and RETRY/FORWARD/TERMINATE reader-failure handling. For one eligible simple-query read, ProxySQL takes a replica connection from the pool, runs the wrapped read, returns that connection, and keeps the transaction-owning writer connection unchanged. CSN integration and optional SMART/SIMPLE ranking remain future work.
 
 Two important rules for reading this document:
 
@@ -21,12 +19,12 @@ Two important rules for reading this document:
 | **Writer / primary** | The PolarDB backend that accepts writes and is always up to date. It is the only node that can hold an open transaction. The two words mean the same thing; the durable field name is `writer_hg` (writer hostgroup id). |
 | **Reader / replica** | A read-only PolarDB backend that replays the writer's write-ahead log and may lag behind it. The two words mean the same thing; the field name is `reader_hg`. |
 | **Autocommit read** | A `SELECT` (or other read) that runs on its own, **not** inside an open `BEGIN ... COMMIT` block. This implementation offloads these to a replica. |
-| **In-transaction read** | A read that runs **between** `BEGIN` and `COMMIT`, after a write in the same transaction. This implementation keeps these on the writer. Transaction split is the feature that offloads them. |
+| **In-transaction read** | A read that runs **between** `BEGIN` and `COMMIT`, after a write in the same transaction. Transaction split can offload an eligible simple-query read to a replica by exporting the writer transaction's XIDs. |
 | **LSN (Log Sequence Number)** | A 64-bit position in PostgreSQL's write-ahead log (WAL); larger means more recent. A replica that has replayed up to LSN X can serve a read whose data was written at or before X. |
 | **WAL (Write-Ahead Log)** | PostgreSQL/PolarDB's append-only log of every change. Replicas replay it to catch up to the writer. LSN is a position in this log. |
 | **GUC** | "Grand Unified Configuration" variable — a PostgreSQL runtime setting changed with `SET name = value`. PolarDB adds several PolarDB-specific GUCs. |
 | **XID / xids** | PostgreSQL transaction id(s). Transaction split needs the open transaction's xids on the replica so the replica can see that transaction's not-yet-committed rows. |
-| **Split backend** | A **second** replica connection that ProxySQL borrows for one in-transaction read, then switches away from. The writer transaction stays on its own connection the whole time. |
+| **Split backend** | A **second** replica connection that ProxySQL temporarily uses for one in-transaction read, then switches away from. The writer transaction stays on its own connection the whole time. |
 | **FSM** | Finite state machine — a small set of named states with rules for moving between them. The split feature has a 4-state FSM. |
 | **RFQ (ReadyForQuery)** | The PostgreSQL wire message a backend sends after each command. It carries a one-byte transaction status: `'I'` = idle (no transaction), `'T'` = in a live transaction, `'E'` = in a failed transaction. The PolarDB patch also attaches the backend's current LSN and (for split) transaction metadata. |
 
@@ -36,7 +34,7 @@ Two important rules for reading this document:
 
 ### 1.1 The one-paragraph summary
 
-This implementation only offloads **autocommit** reads to a replica. It uses an LSN wait so the replica has replayed far enough to give a correct read-your-writes answer. This implementation never touches a read that runs **inside** an open transaction — those always stay on the writer (this implementation forces them to the writer with reason `IN_TRANSACTION`). **Transaction split** is the future feature that also offloads **in-transaction reads after a write** to a replica. It works because PolarDB exposes two server mechanisms: the GUC `polar_xact_split_xids` makes the open transaction's own **uncommitted** rows visible on the replica, and the GUC `polar_xact_split_wait_lsn` makes the replica wait until it has replayed the write's WAL. ProxySQL borrows a second backend connection (the **split backend**) for that one read, then switches back to the writer's connection. The write transaction itself never leaves the writer.
+This implementation offloads autocommit reads and eligible simple-query reads inside an open transaction. Autocommit reads use an LSN wait for read-your-writes. Transaction split uses `polar_xact_split_xids` to expose the open transaction's own **uncommitted** rows on the replica and `polar_xact_split_wait_lsn` to wait for the required WAL. ProxySQL takes a second connection from the reader pool for that one read, returns it afterward, and keeps the write transaction on the writer connection.
 
 ### 1.2 Where split sits in this implementation's pipeline
 
@@ -45,7 +43,7 @@ This implementation already has a four-stage request pipeline, all methods of `P
 - **collect** gains a few extra fields it copies from the session (the split FSM state, the transaction's xids, the split mode knob, two transaction flags).
 - **plan** gains a new branch that decides "this in-transaction read is split-eligible" and a new route action, `REPLICA_TXN_SPLIT`.
 - **execute** gains a new branch that performs the backend swap for a split read.
-- **process_result** gains the FSM driver call and a gate that stops a replica reply from corrupting the writer-side transaction tracking.
+- **process_result** gains the FSM driver call and a condition that stops a replica reply from corrupting the writer-side transaction tracking.
 
 The wait mechanism itself is **reused, not rewritten**. The wrapped split query still ends with the same `polar_xact_split_wait_lsn` SET that this implementation emits for autocommit reads. Split adds the `polar_xact_split_xids` SET in front of it.
 
@@ -64,27 +62,27 @@ client query ─► COLLECT  (snapshot routing inputs)  ───► + copy spli
               (RunQuery on the chosen backend)
                   │
                   ▼
-                PROCESS_RESULT (read RFQ, advance state) ─► + drive split FSM + result-processing gate
+                PROCESS_RESULT (read RFQ, advance state) ─► + drive split FSM + result-processing condition
 ```
 
 ---
 
 ## 2. Functions: the split module's entry points
 
-All functions below are methods of `PgSQL_Session` and live in `lib/PgSQL_PolarDB_Split.cpp` (full implementation, 723 lines). The signature, what it does, what it changes, and where it is called from are listed for each. Line numbers are **(full implementation)**.
+All functions below are methods of `PgSQL_Session` and live in `lib/PgSQL_PolarDB_Split.cpp` (this branch, 942 lines). The split runtime now ships in-branch; several helpers were renamed from the reference tree (see the individual rows). The signature, what it does, what it changes, and where it is called from are listed for each. The per-row line numbers below are still **(full implementation)** reference-tree numbers unless a row says otherwise.
 
 | Function | file:line | Responsibility | Key side effects | Called from |
 |----------|-----------|----------------|------------------|-------------|
 | `polardb_advance_txn_split_fsm(char txn_status)` | `Split.cpp:37` | Drive the FSM forward by one step using the RFQ transaction-status byte. | Changes `polardb_txn_split_state`; may call cleanup; bumps the "became splittable" counter. | result-processing stage (`Flow.cpp:826`, full implementation) |
 | `polardb_update_txn_xids(const char* xids)` | `Split.cpp:145` | Store the transaction's xids (and a pre-escaped copy if they contain a quote). | Sets `polardb_txn_xids`, `polardb_txn_xids_escaped`, `polardb_txn_xids_needs_escape`. | result processing (refresh from RFQ); cleanup (clear with `nullptr`) |
-| `polardb_build_txn_split_query(query, mode, timeout)` | `Split.cpp:195` | Build the multi-statement wrapped split query (SET xids; optional mode/timeout; SET wait_lsn; the read). | Sets `polardb_txn_split_expected_set_results`; bumps an LSN-wait counter. Returns the SQL string (empty string = abort). | `polardb_prepare_txn_split_read()` |
+| `polardb_build_txn_split_wrapped_query(pkt, wait_spec, txn_xids, bypass_wait, wrapped_query)` | `Split.cpp:631` (this branch) | Build the multi-statement wrapped split query (SET xids; optional mode/timeout; SET wait_lsn; the read). | Writes the SQL into `wrapped_query` and returns a `uint32_t` statement count (0 = decline/abort). | `polardb_prepare_txn_split_read()` |
 | `polardb_prepare_txn_split_read(int reader_hg)` | `Split.cpp:417` | The **backend swap**: get a replica connection, build the wrapped query, point `mybe` at the split backend, stage the query. | Many — see Section 4. Moves FSM to `TXN_SPLIT_READ_ACTIVE`. Returns true on success. | execute stage (`Flow.cpp:570`, full implementation) |
 | `polardb_complete_txn_split_read()` | `Split.cpp:635` | Finalize a **successful** split read: record latency/success, restore the writer backend, move FSM back to `TXN_SPLITTABLE`. | Bumps success/latency counters; calls `polardb_reset_txn_split_state()`. | session, deferred after `finishQuery()` (`Session.cpp:4031-4036`, full implementation) |
 | `polardb_abort_txn_split_read(const char* reason)` | `Split.cpp:691` | Finalize a **failed** split read: record fallback, restore the writer backend, move FSM to `TXN_ON_PRIMARY`, and **block** all further splits in this transaction. | Bumps fallback/cleanup counters; sets `polardb_txn_split_blocked = true`. | split error paths |
 | `polardb_reset_txn_split_state()` | `Split.cpp:580` | Free per-read temporaries (wrapped SQL, stolen client packet, staged query pointer) and **restore `mybe`** to the saved writer backend. Does **not** change FSM state. | Restores `mybe`; clears active/pending flags; resets the wait runtime. | `complete`, `abort`, and the cleanup paths |
-| `polardb_cleanup_txn_split_state()` | `Split.cpp:306` | Full transaction-end teardown: reset state, return/destroy the borrowed connection, clear all xid/split state, set FSM to `NONE`. | Releases the reader connection; clears xids and pins. | FSM on transaction end; error paths |
-| `polardb_release_reader_backend(reader_mybe, want_reuse)` | `Split.cpp:325` | Return or destroy **only** the borrowed reader connection, discarding its staged result first. | Pools or destroys the reader connection; nulls `polardb_txn_split_backend`. | `polardb_cleanup_txn_split_state()`; reader-failure recovery (doc 20) |
-| `polardb_clear_txn_xid_state()` | `Split.cpp:351` | Clear all transaction-level xid, splittable, blocked, force-primary, and force-writer-pin flags. | Clears the xid/pin fields. | cleanup; transaction completion; session reset |
+| `polardb_cleanup_txn_split_state()` | `Split.cpp:306` | Full transaction-end teardown: reset state, return/destroy the temporary connection, clear all xid/split state, set FSM to `NONE`. | Releases the reader connection; clears XIDs and routes. | FSM on transaction end; error paths |
+| `polardb_release_reader_backend(reader_mybe, want_reuse)` | `Split.cpp:325` | Return or destroy **only** the temporary reader connection, discarding its staged result first. | Pools or destroys the reader connection; nulls `polardb_txn_split_backend`. | `polardb_cleanup_txn_split_state()`; reader-failure recovery (doc 20) |
+| `polardb_clear_txn_xid_state()` | `Split.cpp:351` | Clear all transaction-level XID, splittable, blocked, force-primary, and writer-only-route flags. | Clears the XID and route fields. | cleanup; transaction completion; session reset |
 | `polardb_clear_staged_session_state_for_reset(bool)` | `Split.cpp:365` | On a SQL `RESET` / `DISCARD ALL`, tear down only genuine in-flight staged split state, not the normal in-transaction FSM. | Resets staged split read; clears wait runtime and pending notices. | session RESET path |
 
 ---
@@ -93,7 +91,7 @@ All functions below are methods of `PgSQL_Session` and live in `lib/PgSQL_PolarD
 
 ### 3.1 New enum: the split FSM state
 
-The FSM state is one enum, `PgSQL_TxnSplitState`, an `enum class : uint8_t` (full implementation `PgSQL_PolarDB.h:112-117`). It does **not** exist in this implementation.
+The full implementation's live FSM state is one enum, `PgSQL_TxnSplitState`, an `enum class : uint8_t` (full implementation `PgSQL_PolarDB.h:112-117`). This branch does not carry that full FSM driver. It carries `PolarDB_TransactionSplitStage` inside `PolarDB_TransactionSplitState`, with the same stage vocabulary. The planner reads that state; execution still does not dispatch a split read.
 
 | State | Value | Meaning | Is a split read running on the replica? |
 |-------|------:|---------|-----------------------------------------|
@@ -108,7 +106,7 @@ The full implementation adds one route action and several action reasons to `Pol
 
 - New `RouteAction`: **`REPLICA_TXN_SPLIT`** (`PgSQL_PolarDB.h:704`) — route the read to a replica and prepend the xids SET plus the wait SET. This sits alongside this implementation's actions `PASSTHROUGH`, `REPLICA_WITH_WAIT`, and `FORCE_PRIMARY`.
 - New `TxnContext` sub-enum (`PgSQL_PolarDB.h:692-697`): `AUTOCOMMIT`, `READ_PRE_WRITE` (in a transaction, before the first write), `READ_POST_WRITE` (in a transaction, after a write — the split-eligible case), and `WRITE`.
-- New `RouteActionReason` values (`PgSQL_PolarDB.h:708-722`) that explain why a split was refused: `WAL_PENDING` (WAL not flushed yet), `SPLIT_BLOCKED` (a prior abort blocked further splits), `TXN_PINNED` (in a transaction but split disabled), `INVARIANT_VIOLATION` (a should-not-happen state), and `NO_REPLICA_CAUGHT_UP`. (The full implementation also carries `READER_FAILURE_FORCE_WRITER` for doc 20's reader-failure feature.)
+- New `RouteActionReason` values that explain why a split was refused: `WAL_PENDING` (WAL not flushed yet), `SPLIT_BLOCKED` (a prior abort blocked further splits), `HG_SPLIT_DISABLED` (hostgroup policy disables split reads), `INVARIANT_VIOLATION` (an unexpected state), and `NO_TXN_LSN` (no transaction wait target). The implementation also carries `READER_FAILURE_FORCE_WRITER` for doc 20's reader-failure feature.
 
 ### 3.3 New fields on `PolarDB_Query_RouteCtx` (collect output)
 
@@ -136,7 +134,7 @@ The full implementation adds (full implementation `PgSQL_PolarDB.h:736-740`):
 
 ### 3.5 New session fields (the durable split state)
 
-These live on `PgSQL_Session` (full implementation `PgSQL_Session.h`, around `:665-687`) and do not exist in this implementation. Like all session state, they are **session-confined** (one thread drives one session at a time, so no locks are needed).
+These live on `PgSQL_Session` in this branch, consolidated into the sub-object `PolarDB_TransactionSplitState polardb_transaction_split` (`include/PgSQL_Session.h:541`; temporary reader `PgSQL_Backend*` and split methods at `:1253-1279`, `:1312`). Like all session state, they are **session-confined** (one thread drives one session at a time, so no locks are needed).
 
 | Field | Type | Purpose |
 |-------|------|---------|
@@ -144,7 +142,7 @@ These live on `PgSQL_Session` (full implementation `PgSQL_Session.h`, around `:6
 | `polardb_txn_xids` / `polardb_txn_xids_escaped` | std::string | The transaction's xids and a pre-escaped copy. |
 | `polardb_txn_splittable` | bool | The PolarDB "WAL flushed, safe to split" marker. |
 | `polardb_txn_split_blocked` | bool | True after an abort; blocks further splits this transaction. |
-| `polardb_txn_split_backend` | `PgSQL_Backend*` | The borrowed replica connection used for split reads. |
+| `polardb_txn_split_backend` | `PgSQL_Backend*` | The temporary replica connection used for split reads. |
 | `polardb_txn_split_saved_mybe` | `PgSQL_Backend*` | The writer backend, saved while `mybe` points at the split backend. |
 | `polardb_txn_split_active` | bool | Mirrors `state == TXN_SPLIT_READ_ACTIVE`; a fast check on the WIRE path. |
 | `polardb_txn_split_pending_complete` | bool | Set when the WIRE finishes; tells the session to call `complete` after `finishQuery()`. |
@@ -203,10 +201,10 @@ Eligibility is decided in the planner `polardb_plan()` (`Flow.cpp:207`, full imp
 | # | Condition | Where checked (full implementation) |
 |---|-----------|---------------------------|
 | 1 | It is a PolarDB hostgroup, a reader hostgroup is configured, and the replica is policy-eligible (`replica_eligible`). | `Flow.cpp:212-244` |
-| 2 | No `/* route=primary */` hint and no reader-failure force-writer pin (doc 20). | `Flow.cpp:223-262` |
+| 2 | No `/* route=primary */` hint and no reader-failure writer-only route (doc 20). | `Flow.cpp:223-262` |
 | 3 | FSM state is `TXN_SPLITTABLE`, **or** `TXN_ON_PRIMARY` with xids + `!wal_pending` + LSN > 0 (the fast path). | `Flow.cpp:324`, `:355-358` |
 | 4 | `txn_xids` is non-empty. | `Flow.cpp:355` |
-| 5 | The read is **not** multi-statement. | `Flow.cpp:324`, `:355`; hard guard repeated at `:492-499` |
+| 5 | The read is **not** multi-statement. | `Flow.cpp:324`, `:355`; hard check repeated at `:492-499` |
 | 6 | The split mode knob is non-zero (split enabled). | `Flow.cpp:324`, `:356` |
 | 7 | The read is **not** extended protocol (Parse/Bind/Execute) — wrappers cannot be injected there. | `Flow.cpp:478-486` |
 | 8 | `txn_split_blocked` is false — a prior abort forces all later reads to the writer. | `Flow.cpp:285-294`, `:346-354` |
@@ -227,7 +225,7 @@ The eligibility **decision matrix** (in-transaction reads only; autocommit reads
 | any | yes | no | no | **yes** | — | — | >0 | FORCE_PRIMARY (action reason, multi-statement rejected) |
 | any | yes | no | no | no | **yes** | — | >0 | FORCE_PRIMARY (action reason `EXTENDED_PROTOCOL`) |
 | any | yes | no | no | no | no | **no** | >0 | FORCE_PRIMARY / writer fallback (reader status `READER_LAG_EXCEEDED`) |
-| any (in txn) | — | — | — | — | — | — | **0** | FORCE_PRIMARY (action reason `TXN_PINNED`) |
+| any (in txn) | — | — | — | — | — | — | **0** | FORCE_PRIMARY (action reason `HG_SPLIT_DISABLED`) |
 
 Query classification (read vs write, multi-statement) is done earlier by the
 query processor and arrives in `PolarDB_Query_RouteCtx`; the planner only ever runs
@@ -263,7 +261,7 @@ for reads.
     │        (Session.cpp:4031-4036 — full implementation)  → restores writer, FSM → TXN_SPLITTABLE
     ▼
  [PROCESS_RESULT]  polardb_process_result()  — for the split-replica reply it SKIPS the
-             transaction-level updates (the "result-processing gate") so the replica's RFQ
+             transaction-level updates (the "result-processing condition") so the replica's RFQ
              (txn='I', no xids) does not overwrite the writer-side FSM
              (Flow.cpp:753-789 — full implementation); it still drives the FSM (Flow.cpp:826)
 ```
@@ -282,7 +280,7 @@ for reads.
 | 6 | Stage the wrapped SQL on the split backend's data stream `pgsql_real_query`. | `Split.cpp:544-545` |
 | 7 | Mark `polardb_txn_split_active = true`, record the start time, move FSM → `TXN_SPLIT_READ_ACTIVE`, bump `polardb_split_reads_total`. | `Split.cpp:551-561` |
 
-The **restore** happens in `polardb_reset_txn_split_state()` (`Split.cpp:580`, full implementation): it clears the split backend's staged query pointer, frees the wrapped query and the stolen packet, and **restores `mybe = polardb_txn_split_saved_mybe`** (`Split.cpp:608-611`). Both `complete` (`Split.cpp:635`) and `abort` (`Split.cpp:691`) call it. The **full** transaction-end teardown is `polardb_cleanup_txn_split_state()` (`Split.cpp:306`), which additionally returns or destroys the borrowed connection via `polardb_release_reader_backend()` (`Split.cpp:325`) and clears all xid/split state via `polardb_clear_txn_xid_state()` (`Split.cpp:351`).
+The **restore** happens in `polardb_reset_txn_split_state()` (`Split.cpp:580`, full implementation): it clears the split backend's staged query pointer, frees the wrapped query and the stolen packet, and **restores `mybe = polardb_txn_split_saved_mybe`** (`Split.cpp:608-611`). Both `complete` (`Split.cpp:635`) and `abort` (`Split.cpp:691`) call it. The **full** transaction-end teardown is `polardb_cleanup_txn_split_state()` (`Split.cpp:306`), which additionally returns or destroys the temporary connection via `polardb_release_reader_backend()` (`Split.cpp:325`) and clears all xid/split state via `polardb_clear_txn_xid_state()` (`Split.cpp:351`).
 
 ---
 
@@ -302,7 +300,7 @@ Key design points:
 
 | Point | Detail | file:line (full implementation) |
 |-------|--------|------------------------|
-| The wait is **always LSN, never CSN** | CSN (commit sequence number) does not advance mid-transaction, so it cannot prove the replica replayed the in-flight write's WAL. Split always uses LSN. | `Split.cpp:221-222`, `:243` |
+| The wait is **always LSN, never CSN** | CSN (commit sequence number) does not advance mid-transaction, so it cannot show the replica replayed the in-flight write's WAL. Split always uses LSN. | `Split.cpp:221-222`, `:243` |
 | No LSN target → abort | If there is no LSN target, the build returns an empty string and the split is aborted (falls back to the writer). | `Split.cpp:249-252` |
 | Expected SET count | `polardb_txn_split_expected_set_results` = 2 (xids + wait) + 1 if a consistency-mode prefix was added + 1 if a timeout SET was added. The WIRE path skips exactly this many SET replies before forwarding the `SELECT` result to the client. | `Split.cpp:259` |
 | **No RESET statements** | PolarDB auto-resets all split GUCs at COMMIT/ABORT. Sending `RESET polar_xact_split_xids` **before** the transaction ends is a server error ("polar_xact_split_xids is incorrectly reset"), so the wrapped query never includes a RESET. | `Split.cpp:268-292` |
@@ -324,15 +322,15 @@ txn_split_enabled INT
   NOT NULL DEFAULT 0
 ```
 
-Meaning: per writer/reader pair, **off by default**, and only settable to 1 when the hostgroup's `check_type` is `'polardb'`. This implementation's V3_0_4 schema does not have this column; its schema is the LSN-only eight-column form with `proxy_protocol`.
+Meaning: per writer/reader pair, **off by default**, and only settable to 1 when the hostgroup's `check_type` is `'polardb'`. This implementation's V3_0_5 schema stores and publishes this column in the hostgroup policy snapshot; the planner reads it before naming a split route, and execution may take a compatible replica connection from the pool for that read.
 
-The full implementation also **widens** the `consistency_mode` CHECK to accept `'csn'`, `'session'`, and `'global'` in addition to this implementation's `'default'/'off'/'lsn'`. Those extra modes belong to the CSN feature, not split — and CSN is experimental and incomplete (it needs PolarDB backend support, applies only in global-consistency mode, and its wait behavior is not reliably verified) — see [18-FUTURE-CSN-DESIGN.md](18-FUTURE-CSN-DESIGN.md). (Operator-confusion note carried from the CSN doc: the schema word `'session'` maps to **LSN**, not to a session-CSN mode.)
+This branch's `consistency_mode` CHECK already accepts `'global_lsn'`/`'lsn_global'`/`'global'` (all mapped to `GLOBAL_LSN`, **not** CSN) alongside `'default'/'off'/'lsn'/'primary'` (`include/PgSQL_HostGroups_Manager.h:61`). A future CSN feature would add `'csn'`/`'session'`; the word `'global'` is already taken by `GLOBAL_LSN`. CSN is experimental and incomplete (it needs PolarDB backend support, applies only in global-consistency mode, and its wait behavior is not reliably verified) — see [18-FUTURE-CSN-DESIGN.md](18-FUTURE-CSN-DESIGN.md).
 
-Any future transaction-split schema re-add must use a post-V3_0_4 versioned macro and disk migration. `REQUEST_RFQ_XID` is the reserved startup-profile vocabulary for future XID payload requests; it does not imply a V3_0_4 schema column or shipped split capability in this implementation.
+Any future transaction-split extension must reuse this existing policy bit and add any further schema changes through a new versioned macro and disk migration. This branch already uses `REQUEST_RFQ_XID` when `txn_split_enabled=1`; that request lets result processing observe split-readable state for planning and dispatch.
 
 ### 6.2 Thread knob
 
-One new thread-local knob, `pgsql-polardb_split_mode` (full implementation `PgSQL_Thread.cpp:425`, default 0 at `:1213`, max value `POLARDB_SPLIT_SMART` at `:2365`):
+In this branch split is enabled per writer/reader pair by the `txn_split_enabled` schema column — there is **no** `pgsql-polardb_split_mode` thread knob here. The reader leg is picked via `get_MyConn_polardb_reader` (LSN-aware), and demand pool warm-up is governed by the `pgsql-polardb_lazy_warmup_split` knob (`include/PgSQL_Thread.h:1134`). The SMART/SIMPLE runtime split-mode knob from the reference tree (full implementation `PgSQL_Thread.cpp:425`, default 0 at `:1213`, max value `POLARDB_SPLIT_SMART` at `:2365`) remains future work:
 
 | Value | Name | Behavior |
 |------:|------|----------|
@@ -344,7 +342,7 @@ Constants: full implementation `PgSQL_Thread.h:45-47`.
 
 ### 6.3 Counters
 
-Split adds a large block of counters in the full implementation (`PgSQL_HostGroups_Manager.h`). That older full-tree code stores all of them as `std::atomic<unsigned long long>` and increments them with `fetch_add(..., relaxed)`. If transaction split is re-added on top of this branch, apply this branch's current counter-storage rule instead: hot per-query counters and degraded-path counters should use per-thread storage plus a global counter, while monitor/config/rare counters may remain global atomics. They are still exposed through `stats_pgsql_global` under stable `PolarDB_*` names the same way this implementation's counters are ([12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md)). The main ones:
+Split adds a large block of counters, defined in this branch through the `POLARDB_COUNTER_LIST` X-macro (`include/PgSQL_PolarDB_Counters.h`). (The older reference tree stored them as `std::atomic<unsigned long long>` incremented with `fetch_add(..., relaxed)`.) This branch's counter-storage rule applies: hot per-query counters and degraded-path counters use per-thread storage plus a global counter (the `T(...)` entries), while monitor/config/rare counters remain global atomics (the `G(...)` entries). They are still exposed through `stats_pgsql_global` under stable `PolarDB_*` names the same way this implementation's counters are ([12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md)). The main ones:
 
 | Counter | Meaning | file:line (full implementation) |
 |---------|---------|------------------------|
@@ -363,24 +361,24 @@ Split adds a large block of counters in the full implementation (`PgSQL_HostGrou
 | `polardb_split_pool_contention` | Pool contention events. | `:868` |
 | `polardb_split_lsn_wait_count` | Number of LSN waits emitted by split builds. | `:862` |
 | `polardb_split_latency_sum_us` / `polardb_split_latency_count` | Split read latency (sum and sample count). | `:902-903` |
-| `polardb_split_conn_cleanup_success` / `polardb_split_conn_cleanup_failed` | Cleanup outcome of the borrowed connection. | `:856-857` |
+| `polardb_split_conn_cleanup_success` / `polardb_split_conn_cleanup_failed` | Cleanup outcome of the temporary connection. | `:856-857` |
 | `polardb_split_error_connection_lost` / `polardb_split_error_timeout` / `polardb_split_error_lsn_wait_timeout` | Split error breakdown. | `:869-872` |
-| `polardb_split_warmup_requested` / `polardb_split_warmup_created` / `polardb_split_warmup_failed` | Pool warm-up for split (depends on the warm-up feature — see [21-FUTURE-OTHER-CAPABILITIES.md](21-FUTURE-OTHER-CAPABILITIES.md)). | `:906-908` |
+| `PolarDB_Split_Warmup_Requested` / `_Created` / `_Failed` | Pool warm-up for split — **shipped in this branch**, enabled by `polardb_lazy_warmup_split`; see [21-FUTURE-OTHER-CAPABILITIES.md](21-FUTURE-OTHER-CAPABILITIES.md). | `PgSQL_PolarDB_Counters.h:972+` |
 
-For context, this implementation's LSN set ships **26 stat counters + 1 `polardb_active` gate** (see [12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md)). The split counters above are **additional** and exist only in the full implementation.
+For context, the split counters above are **shipped in this branch** (generated from `include/PgSQL_PolarDB_Counters.h`, e.g. `PolarDB_Split_Reads_Total` at `:799` and `PolarDB_Txn_Became_Splittable` at `:787`), not full-implementation-only. Apply this branch's current thread/global storage rule from [12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md) when reasoning about them.
 
 ---
 
 ## 7. Lifecycle bookkeeping (state never leaks to the next transaction)
 
-The result-processing stage clears the per-transaction split flags on every transaction end. When the RFQ transaction status is `'I'` (transaction ended), result processing clears `polardb_txn_split_did_split`, `polardb_txn_split_was_splittable`, and `polardb_txn_split_blocked` (`Flow.cpp:858-861`, full implementation), and clears the `/* route=primary */` hint and the reader-failure force-writer pin (`Flow.cpp:833-837`). Commit classification (`with_split` vs `no_split`) runs in the same block (`Flow.cpp:850-857`). The FSM's own cleanup path (`Split.cpp:319` → `NONE`) clears the same flags a second time as a safety backup, in case the FSM path did not run.
+The result-processing stage clears the per-transaction split flags on every transaction end. When the RFQ transaction status is `'I'` (transaction ended), result processing clears `polardb_txn_split_did_split`, `polardb_txn_split_was_splittable`, and `polardb_txn_split_blocked` (`Flow.cpp:858-861`, full implementation), and clears the `/* route=primary */` hint and the reader-failure writer-only route (`Flow.cpp:833-837`). Commit classification (`with_split` vs `no_split`) runs in the same block (`Flow.cpp:850-857`). The FSM's own cleanup path (`Split.cpp:319` → `NONE`) clears the same flags a second time as a safety backup, in case the FSM path did not run.
 
-The **result-processing gate** is the second part of leak prevention. A reply from a replica backend during a transaction must **not** update the writer-side transaction tracking, because the replica's RFQ reports `txn='I'` with no xids — reading those would reset the FSM and erase the xids set by earlier writer writes. The gate skips the transaction-level result-processing steps in two cases (`Flow.cpp:753-789`, full implementation):
+The **result-processing condition** is the second part of leak prevention. A reply from a replica backend during a transaction must **not** update the writer-side transaction tracking, because the replica's RFQ reports `txn='I'` with no xids — reading those would reset the FSM and erase the xids set by earlier writer writes. The condition skips the transaction-level result-processing steps in two cases (`Flow.cpp:753-789`, full implementation):
 
 1. **Split-read result** — detected by `pending_complete && active && backend match`. The deferred `polardb_complete_txn_split_read()` handles the bookkeeping instead.
 2. **Consistency-wait read within a transaction** — a pre-write `SELECT` routed to a replica via `REPLICA_WITH_WAIT`. Detected by FSM state past `NONE` **and** the replica says `txn='I'` **and** this is not a write.
 
-In both cases the gate `return`s before the transaction-level updates, but the per-server LSN update (result-processing steps 1-4) still runs because it is safe regardless of which backend produced the result.
+In both cases the condition `return`s before the transaction-level updates, but the per-server LSN update (result-processing steps 1-4) still runs because it is safe regardless of which backend produced the result.
 
 ---
 
@@ -393,17 +391,17 @@ In both cases the gate `return`s before the transaction-level updates, but the p
 | The `RouteCtx` / `RoutePlan` structs | Split adds the split fields (Sections 3.3-3.4) and the `REPLICA_TXN_SPLIT` action to the same routing pipeline shape. |
 | Per-server LSN tracking (`polardb_update_server_lsn`) ([05-MONITOR-AND-HGM-LSN-STATE.md](05-MONITOR-AND-HGM-LSN-STATE.md)) | Reused for the lag check (eligibility rule 9) and the SMART connection pick. |
 | The async `RunQuery` / `finishQuery` loop | Split runs on it by swapping `mybe`; completion is deferred via `polardb_txn_split_pending_complete` (`Session.cpp:6189`, `:4031-4036`, full implementation). |
-| The connection pool getters | `get_MyConn_polardb_reader` / `get_MyConn_from_pool` source the borrowed replica connection (`Split.cpp:451-457`, full implementation). |
-| The RFQ result-processing read ([09-PUBLISH-AND-WRITE-TRACKING.md](09-PUBLISH-AND-WRITE-TRACKING.md)) | Reused, but guarded by the result-processing gate (Section 7) so a replica reply does not overwrite the writer-side FSM. |
+| The connection pool getters | `get_MyConn_polardb_reader` / `get_MyConn_from_pool` source the temporary replica connection (`Split.cpp:451-457`, full implementation). |
+| The RFQ result-processing read ([09-PUBLISH-AND-WRITE-TRACKING.md](09-PUBLISH-AND-WRITE-TRACKING.md)) | Reused, but protected by the result-processing condition (Section 7) so a replica reply does not overwrite the writer-side FSM. |
 
 ---
 
 ## 9. Notes for reviewers — tricky behaviors to be aware of
 
-These are the details to design around if this feature is ever brought into the main branch.
+These are the details maintainers must preserve when extending the current implementation.
 
 1. **The active-read transition is unconditional.** `TXN_SPLIT_READ_ACTIVE → TXN_SPLITTABLE` fires regardless of the RFQ transaction status (`Split.cpp:124-129`, full implementation). If an `'I'` arrives during an active split read, the FSM lands on `TXN_SPLITTABLE` rather than `NONE`. The design relies on `complete`/`abort` running first. (Tracked in doc-04 P5, `04-TRANSACTION-SPLITTING.md` in the full implementation.)
-2. **Split borrows a second backend in one transaction.** This breaks the upstream `tx_poisoned` recovery assumption that "the dead backend owned the transaction." The death of the split/reader backend must **not** poison the session; only the death of the transaction-owning **writer** should. The full case matrix and tests live in `22-TX-POISONED-AND-SPLIT-RECOVERY.md` (in the full implementation's `doc/polardb-arch/`, not in this docset), and the reader-failure recovery model (RETRY / FORWARD / force-writer pin) is in [20-FUTURE-READER-FAILURE-RETRY-DESIGN.md](20-FUTURE-READER-FAILURE-RETRY-DESIGN.md). Treat both as required companions to any split work.
+2. **Split temporarily uses a second backend in one transaction.** This breaks the upstream `tx_poisoned` recovery assumption that "the dead backend owned the transaction." The death of the split/reader backend must **not** poison the session; only the death of the transaction-owning **writer** should. The full case matrix and tests live in `22-TX-POISONED-AND-SPLIT-RECOVERY.md` (in the full implementation's `doc/polardb-arch/`, not in this docset), and the reader-failure recovery model (RETRY / FORWARD / writer-only route) is in [20-FUTURE-READER-FAILURE-RETRY-DESIGN.md](20-FUTURE-READER-FAILURE-RETRY-DESIGN.md). Treat both as required companions to any split work.
 3. **`abort` blocks; `prepare`-fail does not.** `polardb_abort_txn_split_read()` sets `split_blocked = true` for the rest of the transaction (no retries), but a `prepare` failure only falls back to the writer without blocking — an intentional retry-friendly choice for transient pool gaps. (doc 21 §2 "prepare-fail vs abort".)
 4. **CSN is never used for the split wait.** This is correct (CSN does not advance mid-transaction), but note that it means split is **LSN-only by design** even in a CSN-enabled deployment. CSN itself remains experimental and incomplete — see [18-FUTURE-CSN-DESIGN.md](18-FUTURE-CSN-DESIGN.md).
 
@@ -413,12 +411,12 @@ These are the details to design around if this feature is ever brought into the 
 
 | Item | Status |
 |------|--------|
-| Transaction split feature | **Future, not in this implementation.** Lives only in the full implementation (`lib/PgSQL_PolarDB_Split.cpp`, 723 lines). This implementation has no such file. |
-| In-transaction reads in this implementation | Always forced to the writer (action reason `IN_TRANSACTION`). |
-| Reader-failure recovery for split | **Design only** in the full implementation; see [20-FUTURE-READER-FAILURE-RETRY-DESIGN.md](20-FUTURE-READER-FAILURE-RETRY-DESIGN.md). The force-writer-pin fields and the planner check that forces the writer after a reader failure exist in the full implementation's code, but how much of the RETRY/FORWARD recovery is actually wired vs still planned was not verified end-to-end. |
+| Transaction split feature | **Implemented.** Simple-query split reads, counters, demand warmup, and RETRY/FORWARD/TERMINATE handling are active; CSN integration and optional SMART/SIMPLE ranking remain future work. |
+| In-transaction reads in this implementation | Stay on the writer unless `txn_split_enabled=1`, RFQ evidence is complete, and the split helper can take a compatible replica connection from the pool. |
+| Reader-failure recovery for split | **Implemented.** See [20-FUTURE-READER-FAILURE-RETRY-DESIGN.md](20-FUTURE-READER-FAILURE-RETRY-DESIGN.md). Policy can retry on the writer, forward the reader error, or terminate the session. |
 | `tx_poisoned` coexistence | **Design only**; see `22-TX-POISONED-AND-SPLIT-RECOVERY.md` (full implementation). |
-| Lazy pool warm-up (the split warm-up counters) | A companion future feature; see [21-FUTURE-OTHER-CAPABILITIES.md](21-FUTURE-OTHER-CAPABILITIES.md). |
-| doc-04 function names / line count | **Stale.** doc-04 says 984 lines with `should_split_query()` / `maybe_prepare_split_read()` / `build_split_query()`; the live file is 723 lines and those functions are gone. The live code is authoritative. |
+| Lazy pool warm-up (the split warm-up counters) | **Shipped in this branch**, enabled by `polardb_lazy_warmup_split`; see [21-FUTURE-OTHER-CAPABILITIES.md](21-FUTURE-OTHER-CAPABILITIES.md). |
+| doc-04 function names / line count | **Stale.** doc-04 says 984 lines with `should_split_query()` / `maybe_prepare_split_read()` / `build_split_query()`; the live file is 942 lines and those functions are gone. The live code is authoritative. |
 
 In-code deferred/TODO notes found in the split source (for [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md)):
 
@@ -454,7 +452,7 @@ flowchart TD
     E -->|prepare fail| W["fallback to writer\npolardb_split_reads_fallback++"]
     R --> WD["WIRE done\npending_complete = true"]
     WD --> CP["finishQuery() then\ncomplete_txn_split_read()\nrestore writer, FSM -> TXN_SPLITTABLE"]
-    CP --> PUB["PROCESS_RESULT polardb_process_result()\nresult-processing gate skips txn-level updates\ndrive FSM via advance_txn_split_fsm()"]
+    CP --> PUB["PROCESS_RESULT polardb_process_result()\nresult-processing condition skips txn-level updates\ndrive FSM via advance_txn_split_fsm()"]
 ```
 
 ### A.3 The wrapped split query shape

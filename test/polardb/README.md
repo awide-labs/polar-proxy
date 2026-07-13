@@ -68,12 +68,15 @@ Preferred input is a neutral endpoint list:
 
 ```bash
 POLARDB_AUTODETECT=1
-POLARDB_ENDPOINTS="<primary-host>:<primary-port> <replica-host>:<replica-port>"
+POLARDB_ENDPOINTS="<primary-host>:<primary-port> <replica1-host>:<replica1-port> <replica2-host>:<replica2-port>"
 ```
 
 The harness probes every endpoint with `SELECT pg_is_in_recovery()` and selects
-exactly one primary plus the first available replica. This works for both
-same-host/multi-port docker layouts and multi-host hardware layouts.
+exactly one primary plus every available replica. `REPLICA_HOST` /
+`REPLICA_PORT` are kept as the first-reader compatibility endpoint for direct
+checks, while ProxySQL server setup registers all endpoints in
+`POLARDB_REPLICA_ENDPOINTS`. This works for both same-host/multi-port docker
+layouts and multi-host hardware layouts.
 
 Manual override is also supported:
 
@@ -83,6 +86,9 @@ PRIMARY_HOST=<primary-host>
 PRIMARY_PORT=<primary-port>
 REPLICA_HOST=<replica-host>
 REPLICA_PORT=<replica-port>
+# Optional second reader.
+REPLICA2_HOST=<replica2-host>
+REPLICA2_PORT=<replica2-port>
 ```
 
 By default the manual endpoints are role-checked. Set
@@ -135,6 +141,9 @@ Then use the PolarDB test Makefile so the command names are discoverable:
 ```bash
 make -C test/polardb help
 make -C test/polardb run-c-libpq-lsn
+make -C test/polardb run-c-libpq-xact
+make -C test/polardb run-c-libpq-xact ARGS=--probe-isolation-report
+make -C test/polardb run-c-libpq-xact ARGS=--require-w-marker
 make -C test/polardb run-c-extended-protocol QUERY="SELECT 1"
 ```
 
@@ -142,6 +151,17 @@ make -C test/polardb run-c-extended-protocol QUERY="SELECT 1"
 configured ProxySQL frontend. Normal end-to-end coverage for that helper is in
 `lsn_session_consistency_tap.sh`, which starts and configures ProxySQL before
 calling the helper.
+
+`run-c-libpq-xact ARGS=--probe-isolation-report` checks whether the direct
+backend reports `default_transaction_isolation` through PostgreSQL
+`ParameterStatus`. Unsupported backends return a distinct skip code so TAP can
+verify ProxySQL consumption only when the backend extension is present.
+
+`run-c-libpq-xact ARGS=--require-w-marker` checks the backend RFQ transaction
+split contract directly: after an in-transaction write, the backend must be
+able to emit the WAL-pending `w` marker. The normal helper run probes the same
+path but skips if timing or backend support prevents observing `w`; the TAP
+split suite uses the strict mode so missing backend support is not hidden.
 
 `make -C test/polardb build` delegates to `make -C test polardb`, which checks for PolarDB LSN symbols in the vendored libpq before compiling bundled pgbench and the helpers. If the check fails, rebuild with
 `make polardb-libpq`; the helpers must not fall back to system libpq.
@@ -158,6 +178,51 @@ The lower-level C-helper runner is `test/polardb/test-c/run_helper.sh`; prefer t
 The TAP scripts share `lib/tap_core.sh`, so missing local prerequisites are reported as valid TAP `SKIP` lines with a concrete build command instead of a shell traceback.
 
 ## 6. TAP Tests
+
+### Parallel-Ready ProxySQL Shards
+
+TAP scripts are ProxySQL-instance isolated: set `POLARDB_TEST_SHARD=N` to shift
+the default PGSQL admin, MySQL admin, and proxy listener ports by
+`N * POLARDB_PROXY_SHARD_STRIDE` (default stride: `100`) and to suffix default
+data directories with `.shardN`. Explicit `PROXYSQL_DATA_DIR`,
+`PROXYSQL_ADMIN_PORT`, `PROXYSQL_MYSQL_ADMIN_PORT`, and `PROXYSQL_PORT` values
+win for standalone TAP scripts.
+
+This only isolates ProxySQL. Tests that mutate shared PolarDB/DCS state
+(replay-lag, wait-timeout, WAL pressure, monitor freshness) should remain
+sequential unless each shard is pointed at an independent backend scope, for
+example a separate Docker cluster.
+
+The Makefile also provides a conservative scheduler:
+
+```bash
+make -C test/polardb tap-parallel-list
+make -C test/polardb tap-parallel-safe
+make -C test/polardb tap-exclusive
+make -C test/polardb tap-parallel
+```
+
+`tap-parallel-safe` runs known-safe groups concurrently with distinct
+`POLARDB_TEST_SHARD`, `POLARDB_TAP_GROUP`, and backend object suffixes.
+`tap-exclusive` runs backend-mutating groups sequentially. `tap-parallel` runs
+both phases in that order. The legacy `tap` target remains fully sequential.
+
+The scheduler treats exact ProxySQL port values from `.env` as base ports and
+derives per-shard concrete ports. It also ignores exact `PROXYSQL_DATA_DIR`
+values so parallel jobs cannot delete each other's ProxySQL state. Use
+`PROXYSQL_*_PORT_BASE`, `POLARDB_PROXY_SHARD_STRIDE`, and
+`POLARDB_TAP_SHARD_BASE` for custom parallel layouts.
+
+Current group tags:
+
+- `parallel` means the group may run with other parallel groups on one backend
+  topology when it has a unique ProxySQL shard and unique backend objects.
+- `backend_exclusive` means the group changes replay lag, timeout behavior, or
+  backend sessions and must run alone on a shared backend topology.
+
+Known backend-exclusive groups are `global-timeout`, `split-timeout`,
+`split-failure-policy`, and `wait-timeout`. `wait-timeout` intentionally remains
+sequential as one group.
 
 ### `config_roundtrip_tap.sh`
 
@@ -181,11 +246,11 @@ for maintainers reading the executable test body.
 - **Extended protocol routing** — Parse/Bind/Execute reads are not wait-wrapped in this version; manual routes are still honored.
 - **Proxy-protocol RFQ scope** — `v15`/`legacy`/`off` and hostgroup-override negotiation of RFQ-LSN capability.
 - **Startup identity fallback** — where the RFQ startup client address comes from, and rejecting the backend connection when it cannot be formed.
-- **RFQ availability policy** — `strict` vs `best_effort` when no RFQ LSN is available, and the missing-LSN latches.
+- **RFQ availability policy** — `strict` vs `best_effort` when no RFQ LSN is available, and the missing-LSN flags.
 - **Route hints and session overrides** — `route=primary`, multi-statement queries, the session-level mode override, and `RESET ALL`.
 - **Replica acquisition faults** — debug-fault coverage of the busy and unknown-LSN fallback paths.
 - **Monitor LSN updates** — the background monitor LSN cache, kept separate from the per-query RFQ path.
-- **Lag-cap and freshness routing** — the byte-lag cap, freshness gating, and cold-pool replica creation.
+- **Lag-cap and freshness routing** — the byte-lag cap, freshness checks, and cold-pool replica creation.
 - **RFQ connection-profile reuse** — pooled replica connections reused or evicted by protocol compatibility.
 - **Wrapper error attribution** — ordinary SQL errors and look-alike warnings are not mistaken for LSN wait timeouts.
 
@@ -214,7 +279,7 @@ The PolarDB unit tests live under `test/polardb/test-unit/` and are built by the
 PolarDB-owned Makefile target:
 
 - `polardb_routing_lsn_unit-t` — monotonic session-target, wait-plan, baseline,
-  RFQ-unavailable route policy, query-shape guards, writer-scope matrix
+  RFQ-unavailable route policy, query-shape checks, writer-scope matrix
 - `polardb_protocol_parse_unit-t` — node-type name mapping, monitor-health parsers,
   multi-statement detection
 - `polardb_status_policy_unit-t` — route-action / reader-status names,
@@ -224,7 +289,7 @@ PolarDB-owned Makefile target:
 - `polardb_hgm_lsn_unit-t`
 
 The protocol-parse unit covers the monitor health parsing helpers and the
-monitor-LSN update gate. Live monitor scheduling, invalid health roles/values, and
+rules for accepting monitor LSN updates. Live monitor scheduling, invalid health roles/values, and
 availability-driven shun behavior are covered by the LSN TAP.
 
 Run the full PolarDB coverage checkpoint with:
@@ -236,7 +301,7 @@ make -C test/polardb coverage
 The coverage target builds the dedicated `-O0` gcov/debug binary, runs the TAP
 suite and PolarDB units, analyzes debug traces, and writes focused reports under
 `COVERAGE_DIR` (default `/tmp/proxysql-polardb-coverage`).
-Coverage percentage gates default to report-only during development. Set
+Coverage percentage controls default to report-only during development. Set
 `POLARDB_DEDICATED_TAKEN_MIN` or `POLARDB_FUNCTION_TAKEN_MIN` explicitly when a
 branch wants enforced coverage floors.
 
@@ -261,6 +326,7 @@ short `bench` target:
 - `bench2_lsn_offload.sh` - off/lsn/primary read-after-write offload comparison.
 - `bench3_replica_lag.sh` - replica-lag correctness and lag-cap benchmark.
 - `bench4_loaded_primary.sh` - loaded primary vs LSN offload benchmark.
+- `bench5_consistency_shapes.sh` - synthetic session/transaction shape matrix for primary, session-LSN, and split comparisons.
 
 Run them individually:
 
@@ -269,13 +335,59 @@ make -C test/polardb bench1
 make -C test/polardb bench2
 make -C test/polardb bench3
 make -C test/polardb bench4
+make -C test/polardb bench5
 ```
 
-Or run all four heavy benchmarks:
+Or run all five heavy benchmarks:
 
 ```bash
 make -C test/polardb bench-heavy
 ```
+
+Run a single `bench5` scenario shape with:
+
+```bash
+BENCH5_CASES="session-write-read:lsn" make -C test/polardb bench5
+BENCH5_CASES="txn-write-read:primary txn-write-read:split" make -C test/polardb bench5
+BENCH5_CASES="txn-readonly:primary txn-readonly:split txn-leading-reads-write-read:primary txn-leading-reads-write-read:split" make -C test/polardb bench5
+```
+
+For transaction cases, `split` mode enables both transaction-split reads after a
+write and pre-write/read-only transaction reader waits before write evidence
+exists. Use `primary` for the writer-only baseline. `txn-readonly` and
+`txn-readonly-long` measure fully read-only transactions; `txn-read-write-read`
+and `txn-leading-reads-write-read` measure transactions with read-only work
+before the first write.
+
+Cold transaction-reader runs may fall back to the primary for the first read and
+queue lazy warmup; that is valid and is visible through `WREQ`/`WNEW` in the
+summary. To compare steady-state offload, run more than one iteration and set
+`BENCH5_SPLIT_WARMUP_WAIT_SEC` to give the queued reader connection time to
+record before later iterations.
+Use `BENCH5_PROXY_IDENTITY_MODE=proxy` when a multi-connection benchmark should
+share warmed readers through ProxySQL's listener identity. Use `client` when the
+backend-visible client endpoint is part of the workload contract.
+
+For post-write split cases, `BENCH5_TXN_SPLIT_SELECT_WAIT_MS` controls the
+same-session pause between a transaction write and its split-eligible read.
+`BENCH5_REPLAY_LAG_BYTES` defaults to 0 so the shape matrix starts from a
+no-lag baseline; set it explicitly for delayed-replica runs.
+`BENCH5_TXN_SPLIT_SELECT_WAIT_MS` and `BENCH5_SPLIT_WARMUP_WAIT_SEC` both
+default to 0 so split performance runs do not inject benchmark-side waits. Keep
+`BENCH5_WAIT_TIMEOUT_MS` as the real backend LSN wait timeout; increasing it can
+hide replica lag or missing WAL movement.
+
+Format existing `bench5` output with the report helper. Arguments can be run
+IDs, run directory names, run directory paths, or `bench5_summary.tsv` paths:
+
+```bash
+make -C test/polardb bench5-report ARGS="554"
+make -C test/polardb bench5-report ARGS="554 --view all --sort speedup --desc"
+make -C test/polardb bench5-report ARGS="554 --view winners --case txn-"
+```
+
+The helper reads `bench5_summary.tsv`, computes `vs_primary` for each shape,
+and can filter by case/shape/mode/warmup or print only winners/neutral rows.
 
 The heavy benchmarks are manual performance tools, not PR acceptance tests. They
 should be run only in an environment where replay-lag DCS controls, backend log

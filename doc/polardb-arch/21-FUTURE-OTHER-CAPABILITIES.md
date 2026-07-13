@@ -1,6 +1,6 @@
 # 21 — Future: Other Capabilities from the full implementation
 
-> Scope: the remaining PolarDB capabilities that exist in the full implementation but are NOT in this LSN-only PolarDB feature — connection-pool warmup, version-aware connection naming, session-identity generation, deeper health checks, the extra config knobs, and the reader-acquisition quality gates — described as a delta from this implementation: what each one does and exactly where it would slot back into this implementation's hooks. | Audience: R/M/O/C | Status: stable | Prereqs: [01-BACKGROUND-AND-DESIGN.md](01-BACKGROUND-AND-DESIGN.md), [05-MONITOR-AND-HGM-LSN-STATE.md](05-MONITOR-AND-HGM-LSN-STATE.md), [11-CONNECTION-AND-LIBPQ.md](11-CONNECTION-AND-LIBPQ.md), [12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md), [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md) | Verified against: this branch
+> Scope: the remaining PolarDB capabilities that exist in the full implementation but are NOT in this LSN-only PolarDB feature — connection-pool warmup, version-aware connection naming, session-identity generation, deeper health checks, the extra config knobs, and the reader-acquisition quality controls — described as a delta from this implementation: what each one does and exactly where it would slot back into this implementation's hooks. | Audience: R/M/O/C | Status: stable | Prereqs: [01-BACKGROUND-AND-DESIGN.md](01-BACKGROUND-AND-DESIGN.md), [05-MONITOR-AND-HGM-LSN-STATE.md](05-MONITOR-AND-HGM-LSN-STATE.md), [11-CONNECTION-AND-LIBPQ.md](11-CONNECTION-AND-LIBPQ.md), [12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md), [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md) | Verified against: this branch
 
 ---
 
@@ -22,7 +22,7 @@ Three of the big future capabilities have their own dedicated documents:
 2. Version-aware connection naming (different startup parameter names for PolarDB 11 vs PolarDB 15).
 3. Session-identity generation (proxy session id and cancel key).
 4. Deeper health checks (the CSN health column — today a no-op even in the full implementation).
-5. The reader-acquisition quality gates (the hard caught-up filter, and smart vs simple split-mode ranking).
+5. The reader-acquisition quality controls (the hard caught-up filter, and smart vs simple split-mode ranking).
 6. The extra config knobs that go with capabilities #1–#5 above and with docs 18/19/20.
 
 ### 1.1 How to read the file:line citations in this document
@@ -33,7 +33,7 @@ This document spans **two source trees**. The rule is strict:
 - **(full implementation)** — a fact in the full implementation. This is the authority for "what the future code looks like."
 
 Full-implementation citations are tagged explicitly. Check symbols
-against the current checkout before using any line number.
+against the current branch before using any line number.
 
 ### 1.2 Terms used here (defined on first use)
 
@@ -59,7 +59,7 @@ against the current checkout before using any line number.
 
 ### 2.1 This feature ships the foundation files; the full implementation expands two domains
 
-This branch ships **seven** PolarDB source files (this branch):
+This branch ships **nine** PolarDB source files (this branch):
 
 | PolarDB file (this branch) | Present in this feature? |
 |---|---|
@@ -69,12 +69,13 @@ This branch ships **seven** PolarDB source files (this branch):
 | `lib/PgSQL_PolarDB_Wrap.cpp` | yes |
 | `lib/PgSQL_PolarDB_Notices.cpp` | yes |
 | `lib/PgSQL_PolarDB_Stubs.cpp` | yes |
-| `lib/PgSQL_PolarDB_Split.cpp` | **no** (full implementation only) |
-| `lib/PgSQL_PolarDB_Failure.cpp` | yes, narrow wait-read retry foundation only |
+| `lib/PgSQL_PolarDB_Split.cpp` | **yes** (942 lines, shipped in this branch) |
+| `lib/PgSQL_PolarDB_Failure.cpp` | **yes** (1449 lines, shipped in this branch) |
+| `lib/PgSQL_PolarDB_ReaderPool.cpp` | **yes** (shipped in this branch) |
 
-The full implementation ships the same foundation plus `lib/PgSQL_PolarDB_Split.cpp` (723 lines, full implementation) and a much larger `lib/PgSQL_PolarDB_Failure.cpp` (410 lines, full implementation). The full implementation also has a much larger HostGroups-Manager, Monitor, and Connection footprint. The capabilities in this document live in the larger HGM/Connection/Monitor code and in those expanded files.
+This branch already ships `lib/PgSQL_PolarDB_Split.cpp` (942 lines) and `lib/PgSQL_PolarDB_Failure.cpp` (1449 lines). The capabilities in this document that remain future live in the larger HGM/Connection/Monitor footprint, not in these two files.
 
-This was confirmed by listing the files and checking symbols: this feature has no split implementation, and the split and warmup symbol names return **zero hits** in this tree (verified by grep). The local failure file contains only the autocommit wait-read retry foundation, not the full reader-failure policy.
+This branch ships `PgSQL_PolarDB_Split.cpp` with a split executor branch that dispatches an eligible in-transaction read to a replica (`polardb_prepare_txn_split_read`, `Split.cpp:462`), a demand pool warm-up path, and a full `PgSQL_PolarDB_Failure.cpp` (1449 lines) implementing RETRY/FORWARD/TERMINATE. What genuinely remains future is the `polardb_split_mode` SMART/SIMPLE runtime knob and advanced policy work.
 
 ### 2.2 The four hooks in this feature these capabilities would extend
 
@@ -100,7 +101,7 @@ The mapping from each future capability to the hook it extends:
 | Version-aware connection naming | HOOK 1 (connect/enable) | the conninfo emitter chooses the parameter name from the detected version |
 | Session-identity generation | HOOK 1 (connect/enable) | the proxy session id / cancel key are added to the startup conninfo |
 | Deeper health checks (CSN column) | the monitor (feeds HOOK 2's reader acquisition) | the monitor learns CSN the same way it learns LSN today |
-| Reader-acquisition caught-up gate | HOOK 2 (route pipeline, reader acquisition) | a hard pre-filter inside the reader acquisition; this feature already has preference-only target-LSN selection |
+| Reader-acquisition caught-up condition | HOOK 2 (route pipeline, reader acquisition) | a hard pre-filter inside the reader acquisition; this feature already has preference-only target-LSN selection |
 | Smart vs simple split-mode ranking | HOOK 2 (route pipeline, reader acquisition) | split-mode reader ranking beyond this feature's target-LSN preference |
 | Extra config knobs | the config layer that all hooks read | each knob lands with its owning feature |
 
@@ -117,7 +118,7 @@ this feature (LSN-only, autocommit RYW)
         └── transaction split (doc 19) ... enables reads inside open transactions
                  ├── lazy pool warmup (this doc §3) ...... only split reads queue warmup
                  ├── reader-failure recovery (doc 20) .... only matters once reads run inside txns
-                 └── reader-acquisition extensions (this doc §7) hard caught-up gate / split smart ranking
+                 └── reader-acquisition extensions (this doc §7) hard caught-up condition / split smart ranking
 ```
 
 CSN (doc 18) can land before or after split. **Warmup (§3) and the reader-acquisition split-mode ranking (§7) both require transaction split (doc 19) first.** Version-aware naming (§4) and session identity (§5) are independent of all of the above — they could land on their own.
@@ -128,13 +129,13 @@ CSN (doc 18) can land before or after split. **Warmup (§3) and the reader-acqui
 
 ### 3.1 What it does
 
-In ProxySQL, a reader hostgroup that only ever serves **transaction-split reads** has a problem: split reads borrow a connection from the pool but never *create* one. So if the reader pool starts empty, it stays empty, and every split attempt fails for lack of a connection. Lazy pool warmup fixes this. When a split read needs a reader connection and the pool is empty, the session hands its **already-authenticated** credentials to the HGM. A background HGM maintenance loop then opens reader connections so the **next** split attempt finds a warm pool. It is demand-driven: the pool grows in response to real split failures, not from pre-configuration.
+In ProxySQL, a reader hostgroup that only ever serves **transaction-split reads** has a problem: split reads temporarily use a connection from the pool but never *create* one. So if the reader pool starts empty, it stays empty, and every split attempt fails for lack of a connection. Lazy pool warmup fixes this. When a split read needs a reader connection and the pool is empty, the session hands its **already-authenticated** credentials to the HGM. A background HGM maintenance loop then opens reader connections so the **next** split attempt finds a warm pool. It is demand-driven: the pool grows in response to real split failures, not from pre-configuration.
 
 It also throttles. It does not open connections without limit — it caps how many it opens per interval based on a target pool size, a per-second rate limit, and an adaptive backoff that slows down when connection attempts are failing.
 
 ### 3.2 Why it is not in this feature
 
-Warmup exists **only to support transaction-split reads**. This feature has no transaction split: this feature sends every read that is inside an open transaction to the writer (the `IN_TRANSACTION` action reason). So in this feature there is never a split read, never an empty-reader-pool-during-split situation, and nothing to warm. Warmup is tied 1:1 to the split feature (doc 19). All warmup symbols return zero hits in this tree (verified by grep).
+Warmup exists **only to support transaction-split reads**. This branch has split dispatch **and** the demand warm-up path: when a split read finds no usable replica connection, `polardb_request_txn_split_warmup()` (`Split.cpp:228`) queues a demand warm-up (enabled by `polardb_lazy_warmup_split`) so the next attempt finds a warm pool. On decline the read still falls back to the primary. Warmup remains tied 1:1 to the split feature (doc 19), but it is a later scalability improvement rather than a correctness requirement.
 
 ### 3.3 The full-implementation code
 
@@ -166,38 +167,35 @@ Warmup adds per-hostgroup state on the HGM (full implementation):
 
 ### 3.5 The counters it adds
 
-Warmup adds four stat counters to `PgHGM->status` (full implementation); this feature has **none** of them (verified absent in this branch):
+Warmup adds warm-up stat counters, and these are **present in this branch** (`include/PgSQL_PolarDB_Counters.h:972` onward), including `PolarDB_Split_Warmup_Requested`, `PolarDB_Split_Warmup_Created`, `PolarDB_Split_Warmup_Failed` plus queue/connect/add timing counters:
 
-| Counter (full implementation) | Location | Meaning |
+| Counter (this branch) | Location | Meaning |
 |---|---|---|
-| `polardb_split_warmup_requested` | `include/PgSQL_HostGroups_Manager.h:906` | Warmup requests queued (incremented at the top of `request_split_warmup`). |
-| `polardb_split_warmup_created` | `include/PgSQL_HostGroups_Manager.h:907` | Connections successfully created for warmup. |
-| `polardb_split_warmup_failed` | `include/PgSQL_HostGroups_Manager.h:908` | Warmup connection attempts that failed. |
-| `polardb_warmup_pending` | `include/PgSQL_HostGroups_Manager.h:909` | Currently-pending warmups (a gauge). |
+| `PolarDB_Split_Warmup_Requested` | `include/PgSQL_PolarDB_Counters.h:972` | Warmup requests queued after a pool-empty split attempt. |
+| `PolarDB_Split_Warmup_Target_Attempts` | `include/PgSQL_PolarDB_Counters.h:975` | Backend connect attempts produced by warmup requests. |
+| `PolarDB_Split_Warmup_Created` | `include/PgSQL_PolarDB_Counters.h:978` | Warmup connections added to replica pools. |
+| `PolarDB_Split_Warmup_Failed` | `include/PgSQL_PolarDB_Counters.h:981` | Warmup base requests rejected or completed without a target. |
 
-For comparison, this feature's LSN set has **26 stat counters + 1 `polardb_active` gate** (see [12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md)). These four warmup counters would be additions on top of that set, not part of it.
+For comparison, this feature's core LSN set has **26 stat counters + 1 `polardb_active` condition** (see [12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md)). These warmup counters are exported by this branch on top of that core set.
 
 ### 3.6 The knobs it adds
 
-Warmup adds four config knobs (full implementation); this feature has **none** of them:
+Warmup ships two config knobs in this branch: `polardb_lazy_warmup_split` (bool, default `true`) and `polardb_split_warmup_max_connections_per_request` (int, default 1). The `warmup_queue_min/max/pct` knobs from the reference tree are not used here:
 
-| Knob (full implementation) | Default | Range | Purpose |
+| Knob (this branch) | Default | Range | Purpose |
 |---|---|---|---|
-| `polardb_lazy_warmup_split` | `true` | bool | Enable lazy warmup for split reads. (`lib/PgSQL_Thread.cpp:1220`, full implementation) |
-| `polardb_warmup_queue_min` | `10` | 1..10000 | Floor for the warmup queue size. (`lib/PgSQL_Thread.cpp:1226`, full implementation) |
-| `polardb_warmup_queue_max` | `1000` | 10..100000 | Ceiling for the warmup queue size. (`lib/PgSQL_Thread.cpp:1227`, full implementation) |
-| `polardb_warmup_queue_pct` | `10` | 1..100 | Warmup queue size as a percent of `max_connections`. (`lib/PgSQL_Thread.cpp:1228`, full implementation) |
+| `polardb_lazy_warmup_split` | `true` | bool | Enable demand warmup for split reads. (`lib/PgSQL_Thread.cpp:511`) |
+| `polardb_split_warmup_max_connections_per_request` | `1` | 1..64 | Max backends one warmup request opens. (`lib/PgSQL_Thread.cpp:514`) |
 
-The effective queue capacity in the full implementation is computed as `clamp(pct * max_connections, min, max)` (full-implementation comment, `lib/PgSQL_Thread.cpp:1225`).
+Warmup here is demand-driven: it fires only when a split read finds an empty reader pool, and `polardb_split_warmup_max_connections_per_request` caps how many backends each drained request opens (default 1, range 1..64).
 
 ### 3.7 Where it slots into this feature
 
-Warmup does **not** attach to a hook in this feature on its own. It attaches to the transaction-split feature (doc 19). To bring it in:
+Warmup attaches to the transaction-split feature (doc 19). To bring it in:
 
-1. First bring in transaction split (doc 19) — without split reads there is nothing to warm.
-2. Re-add the warmup code to the HGM and call `warm_split_pools()` from the HGM maintenance path.
-3. Have the split read path call `request_split_warmup()` when it finds an empty reader pool.
-4. Re-add the four knobs (§3.6) and the four counters (§3.5).
+1. Re-add the warmup code to the HGM and call `warm_split_pools()` from the HGM maintenance path.
+2. Have the split read path call `request_split_warmup()` when it finds an empty reader pool.
+3. Re-add the four knobs (§3.6) and the four counters (§3.5).
 
 ### 3.8 Warmup implementation note
 
@@ -219,7 +217,7 @@ with different replication groups/clusters.
 
 ### 4.2 What is missing from this feature
 
-This feature has profile-driven startup naming, not automatic version-derived naming. The connection-info emitter `append_polardb_startup_params` resolves the effective startup profile from per-HG/global `proxy_protocol`: `v15` emits `_polar_proxy_client_host`, `_polar_proxy_client_port`, and `_polar_proxy_send_lsn=true`; `legacy` emits `_polar_origin_client_ip`, `_polar_origin_client_port`, and `_polar_send_lsn=true`; `off` emits no PolarDB proxy startup params (`lib/PgSQL_Connection.cpp:1398-1436`). It still does not use the detected backend version to pick the parameter name automatically, and it never emits CSN or transaction parameters.
+This feature has profile-driven startup naming, not automatic version-derived naming. The connection-info emitter `append_polardb_startup_params` resolves the effective startup profile from per-HG/global `proxy_protocol`: `v15` emits `_polar_proxy_client_host`, `_polar_proxy_client_port`, and `_polar_proxy_send_lsn=true`; `legacy` emits `_polar_origin_client_ip`, `_polar_origin_client_port`, and `_polar_send_lsn=true`; `off` emits no PolarDB proxy startup params (`lib/PgSQL_Connection.cpp:1398-1436`). When `txn_split_enabled=1`, the same resolved dialect also emits the xact RFQ request key for observation. It still does not use the detected backend version to pick the parameter name automatically, and it never emits CSN parameters.
 
 The full implementation uses the detected version to **choose the parameter name**, and emits more parameters. In the full implementation (`lib/PgSQL_Connection.cpp`):
 
@@ -274,7 +272,7 @@ This is a change to **HOOK 1** (connect/enable). To bring it in:
 1. Re-add `generate_polar_session_id` and `generate_polar_cancel_key` to `lib/PgSQL_PolarDB.cpp`.
 2. Add the session-side state they populate.
 3. Emit `_polar_proxy_session_id` / `_polar_proxy_cancel_key` in
-   `append_polardb_startup_params`, gated on the resolved v15 capability.
+   `append_polardb_startup_params`, enabled when the resolved v15 capability.
 4. Add cancel request routing and tests in the same feature series.
 
 ---
@@ -308,21 +306,21 @@ The CSN column feeds the monitor, which feeds reader acquisition in **HOOK 2**. 
 
 ---
 
-## 7. Capability: reader-acquisition quality gates
+## 7. Capability: reader-acquisition quality controls
 
-This feature keeps reader acquisition preference-only on purpose. The reader acquisition is `get_MyConn_polardb_reader`. It runs one filter pass for the original weighted candidate set (online, has capacity, pooled-if-asked), and when `consistency_target_lsn > 0` it also builds a fresh cached caught-up subset whose LSN is `>= consistency_target_lsn`. It tries that subset first, then falls back to the full weighted candidate set. It does **not** reject a replica solely for being behind; the `SET polar_xact_split_wait_lsn` wait gate does the catching-up.
+This feature keeps reader acquisition preference-only on purpose. The reader acquisition is `get_MyConn_polardb_reader`. It runs one filter pass for the original weighted candidate set (online, has capacity, pooled-if-asked), and when `consistency_target_lsn > 0` it also builds a fresh cached caught-up subset whose LSN is `>= consistency_target_lsn`. It tries that subset first, then falls back to the full weighted candidate set. It does **not** reject a replica solely for being behind; the `SET polar_xact_split_wait_lsn` wait condition does the catching-up.
 
 **Important naming note:** the function name `get_MyConn_polardb_reader` is the **same in both trees**, but the body differs. This feature has consistency-target preference counters (`PolarDB_Target_LSN_Preferred`, `PolarDB_Target_LSN_Fallback_Wait`) and the explicit no-hard-reject rule (`lib/PgSQL_HostGroups_Manager.cpp:5109-5111`; `include/PgSQL_HostGroups_Manager.h:1073-1078`). The two mechanisms below are future additions or extensions to a function that already exists, not a brand-new function.
 
 The full implementation has two extra reader-acquisition mechanisms that this feature deliberately dropped or never added.
 
-### 7.1 The caught-up gate (a hard LSN/CSN filter)
+### 7.1 The caught-up condition (a hard LSN/CSN filter)
 
 **What it does (full implementation):** the reader acquisition **rejects** any replica whose monitor-observed LSN is below the LSN the read needs (and the CSN equivalent). It only picks replicas that are already caught up. In the full implementation this is "Filter 5" inside `get_MyConn_polardb_reader` (full implementation, `lib/PgSQL_HostGroups_Manager.cpp:2773`, the filter near `:2836`), backed by the predicates `has_replica_caught_up` (full implementation, `lib/PgSQL_HostGroups_Manager.cpp:5273`) and `has_replica_caught_up_csn` (full implementation, `lib/PgSQL_HostGroups_Manager.cpp:5350`).
 
-**Why this feature dropped it:** this feature does not use a hard caught-up pre-filter. It prefers readers that are already fresh and caught up to the target, then falls back to the full candidate set and relies on the wait `SET` to block the read until the replica catches up. The lag cap in this feature is a **safety-only** byte bound (`max_lag_bytes`), not the correctness gate — see [14-INVARIANTS-AND-FAILURE-MODES.md](14-INVARIANTS-AND-FAILURE-MODES.md) and the glossary entry for "lag cap." Removing the hard gate keeps this feature simpler and avoids rejecting a replica that the wait would have caught up anyway.
+**Why this feature dropped it:** this feature does not use a hard caught-up pre-filter. It prefers readers that are already fresh and caught up to the target, then falls back to the full candidate set and relies on the wait `SET` to block the read until the replica catches up. The lag cap in this feature is a **safety-only** byte bound (`max_lag_bytes`), not the correctness enforcement — see [14-INVARIANTS-AND-FAILURE-MODES.md](14-INVARIANTS-AND-FAILURE-MODES.md) and the glossary entry for "lag cap." Removing the hard condition keeps this feature simpler and avoids rejecting a replica that the wait would have caught up anyway.
 
-**Caveat:** in the full implementation, `has_replica_caught_up_csn` and the CSN reader-acquisition branch have **no callers** in `lib/`, `include/`, or `test/` (verified by grep in the full implementation) — the CSN side of the gate is currently dead. The LSN side is wired.
+**Caveat:** in the full implementation, `has_replica_caught_up_csn` and the CSN reader-acquisition branch have **no callers** in `lib/`, `include/`, or `test/` (verified by grep in the full implementation) — the CSN side of the condition is currently dead. The LSN side is wired.
 
 **Where it would slot into this feature:** **HOOK 2**, inside the existing reader-acquisition helper `get_MyConn_polardb_reader`. It would replace the current preference-only fallback with an optional pre-filter, or a stricter policy mode, before the full-set weighted fallback.
 
@@ -343,13 +341,13 @@ The selector is `get_MyConn_polardb_reader` (full implementation, `lib/PgSQL_Hos
 
 ### 7.3 The monitor CSN update
 
-This was covered in §6.2: the full implementation's monitor CSN update (`update_server_csn`, full implementation `lib/PgSQL_Monitor.cpp:1963`) is an explicit no-op pending a CSN health column. It is listed here too because it feeds the CSN side of the caught-up gate in §7.1.
+This was covered in §6.2: the full implementation's monitor CSN update (`update_server_csn`, full implementation `lib/PgSQL_Monitor.cpp:1963`) is an explicit no-op pending a CSN health column. It is listed here too because it feeds the CSN side of the caught-up condition in §7.1.
 
 ---
 
 ## 8. Capability: the extra config knobs
 
-This feature keeps **twelve** PolarDB knobs (`lib/PgSQL_Thread.cpp` registration block):
+This feature registers **24** PolarDB knobs (`lib/PgSQL_Thread.cpp` registration array at `:501` onward):
 
 | Knob in this feature | Default |
 |---|---|
@@ -358,32 +356,37 @@ This feature keeps **twelve** PolarDB knobs (`lib/PgSQL_Thread.cpp` registration
 | `polardb_lag_ms` | `0` (deferred — see below) |
 | `polardb_lag_wait_ms` | `1000` |
 | `polardb_lsn_freshness_ms` | `5000` |
+| `polardb_lag_cap_freshness_ms` | `250` |
+| `polardb_reader_lsn_lag_range_bytes` | `0` |
+| `polardb_output_coalesce_bytes` | `0` |
+| `polardb_output_coalesce_packets` | `0` |
 | `polardb_monitor_lsn_updates` | `true` |
+| `polardb_lazy_warmup_split` | `true` |
+| `polardb_writev_direct` | `true` |
+| `polardb_result_fast_forward` | `false` |
+| `polardb_split_warmup_max_connections_per_request` | `1` |
 | `polardb_wait_timeout_mode` | `"best_effort"` |
 | `polardb_proxy_protocol` | `"v15"` |
 | `polardb_route_rfq_policy` | `"strict"` |
 | `polardb_session_lsn_baseline` | `"observed"` |
+| `polardb_reader_death_action` | `"retry"` |
+| `polardb_reader_timeout_action` | `"retry"` |
+| `polardb_reader_error_action` | `"forward"` |
+| `polardb_proxy_identity_mode` | `"proxy"` |
 | `polardb_proxy_identity_host` | `""` |
 | `polardb_proxy_identity_port` | `0` |
 
-The full implementation adds **eight more** knobs that this feature does not ship. Each future knob lands **with its owning feature** — this feature's rule is "no dead knobs": do not add a knob before the feature that uses it.
+The full implementation adds one more knob that this branch does not ship — `polardb_split_mode` (SMART/SIMPLE reader ranking, §7.2). The reference tree's `polardb_warmup_queue_min/max/pct` knobs are not used here either. This branch's rule remains "no dead knobs": do not add a knob before the feature that uses it.
 
-| Future knob (full implementation) | Owning feature | Location (full implementation) |
+| Future knob (full implementation) | Owning feature | Location |
 |---|---|---|
-| `polardb_split_mode` | transaction split (doc 19) + smart ranking (§7.2) | `lib/PgSQL_Thread.cpp:425`, default 0 |
-| `polardb_lazy_warmup_split` | lazy pool warmup (§3) | `lib/PgSQL_Thread.cpp:432`, default true |
-| `polardb_warmup_queue_min` | lazy pool warmup (§3) | `lib/PgSQL_Thread.cpp:433`, default 10 |
-| `polardb_warmup_queue_max` | lazy pool warmup (§3) | `lib/PgSQL_Thread.cpp:434`, default 1000 |
-| `polardb_warmup_queue_pct` | lazy pool warmup (§3) | `lib/PgSQL_Thread.cpp:435`, default 10 |
-| `polardb_reader_death_action` | reader-failure recovery (doc 20) | `lib/PgSQL_Thread.cpp:437`, default RETRY (0) |
-| `polardb_reader_timeout_action` | reader-failure recovery (doc 20) | `lib/PgSQL_Thread.cpp:438`, default RETRY (0) |
-| `polardb_reader_error_action` | reader-failure recovery (doc 20) | `lib/PgSQL_Thread.cpp:439`, default FORWARD (1) |
+| `polardb_split_mode` | transaction split (doc 19) + smart ranking (§7.2) | reference tree only; not registered in this branch |
 
-The three reader-action knobs take values from `enum class PolarDB_ReaderAction { RETRY = 0, FORWARD = 1, TERMINATE = 2 }` (full implementation, `include/PgSQL_PolarDB.h:299`), validated to the range 0..2 (full implementation, `lib/PgSQL_Thread.cpp:2377-2379`). See [20-FUTURE-READER-FAILURE-RETRY-DESIGN.md](20-FUTURE-READER-FAILURE-RETRY-DESIGN.md).
+In this branch the three reader-action knobs are **string-valued** (`retry`, `forward`, `terminate`; defaults `retry`/`retry`/`forward`), mapped to `enum class PolarDB_ReaderAction { RETRY, FORWARD, TERMINATE }` (`include/PgSQL_PolarDB.h:2828`) via `polardb_reader_action_from_string` (`include/PgSQL_PolarDB.h:2861`). See [20-FUTURE-READER-FAILURE-RETRY-DESIGN.md](20-FUTURE-READER-FAILURE-RETRY-DESIGN.md).
 
 ### 8.1 The deferred ms-lag knob (inert in this feature today)
 
-One knob in this feature is registered but **inert**: `polardb_lag_ms`. Its default is 0 (set in this branch at `lib/PgSQL_Thread.cpp:1125`, name entry at `:377`, runtime range 0 only at `:2417`), but it has **no producer** — the PolarDB path has no millisecond-lag source feeding it. The header says so directly: the freshness/lag comment states the millisecond lag is "intentionally deferred" and "Do not treat `polardb_lag_ms` as a supported routing gate" (this branch, `include/PgSQL_PolarDB.h:510-513`), and the time-lag-cap predicate carries "TODO: wire only after PgSQL/PolarDB has a real millisecond-lag producer" (this branch, `include/PgSQL_PolarDB.h:542`).
+One knob in this feature is registered but **inert**: `polardb_lag_ms`. Its default is 0 (set in this branch at `lib/PgSQL_Thread.cpp:1125`, name entry at `:377`, runtime range 0 only at `:2417`), but it has **no producer** — the PolarDB path has no millisecond-lag source feeding it. The header says so directly: the freshness/lag comment states the millisecond lag is "intentionally deferred" and "Do not treat `polardb_lag_ms` as a supported routing condition" (this branch, `include/PgSQL_PolarDB.h:510-513`), and the time-lag-cap predicate carries "TODO: wire only after PgSQL/PolarDB has a real millisecond-lag producer" (this branch, `include/PgSQL_PolarDB.h:542`).
 
 Because of this, the ms-lag path is inactive in this feature. `PolarDB_LSN_Stale_Count` is still active for the separate byte-lag safety path when `max_lag_bytes` is enabled, so operator and tuning docs must not describe it as a millisecond-lag signal. See [12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md) and [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md).
 
@@ -395,15 +398,15 @@ Every capability in this document, as a delta from this feature:
 
 | Capability | In this feature? | Home in the full implementation | New state | New knobs | New counters | Hook it extends |
 |---|---|---|---|---|---|---|
-| Lazy pool warmup | no | HGM (`HostGroups_Manager.cpp:3221/3403/3505`) | queue + throttle (`HGM.h:165/413/414/1336`) | 4 (`Thread.cpp:432-435`) | 4 (`HGM.h:906-909`) | via transaction split (doc 19); HGM maintenance loop |
+| Demand pool warmup | yes — ReaderPool chooses targets and HGM creates compatible connections | `PgSQL_PolarDB_ReaderPool.cpp` + HGM | bounded request queue and per-server creation | active warmup settings | active warmup counters | transaction split and HGM maintenance |
 | Automatic version-derived naming | no (this feature uses configured startup profiles; `v15` already emits `_polar_proxy_send_lsn`) | `Connection.cpp:1275/1277` | none | none | none | HOOK 1 (connect) |
 | Session-identity generation | no | `PgSQL_PolarDB.cpp:168/195` | session-side cancel metadata | none | none | HOOK 1 (connect) |
 | Deeper health (CSN column) | no (LSN column present); **experimental, no-op in full implementation** | `Monitor.cpp:763/1961/1963` | per-server CSN cache | (part of doc 18) | (part of doc 18) | monitor → HOOK 2 |
-| Caught-up gate (hard filter) | no (selector exists; this feature implements preference-only target-LSN selection, not rejection) | `HostGroups_Manager.cpp:2773/5273/5350` | optional hard pre-filter / stricter policy | none | none | HOOK 2 (reader acquisition) |
+| Caught-up condition (hard filter) | no (selector exists; this feature implements preference-only target-LSN selection, not rejection) | `HostGroups_Manager.cpp:2773/5273/5350` | optional hard pre-filter / stricter policy | none | none | HOOK 2 (reader acquisition) |
 | Smart split-mode ranking | no (this feature has target-LSN preference, but no split-mode knob or sorted least-lagging policy) | `HostGroups_Manager.cpp:2773` | split-mode reader ranking | 1 (`polardb_split_mode`) | none | HOOK 2 (reader acquisition) |
 | Extra knobs (8 total) | no | `Thread.cpp:425-439` | varies | 8 | varies | config layer (each with its feature) |
 
-The "no" rows mark capabilities that are absent from this branch (verified by grep): the warmup/split/reader-action/CSN symbol names return zero hits in this feature. The two reader-acquisition rows are subtler — the selector function `get_MyConn_polardb_reader` exists in this feature and includes target-LSN preference, but deliberately omits a hard caught-up rejection gate and the split-mode sorted ranking policy (see §7). All full-implementation line numbers are tagged `(full implementation)` because this tree has different line numbers for the same symbols.
+Warmup is implemented. The remaining absent items are CSN health, hard caught-up rejection, automatic version-derived naming, and split-mode ranking. The two reader-acquisition rows are subtler — the selector includes target-LSN preference but deliberately omits a hard caught-up rejection condition and the split-mode sorted ranking policy (see §7). Any external-reference line numbers are tagged because this tree has different locations for the same symbols.
 
 ---
 
@@ -411,7 +414,7 @@ The "no" rows mark capabilities that are absent from this branch (verified by gr
 
 - **Tree confusion is the main risk.** Every line number in §3–§8 that names a full-implementation symbol is tagged `(full implementation)`. The same symbol, if it existed in this feature, would be at a different line. Do not cross-look-up. The discrepancy is real and important (the prior design notes flags it as "DISCREPANCY 3").
 - **Earlier design notes are not reflected in the current branch for session identity.** Part G.4 of the earlier design notes said session-identity generation is "in this feature." This feature has neither generator functions nor session-side cancel fields. This document follows the code, which is the authority.
-- **CSN is experimental and partly stubbed even in the full implementation.** The deeper-health CSN column (§6) and the CSN side of the caught-up gate (§7.1) are no-ops or have no callers in the full implementation. "Re-add CSN" is partly "finish CSN." Keep the working-vs-stubbed line clear; the full CSN picture is in [18-FUTURE-CSN-DESIGN.md](18-FUTURE-CSN-DESIGN.md).
+- **CSN is experimental and partly stubbed even in the full implementation.** The deeper-health CSN column (§6) and the CSN side of the caught-up condition (§7.1) are no-ops or have no callers in the full implementation. "Re-add CSN" is partly "finish CSN." Keep the working-vs-stubbed line clear; the full CSN picture is in [18-FUTURE-CSN-DESIGN.md](18-FUTURE-CSN-DESIGN.md).
 - **Warmup is downstream of split.** Do not plan warmup as a standalone feature — it has no purpose without transaction-split reads (doc 19) to create the empty-pool situation it solves.
 - **Warmup implementation source.** Implement warmup directly in the current
   tree rather than applying a standalone patch.
@@ -422,13 +425,13 @@ The "no" rows mark capabilities that are absent from this branch (verified by gr
 
 | Item | Status |
 |---|---|
-| Lazy pool warmup | Future. In the full implementation only. Requires transaction split (doc 19) first. |
+| Lazy pool warmup | Shipped in this branch (demand warm-up via `polardb_lazy_warmup_split`). |
 | Automatic version-derived connection naming | Future. Independent. This feature uses configured startup profiles; `v15` already emits `_polar_proxy_send_lsn`. |
 | Session-identity generation | Future. Independent. This feature has no session-side cancel fields and no generators. |
 | Deeper health checks (CSN column) | Future and **experimental**. No-op even in the full implementation. Part of CSN (doc 18). |
-| Caught-up gate (hard reader filter) | Future. Deliberately not used in this feature; target-LSN preference is implemented. CSN side is dead in the full implementation. |
+| Caught-up condition (hard reader filter) | Future. Deliberately not used in this feature; target-LSN preference is implemented. CSN side is dead in the full implementation. |
 | Smart split-mode ranking | Future. Part of transaction split (doc 19), beyond this feature's target-LSN preference. |
-| Extra knobs (8) | Future. Each lands with its owning feature; this feature keeps 7 knobs. |
+| Extra knobs | This feature registers 24 knobs (reader-failure and warm-up knobs shipped). Only `polardb_split_mode` remains future. |
 | `polardb_lag_ms` knob | Registered in this feature but **inert** (no producer). Deferred. |
 | `PolarDB_LSN_Stale_Count` counter | Active for this feature's byte-lag stale/missing samples; not a millisecond-lag signal. |
 
@@ -450,7 +453,7 @@ flowchart TD
     VN["Automatic version-derived naming (sec 4)"] -.extends.-> H1
     SI["Session-identity generation (sec 5)"] -.extends.-> H1
     HC["Deeper health: CSN column (sec 6)"] -.feeds.-> H2
-    CG["Hard caught-up gate (sec 7.1)"] -.extends.-> H2
+    CG["Hard caught-up condition (sec 7.1)"] -.extends.-> H2
     SM["Split smart ranking (sec 7.2)"] -.extends.-> H2
     WU["Lazy pool warmup (sec 3)"] -.via split.-> H2
 ```
@@ -465,14 +468,14 @@ flowchart TD
     HCCSN["deeper health: CSN column (sec 6)"]
     WARM["lazy pool warmup (sec 3)"]
     FAIL["reader-failure recovery (doc 20)"]
-    GATES["reader-acquisition gates (sec 7)"]
+    controls["reader-acquisition controls (sec 7)"]
 
     V1 --> CSN
     V1 --> SPLIT
     CSN --> HCCSN
     SPLIT --> WARM
     SPLIT --> FAIL
-    SPLIT --> GATES
+    SPLIT --> controls
 ```
 
 ### A3. Lazy pool warmup flow (full implementation)
@@ -497,7 +500,7 @@ flowchart TD
     B --> C{resolved startup protocol?}
     C -- "this feature's configured profile" --> D["proxy_protocol chooses v15 / legacy / off<br/>Connection.cpp:1398"]
     C -- "POLARDB_11 (full implementation)" --> E["_polar_send_lsn=true<br/>Connection.cpp:1277 (full implementation)"]
-    C -- "POLARDB_15 (full implementation)" --> F["_polar_proxy_send_lsn=true<br/>Connection.cpp:1275 (full implementation)<br/>(+ _polar_send_xact / _polar_send_csn when those features land)"]
+    C -- "POLARDB_15 (full implementation)" --> F["_polar_proxy_send_lsn=true<br/>Connection.cpp:1275 (full implementation)<br/>(+ xact RFQ when txn_split_enabled=1; CSN remains future)"]
 ```
 
 ---

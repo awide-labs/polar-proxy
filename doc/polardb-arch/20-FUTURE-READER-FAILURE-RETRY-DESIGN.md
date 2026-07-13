@@ -1,35 +1,28 @@
-# 20 — Future: Reader-Failure Recovery and Retry
+# 20 — Reader-Failure Recovery and Retry
 
-> Scope: how a failed replica read is recovered — RETRY (re-run on the writer), FORWARD (send the real error but keep the transaction alive), TERMINATE (close the session), and writer-loss poison (reserved for the writer's own death) — framed as a future delta on top of the current LSN-only PolarDB feature. | Audience: R/M/O/C | Status: stable (describes a FUTURE feature; NOT in this implementation) | Prereqs: [01-BACKGROUND-AND-DESIGN.md](01-BACKGROUND-AND-DESIGN.md), [06-ROUTING-PIPELINE.md](06-ROUTING-PIPELINE.md), [10-SESSION-INTEGRATION.md](10-SESSION-INTEGRATION.md), [14-INVARIANTS-AND-FAILURE-MODES.md](14-INVARIANTS-AND-FAILURE-MODES.md), [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md), [19-FUTURE-TXN-SPLIT-DESIGN.md](19-FUTURE-TXN-SPLIT-DESIGN.md) | Verified against: this branch
+> Scope: how a failed replica read is recovered — RETRY (re-run on a safe target), FORWARD (send the real error but keep the transaction alive), TERMINATE (close the session), and writer-loss poison (reserved for the writer's own death). | Audience: R/M/O/C | Status: active for autocommit wait reads and simple-query transaction-split reads; roadmap for advanced policies | Prereqs: [01-BACKGROUND-AND-DESIGN.md](01-BACKGROUND-AND-DESIGN.md), [06-ROUTING-PIPELINE.md](06-ROUTING-PIPELINE.md), [10-SESSION-INTEGRATION.md](10-SESSION-INTEGRATION.md), [14-INVARIANTS-AND-FAILURE-MODES.md](14-INVARIANTS-AND-FAILURE-MODES.md), [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md), [19-FUTURE-TXN-SPLIT-DESIGN.md](19-FUTURE-TXN-SPLIT-DESIGN.md) | Verified against: this branch
 
-## 0. Read this first: what this document is, and is NOT
+## 0. Read this first: current branch vs remaining roadmap
 
-This document describes the **future general reader-failure feature**. One narrow foundation is already present in this implementation: an autocommit wait-wrapped reader query can be retried once on the writer after a strict LSN wait timeout or reader connection loss, when no user result has started. The broader policy model in this document is not present yet.
+This document now has two layers. The current branch implements the common reader-failure policy for:
 
-We confirmed the missing full policy directly. In this implementation:
+- autocommit wait-wrapped reads, where retry targets the writer before any user result is sent; and
+- simple-query transaction-split reads, where policy can retry, forward, or terminate. For split connection loss, retry first tries another compatible reader with the same XID/LSN wrapper before falling back to the writer. For wait timeouts, retry targets the writer to avoid spending a second tail timeout on another lagging replica.
 
-- `lib/PgSQL_PolarDB_Failure.cpp` exists, but it contains only the narrow autocommit wait-read retry foundation. It does not contain the general reader-failure policy model.
-- A grep for `polardb_on_failure`, `PolarDB_ReaderAction`, `PolarDB_WriterState`, `PolarDB_FailureAction`, `READER_FAILURE_FORCE_WRITER`, `polardb_capture_outcome`, `terminate_reader`, and `polardb_reader_death_action` over `lib/` and `include/` returns **zero hits**.
-- The current routing `RouteActionReason` enum in this implementation includes the base route reasons plus the LSN-policy reasons `WRITE_LSN_UNKNOWN`, `OBSERVED_LSN_UNKNOWN`, and `PRIMARY_LSN_UNKNOWN`. There is still no `READER_FAILURE_FORCE_WRITER`; the retry feature would add it as a new future reason.
-- The current branch does have `PolarDB_WaitReadFailure`, `polardb_capture_wait_read_failure()`, and `polardb_retry_wait_read_on_writer()`. These are intentionally limited to autocommit wait-wrapped reads that fail before any user result because of strict LSN wait timeout or reader connection loss, and do not implement the policy matrix below.
+The remaining roadmap in this document is advanced policy work: per-error-class policy tables, retry budgets, reader circuit-breaker / quarantine, and broader ranking integration. CSN/global consistency remains outside this document's active scope.
 
-The feature is **fully built in a separate full implementation**, in `lib/PgSQL_PolarDB_Failure.cpp` (410 lines), and specified in the design document `doc/polardb-arch/23-READ-SIDE-FAILURE-RECOVERY.md` (3029 lines, titled "PolarDB Reader Failure Recovery (V9 — Transparent Forwarding)"). This document draws on that full implementation and frames everything as a **delta from this implementation**.
-
-**Citation convention in this document.** Because the same symbol can sit at a different line in each tree, every code citation is tagged:
-
-- **(full implementation)** = the full implementation — where this feature actually lives.
-- **(this implementation)** = the current LSN-only branch this document is committed into.
-
-Do not look up a "(full implementation)" line number in this implementation; the numbers differ between trees.
+This document was originally written while comparing this branch with the full
+prototype. It now describes the active code in this branch. Line anchors are a
+review aid, not a stable API; prefer symbol search when the tree has moved.
 
 ### 0.1 The hard prerequisite
 
-This feature is only useful **after** the transaction-split feature lands (see [19-FUTURE-TXN-SPLIT-DESIGN.md](19-FUTURE-TXN-SPLIT-DESIGN.md)). The reason is simple:
+The split side of this feature is useful around transaction split (see [19-FUTURE-TXN-SPLIT-DESIGN.md](19-FUTURE-TXN-SPLIT-DESIGN.md)). The reason is simple:
 
-- This implementation routes a read to a replica **only when the session is in autocommit** (no open transaction). An in-transaction read is forced to the writer with action reason `IN_TRANSACTION` (this implementation `lib/PgSQL_PolarDB_Flow.cpp:269-272`).
-- A reader-failure recovery model is about keeping a **live transaction** alive when one of its offloaded reads fails on a replica. This implementation has no in-transaction offloaded reads, so there is almost no transaction to rescue.
+- This implementation can route an eligible simple-query in-transaction read to a replica after primary RFQ XID evidence is complete.
+- Reader-failure recovery keeps a **live transaction** alive when one of its offloaded reads fails on a replica, then chooses retry, forward, or terminate behavior.
 
-So the realistic reader failure in this implementation today is an **autocommit wait read** that times out on a replica in strict mode. This branch handles that one case by retrying the original read on the writer when no user result has started. Most of the machinery in this document is exercised only once in-transaction offload (split reads and in-transaction wait reads) exists. See §11 for the exact delta from this implementation to the future.
+The two active reader-failure families are therefore: an **autocommit wait read** that can retry on the writer when no user result has started, and a **split read** that can retry/forward/terminate under policy while preserving the writer transaction.
 
 ---
 
@@ -47,13 +40,13 @@ When a read that ProxySQL **offloaded to a replica** fails, the proxy must decid
 | **reader** (replica) | A backend that runs *offloaded reads* only. It never holds the transaction. |
 | **offloaded read** | A read the proxy sent to a replica instead of the writer. Two kinds: split read and wait read (below). |
 | **wait read** | A read prefixed with `SET polar_xact_split_wait_lsn=...` so the replica waits for the writer's WAL position before answering (read-your-writes). **This implementation has this, but autocommit-only.** |
-| **split read** | An in-transaction read run on a replica that *mimics* the writer's transaction by importing its transaction IDs (XIDs). **This implementation has none of this; it arrives with the transaction-split feature.** |
+| **split read** | A simple-query in-transaction read run on a replica that *mimics* the writer's transaction by importing its transaction IDs (XIDs). This implementation supports the simple-query split path; extended-protocol split remains outside the active scope. |
 | **rc == -1** | The session handler's "the backend query failed" branch (full implementation `lib/PgSQL_Session.cpp:4061` onward). This is the single seam the feature hooks. |
 | **RFQ** (ReadyForQuery) | The PostgreSQL wire message a backend sends after a command. It carries a transaction-status byte. |
 | **RFQ('T') / RFQ('E') / RFQ('I')** | The transaction-status byte in RFQ: `'T'` = the client is in a live transaction; `'E'` = the transaction is in PostgreSQL's aborted state; `'I'` = idle (no transaction). The proxy must send the **truthful** byte. |
 | **tx_poisoned** | An existing session flag in this implementation and upstream. When a backend dies mid-transaction, the proxy synthesizes `ERROR 25P02` (current transaction is aborted) + `RFQ('E')` and keeps the client alive so it can `ROLLBACK`. **Shared base; reused unchanged by this feature.** |
 | **reusable** | `is_connection_in_reusable_state()` = `!(PQTRANS_UNKNOWN || PQTRANS_ACTIVE)`. It is the **death-vs-error discriminator**: a connection **death** maps to *not reusable*; a plain **SQL error** or a **strict wait-timeout** maps to *reusable* (full implementation `lib/PgSQL_Connection.cpp:2178`). |
-| **force-writer pin** | Session state set after one reader failure that forces the **rest of the transaction** onto the writer. |
+| **writer-only route** | Session state set after one reader failure that forces the **rest of the transaction** onto the writer. |
 | **25P02** | The PostgreSQL SQLSTATE `ERRCODE_IN_FAILED_SQL_TRANSACTION` ("current transaction is aborted"). Used **only** by the writer-loss poison path, never by reader recovery (constant at full implementation `include/PgSQL_Error_Helper.h:506`; this implementation `include/PgSQL_Error_Helper.h:506`). |
 | **08006** | The PostgreSQL SQLSTATE `ERRCODE_CONNECTION_FAILURE`. Synthesized when a reader **died with no result** and the proxy must forward something. |
 
@@ -106,7 +99,7 @@ Implementation: `polardb_try_redispatch_to_writer` (full implementation `lib/PgS
 
 ### 3.2 Outcome 2 — FORWARD (forward the real error, keep the transaction alive)
 
-Reached when redispatch is **not** chosen (rows were already streamed to the client, or the policy for this failure type is FORWARD). The proxy forwards the replica's **REAL** `ErrorResponse` (or a synthesized `08006 connection_failure` if the replica died with no result), followed by **`RFQ('T')`**, and then releases the reader. The writer's transaction is genuinely alive, so `'T'` is the truth; sending `'E'` would lie. The client decides what to do next: re-issue the read (now pinned to the writer), continue, or `ROLLBACK`.
+Reached when redispatch is **not** chosen (rows were already streamed to the client, or the policy for this failure type is FORWARD). The proxy forwards the replica's **REAL** `ErrorResponse` (or a synthesized `08006 connection_failure` if the replica died with no result), followed by **`RFQ('T')`**, and then releases the reader. The writer's transaction is genuinely alive, so `'T'` is the truth; sending `'E'` would lie. The client decides what to do next: re-issue the read (now kept to the writer), continue, or `ROLLBACK`.
 
 Implementation: `polardb_forward_and_continue` and `polardb_forward_reader_error` (full implementation `lib/PgSQL_PolarDB_Failure.cpp:391` and `:311`).
 
@@ -114,7 +107,7 @@ Implementation: `polardb_forward_and_continue` and `polardb_forward_reader_error
 
 Opt-in. The proxy tears the session down. PostgreSQL rolls back the writer transaction on disconnect (every active-transaction backend is physically destroyed, never returned to the pool). Used in two cases: (a) the operator set a `TERMINATE` policy for this failure type, or (b) the writer turned out to be `LOST` (see §6).
 
-Implementation: `terminate_reader` (full implementation `lib/PgSQL_PolarDB_Failure.cpp:404`).
+Implementation: `polardb_terminate_reader` (full implementation `lib/PgSQL_PolarDB_Failure.cpp:993`).
 
 ### 3.4 Reserved — writer-loss POISON
 
@@ -148,32 +141,44 @@ else { /* PASSTHROUGH -> fall through to the existing upstream rc==-1 handling (
 Two design rules govern this seam:
 
 1. **The decision function holds no control flow.** `polardb_on_failure(out)` classifies and applies side effects, then returns a `PolarDB_FailureAction` value. The **handler** owns every control-flow macro (`NEXT_IMMEDIATE`, `RequestEnd`, the `return`). This keeps the decision logic unit-testable and the handler the single owner of session lifetime.
-2. **This dispatch sits ABOVE the upstream retry logic.** The upstream `query_retries_on_failure` retry path must not run for a handled reader failure. RETRY is **single-shot**: the force-writer pin (§5) blocks any second attempt, so a handled reader failure and an upstream retry are mutually exclusive.
+2. **This dispatch sits ABOVE the upstream retry logic.** The upstream `query_retries_on_failure` retry path must not run for a handled reader failure. RETRY is **single-shot**: the writer-only route (§5) blocks any second attempt, so a handled reader failure and an upstream retry are mutually exclusive.
 
 The dispatch's `PASSTHROUGH` value falls through to the **unchanged** upstream `rc == -1` handling, which still owns writer-loss poison and the non-PolarDB cases.
 
 ---
 
-## 5. The force-writer pin — "the rest of the transaction stays on the writer"
+## 5. Reader-failure routes after a reader failure
 
-After **one** reader failure, every later statement in the same transaction is forced onto the writer — for **both** RETRY and FORWARD. There is no second reader, no retry loop, and no later read routing back to a replica.
+After **one** reader failure, the transaction records an explicit reader-failure route so
+the next routing decision cannot silently choose the same unsafe path again.
 
-The pin is set centrally in `polardb_on_failure` once the writer resolves to `LIVE` or `NOT_STARTED`, via `polardb_force_writer_after_reader_failure` (full implementation `lib/PgSQL_PolarDB_Failure.cpp:280`). It sets two session fields:
+There are two route forms:
 
-- `polardb_txn_force_writer_after_reader_failure` (bool), and
-- `polardb_txn_writer_hg` (the writer hostgroup id).
+- `FORCE_WRITER`: set after writer-targeted retry, forward, or a retry decline.
+  Later statements in the same transaction stay on the writer.
+- `SKIP_READER`: set after a successful retry on another compatible reader.
+  The failed reader endpoint is excluded while the transaction remains eligible
+  for split reads on a different reader.
 
-The pin is **authoritative** — it beats query rules and the query cache. It is honored at **three layers** (this implementation has none of these):
+The route is set centrally in `polardb_on_failure` through
+`polardb_apply_reader_failure_route_state`. The writer-only route stores the writer
+hostgroup; the reader-skip route stores the failed reader hostgroup/address/port.
+
+The route is **authoritative** — it beats query rules and the query cache. It is
+honored at the routing layers below:
 
 | Layer | Site (full implementation) | Why it is needed |
 |---|---|---|
-| qpo handler | `lib/PgSQL_Session.cpp:5721` | Runs first. Placed **after** the rule-driven returns but **before** the query cache, the destination override, and the hostgroup-lock — so a pinned read never serves from cache and is immune to a hostgroup lock. Returns `false` (it does **not** short-circuit the rest of routing). |
+| qpo handler | `lib/PgSQL_Session.cpp:5721` | Runs first. Placed **after** the rule-driven returns but **before** the query cache, the destination override, and the hostgroup-lock — so a kept read never serves from cache and is immune to a hostgroup lock. Returns `false` (it does **not** short-circuit the rest of routing). |
 | manual-mode backstop | `lib/PgSQL_Session.cpp:2723` | Covers paths that skip the PolarDB planner (manual query-rule routing). |
-| planner rule | `lib/PgSQL_PolarDB_Flow.cpp:223` | **Required**, because the writer hostgroup is itself a PolarDB hostgroup, so the planner re-runs on the redispatched query and would otherwise overwrite the target. It forces `target_hg = txn_writer_hg` and records action reason `READER_FAILURE_FORCE_WRITER`. It is **not** gated on `in_transaction`, because `NOT_STARTED` is pre-write. |
+| planner rule | `lib/PgSQL_PolarDB_Flow.cpp` | **Required**, because the writer hostgroup is itself a PolarDB hostgroup, so the planner re-runs on the redispatched query and would otherwise overwrite the target. A writer-only route forces `target_hg = txn_writer_hg` and records action reason `READER_FAILURE_FORCE_WRITER`; a reader-skip route excludes the failed reader from split acquisition. |
 
-The pin is **cleared** on transaction end (`COMMIT` / `ROLLBACK`) and on session reset, inside `polardb_clear_txn_xid_state` (full implementation `lib/PgSQL_PolarDB_Split.cpp:351`; the two pin fields are reset at `:357-358`, setting `polardb_txn_force_writer_after_reader_failure = false` and `polardb_txn_writer_hg = -1`).
+The route is **cleared** on transaction end (`COMMIT` / `ROLLBACK`) and on
+session reset, inside `polardb_clear_txn_xid_state`.
 
-A new action reason `READER_FAILURE_FORCE_WRITER` is added **alongside** the existing reasons in this implementation in the `RouteActionReason` enum (full implementation `include/PgSQL_PolarDB.h:721`). This implementation already has the LSN-policy reasons `WRITE_LSN_UNKNOWN`, `OBSERVED_LSN_UNKNOWN`, and `PRIMARY_LSN_UNKNOWN`; retry adds one more reason for the force-writer pin.
+The action reason `READER_FAILURE_FORCE_WRITER` lives alongside the existing
+LSN-policy reasons (`WRITE_LSN_UNKNOWN`, `OBSERVED_LSN_UNKNOWN`, and
+`PRIMARY_LSN_UNKNOWN`) and records the writer-only-route override in traces/counters.
 
 ---
 
@@ -183,8 +188,8 @@ A reader failure must classify the writer **before** deciding. A boolean "is the
 
 | State | When (writer-side evidence only) | Action |
 |---|---|---|
-| **LIVE** | a connected writer backend holds the open transaction (validated: `is_connected()` **and** `IsKnownActiveTransaction()`) | RETRY or FORWARD; set the force-writer pin |
-| **NOT_STARTED** | the client `BEGIN` is tracked but it is pre-write — **no XIDs, no persistent binding** yet | FORWARD + pin to the writer hostgroup; the client's next statement opens the transaction on the writer. **Never poison** — nothing is orphaned |
+| **LIVE** | a connected writer backend holds the open transaction (validated: `is_connected()` **and** `IsKnownActiveTransaction()`) | RETRY or FORWARD; set the writer-only route |
+| **NOT_STARTED** | the client `BEGIN` is tracked but it is pre-write — **no XIDs, no persistent binding** yet | FORWARD + route to the writer hostgroup; the client's next statement opens the transaction on the writer. **Never poison** — nothing is orphaned |
 | **LOST** | a writer existed (XIDs present *or* `transaction_persistent_hostgroup != -1`) but its connection died | **TERMINATE** the session |
 
 Two correctness rules govern the resolution:
@@ -210,7 +215,7 @@ The failure **type** picks the knob; the knob picks RETRY / FORWARD / TERMINATE.
 | strict **timeout** (LSN/CSN wait) | `fail.timeout` | `pgsql-polardb_reader_timeout_action` | **RETRY** (0) |
 | reusable **SQL error** | else | `pgsql-polardb_reader_error_action` | **FORWARD** (1) |
 
-Values: `0 = RETRY`, `1 = FORWARD`, `2 = TERMINATE` (enum `PolarDB_ReaderAction`, full implementation `include/PgSQL_PolarDB.h:299`). The three knobs are registered with the valid range `[0..2]` (full implementation `lib/PgSQL_Thread.cpp:2377-2379`) and refreshed into the thread-local snapshot (full implementation `lib/PgSQL_Thread.cpp:4148-4150`).
+Values: `0 = RETRY`, `1 = FORWARD`, `2 = TERMINATE` (enum `PolarDB_ReaderAction`, full implementation `include/PgSQL_PolarDB.h:299`). The three knobs are registered as string variables taking `retry` / `forward` / `terminate` (full implementation `lib/PgSQL_Thread.cpp:2377-2379`) and refreshed into the thread-local snapshot (full implementation `lib/PgSQL_Thread.cpp:4148-4150`).
 
 **Rationale for the defaults.** A death or a timeout can often be re-run on the writer and succeed (the client sees no error at all), so the default is RETRY. A deterministic SQL error usually fails the same way on the writer, so re-running it would waste work; the default is therefore FORWARD. Either way the client gets the **real** SQLSTATE — never a generic `25P02` (that is writer-loss only).
 
@@ -240,13 +245,13 @@ ALWAYS, before any terminal return:
    tear down split or wait op state (Failure.cpp:154-155)
         |
         v
-writer LOST          -> return terminate_reader(...)    (Failure.cpp:160-161)
+writer LOST          -> return polardb_terminate_reader(...)    (Failure.cpp:160-161)
         |
         v
-knob == TERMINATE    -> return terminate_reader(...)    (Failure.cpp:165-166)
+knob == TERMINATE    -> return polardb_terminate_reader(...)    (Failure.cpp:165-166)
         |
         v
-set the force-writer pin (for BOTH RETRY and FORWARD)    (Failure.cpp:169)
+set the writer-only route (for BOTH RETRY and FORWARD)    (Failure.cpp:169)
         |
         v
 RETRY eligible? (knob==RETRY && writer LIVE && !rows_sent && redispatch succeeds)
@@ -255,7 +260,7 @@ RETRY eligible? (knob==RETRY && writer LIVE && !rows_sent && redispatch succeeds
 return polardb_forward_and_continue(...)  -> FORWARD     (Failure.cpp:180)
 ```
 
-Note the **"always, before any terminal return"** step. Status accounting and state teardown run for **every** handled outcome (including `LOST -> TERMINATE`), so `terminate_reader`'s contract holds: by the time it runs, status and teardown are already done (full implementation `lib/PgSQL_PolarDB_Failure.cpp:151-155`).
+Note the **"always, before any terminal return"** step. Status accounting and state teardown run for **every** handled outcome (including `LOST -> TERMINATE`), so `polardb_terminate_reader`'s contract holds: by the time it runs, status and teardown are already done (full implementation `lib/PgSQL_PolarDB_Failure.cpp:151-155`).
 
 ### 8.2 The helper functions
 
@@ -267,16 +272,18 @@ Note the **"always, before any terminal return"** step. Status accounting and st
 | `polardb_writer_hgid()` | `Failure.cpp:215` | The configured writer hostgroup (the `NOT_STARTED` target). Thin wrapper over the same topology lookup `polardb_collect` uses. |
 | `polardb_find_live_writer(...)` | `Failure.cpp:221` | The LIVE-writer probe. Excludes the failed reader; validates every candidate's liveness. |
 | `polardb_resolve_writer_state(...)` | `Failure.cpp:248` | Resolve LIVE / NOT_STARTED / LOST from writer-side evidence only. |
-| `polardb_reader_action_for(fail)` | `Failure.cpp:272` | Map the failure **type** to the knob value (RETRY/FORWARD/TERMINATE). |
-| `polardb_force_writer_after_reader_failure(hg)` | `Failure.cpp:280` | Set the force-writer pin (called for both RETRY and FORWARD). |
+| `polardb_reader_decision_for(fail)` | `Failure.cpp` | Map the failure **type** to an action, retry target, and reader-failure route. |
+| `polardb_apply_reader_failure_route_state(route, ...)` | `Failure.cpp` | Apply the writer-only or reader-skip route used by later routing decisions. |
 | `polardb_record_reader_failure_status(fail)` | `Failure.cpp:327` | Error accounting + mark a died reader so it is destroyed, not pooled. Does **no** upstream retry. |
 | `polardb_finish_reader_failure_wait_op(fail)` | `Failure.cpp:343` | Wait-op state teardown (latency, plan reset, drop staged notices). RETRY skips `RequestEnd`, so the teardown must happen here. |
-| `polardb_try_redispatch_to_writer(...)` | `Failure.cpp:352` | RETRY mechanics: re-point both `mybe` and `current_hostgroup` at the writer, install the client's own query packet, and re-prime `CurrentQuery`. Preconditions are checked first with no side effects. |
+| `polardb_try_redispatch_to_writer(...)` | `Failure.cpp:352` | RETRY mechanics: re-point both `mybe` and `current_hostgroup` at the writer, move the client's own query packet to the writer stream, and reset `CurrentQuery` from that packet. Preconditions are checked first with no side effects. |
 | `polardb_forward_and_continue(fail)` | `Failure.cpp:391` | FORWARD mechanics: emit the real error + `RFQ('T')`, release the reader, bump the forward counter. |
 | `polardb_forward_reader_error(fail, rfq)` | `Failure.cpp:311` | Emit `ErrorResponse(real error OR 08006)` + `ReadyForQuery(rfq)` onto the client output. Never synthesizes `25P02`; never routed through `generate_error_packet()` (which would hardcode `RFQ('I')`). |
-| `terminate_reader(...)` | `Failure.cpp:404` | TERMINATE mechanics: free the retry packet, release (destroy) the reader, return TERMINATE. |
+| `polardb_terminate_reader(...)` | `Failure.cpp:993` | TERMINATE mechanics: free the retry packet, release (destroy) the reader, return TERMINATE. |
 
-Split-domain teardown helpers it leans on — `polardb_release_reader_backend`, `polardb_clear_txn_xid_state`, `polardb_finish_reader_failure_split_op` — live in `lib/PgSQL_PolarDB_Split.cpp` (full implementation `:325`, `:351`, `:394`), which is itself a future file.
+Split-domain teardown helpers it leans on — `polardb_release_reader_backend`,
+`polardb_clear_txn_xid_state`, `polardb_finish_reader_failure_split_op` — live
+in `lib/PgSQL_PolarDB_Split.cpp`.
 
 ### 8.3 How RETRY rewires the request (mechanics)
 
@@ -284,11 +291,11 @@ Split-domain teardown helpers it leans on — `polardb_release_reader_backend`, 
 
 1. release the reader backend (with reuse if the reader is reusable);
 2. **re-point both** `current_hostgroup = writer_hg` **and** `mybe = writer_mybe` — re-pointing `current_hostgroup` alone would be inert, because `CONNECTING_SERVER` drives `mybe->server_myds` and never re-resolves `mybe`;
-3. install the client's own query packet into the writer's data stream (`pgsql_real_query`);
+3. move the client's own query packet into the writer's data stream (`pgsql_real_query`);
 4. bump the retry counter (`polardb_split_reads_retried`; wait read retry reuses or generalizes the current `polardb_wait_reads_retried_on_writer`);
-5. re-prime `CurrentQuery` from the writer's query packet and call `set_previous_status_mode3()` so the handler resumes correctly.
+5. reset `CurrentQuery` from the writer's query packet and call `set_previous_status_mode3()` so the handler resumes correctly.
 
-The handler then runs `NEXT_IMMEDIATE(CONNECTING_SERVER)` and the writer executes the query. The force-writer pin (already set by `polardb_on_failure`) prevents a second offload.
+The handler then runs `NEXT_IMMEDIATE(CONNECTING_SERVER)` and the writer executes the query. The writer-only route (already set by `polardb_on_failure`) prevents a second offload.
 
 ---
 
@@ -298,18 +305,18 @@ The handler then runs `NEXT_IMMEDIATE(CONNECTING_SERVER)` and the writer execute
 
 | New item | Where (full implementation) |
 |---|---|
-| Translation unit `lib/PgSQL_PolarDB_Failure.cpp` (410 lines) | the whole feature body |
+| Translation unit `lib/PgSQL_PolarDB_Failure.cpp` (1449 lines, this branch) | the whole feature body |
 | enum `PolarDB_FailureAction { PASSTHROUGH, RETRY, FORWARD, TERMINATE }` | `include/PgSQL_PolarDB.h:290` |
 | enum `PolarDB_ReaderAction { RETRY=0, FORWARD=1, TERMINATE=2 }` | `include/PgSQL_PolarDB.h:299` |
 | enum `PolarDB_WriterState { LIVE, NOT_STARTED, LOST }` | `include/PgSQL_PolarDB.h:311` |
 | struct `PolarDB_RequestOutcome` (captured once per failed request) | `include/PgSQL_PolarDB.h:254` |
 | struct `PolarDB_ReaderFailure` (the working view) | full implementation header (consumed throughout `Failure.cpp`) |
 | `RouteActionReason::READER_FAILURE_FORCE_WRITER` (added alongside the existing reasons) | `include/PgSQL_PolarDB.h:721` |
-| session fields `polardb_txn_force_writer_after_reader_failure`, `polardb_txn_writer_hg` | `include/PgSQL_Session.h` (full implementation) |
+| session fields `polardb_txn_reader_failure.route`, `polardb_txn_writer_hg`, `polardb_txn_skipped_reader_*` | `include/PgSQL_Session.h` |
 
 ### 9.2 New configuration knobs (three)
 
-All three are `int` thread variables with valid range `[0..2]` and the value mapping `0=RETRY, 1=FORWARD, 2=TERMINATE`.
+All three are **string** thread variables taking `retry` / `forward` / `terminate` (defaults `retry` / `retry` / `forward`, `lib/PgSQL_Thread.cpp:1284-1286`), mapping onto `RETRY=0, FORWARD=1, TERMINATE=2` in `PolarDB_ReaderAction`.
 
 | Knob | Default | Fires when the failure is… |
 |---|---|---|
@@ -317,32 +324,32 @@ All three are `int` thread variables with valid range `[0..2]` and the value map
 | `pgsql-polardb_reader_timeout_action` | RETRY (0) | a strict **wait timeout** (LSN/CSN) |
 | `pgsql-polardb_reader_error_action` | FORWARD (1) | a reusable **SQL error** |
 
-Registered at full implementation `lib/PgSQL_Thread.cpp:2377-2379`; defaults at `:1222-1224`; thread-local refresh at `:4148-4150`. None of these knobs exists in this implementation.
+Registered by this implementation as `pgsql-polardb_reader_death_action`, `pgsql-polardb_reader_timeout_action`, and `pgsql-polardb_reader_error_action`. They select the common reader-failure policy for split reads and wait reads.
 
 ### 9.3 Counters
 
-This branch already exports `PolarDB_Wait_Reads_Retried_On_Writer` for the narrow autocommit wait-read retry and `PolarDB_Wait_Error_Connection_Lost` for the connection-loss reason. The future feature keeps those signals and adds the remaining split/forwarding counters needed by the full policy matrix.
+This branch exports the wait-read retry/error counters and the split reader-failure counters from `include/PgSQL_PolarDB_Counters.h`, including `PolarDB_Split_Reads_Retried`, `PolarDB_Split_Reads_Retried_On_Reader`, `PolarDB_Split_Reads_Forwarded`, and `PolarDB_Reader_Terminations`.
 
-### 9.3.1 Future counters
+### 9.3.1 Remaining counter guidance
 
-The full implementation adds the following counters. In that older tree they are `std::atomic<unsigned long long>` fields on `PgSQL_HostGroups_Manager::status`; when re-adding them to this branch, classify them using the current thread/global counter rule from [12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md). New counters should be added to the shared PolarDB counter metadata so both `stats_pgsql_global` and Prometheus remain covered.
+New counters should be added to the shared PolarDB counter metadata so both
+`stats_pgsql_global` and Prometheus remain covered. Keep the taxonomy
+non-overlapping: `split_reads_fallback` means a split read was never dispatched,
+`split_reads_retried` means redispatched on the writer,
+`split_reads_retried_on_reader` means redispatched on another replica,
+`split_reads_forwarded` means the real reader error was forwarded, and
+`reader_terminations` means the session was closed.
 
-| Counter | Increment site (full implementation) | Meaning |
-|---|---|---|
-| `polardb_split_reads_retried` | `Failure.cpp:377` | a **split** read failure was RETRY-redispatched on the writer |
-| `polardb_split_reads_forwarded` | `Failure.cpp:393` | a **split** read error was FORWARDed (real error + `RFQ('T')`, transaction continued) |
-| `polardb_wait_reads_forwarded` | `Failure.cpp:394` | a **wait** read error was FORWARDed (real error + `RFQ('T')`, transaction continued) |
-
-> **Reminder on counters in this implementation.** The current LSN set ships **26 stat counters + 1 `polardb_active` gate**. The deferred millisecond-lag knob (`pgsql-polardb_lag_ms`) and the byte-lag stale-sample counter (`PolarDB_LSN_Stale_Count`) are unrelated to this feature; see [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md).
+> **Reminder on counters in this implementation.** The current stat surface is generated from `include/PgSQL_PolarDB_Counters.h`; `polardb_active` is an internal enabled check, not an exported counter. The deferred millisecond-lag knob (`pgsql-polardb_lag_ms`) and the byte-lag stale-sample counter (`PolarDB_LSN_Stale_Count`) are unrelated to this feature; see [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md).
 
 ### 9.4 Hooks in this implementation that this feature extends (already present in this implementation / upstream)
 
 | Existing hook | What this feature does to it |
 |---|---|
 | the `rc == -1` handler branch | adds the `polardb_capture_outcome` + `polardb_on_failure` dispatch above the upstream retry logic |
-| the `tx_poisoned` writer-loss poison (`handler_minus1_PoisonTransaction`) + recovery (`handler_poisoned_simple_query`) | **reused unchanged**, plus one guarded `polardb_cleanup_txn_split_state()` call on the poison path (full implementation `lib/PgSQL_Session.cpp:3044`, inside `#if POLARDB_PROXY`) for when the writer dies while holding an open split |
+| the `tx_poisoned` writer-loss poison (`handler_minus1_PoisonTransaction`) + recovery (`handler_poisoned_simple_query`) | **reused unchanged**, plus one protected `polardb_cleanup_txn_split_state()` call on the poison path (full implementation `lib/PgSQL_Session.cpp:3044`, inside `#if POLARDB_PROXY`) for when the writer dies while holding an open split |
 | the `reusable` discriminator (`is_connection_in_reusable_state`) | reused as the death-vs-error classifier |
-| the qpo handler and the PolarDB planner / `RouteActionReason` | extended with the force-writer pin override and the new action reason |
+| the qpo handler and the PolarDB planner / `RouteActionReason` | extended with the writer-only route override and the new action reason |
 
 ---
 
@@ -359,14 +366,14 @@ So: the reader-failure model is **LSN-first** in practice (the only wait type th
 
 ## 11. Concrete delta from this implementation (side-by-side)
 
-| This implementation today (LSN-only series) | This future feature adds |
+| Active in this branch | Remaining advanced roadmap |
 |---|---|
-| Reads are offloaded to replicas **only when autocommit**; an in-transaction read is forced to the writer with `IN_TRANSACTION` (this implementation `Flow.cpp:269-272`) | In-transaction offloaded reads (via the split feature), so reader failures **can** happen mid-transaction and there is a live transaction to rescue |
-| `rc == -1` has a narrow autocommit wait-read retry hook for strict timeout and reader connection loss before any user result | generalized hook: `polardb_capture_outcome` + `polardb_on_failure` dispatch above the upstream retry logic |
-| no general reader-failure policy, FORWARD, or TERMINATE model | expanded `lib/PgSQL_PolarDB_Failure.cpp`; enums `PolarDB_FailureAction` / `PolarDB_ReaderAction` / `PolarDB_WriterState`; structs `PolarDB_RequestOutcome` and `PolarDB_ReaderFailure` |
-| `RouteActionReason` has this implementation's base and LSN-policy reasons, but no reader-failure reason | `READER_FAILURE_FORCE_WRITER` action reason + the planner rule + the qpo / manual-mode overrides |
-| `tx_poisoned` writer-loss poison + recovery exist as the shared base: the poison-set helper `handler_minus1_PoisonTransaction` (this implementation `lib/PgSQL_Session.cpp:2838`, called at `:2940` and `:3012`), the recovery helper `handler_poisoned_simple_query` (this implementation `:480`), the shared wire-write helper `write_tx_poisoned_error` (this implementation `:130`), and the reset clear (this implementation `:399`) | **reused unchanged**, plus one guarded `polardb_cleanup_txn_split_state()` on the poison path |
-| no reader-failure knobs or counters | 3 knobs (`pgsql-polardb_reader_{death,timeout,error}_action`) + 4 counters (`polardb_{split,wait}_reads_{retried,forwarded}`) |
+| Simple-query split reads can be offloaded after primary RFQ XID evidence is complete | Advanced split ranking and CSN/global consistency remain outside this feature |
+| `rc == -1` has a common reader-failure hook for wait reads and split reads | Future policy tables can refine the current action knobs by failure class and retry budget |
+| RETRY/FORWARD/TERMINATE are implemented for the active wait/split paths | Future reader circuit-breakers can feed failure history back into reader selection |
+| `RouteActionReason` includes reader-failure and split rejection reasons | Future routing can add richer reasons only when they are visible in traces/counters |
+| `tx_poisoned` writer-loss poison + recovery exist as the shared base: the poison-set helper `handler_minus1_PoisonTransaction` (this implementation `lib/PgSQL_Session.cpp:2838`, called at `:2940` and `:3012`), the recovery helper `handler_poisoned_simple_query` (this implementation `:480`), the shared wire-write helper `write_tx_poisoned_error` (this implementation `:130`), and the reset clear (this implementation `:399`) | **reused unchanged**, plus one protected `polardb_cleanup_txn_split_state()` on the poison path |
+| Reader-failure knobs and counters are active | Future additions should keep the shared counter metadata and trace taxonomy non-overlapping |
 
 **Scope caveat for manually-routed extended-protocol reads.** The "no orphaned writer" guarantee holds only for reads routed by the **PolarDB pipeline** on the simple-query protocol (the `'Q'` message). A read manually routed to a replica by a query rule on the **extended protocol** inside a transaction **bypasses** the pipeline; the failure of its first statement is a documented follow-up, not covered by this model (design reference `doc/polardb-arch/23-READ-SIDE-FAILURE-RECOVERY.md:359` (full implementation)).
 
@@ -374,7 +381,9 @@ So: the reader-failure model is **LSN-first** in practice (the only wait type th
 
 ## 12. Worked traces
 
-Each trace lists the backend involved, the outcome chosen, and the bytes the client receives. These describe the **future** behavior (full implementation), not this implementation.
+Each trace lists the backend involved, the outcome chosen, and the bytes the
+client receives. These describe the active behavior for autocommit wait reads
+and simple-query transaction-split reads in this branch.
 
 ### Trace A — wait read times out, writer LIVE, no rows sent -> RETRY (transparent success)
 
@@ -385,7 +394,7 @@ Each trace lists the backend involved, the outcome chosen, and the bytes the cli
 4. polardb_on_failure:
       writer state = LIVE  (a connected writer holds the txn)
       knob = reader_timeout_action = RETRY (default)
-      set force-writer pin
+      set writer-only route
       RETRY eligible (LIVE && !rows_sent && redispatch ok) -> redispatch the client's own query on the writer
 5. handler: NEXT_IMMEDIATE(CONNECTING_SERVER); writer runs the query -> rows + RFQ('T')
 RESULT: client sees the real data and RFQ('T'); the failure was transparent. The wait read retry counter moves.
@@ -400,10 +409,10 @@ RESULT: client sees the real data and RFQ('T'); the failure was transparent. The
 4. polardb_on_failure:
       writer state = LIVE
       knob = reader_error_action = FORWARD (default)  (and rows already sent -> RETRY ineligible anyway)
-      set force-writer pin
+      set writer-only route
       FORWARD -> emit the REAL ErrorResponse(42P01) + RFQ('T'); release the reader
 RESULT: client sees the real 42P01 error and RFQ('T'); the txn is still live on the writer.
-        The next statement routes to the writer (pin). polardb_split_reads_forwarded++.
+        The next statement routes to the writer. polardb_split_reads_forwarded++.
 ```
 
 ### Trace C — reader dies, writer LOST -> TERMINATE (clean rollback)
@@ -428,7 +437,7 @@ RESULT: PostgreSQL rolls back the dead writer's txn on disconnect. No orphan. No
    neither split_read nor wait_read -> returns PASSTHROUGH
 3. control falls through to the existing upstream rc==-1 handling
 4. tx_poisoned path: handler_minus1_PoisonTransaction synthesizes ERROR 25P02 + RFQ('E');
-   (full implementation) one guarded polardb_cleanup_txn_split_state() also runs (Session.cpp:3044)
+   one protected polardb_cleanup_txn_split_state() also runs on the PolarDB path
 RESULT: the client gets 25P02 + RFQ('E') and stays alive to ROLLBACK. This is the ONLY fabricated
         transaction control, and it is reached only by the writer's own death.
 ```
@@ -440,8 +449,8 @@ RESULT: the client gets 25P02 + RFQ('E') and stays alive to ROLLBACK. This is th
 - **The proxy never fabricates transaction control on a live transaction.** RETRY and FORWARD always tell the truth: RETRY lets the writer emit the real RFQ; FORWARD sends the reader's real error with `RFQ('T')` because the transaction really is alive. Only writer-loss poison fabricates (`25P02` + `RFQ('E')`), and only on the writer's own death.
 - **Tri-state writer resolution is the important rule.** The single most important correctness rule is the LIVE/NOT_STARTED/LOST distinction (§6) using writer-side evidence only, never `active_transactions`. A boolean live-writer check cannot distinguish pre-write transactions from writer loss.
 - **LOST -> TERMINATE, never poison from the reader stage** (§6.1). Handing a reusable reader to the upstream poison path would FORWARD the reader's error and orphan the dead writer.
-- **The pin must beat the cache.** The qpo-handler override is placed deliberately before the query-cache / destination-override / hostgroup-lock, so a pinned read never serves from cache (full implementation `Session.cpp:5721`).
-- **RETRY is single-shot.** The pin (set before redispatch) prevents a second offload, and the dispatch sits above the upstream retry logic, so a handled reader failure and an upstream retry are mutually exclusive.
+- **The route must beat the cache.** The qpo-handler override is placed deliberately before the query-cache / destination-override / hostgroup-lock, so a kept read never serves from cache (full implementation `Session.cpp:5721`).
+- **RETRY is single-shot.** The route (set before redispatch) prevents a second offload, and the dispatch sits above the upstream retry logic, so a handled reader failure and an upstream retry are mutually exclusive.
 - **Capture once.** `polardb_capture_outcome` reads the failed connection exactly once into a snapshot; later stages never re-read a connection that may already be released. The reader address is **copied** while the connection is live for later error accounting (full implementation `Failure.cpp:58`, `:331-333`).
 - **Status + teardown run before any terminal return** so every outcome — including `LOST -> TERMINATE` — has consistent accounting and clean state (full implementation `Failure.cpp:151-155`).
 - **The manually-routed extended-protocol carve-out is a known hole** (§11): an extended-protocol read manually routed to a replica inside a transaction bypasses the pipeline and is not covered.
@@ -452,13 +461,14 @@ RESULT: the client gets 25P02 + RFQ('E') and stays alive to ROLLBACK. This is th
 
 | Item | Status |
 |---|---|
-| Reader-failure recovery (RETRY / FORWARD / TERMINATE) | **Future. Not in this implementation.** This branch's `lib/PgSQL_PolarDB_Failure.cpp` contains only the autocommit wait-read retry foundation; the full policy model is built in the full implementation. |
-| Writer-loss poison (`tx_poisoned`) | **Present in this implementation** as the shared base; reused unchanged. A reader failure never reaches it. |
-| Hard prerequisite | The transaction-split feature ([19-FUTURE-TXN-SPLIT-DESIGN.md](19-FUTURE-TXN-SPLIT-DESIGN.md)) must land first; this implementation offloads reads only in autocommit. |
+| Reader-failure recovery (RETRY / FORWARD / TERMINATE) | **Active** for autocommit wait reads and simple-query transaction-split reads. |
+| Writer-loss poison (`tx_poisoned`) | **Present** as the shared base; reused unchanged. A reader failure never reaches it. |
+| Transaction split prerequisite | **Satisfied for simple-query split reads.** Extended-protocol split and CSN/global consistency remain outside this document's active scope. |
 | CSN-timeout handling inside this model | Pre-wired but **inert / experimental** until the CSN feature ([18-FUTURE-CSN-DESIGN.md](18-FUTURE-CSN-DESIGN.md)) is finished. CSN is incomplete and experimental: it needs PolarDB backend support, applies only in global-consistency mode, and its wait behavior is not reliably verified. |
 | Manually-routed extended-protocol carve-out | Documented open follow-up; not covered by the no-orphan guarantee. |
 
-For the full out-of-scope list and the roadmap that ties these future docs together, see [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md).
+For the full out-of-scope list and the roadmap for remaining advanced policy
+work, see [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md).
 
 ---
 
@@ -507,8 +517,8 @@ flowchart TD
     L -->|yes| T1["terminate_reader -> TERMINATE"]
     L -->|no| K{"knob == TERMINATE?"}
     K -->|yes| T2["terminate_reader -> TERMINATE"]
-    K -->|no| PIN["set force-writer pin<br/>(for BOTH RETRY and FORWARD)"]
-    PIN --> RE{"knob==RETRY && writer LIVE<br/>&& no rows sent<br/>&& redispatch ok?"}
+    K -->|no| ROUTE["set writer-only route<br/>(for BOTH RETRY and FORWARD)"]
+    ROUTE --> RE{"knob==RETRY && writer LIVE<br/>&& no rows sent<br/>&& redispatch ok?"}
     RE -->|yes| RR["return RETRY"]
     RE -->|no| FF["forward_and_continue -> FORWARD"]
 ```
@@ -518,27 +528,29 @@ flowchart TD
 ```mermaid
 flowchart TD
     P["reader failed -> classify writer"] --> LP["LIVE probe<br/>(excludes failed reader,<br/>validates each candidate)"]
-    LP -->|connected + known active txn| LIVE["LIVE<br/>RETRY or FORWARD + pin"]
+    LP -->|connected + known active txn| LIVE["LIVE<br/>RETRY or FORWARD + writer-only route"]
     LP -->|none live| EV{"writer-side evidence?<br/>(XIDs OR persistent binding)"}
     EV -->|yes, writer existed| LOST["LOST<br/>TERMINATE"]
-    EV -->|no, but client BEGIN tracked| NS["NOT_STARTED<br/>FORWARD + pin to writer_hg<br/>never poison"]
+    EV -->|no, but client BEGIN tracked| NS["NOT_STARTED<br/>FORWARD + route to writer_hg<br/>never poison"]
     EV -->|no evidence, no BEGIN| LOST2["LOST (stop safely)<br/>TERMINATE"]
 ```
 
-### A.5 The force-writer pin honored at three layers
+### A.5 The writer-only route honored at three layers
 
 ```mermaid
 flowchart TD
-    SET["pin set in polardb_on_failure<br/>(force_writer_after_reader_failure)"] --> Q["qpo handler<br/>(full implementation Session.cpp:5721)<br/>before cache / override / lock"]
+    SET["route set in polardb_on_failure<br/>(apply_reader_failure_route_state)"] --> Q["qpo handler<br/>before cache / override / lock"]
     SET --> M["manual-mode backstop<br/>(full implementation Session.cpp:2723)"]
-    SET --> PL["planner rule<br/>(full implementation Flow.cpp:223)<br/>target_hg = txn_writer_hg<br/>action reason READER_FAILURE_FORCE_WRITER"]
-    Q --> CLR["cleared on COMMIT/ROLLBACK/reset<br/>(clear_txn_xid_state, full implementation Split.cpp:357-358)"]
+    SET --> PL["planner rule<br/>writer-only route sets target_hg = txn_writer_hg<br/>reader-skip route excludes failed reader"]
+    Q --> CLR["cleared on COMMIT/ROLLBACK/reset<br/>(clear_txn_xid_state)"]
     M --> CLR
     PL --> CLR
 ```
 
 ---
 
-*This document describes a FUTURE feature that lives in the full implementation and is specified in `doc/polardb-arch/23-READ-SIDE-FAILURE-RECOVERY.md`. It is NOT present in this LSN-only branch. All "(this implementation)" facts were read from this branch.*
+*This document describes the active reader-failure recovery shape in this
+branch. Remaining work is advanced policy refinement, not the base retry /
+forward / terminate model.*
 
 Verified against this branch.
