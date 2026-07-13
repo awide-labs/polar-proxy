@@ -72,3 +72,81 @@ polardb_require_proxysql_or_skip_all() {
     polardb_skip_remaining "ProxySQL binary not built"
     exit 0
 }
+
+tap_trace_count() {
+    local log_file="$1"
+    local pattern="$2"
+    local count
+
+    count=$(grep -F -- "$pattern" "$log_file" 2>/dev/null | wc -l | tr -d '[:space:]')
+    printf '%s\n' "${count:-0}"
+}
+
+tap_trace_has() {
+    local log_file="$1"
+    local pattern="$2"
+    [ "$(tap_trace_count "$log_file" "$pattern")" -gt 0 ]
+}
+
+tap_trace_checks_enabled() {
+    local log_file="$1"
+    [ -f "$log_file" ] && tap_trace_has "$log_file" "PolarDB "
+}
+
+tap_trace_expect_count() {
+    local log_file="$1"
+    local pattern="$2"
+    local op="$3"
+    local expected="$4"
+    local count
+
+    count=$(tap_trace_count "$log_file" "$pattern")
+    case "$op" in
+    ge)
+        if [ "$count" -ge "$expected" ]; then
+            return 0
+        fi
+        diag "trace pattern count too low in $log_file: $pattern (count=$count expected>=$expected)"
+        ;;
+    eq)
+        if [ "$count" -eq "$expected" ]; then
+            return 0
+        fi
+        diag "trace pattern count mismatch in $log_file: $pattern (count=$count expected=$expected)"
+        ;;
+    *)
+        diag "invalid trace count expectation op=$op pattern=$pattern"
+        ;;
+    esac
+    return 1
+}
+
+tap_trace_must_have() {
+    local log_file="$1"
+    local pattern="$2"
+
+    tap_trace_expect_count "$log_file" "$pattern" ge 1
+}
+
+tap_trace_must_not_have() {
+    local log_file="$1"
+    local pattern="$2"
+
+    tap_trace_expect_count "$log_file" "$pattern" eq 0
+}
+
+tap_trace_must_count_ge() {
+    local log_file="$1"
+    local pattern="$2"
+    local min_count="$3"
+
+    tap_trace_expect_count "$log_file" "$pattern" ge "$min_count"
+}
+
+tap_trace_must_count_eq() {
+    local log_file="$1"
+    local pattern="$2"
+    local expected_count="$3"
+
+    tap_trace_expect_count "$log_file" "$pattern" eq "$expected_count"
+}

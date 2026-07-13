@@ -35,6 +35,7 @@ BENCH3_WAL_SLEEP_SEC="${BENCH3_WAL_SLEEP_SEC:-0.02}"
 BENCH3_WAL_BYTES="${BENCH3_WAL_BYTES:-200}"
 BENCH3_TABLE="${BENCH3_TABLE:-polardb_bench3_replica_lag}"
 BENCH3_LOAD_TABLE="${BENCH3_LOAD_TABLE:-polardb_bench3_load}"
+BENCH3_RESULT_TABLE="${BENCH3_RESULT_TABLE:-polardb_bench3_results}"
 
 bench3_modes=()
 
@@ -54,7 +55,8 @@ bench3_worker_script() {
     local worker="$2"
     local sql_file="$3"
 
-    polardb_bench_write_ryw_worker_script "$mode" "$worker" "$sql_file" \
+    POLARDB_BENCH_RESULT_TABLE="$BENCH3_RESULT_TABLE" \
+        polardb_bench_write_ryw_worker_script "$mode" "$worker" "$sql_file" \
         "$BENCH3_TABLE" "$BENCH3_ITERS" bench3
 }
 
@@ -75,6 +77,7 @@ bench3_run_mode() {
     bench3_configure_mode "$mode" "$consistency" "$max_lag_bytes" || return 1
 
     polardb_bench_truncate "$BENCH3_TABLE" || return 1
+    polardb_bench_truncate "$BENCH3_RESULT_TABLE" || return 1
     sleep 1
 
     wait_before=$(polardb_bench_counter PolarDB_Wait_LSN_Sent)
@@ -83,7 +86,8 @@ bench3_run_mode() {
     reader_before=$(polardb_bench_pool_queries "$POLARDB_BENCH_READER_HG")
 
     t0=$(date +%s%3N)
-    polardb_bench_run_workers "$mode" "$BENCH3_CLIENTS" bench3_worker_script polardb_bench_mark_fail
+    POLARDB_BENCH_RESULT_TABLE="$BENCH3_RESULT_TABLE" \
+        polardb_bench_run_workers "$mode" "$BENCH3_CLIENTS" bench3_worker_script polardb_bench_mark_fail
     t1=$(date +%s%3N)
     elapsed=$((t1 - t0))
 
@@ -99,7 +103,8 @@ bench3_run_mode() {
     B3_WRITER_Q[$mode]=$((writer_after - writer_before))
     B3_READER_Q[$mode]=$((reader_after - reader_before))
 
-    polardb_bench_capture_ryw_results "$mode" "$expected" polardb_bench_mark_fail \
+    POLARDB_BENCH_RESULT_TABLE="$BENCH3_RESULT_TABLE" \
+        polardb_bench_capture_ryw_results "$mode" "$expected" polardb_bench_mark_fail \
         B3_FRESH B3_STALE B3_BAD B3_ERRORS
     echo "[$(ts)]   elapsed=${elapsed}ms tps=${B3_TPS[$mode]} writer_q=${B3_WRITER_Q[$mode]} reader_q=${B3_READER_Q[$mode]} waits=${B3_WAITS[$mode]} wait_us=${B3_WAIT_US[$mode]}"
 }
@@ -159,7 +164,7 @@ run_bench3_replica_lag_bench() {
     set_polar_proxy_wait_timeout_ms "$BENCH3_WAIT_TIMEOUT_MS" || return 1
 
     echo "[$(ts)] Creating benchmark tables"
-    polardb_bench_create_ryw_tables "$BENCH3_TABLE" "$BENCH3_LOAD_TABLE" || return 1
+    polardb_bench_create_ryw_tables "$BENCH3_TABLE" "$BENCH3_LOAD_TABLE" "$BENCH3_RESULT_TABLE" || return 1
 
     snapshot "B"
     snapshot_pool "B"
@@ -229,7 +234,7 @@ run_bench3_replica_lag_bench() {
 
     bench3_disable_lag_window
     stop_proxysql
-    polardb_bench_drop_tables "$BENCH3_TABLE" "$BENCH3_LOAD_TABLE"
+    polardb_bench_drop_tables "$BENCH3_TABLE" "$BENCH3_LOAD_TABLE" "$BENCH3_RESULT_TABLE"
 
     echo ""
     echo "================================================================"
@@ -240,5 +245,5 @@ run_bench3_replica_lag_bench() {
     [ "$(polardb_bench_fail_count)" -eq 0 ]
 }
 
-trap 'bench3_disable_lag_window 2>/dev/null || true; cleanup_all' EXIT
+trap 'bench3_disable_lag_window 2>/dev/null || true; polardb_bench_drop_tables "$BENCH3_TABLE" "$BENCH3_LOAD_TABLE" "$BENCH3_RESULT_TABLE"; cleanup_all' EXIT
 run_test "Bench 3: replica lag benchmark" run_bench3_replica_lag_bench

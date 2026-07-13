@@ -38,6 +38,7 @@ BENCH2_WAIT_MODE="${BENCH2_WAIT_MODE:-strict}"
 BENCH2_WAL_SLEEP_SEC="${BENCH2_WAL_SLEEP_SEC:-0.01}"
 BENCH2_TABLE="${BENCH2_TABLE:-polardb_bench2_lsn_offload}"
 BENCH2_LOAD_TABLE="${BENCH2_LOAD_TABLE:-polardb_bench2_load}"
+BENCH2_RESULT_TABLE="${BENCH2_RESULT_TABLE:-polardb_bench2_results}"
 
 bench2_modes=()
 
@@ -61,7 +62,8 @@ bench2_write_worker_script() {
         pre_sql="SET polar_query_delay_us = $BENCH2_PRIMARY_DELAY_US;"
         post_sql="SET polar_query_delay_us = 0;"
     fi
-    polardb_bench_write_ryw_worker_script "$mode" "$worker" "$sql_file" \
+    POLARDB_BENCH_RESULT_TABLE="$BENCH2_RESULT_TABLE" \
+        polardb_bench_write_ryw_worker_script "$mode" "$worker" "$sql_file" \
         "$BENCH2_TABLE" "$BENCH2_ITERS" bench2 "$pre_sql" "$post_sql"
 }
 
@@ -80,6 +82,7 @@ bench2_run_mode() {
     bench2_configure_mode "$mode" || return 1
 
     polardb_bench_truncate "$BENCH2_TABLE" || return 1
+    polardb_bench_truncate "$BENCH2_RESULT_TABLE" || return 1
     sleep 1
 
     wait_prepared_before=$(polardb_bench_counter PolarDB_Wait_Wrap_Prepared)
@@ -88,7 +91,8 @@ bench2_run_mode() {
     reader_before=$(polardb_bench_pool_queries "$POLARDB_BENCH_READER_HG")
 
     t0=$(date +%s%3N)
-    polardb_bench_run_workers "$mode" "$BENCH2_CLIENTS" bench2_write_worker_script polardb_bench_mark_fail
+    POLARDB_BENCH_RESULT_TABLE="$BENCH2_RESULT_TABLE" \
+        polardb_bench_run_workers "$mode" "$BENCH2_CLIENTS" bench2_write_worker_script polardb_bench_mark_fail
     t1=$(date +%s%3N)
     elapsed=$((t1 - t0))
 
@@ -104,7 +108,8 @@ bench2_run_mode() {
     B2_WRITER_Q[$mode]=$((writer_after - writer_before))
     B2_READER_Q[$mode]=$((reader_after - reader_before))
 
-    polardb_bench_capture_ryw_results "$mode" "$expected" polardb_bench_mark_fail \
+    POLARDB_BENCH_RESULT_TABLE="$BENCH2_RESULT_TABLE" \
+        polardb_bench_capture_ryw_results "$mode" "$expected" polardb_bench_mark_fail \
         B2_FRESH B2_STALE B2_BAD B2_ERRORS
 
     echo "[$(ts)]   elapsed=${elapsed}ms tps=${B2_TPS[$mode]} writer_q=${B2_WRITER_Q[$mode]} reader_q=${B2_READER_Q[$mode]} wait_prepared=${B2_WAIT_PREPARED[$mode]} wait_sent=${B2_WAIT_SENT[$mode]}"
@@ -206,7 +211,7 @@ run_bench2_lsn_offload() {
     set_polar_proxy_wait_timeout_ms "$BENCH2_WAIT_TIMEOUT_MS" || return 1
 
     echo "[$(ts)] Creating benchmark tables"
-    polardb_bench_create_ryw_tables "$BENCH2_TABLE" "$BENCH2_LOAD_TABLE" || return 1
+    polardb_bench_create_ryw_tables "$BENCH2_TABLE" "$BENCH2_LOAD_TABLE" "$BENCH2_RESULT_TABLE" || return 1
 
     enable_replay_lag "$BENCH2_REPLAY_LAG_BYTES" || return 1
     polardb_bench_start_wal_generator "$BENCH2_LOAD_TABLE" 1000 "$BENCH2_WAL_SLEEP_SEC" "WAL generator for replay-lag movement"
@@ -239,7 +244,7 @@ run_bench2_lsn_offload() {
     polardb_bench_stop_wal_generator
     disable_replay_lag 2>/dev/null || true
     stop_proxysql
-    polardb_bench_drop_tables "$BENCH2_TABLE" "$BENCH2_LOAD_TABLE"
+    polardb_bench_drop_tables "$BENCH2_TABLE" "$BENCH2_LOAD_TABLE" "$BENCH2_RESULT_TABLE"
 
     echo ""
     echo "================================================================"
@@ -256,5 +261,5 @@ run_bench2_lsn_offload() {
     return 1
 }
 
-trap 'polardb_bench_stop_wal_generator; disable_replay_lag 2>/dev/null || true; polardb_bench_drop_tables "$BENCH2_TABLE" "$BENCH2_LOAD_TABLE"; cleanup_all' EXIT
+trap 'polardb_bench_stop_wal_generator; disable_replay_lag 2>/dev/null || true; polardb_bench_drop_tables "$BENCH2_TABLE" "$BENCH2_LOAD_TABLE" "$BENCH2_RESULT_TABLE"; cleanup_all' EXIT
 run_test "Bench 2: LSN offload benchmark" run_bench2_lsn_offload
