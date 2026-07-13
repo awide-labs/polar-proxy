@@ -13,8 +13,8 @@
 # full control over its own plan count and diagnostics.
 #
 # Contract for callers:
-#   - source common/env.sh and lib/tap_core.sh first (this file relies on
-#     PROXYSQL_HOST / PROXYSQL_*_PORT / PG* and on ok()/diag());
+#   - source lib/tap_core.sh first (this file loads common/env.sh itself and
+#     relies on ok()/diag());
 #   - export the connection variables this file reads (documented per function);
 #   - the assert_* helpers call ok() exactly once each.
 
@@ -23,16 +23,22 @@ if [ -n "${POLARDB_TAP_POLARDB_LOADED:-}" ]; then
 fi
 POLARDB_TAP_POLARDB_LOADED=1
 
+POLARDB_TAP_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../common/env.sh
+source "$POLARDB_TAP_LIB_DIR/../common/env.sh"
+
 # -----------------------------------------------------------------------------
 # Admin / proxy SQL wrappers
 # -----------------------------------------------------------------------------
 
 # Run one statement against the ProxySQL PostgreSQL admin interface and print
 # the bare result. Uses ON_ERROR_STOP so callers can rely on the exit status.
-# Reads: PROXYSQL_HOST, PROXYSQL_ADMIN_PORT.
+# Reads: PROXYSQL_HOST, PROXYSQL_ADMIN_PORT, and PROXYSQL_ADMIN_*.
 admin_sql() {
-    PGPASSWORD=admin PGSSLMODE=disable psql -h "$PROXYSQL_HOST" -p "$PROXYSQL_ADMIN_PORT" \
-        -U admin -d main -A -t -q -v ON_ERROR_STOP=1 -c "$1"
+    PGPASSWORD="$PROXYSQL_ADMIN_PASSWORD" PGSSLMODE="$PROXYSQL_ADMIN_PGSSLMODE" \
+        psql -h "$PROXYSQL_HOST" -p "$PROXYSQL_ADMIN_PORT" \
+        -U "$PROXYSQL_ADMIN_USER" -d "$PROXYSQL_ADMIN_DATABASE" \
+        -A -t -q -v ON_ERROR_STOP=1 -c "$1"
 }
 
 # Run one statement against the ProxySQL PostgreSQL proxy port (the data path).
@@ -199,7 +205,7 @@ set_select_rule_auto() {
     admin_sql "LOAD PGSQL QUERY RULES TO RUNTIME;" >/dev/null
 }
 
-# Manual reader route: pin ^SELECT to the reader hostgroup, bypassing the planner.
+# Manual reader route: send ^SELECT to the reader hostgroup, bypassing the planner.
 set_select_rule_manual_reader() {
     local comment="${1:-manual_reader_route}"
     admin_sql "DELETE FROM pgsql_query_rules;" >/dev/null
@@ -291,6 +297,36 @@ wait_until() {
         [ $(($(date +%s) - start)) -ge "$timeout_s" ] && return 1
         sleep "$interval_s"
     done
+}
+
+# Generate small write traffic on a direct writer connection. Tests use this to
+# move WAL forward while a replica is intentionally held behind. The caller owns
+# the table lifecycle and must call tap_stop_wal_pulse during cleanup.
+tap_start_wal_pulse() {
+    local host="$1"
+    local port="$2"
+    local table="$3"
+    local max_iters="${4:-200}" # 0 = run until tap_stop_wal_pulse
+
+    (
+        local i=0
+        while true; do
+            polardb_direct_sql "$host" "$port" \
+                "INSERT INTO $table VALUES (0, repeat('x', 200)) ON CONFLICT (id) DO UPDATE SET data=repeat('x', 200);" >/dev/null 2>&1
+            i=$((i + 1))
+            [ "$max_iters" -gt 0 ] && [ "$i" -ge "$max_iters" ] && break
+            sleep 0.05
+        done
+    ) &
+    TAP_WAL_PULSE_PID=$!
+}
+
+tap_stop_wal_pulse() {
+    if [ -n "${TAP_WAL_PULSE_PID:-}" ]; then
+        kill "$TAP_WAL_PULSE_PID" 2>/dev/null || true
+        wait "$TAP_WAL_PULSE_PID" 2>/dev/null || true
+        TAP_WAL_PULSE_PID=""
+    fi
 }
 
 # -----------------------------------------------------------------------------

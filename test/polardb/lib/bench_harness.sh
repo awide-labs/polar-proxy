@@ -87,10 +87,17 @@ polardb_bench_drop_tables() {
 polardb_bench_create_ryw_tables() {
     local main_table="$1"
     local load_table="$2"
+    local result_table="${3:-}"
+    local sql
 
     polardb_bench_validate_identifier "$main_table" || return 1
     polardb_bench_validate_identifier "$load_table" || return 1
-    polardb_bench_primary_sql "DROP TABLE IF EXISTS ${main_table}; DROP TABLE IF EXISTS ${load_table}; CREATE TABLE ${main_table}(id int PRIMARY KEY, worker_id int, iter int, marker text, updated_at timestamp default now()); CREATE TABLE ${load_table}(id serial PRIMARY KEY, data text);" >/dev/null
+    sql="DROP TABLE IF EXISTS ${main_table}; DROP TABLE IF EXISTS ${load_table}; CREATE TABLE ${main_table}(id int PRIMARY KEY, worker_id int, iter int, marker text, updated_at timestamp default now()); CREATE TABLE ${load_table}(id serial PRIMARY KEY, data text);"
+    if [ -n "$result_table" ]; then
+        polardb_bench_validate_identifier "$result_table" || return 1
+        sql="${sql} DROP TABLE IF EXISTS ${result_table}; CREATE TABLE ${result_table}(tag text, mode text, worker_id int, iter int, status text, observed_marker text, backend_port text, created_at timestamp default now());"
+    fi
+    polardb_bench_primary_sql "$sql" >/dev/null
 }
 
 polardb_bench_truncate() {
@@ -109,6 +116,71 @@ polardb_bench_tps() {
     else
         echo 0
     fi
+}
+
+polardb_bench_pgbench_sleep_ms() {
+    local ms="$1"
+
+    printf '\\sleep %d ms\n' "$ms"
+}
+
+polardb_bench_emit_result_insert_from_vars() {
+    local mode="$1"
+    local worker="$2"
+    local iter="$3"
+    local result_table="${POLARDB_BENCH_RESULT_TABLE:-}"
+
+    [ -z "$result_table" ] && return 0
+    cat <<EOF
+INSERT INTO $result_table(tag, mode, worker_id, iter, status, observed_marker, backend_port)
+VALUES ('RYW', '$mode', $worker, $iter, :bench_status, :bench_marker, :bench_port);
+EOF
+}
+
+polardb_bench_emit_marker_check_iter() {
+    local mode="$1"
+    local worker="$2"
+    local iter="$3"
+    local table="$4"
+    local id="$5"
+    local marker="$6"
+    local lock_clause="${7:-}"
+    local defer_result="${8:-0}"
+    local result_table="${POLARDB_BENCH_RESULT_TABLE:-}"
+
+    if [ -n "$result_table" ]; then
+        cat <<EOF
+SELECT quote_literal(CASE
+         WHEN t.marker = '$marker' THEN 'fresh'
+         WHEN t.marker IS NULL THEN 'stale'
+         ELSE 'bad'
+       END) AS bench_status,
+       quote_literal(COALESCE(t.marker, '')) AS bench_marker,
+       quote_literal(p.backend_port) AS bench_port
+  FROM (SELECT inet_server_port()::text AS backend_port) p
+  LEFT JOIN (SELECT marker FROM $table WHERE id = $id${lock_clause}) t ON true \gset
+EOF
+        if [ "$defer_result" != "1" ]; then
+            polardb_bench_emit_result_insert_from_vars "$mode" "$worker" "$iter"
+        fi
+        return 0
+    fi
+
+    cat <<EOF
+SELECT 'RYW' AS tag,
+       '$mode' AS mode,
+       $worker AS worker_id,
+       $iter AS iter,
+       CASE
+         WHEN t.marker = '$marker' THEN 'fresh'
+         WHEN t.marker IS NULL THEN 'stale'
+         ELSE 'bad'
+       END AS status,
+       COALESCE(t.marker, '') AS observed_marker,
+       p.backend_port
+  FROM (SELECT inet_server_port()::text AS backend_port) p
+  LEFT JOIN (SELECT marker FROM $table WHERE id = $id${lock_clause}) t ON true;
+EOF
 }
 
 polardb_bench_write_ryw_worker_script() {
@@ -139,20 +211,271 @@ ON CONFLICT (id) DO UPDATE
       iter = EXCLUDED.iter,
       marker = EXCLUDED.marker,
       updated_at = now();
+EOF
+            polardb_bench_emit_marker_check_iter "$mode" "$worker" "$iter" "$table" "$id" "$marker"
+        done
+        if [ -n "$post_sql" ]; then
+            echo "$post_sql"
+        fi
+    } >"$sql_file"
+}
+
+polardb_bench_emit_readonly_iter() {
+    local mode="$1"
+    local worker="$2"
+    local iter="$3"
+    local table="$4"
+    local defer_result="${5:-0}"
+    local result_table="${POLARDB_BENCH_RESULT_TABLE:-}"
+
+    if [ -n "$result_table" ]; then
+        cat <<EOF
+SELECT quote_literal('fresh') AS bench_status,
+       quote_literal(COALESCE(marker, '')) AS bench_marker,
+       quote_literal(inet_server_port()::text) AS bench_port
+  FROM $table
+ WHERE id = 0 \gset
+EOF
+        if [ "$defer_result" != "1" ]; then
+            polardb_bench_emit_result_insert_from_vars "$mode" "$worker" "$iter"
+        fi
+        return 0
+    fi
+    cat <<EOF
 SELECT 'RYW' AS tag,
        '$mode' AS mode,
        $worker AS worker_id,
        $iter AS iter,
-       CASE
-         WHEN t.marker = '$marker' THEN 'fresh'
-         WHEN t.marker IS NULL THEN 'stale'
-         ELSE 'bad'
-       END AS status,
-       COALESCE(t.marker, '') AS observed_marker,
-       p.backend_port
-  FROM (SELECT inet_server_port()::text AS backend_port) p
-  LEFT JOIN (SELECT marker FROM $table WHERE id = $id) t ON true;
+       'fresh' AS status,
+       marker AS observed_marker,
+       inet_server_port()::text AS backend_port
+  FROM $table
+ WHERE id = 0;
 EOF
+}
+
+polardb_bench_emit_write_read_iter() {
+    local mode="$1"
+    local worker="$2"
+    local iter="$3"
+    local table="$4"
+    local id="$5"
+    local marker="$6"
+    local mid_sql="${7:-}"
+    local defer_result="${8:-0}"
+
+    cat <<EOF
+INSERT INTO $table(id, worker_id, iter, marker)
+VALUES ($id, $worker, $iter, '$marker')
+ON CONFLICT (id) DO UPDATE
+  SET worker_id = EXCLUDED.worker_id,
+      iter = EXCLUDED.iter,
+      marker = EXCLUDED.marker,
+      updated_at = now();
+EOF
+    if [ -n "$mid_sql" ]; then
+        printf '%s\n' "$mid_sql"
+    fi
+    polardb_bench_emit_marker_check_iter "$mode" "$worker" "$iter" "$table" "$id" "$marker" "" "$defer_result"
+}
+
+polardb_bench_emit_shape_iter() {
+    local shape="$1"
+    local mode="$2"
+    local worker="$3"
+    local iter="$4"
+    local table="$5"
+    local id="$6"
+    local marker="$7"
+    local choice mid_sql=""
+
+    # Split reads use transaction RFQ evidence from the write. A small pause
+    # mirrors the committed TAP path and lets WAL state settle before the read.
+    if [ "$mode" = "split" ]; then
+        case "$shape" in
+        txn-write-read|txn-read-write-read|txn-leading-reads-write-read|txn-write-many-reads|txn-locking|txn-mixed)
+            if [ "${POLARDB_BENCH_TXN_SPLIT_SELECT_WAIT_MS:-0}" != "0" ]; then
+                mid_sql="$(polardb_bench_pgbench_sleep_ms "${POLARDB_BENCH_TXN_SPLIT_SELECT_WAIT_MS:-0}")"
+            fi
+            ;;
+        esac
+    fi
+
+    case "$shape" in
+    session-readonly)
+        polardb_bench_emit_readonly_iter "$mode" "$worker" "$iter" "$table"
+        ;;
+    session-write-read)
+        polardb_bench_emit_write_read_iter "$mode" "$worker" "$iter" "$table" "$id" "$marker"
+        ;;
+    session-read-write-read)
+        cat <<EOF
+SELECT marker FROM $table WHERE id = 0;
+EOF
+        polardb_bench_emit_write_read_iter "$mode" "$worker" "$iter" "$table" "$id" "$marker"
+        ;;
+    session-write-many-reads)
+        polardb_bench_emit_write_read_iter "$mode" "$worker" "$iter" "$table" "$id" "$marker"
+        cat <<EOF
+SELECT marker FROM $table WHERE id = $id;
+SELECT marker FROM $table WHERE id = $id;
+EOF
+        ;;
+    txn-readonly)
+        cat <<EOF
+BEGIN;
+SELECT marker FROM $table WHERE id = 0;
+EOF
+        polardb_bench_emit_readonly_iter "$mode" "$worker" "$iter" "$table" 1
+        echo "COMMIT;"
+        polardb_bench_emit_result_insert_from_vars "$mode" "$worker" "$iter"
+        ;;
+    txn-readonly-long)
+        cat <<EOF
+BEGIN;
+SELECT marker FROM $table WHERE id = 0;
+EOF
+        polardb_bench_pgbench_sleep_ms "${POLARDB_BENCH_TXN_LONG_WORK_MS:-1500}"
+        polardb_bench_emit_readonly_iter "$mode" "$worker" "$iter" "$table" 1
+        echo "SELECT marker FROM $table WHERE id = 0;"
+        echo "COMMIT;"
+        polardb_bench_emit_result_insert_from_vars "$mode" "$worker" "$iter"
+        ;;
+    txn-write-read)
+        echo "BEGIN;"
+        polardb_bench_emit_write_read_iter "$mode" "$worker" "$iter" "$table" "$id" "$marker" "$mid_sql" 1
+        echo "COMMIT;"
+        polardb_bench_emit_result_insert_from_vars "$mode" "$worker" "$iter"
+        ;;
+    txn-write-read-long)
+        echo "BEGIN;"
+        polardb_bench_pgbench_sleep_ms "${POLARDB_BENCH_TXN_LONG_WORK_MS:-1500}"
+        polardb_bench_emit_write_read_iter "$mode" "$worker" "$iter" "$table" "$id" "$marker" "$mid_sql" 1
+        echo "COMMIT;"
+        polardb_bench_emit_result_insert_from_vars "$mode" "$worker" "$iter"
+        ;;
+    txn-read-write-read)
+        cat <<EOF
+BEGIN;
+SELECT marker FROM $table WHERE id = 0;
+EOF
+        polardb_bench_emit_write_read_iter "$mode" "$worker" "$iter" "$table" "$id" "$marker" "$mid_sql" 1
+        echo "COMMIT;"
+        polardb_bench_emit_result_insert_from_vars "$mode" "$worker" "$iter"
+        ;;
+    txn-leading-reads-write-read)
+        cat <<EOF
+BEGIN;
+SELECT marker FROM $table WHERE id = 0;
+SELECT marker FROM $table WHERE id = 0;
+SELECT marker FROM $table WHERE id = 0;
+EOF
+        polardb_bench_emit_write_read_iter "$mode" "$worker" "$iter" "$table" "$id" "$marker" "$mid_sql" 1
+        echo "COMMIT;"
+        polardb_bench_emit_result_insert_from_vars "$mode" "$worker" "$iter"
+        ;;
+    txn-read-write-read-long)
+        cat <<EOF
+BEGIN;
+SELECT marker FROM $table WHERE id = 0;
+EOF
+        polardb_bench_pgbench_sleep_ms "${POLARDB_BENCH_TXN_LONG_WORK_MS:-1500}"
+        polardb_bench_emit_write_read_iter "$mode" "$worker" "$iter" "$table" "$id" "$marker" "$mid_sql" 1
+        echo "COMMIT;"
+        polardb_bench_emit_result_insert_from_vars "$mode" "$worker" "$iter"
+        ;;
+    txn-write-many-reads)
+        echo "BEGIN;"
+        polardb_bench_emit_write_read_iter "$mode" "$worker" "$iter" "$table" "$id" "$marker" "$mid_sql" 1
+        cat <<EOF
+SELECT marker FROM $table WHERE id = $id;
+SELECT marker FROM $table WHERE id = $id;
+COMMIT;
+EOF
+        polardb_bench_emit_result_insert_from_vars "$mode" "$worker" "$iter"
+        ;;
+    txn-write-many-reads-long)
+        echo "BEGIN;"
+        polardb_bench_pgbench_sleep_ms "${POLARDB_BENCH_TXN_LONG_WORK_MS:-1500}"
+        polardb_bench_emit_write_read_iter "$mode" "$worker" "$iter" "$table" "$id" "$marker" "$mid_sql" 1
+        cat <<EOF
+SELECT marker FROM $table WHERE id = $id;
+SELECT marker FROM $table WHERE id = $id;
+COMMIT;
+EOF
+        polardb_bench_emit_result_insert_from_vars "$mode" "$worker" "$iter"
+        ;;
+    txn-locking)
+        cat <<EOF
+BEGIN;
+INSERT INTO $table(id, worker_id, iter, marker)
+VALUES ($id, $worker, $iter, '$marker')
+ON CONFLICT (id) DO UPDATE
+  SET worker_id = EXCLUDED.worker_id,
+      iter = EXCLUDED.iter,
+      marker = EXCLUDED.marker,
+      updated_at = now();
+EOF
+        if [ -n "$mid_sql" ]; then
+            printf '%s\n' "$mid_sql"
+        fi
+        polardb_bench_emit_marker_check_iter "$mode" "$worker" "$iter" "$table" "$id" "$marker" " FOR UPDATE" 1
+        echo "COMMIT;"
+        polardb_bench_emit_result_insert_from_vars "$mode" "$worker" "$iter"
+        ;;
+    session-mixed)
+        choice=$((iter % 3))
+        case "$choice" in
+        0) polardb_bench_emit_shape_iter session-readonly "$mode" "$worker" "$iter" "$table" "$id" "$marker" ;;
+        1) polardb_bench_emit_shape_iter session-write-read "$mode" "$worker" "$iter" "$table" "$id" "$marker" ;;
+        *) polardb_bench_emit_shape_iter session-read-write-read "$mode" "$worker" "$iter" "$table" "$id" "$marker" ;;
+        esac
+        ;;
+    txn-mixed)
+        choice=$((iter % 4))
+        case "$choice" in
+        0) polardb_bench_emit_shape_iter txn-readonly "$mode" "$worker" "$iter" "$table" "$id" "$marker" ;;
+        1) polardb_bench_emit_shape_iter txn-write-read "$mode" "$worker" "$iter" "$table" "$id" "$marker" ;;
+        2) polardb_bench_emit_shape_iter txn-read-write-read "$mode" "$worker" "$iter" "$table" "$id" "$marker" ;;
+        *) polardb_bench_emit_shape_iter txn-locking "$mode" "$worker" "$iter" "$table" "$id" "$marker" ;;
+        esac
+        ;;
+    *)
+        echo "SELECT 'RYW' AS tag, '$mode' AS mode, $worker AS worker_id, $iter AS iter, 'bad' AS status, 'unknown shape: $shape' AS observed_marker, '' AS backend_port;"
+        return 1
+        ;;
+    esac
+}
+
+polardb_bench_write_shape_worker_script() {
+    local shape="$1"
+    local mode="$2"
+    local worker="$3"
+    local sql_file="$4"
+    local table="$5"
+    local iters="$6"
+    local marker_prefix="$7"
+    local pre_sql="${8:-}"
+    local post_sql="${9:-}"
+    local iter id marker
+
+    polardb_bench_validate_identifier "$table" || return 1
+    {
+        echo "\set QUIET 1"
+        if [ -n "$pre_sql" ]; then
+            echo "$pre_sql"
+        fi
+        for iter in $(seq 1 "$iters"); do
+            id=$((worker * 1000000 + iter))
+            marker="${marker_prefix}_${shape}_${mode}_${worker}_${iter}_$$"
+            polardb_bench_emit_shape_iter "$shape" "$mode" "$worker" "$iter" "$table" "$id" "$marker"
+            if [ "$mode" = "split" ] && [ "$iter" -eq 1 ] && [ "${POLARDB_BENCH_SPLIT_WARMUP_WAIT_SEC:-0}" != "0" ]; then
+                case "$shape" in
+                txn-readonly|txn-readonly-long|txn-write-read|txn-read-write-read|txn-leading-reads-write-read|txn-write-many-reads|txn-mixed)
+                    echo "\\sleep ${POLARDB_BENCH_SPLIT_WARMUP_WAIT_SEC} s"
+                    ;;
+                esac
+            fi
         done
         if [ -n "$post_sql" ]; then
             echo "$post_sql"
@@ -228,14 +551,26 @@ polardb_bench_proxy_psql_file() {
     polardb_proxy_psql -X -A -t -q -v ON_ERROR_STOP=1 -f "$sql_file"
 }
 
+polardb_bench_pgbench_file() {
+    local protocol_mode="$1"
+    local sql_file="$2"
+
+    LD_LIBRARY_PATH="$(polardb_bench_libpq_ld_path)" \
+    PGPASSWORD="$PGPASSWORD" PGSSLMODE="$PGSSLMODE" "$PGBENCH_BIN" \
+        -h "$PROXYSQL_HOST" -p "$PROXYSQL_PORT" \
+        -U "$PGUSER" -d "$PGDB" \
+        -n -t 1 -c 1 -j 1 -M "$protocol_mode" \
+        -f "$sql_file"
+}
+
 polardb_bench_pgbench_simple() {
     local duration_sec="$1"
     local clients="$2"
     local script="$3"
     LD_LIBRARY_PATH="$(polardb_bench_libpq_ld_path)" \
-    PGPASSWORD="${PGPASSWORD:-postgres}" PGSSLMODE="$PGSSLMODE" "$PGBENCH_BIN" \
+    PGPASSWORD="$PGPASSWORD" PGSSLMODE="$PGSSLMODE" "$PGBENCH_BIN" \
         -h "$PROXYSQL_HOST" -p "$PROXYSQL_PORT" \
-        -U "${PGUSER:-postgres}" -d "${PGDB:-postgres}" \
+        -U "$PGUSER" -d "$PGDB" \
         -n -T "$duration_sec" -c "$clients" -j "$clients" -M simple \
         -f "$script"
 }
@@ -244,9 +579,15 @@ polardb_bench_parse_ryw_results() {
     local mode="$1"
     local expected="$2"
     local fail_func="$3"
-    local combined="$RUN_DIR/${mode}_combined.out"
+    local artifact_label="${4:-$mode}"
+    local combined="$RUN_DIR/${artifact_label}_combined.out"
 
-    cat "$RUN_DIR"/"${mode}"_worker_*.out >"$combined" 2>/dev/null || true
+    if [ -n "${POLARDB_BENCH_RESULT_TABLE:-}" ]; then
+        polardb_bench_validate_identifier "$POLARDB_BENCH_RESULT_TABLE" || return 1
+        polardb_bench_primary_sql "SELECT tag || '|' || mode || '|' || worker_id || '|' || iter || '|' || status || '|' || COALESCE(observed_marker, '') || '|' || COALESCE(backend_port, '') FROM ${POLARDB_BENCH_RESULT_TABLE} ORDER BY worker_id, iter;" >"$combined" 2>/dev/null || true
+    else
+        cat "$RUN_DIR"/"${artifact_label}"_worker_*.out >"$combined" 2>/dev/null || true
+    fi
     POLARDB_BENCH_ACTUAL=$(grep -c '^RYW|' "$combined" 2>/dev/null || true)
     POLARDB_BENCH_FRESH=$(awk -F'|' '$1 == "RYW" && $5 == "fresh" { c++ } END { print c+0 }' "$combined" 2>/dev/null)
     POLARDB_BENCH_STALE=$(awk -F'|' '$1 == "RYW" && $5 == "stale" { c++ } END { print c+0 }' "$combined" 2>/dev/null)
@@ -270,16 +611,17 @@ polardb_bench_capture_ryw_results() {
     local -n stale_ref="$5"
     local -n bad_ref="$6"
     local -n errors_ref="$7"
+    local artifact_label="${8:-$mode}"
 
-    polardb_bench_parse_ryw_results "$mode" "$expected" "$fail_func"
+    polardb_bench_parse_ryw_results "$mode" "$expected" "$fail_func" "$artifact_label"
     # shellcheck disable=SC2034 # Namerefs write into caller-owned result arrays.
-    fresh_ref["$mode"]="$POLARDB_BENCH_FRESH"
+    fresh_ref["$artifact_label"]="$POLARDB_BENCH_FRESH"
     # shellcheck disable=SC2034 # Namerefs write into caller-owned result arrays.
-    stale_ref["$mode"]="$POLARDB_BENCH_STALE"
+    stale_ref["$artifact_label"]="$POLARDB_BENCH_STALE"
     # shellcheck disable=SC2034 # Namerefs write into caller-owned result arrays.
-    bad_ref["$mode"]="$POLARDB_BENCH_BAD"
+    bad_ref["$artifact_label"]="$POLARDB_BENCH_BAD"
     # shellcheck disable=SC2034 # Namerefs write into caller-owned result arrays.
-    errors_ref["$mode"]="$POLARDB_BENCH_ERRORS"
+    errors_ref["$artifact_label"]="$POLARDB_BENCH_ERRORS"
 }
 
 polardb_bench_run_workers() {
@@ -290,12 +632,17 @@ polardb_bench_run_workers() {
     local pids=()
     local worker sql_file log_file pid rc
 
+    if ! polardb_require_pgbench; then
+        "$fail_func" "pgbench is not available"
+        return 1
+    fi
+
     for worker in $(seq 1 "$clients"); do
         sql_file="$RUN_DIR/${mode}_worker_${worker}.sql"
         log_file="$RUN_DIR/${mode}_worker_${worker}.out"
         "$writer_func" "$mode" "$worker" "$sql_file"
         (
-            polardb_bench_proxy_psql_file "$sql_file"
+            polardb_bench_pgbench_file simple "$sql_file"
         ) >"$log_file" 2>&1 &
         pids+=("$!")
     done

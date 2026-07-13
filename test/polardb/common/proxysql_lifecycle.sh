@@ -3,7 +3,7 @@
 # proxysql_lifecycle.sh - ProxySQL lifecycle helper for PolarDB tests
 #
 # Usage:
-#   ./proxysql_lifecycle.sh start [--config FILE] [--data-dir DIR] [--admin-port PORT] [--proxy-port PORT]
+#   ./proxysql_lifecycle.sh start [--config FILE] [--data-dir DIR] [--admin-port PORT] [--proxy-port PORT] [--mysql-admin-port PORT]
 #   ./proxysql_lifecycle.sh stop
 #   ./proxysql_lifecycle.sh status
 #   ./proxysql_lifecycle.sh restart [options...]
@@ -17,14 +17,14 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROXYSQL_ROOT="${PROXYSQL_ROOT:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
+# shellcheck source=env.sh
+source "$SCRIPT_DIR/env.sh"
 
 # Default configuration
-PROXYSQL_BINARY="${PROXYSQL_BINARY:-$PROXYSQL_ROOT/src/proxysql}"
-DEFAULT_DATA_DIR="${PROXYSQL_DATA_DIR:-/tmp/proxysql_test_data}"
-DEFAULT_ADMIN_PORT=16132
-DEFAULT_PROXY_PORT=16433
-DEFAULT_MYSQL_ADMIN_PORT=16033
+DEFAULT_DATA_DIR="${PROXYSQL_DATA_DIR:-$(polardb_proxy_sharded_data_dir "$POLARDB_RUNTIME_DIR/proxysql_test_data")}"
+DEFAULT_ADMIN_PORT="$PROXYSQL_ADMIN_PORT"
+DEFAULT_PROXY_PORT="$PROXYSQL_PORT"
+DEFAULT_MYSQL_ADMIN_PORT="$PROXYSQL_MYSQL_ADMIN_PORT"
 
 # Colors for output
 RED='\033[0;31m'
@@ -45,6 +45,51 @@ wait_for_pid_exit() {
         if ! kill -0 "$pid" 2>/dev/null; then
             return 0
         fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    return 1
+}
+
+port_is_listening() {
+    local port="$1"
+    command -v ss >/dev/null 2>&1 || return 1
+    ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .
+}
+
+require_ports_free() {
+    local port
+    for port in "$@"; do
+        if port_is_listening "$port"; then
+            log_error "Port already has a listener: $port"
+            ss -H -ltnp "sport = :$port" 2>/dev/null || true
+            return 1
+        fi
+    done
+}
+
+listener_is_owned_by_pid() {
+    local port="$1"
+    local pid="$2"
+    ss -H -ltnp "sport = :$port" 2>/dev/null | grep -Fq "pid=$pid,"
+}
+
+wait_for_owned_listeners() {
+    local pid="$1"
+    shift
+    local waited=0 port ready
+
+    command -v ss >/dev/null 2>&1 || return 0
+    while [ "$waited" -lt 10 ]; do
+        ready=1
+        for port in "$@"; do
+            if ! listener_is_owned_by_pid "$port" "$pid"; then
+                ready=0
+                break
+            fi
+        done
+        [ "$ready" -eq 1 ] && return 0
+        kill -0 "$pid" 2>/dev/null || return 1
         sleep 1
         waited=$((waited + 1))
     done
@@ -83,7 +128,7 @@ proxysql_data_dir_from_start_args() {
             data_dir=$(require_option_value "$1" "${2:-}")
             shift 2
             ;;
-        --config | --admin-port | --proxy-port)
+        --config | --admin-port | --proxy-port | --mysql-admin-port)
             require_option_value "$1" "${2:-}" >/dev/null
             shift 2
             ;;
@@ -182,13 +227,19 @@ kill_test_instances() {
 # Wait for ProxySQL admin to be ready
 wait_for_ready() {
     local admin_port="$1"
+    local pid="$2"
     local max_wait=30
     local waited=0
 
     log_info "Waiting for ProxySQL admin to be ready on port $admin_port..."
 
     while [ $waited -lt $max_wait ]; do
-        if PGPASSWORD="admin" psql -h 127.0.0.1 -p "$admin_port" -U admin -d main -c "SELECT 1" >/dev/null 2>&1; then
+        if ! kill -0 "$pid" 2>/dev/null; then
+            log_error "ProxySQL exited before its admin listener became ready"
+            return 1
+        fi
+        if PGPASSWORD="$PROXYSQL_ADMIN_PASSWORD" psql -h "$PROXYSQL_HOST" -p "$admin_port" \
+                -U "$PROXYSQL_ADMIN_USER" -d "$PROXYSQL_ADMIN_DATABASE" -c "SELECT 1" >/dev/null 2>&1; then
             log_info "ProxySQL admin is ready!"
             return 0
         fi
@@ -206,6 +257,7 @@ cmd_start() {
     local data_dir="$DEFAULT_DATA_DIR"
     local admin_port="$DEFAULT_ADMIN_PORT"
     local proxy_port="$DEFAULT_PROXY_PORT"
+    local mysql_admin_port="$DEFAULT_MYSQL_ADMIN_PORT"
 
     # Parse options
     while [ $# -gt 0 ]; do
@@ -226,6 +278,10 @@ cmd_start() {
             proxy_port=$(require_option_value "$1" "${2:-}")
             shift 2
             ;;
+        --mysql-admin-port)
+            mysql_admin_port=$(require_option_value "$1" "${2:-}")
+            shift 2
+            ;;
         *)
             log_error "Unknown option: $1"
             exit 1
@@ -235,6 +291,7 @@ cmd_start() {
 
     check_binary
     kill_test_instances "$data_dir"
+    require_ports_free "$admin_port" "$proxy_port" "$mysql_admin_port"
 
     # Create data directory (try sudo if regular rm fails due to root-owned files)
     if ! rm -rf "$data_dir" 2>/dev/null; then
@@ -257,9 +314,9 @@ cmd_start() {
 datadir="$data_dir"
 admin_variables=
 {
-    admin_credentials="admin:admin"
-    mysql_ifaces="127.0.0.1:$DEFAULT_MYSQL_ADMIN_PORT"
-    pgsql_ifaces="127.0.0.1:$admin_port"
+    admin_credentials="$PROXYSQL_ADMIN_USER:$PROXYSQL_ADMIN_PASSWORD"
+    mysql_ifaces="$PROXYSQL_LISTEN_HOST:$mysql_admin_port"
+    pgsql_ifaces="$PROXYSQL_LISTEN_HOST:$admin_port"
 }
 mysql_variables=
 {
@@ -268,9 +325,9 @@ mysql_variables=
 pgsql_variables=
 {
     threads=${PROXYSQL_PGSQL_THREADS:-4}
-    interfaces="127.0.0.1:$proxy_port"
-    monitor_username="postgres"
-    monitor_password="postgres"
+    interfaces="$PROXYSQL_LISTEN_HOST:$proxy_port"
+    monitor_username="$PROXYSQL_MONITOR_USER"
+    monitor_password="$PROXYSQL_MONITOR_PASSWORD"
     polardb_consistency_mode="off"
     polardb_lag_ms=0
     polardb_lag_bytes=0
@@ -288,6 +345,7 @@ EOF
     log_info "  Data dir: $data_dir"
     log_info "  Admin port: $admin_port"
     log_info "  Proxy port: $proxy_port"
+    log_info "  MySQL admin port: $mysql_admin_port"
 
     if [ -n "$PROXYSQL_DEBUG" ] && [ "$PROXYSQL_DEBUG" != "0" ]; then
         log_info "  Debug: enabled (PROXYSQL_DEBUG=$PROXYSQL_DEBUG)"
@@ -302,16 +360,18 @@ EOF
 
     log_info "ProxySQL started with PID: $pid"
 
-    if wait_for_ready "$admin_port"; then
+    if wait_for_ready "$admin_port" "$pid" &&
+        wait_for_owned_listeners "$pid" "$admin_port" "$proxy_port" "$mysql_admin_port"; then
         log_info "ProxySQL is ready!"
         echo ""
         echo "Connection info:"
-        echo "  Admin: PGPASSWORD=admin psql -h 127.0.0.1 -p $admin_port -U admin -d main"
-        echo "  Proxy: PGPASSWORD=postgres psql -h 127.0.0.1 -p $proxy_port -U postgres -d postgres"
+        echo "  Admin: PGPASSWORD=... psql -h $PROXYSQL_HOST -p $admin_port -U $PROXYSQL_ADMIN_USER -d $PROXYSQL_ADMIN_DATABASE"
+        echo "  MySQL admin: MYSQL_PWD=... mysql -h $PROXYSQL_HOST -P $mysql_admin_port -u $PROXYSQL_MYSQL_ADMIN_USER"
+        echo "  Proxy: PGPASSWORD=... psql -h $PROXYSQL_HOST -p $proxy_port -U $PGUSER -d $PGDB"
         echo "  Logs:  tail -f $data_dir/proxysql.log"
         return 0
     else
-        log_error "ProxySQL failed to start properly"
+        log_error "ProxySQL failed to start all requested listeners under PID $pid"
         tail -20 "$data_dir/proxysql.log"
         return 1
     fi
@@ -400,6 +460,7 @@ restart)
     echo "  --config FILE      Use specified config file"
     echo "  --admin-port PORT  Admin port (default: $DEFAULT_ADMIN_PORT)"
     echo "  --proxy-port PORT  Proxy port (default: $DEFAULT_PROXY_PORT)"
+    echo "  --mysql-admin-port PORT  MySQL admin port (default: $DEFAULT_MYSQL_ADMIN_PORT)"
     exit 1
     ;;
 esac
