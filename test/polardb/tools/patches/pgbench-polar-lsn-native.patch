@@ -1,0 +1,69 @@
+--- a/deps/postgresql/postgresql/src/bin/pgbench/pgbench.c	2025-08-12 00:06:43.000000000 +0300
++++ b/deps/postgresql/postgresql/src/bin/pgbench/pgbench.c	2026-06-23 22:22:04.158703304 +0300
+@@ -79,0 +80,2 @@
++#define POLARDB_PGBENCH_VERSION PG_VERSION "-polar-rfq-lsn"
++
+@@ -710 +712,2 @@
+-	META_ENDPIPELINE			/* \endpipeline */
++	META_ENDPIPELINE,			/* \endpipeline */
++	META_POLAR_LSN				/* \polar_lsn */
+@@ -2899,0 +2903,2 @@
++	else if (pg_strcasecmp(cmd, "polar_lsn") == 0)
++		mc = META_POLAR_LSN;
+@@ -2905,0 +2911,32 @@
++ * Store the latest PolarDB RFQ LSN observed by patched libpq into pgbench
++ * variables.  The optional prefix keeps scripts readable:
++ *
++ *   \polar_lsn read
++ *
++ * creates :read_has_lsn and :read_lsn after the previous SQL command has
++ * completed.  This is intentionally explicit rather than automatic so scripts
++ * choose the boundary at which they want to assert session/transaction
++ * consistency.
++ */
++static bool
++polarStoreLSNVariable(CState *st, const char *prefix)
++{
++	char		has_name[128];
++	char		lsn_name[128];
++	char		has_value[2];
++	char		lsn_value[32];
++
++	if (prefix == NULL || *prefix == '\0')
++		prefix = "polar";
++
++	snprintf(has_name, sizeof(has_name), "%s_has_lsn", prefix);
++	snprintf(lsn_name, sizeof(lsn_name), "%s_lsn", prefix);
++	snprintf(has_value, sizeof(has_value), "%d", PQhasLSN(st->con) ? 1 : 0);
++	snprintf(lsn_value, sizeof(lsn_value), "%llu",
++			 (unsigned long long) PQgetLSN(st->con));
++
++	return putVariable(&st->variables, "polar_lsn", has_name, has_value) &&
++		putVariable(&st->variables, "polar_lsn", lsn_name, lsn_value);
++}
++
++/*
+@@ -4326,0 +4364,10 @@
++	else if (command->meta == META_POLAR_LSN)
++	{
++		const char *prefix = (argc > 1) ? argv[1] : "polar";
++
++		if (!polarStoreLSNVariable(st, prefix))
++		{
++			commandFailed(st, "polar_lsn", "assignment of meta-command failed");
++			return CSTATE_ABORTED;
++		}
++	}
+@@ -5799 +5846,2 @@
+-	else if (my_command->meta == META_GSET || my_command->meta == META_ASET)
++	else if (my_command->meta == META_GSET || my_command->meta == META_ASET ||
++			 my_command->meta == META_POLAR_LSN)
+@@ -6316 +6364 @@
+-			   "pgbench", PG_VERSION, server_version);
++			   "pgbench", POLARDB_PGBENCH_VERSION, server_version);
+@@ -6320 +6368 @@
+-		printf("%s (%s)\n", "pgbench", PG_VERSION);
++		printf("%s (%s)\n", "pgbench", POLARDB_PGBENCH_VERSION);
+@@ -6697 +6745 @@
+-			puts("pgbench (PostgreSQL) " PG_VERSION);
++			puts("pgbench (PostgreSQL) " POLARDB_PGBENCH_VERSION);
