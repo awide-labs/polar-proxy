@@ -128,7 +128,19 @@ POLARDB_DOCKER_CONTAINER=<container-name>
 POLARDB_DOCKER_SUDO=0
 ```
 
-If the environment cannot provide DCS control, set:
+Direct-SQL environment, for setups without Patroni/polarctl access:
+
+```bash
+POLARDB_DCS_MODE=direct
+```
+
+In `direct` mode, `polardb_set_guc_direct_sql()` in `common/env.sh` runs
+`ALTER SYSTEM SET <key> = '<value>'; SELECT pg_reload_conf();` against each
+node reachable via `PGUSER_DIRECT`/`PGPASSWORD_DIRECT`, so no DCS
+(Patroni/polarctl) access is required. This needs the direct-SQL role to have
+enough privilege to run `ALTER SYSTEM`.
+
+If the environment cannot provide any of the above, set:
 
 ```bash
 POLARDB_DCS_MODE=none

@@ -16,6 +16,7 @@ POLARDB_TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROXYSQL_ROOT="${PROXYSQL_ROOT:-$(cd "$POLARDB_TEST_DIR/../.." && pwd)}"
 export POLARDB_RUNTIME_DIR="${POLARDB_RUNTIME_DIR:-${TMPDIR:-/tmp}/proxysql-polardb-${UID}}"
 export POLARDB_OUTPUT_DIR="${POLARDB_OUTPUT_DIR:-$POLARDB_TEST_DIR/test_output}"
+mkdir -p "$POLARDB_RUNTIME_DIR" "$POLARDB_OUTPUT_DIR"
 
 _POLARDB_CALLER_SET_PROXYSQL_PORT="${PROXYSQL_PORT+x}"
 _POLARDB_CALLER_SET_PROXYSQL_ADMIN_PORT="${PROXYSQL_ADMIN_PORT+x}"
@@ -316,12 +317,13 @@ export REPLICA_SERVER_ENDPOINT="${REPLICA_SERVER_ENDPOINT:-}"
 export PRIMARY_INSTANCE="${PRIMARY_INSTANCE:-}"
 export REPLICA_INSTANCE="${REPLICA_INSTANCE:-}"
 
-# DCS / cluster-control settings. Replay-lag tests call polardb_run_dcs(); if a
-# test environment cannot expose a DCS command, leave POLARDB_DCS_MODE=none and
+# DCS / cluster-control settings. Replay-lag tests call polardb_set_guc(), If a
+# test environment cannot expose any way to configure GUC, leave POLARDB_DCS_MODE=none and
 # timeout-edge checks will fail or skip at their own call sites.
 case "${POLARDB_DCS_MODE:-}" in
 host | hw | hardware | polarctl) POLARDB_DCS_MODE=polarctl ;;
 docker) POLARDB_DCS_MODE=docker ;;
+direct) POLARDB_DCS_MODE=direct ;;
 none | off) POLARDB_DCS_MODE=none ;;
 "")
     if [ "$POLARDB_TEST_ENV" = "docker" ]; then
@@ -511,6 +513,32 @@ polardb_run_dcs() {
         return 1
         ;;
     esac
+}
+
+# Apply a SIGHUP-reloadable GUC directly on the primary and every replica via
+# SQL, instead of pushing it through a DCS (Patroni/polarctl).
+polardb_set_guc_direct_sql_one() {
+    local host="$1"
+    local port="$2"
+    local key="$3"
+    local value="$4"
+
+    polardb_direct_sql "$host" "$port" "ALTER SYSTEM SET $key = '$value';" >/dev/null || return 1
+    polardb_direct_sql "$host" "$port" "SELECT pg_reload_conf();" >/dev/null || return 1
+}
+
+polardb_set_guc_direct_sql() {
+    local key="$1"
+    local value="$2"
+    local host port endpoint
+
+    polardb_set_guc_direct_sql_one "$PRIMARY_HOST" "$PRIMARY_PORT" "$key" "$value" || return 1
+
+    for endpoint in $(polardb_each_replica_endpoint); do
+        host=$(polardb_endpoint_host "$endpoint")
+        port=$(polardb_endpoint_port "$endpoint")
+        polardb_set_guc_direct_sql_one "$host" "$port" "$key" "$value" || return 1
+    done
 }
 
 polardb_normalize_guc() {
