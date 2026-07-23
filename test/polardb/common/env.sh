@@ -512,3 +512,25 @@ polardb_run_dcs() {
         ;;
     esac
 }
+
+polardb_normalize_guc() {
+    local raw="$1"
+
+    # PostgreSQL normalizes memory-unit GUC output to the largest clean unit,
+    # regardless of how the value was set. Byte-lag GUC comparisons
+    # need to normalize both sides to raw bytes before comparing
+    if [[ "$raw" =~ ^[0-9]+(\.[0-9]+)?(kB|MB|GB|TB|B)?$ ]]; then
+        case "$raw" in
+        *TB) awk -v v="${raw%TB}" 'BEGIN { printf "%.0f\n", v * 1024 * 1024 * 1024 * 1024 }' ;;
+        *GB) awk -v v="${raw%GB}" 'BEGIN { printf "%.0f\n", v * 1024 * 1024 * 1024 }' ;;
+        *MB) awk -v v="${raw%MB}" 'BEGIN { printf "%.0f\n", v * 1024 * 1024 }' ;;
+        *kB) awk -v v="${raw%kB}" 'BEGIN { printf "%.0f\n", v * 1024 }' ;;
+        *B) awk -v v="${raw%B}" 'BEGIN { printf "%.0f\n", v }' ;;
+        *) awk -v v="$raw" 'BEGIN { printf "%.0f\n", v }' ;;
+        esac
+
+        return
+    fi
+
+    echo "$raw"
+}

@@ -442,6 +442,11 @@ wait_for_guc_value() {
 		if [[ "$expected" =~ ^[0-9]+$ ]] && [ "$current" = "$expected" ]; then
 			return 0
 		fi
+
+		if [ -n "$current" ] &&
+			[ "$(polardb_normalize_guc "$current")" = "$(polardb_normalize_guc "$expected")" ]; then
+			return 0
+		fi
 		if [ $(($(date +%s) - start_ts)) -ge "$timeout_sec" ]; then
 			log_warning "Timed out waiting for $name=$expected on $host:$port (current=${current:-<empty>})"
 			return 1
