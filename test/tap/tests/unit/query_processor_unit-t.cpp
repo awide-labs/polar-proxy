@@ -38,6 +38,13 @@ extern PgSQL_Query_Processor *GloPgQPro;
 // Helpers
 // ============================================================================
 
+// Because new_query_rule()'s signature depends on POLARDB_PROXY
+#if POLARDB_PROXY
+#define POLAR_REPLICA_ELIGIBLE -1,
+#else
+#define POLAR_REPLICA_ELIGIBLE
+#endif // POLARDB_PROXY
+
 /**
  * @brief Create a simple MySQL query rule with common defaults.
  *
@@ -117,6 +124,7 @@ static PgSQL_Query_Processor_Rule_t *pgsql_simple_rule(
 		-1, -1, -1,            // next_query_flagIN, mirror_flagOUT, mirror_hostgroup
 		nullptr, nullptr,       // error_msg, OK_msg
 		-1, -1,                 // sticky_conn, multiplex
+		POLAR_REPLICA_ELIGIBLE
 		-1,                     // log
 		apply,                  // apply
 		nullptr, nullptr        // attributes, comment
@@ -551,6 +559,7 @@ static void test_pgsql_rule_creation_all_fields() {
 		"done",                 // OK_msg
 		1,                      // sticky_conn
 		2,                      // multiplex
+		POLAR_REPLICA_ELIGIBLE
 		1,                      // log
 		true,                   // apply
 		nullptr,                // attributes
@@ -632,7 +641,7 @@ static void test_pgsql_client_addr_wildcard() {
 		"%",                    // client_addr = catch-all
 		nullptr, -1, nullptr, nullptr, nullptr, false, nullptr,
 		-1, nullptr, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-		nullptr, nullptr, -1, -1, -1, false, nullptr, nullptr);
+		nullptr, nullptr, -1, -1, POLAR_REPLICA_ELIGIBLE -1, false, nullptr, nullptr);
 	ok(r1->client_addr_wildcard_position == 0,
 		"PgSQL QP: client_addr catch-all sets wildcard position to 0");
 	free(r1->client_addr);
@@ -644,7 +653,7 @@ static void test_pgsql_client_addr_wildcard() {
 		"192.168.1.1",          // no wildcard
 		nullptr, -1, nullptr, nullptr, nullptr, false, nullptr,
 		-1, nullptr, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-		nullptr, nullptr, -1, -1, -1, false, nullptr, nullptr);
+		nullptr, nullptr, -1, -1, POLAR_REPLICA_ELIGIBLE -1, false, nullptr, nullptr);
 	ok(r2->client_addr_wildcard_position == -1,
 		"PgSQL QP: client_addr without wildcard has position -1");
 	free(r2->client_addr);
@@ -656,7 +665,7 @@ static void test_pgsql_client_addr_wildcard() {
 		nullptr,                // no client_addr
 		nullptr, -1, nullptr, nullptr, nullptr, false, nullptr,
 		-1, nullptr, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-		nullptr, nullptr, -1, -1, -1, false, nullptr, nullptr);
+		nullptr, nullptr, -1, -1, POLAR_REPLICA_ELIGIBLE -1, false, nullptr, nullptr);
 	ok(r3->client_addr == nullptr,
 		"PgSQL QP: null client_addr is stored as null");
 	ok(r3->client_addr_wildcard_position == -1,
@@ -681,7 +690,7 @@ static void test_pgsql_rule_attributes_flagouts() {
 		50, true, nullptr, nullptr, 0,
 		nullptr, nullptr, -1, nullptr, nullptr, nullptr, false, nullptr,
 		-1, nullptr, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-		nullptr, nullptr, -1, -1, -1, false, attrs, nullptr);
+		nullptr, nullptr, -1, -1, POLAR_REPLICA_ELIGIBLE -1, false, attrs, nullptr);
 
 	ok(rule->flagOUT_ids != nullptr,
 		"PgSQL QP: flagOUT_ids parsed from attributes");
@@ -810,7 +819,7 @@ static void test_pgsql_get_current_query_rules_columns() {
 		nullptr, nullptr, -1, nullptr, nullptr, "^SELECT", false,
 		"CASELESS,GLOBAL",
 		-1, nullptr, 7, -1, -1, -1, -1, 3000, -1, -1, -1, -1, -1,
-		nullptr, nullptr, -1, -1, 1, true, nullptr, "test comment");
+		nullptr, nullptr, -1, -1, POLAR_REPLICA_ELIGIBLE 1, true, nullptr, "test comment");
 	GloPgQPro->insert((QP_rule_t *)rule);
 	GloPgQPro->sort();
 	GloPgQPro->commit();
@@ -924,14 +933,14 @@ static void test_pgsql_flag_chaining() {
 		nullptr, nullptr, -1, nullptr, nullptr, nullptr, false, nullptr,
 		1,                      // flagOUT
 		nullptr, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-		nullptr, nullptr, -1, -1, -1, false, nullptr, nullptr);
+		nullptr, nullptr, -1, -1, POLAR_REPLICA_ELIGIBLE -1, false, nullptr, nullptr);
 	auto *r2 = PgSQL_Query_Processor::new_query_rule(
 		20, true, nullptr, nullptr,
 		1,                      // flagIN = prev flagOUT
 		nullptr, nullptr, -1, nullptr, nullptr, nullptr, false, nullptr,
 		-1,                     // flagOUT (terminal)
 		nullptr, 5, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-		nullptr, nullptr, -1, -1, -1, true, nullptr, nullptr);
+		nullptr, nullptr, -1, -1, POLAR_REPLICA_ELIGIBLE -1, true, nullptr, nullptr);
 
 	GloPgQPro->insert((QP_rule_t *)r1);
 	GloPgQPro->insert((QP_rule_t *)r2);
