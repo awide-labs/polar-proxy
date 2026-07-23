@@ -161,8 +161,10 @@ backend_setting_is() {
 	local port="$2"
 	local name="$3"
 	local expected="$4"
+	local current
 
-	[ "$(direct_sql "$host" "$port" "SELECT current_setting('$name', true);" 2>/dev/null | tr -d '[:space:]')" = "$expected" ]
+	current=$(direct_sql "$host" "$port" "SELECT current_setting('$name', true);" 2>/dev/null | tr -d '[:space:]')
+	[ "$(polardb_normalize_guc "$current")" = "$(polardb_normalize_guc "$expected")" ]
 }
 
 wait_for_backend_setting() {

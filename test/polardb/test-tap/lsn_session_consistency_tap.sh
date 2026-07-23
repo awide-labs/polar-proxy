@@ -142,7 +142,9 @@ polardb_dcs_set() {
 }
 
 _backend_setting_is() {
-    [ "$(direct_sql "$1" "$2" "SELECT current_setting('$3', true);" 2>/dev/null | tr -d '[:space:]')" = "$4" ]
+    local current
+    current=$(direct_sql "$1" "$2" "SELECT current_setting('$3', true);" 2>/dev/null | tr -d '[:space:]')
+    [ "$(polardb_normalize_guc "$current")" = "$(polardb_normalize_guc "$4")" ]
 }
 wait_for_backend_setting() {
     local host="$1"
