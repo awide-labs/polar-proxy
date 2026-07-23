@@ -45,6 +45,8 @@ source "$SCRIPT_DIR/../common/env.sh"
 source "$SCRIPT_DIR/../lib/tap_core.sh"
 # shellcheck source=../lib/tap_polardb.sh
 source "$SCRIPT_DIR/../lib/tap_polardb.sh"
+# shellcheck source=../lib/scenario_harness.sh
+source "$SCRIPT_DIR/../lib/scenario_harness.sh"
 PROXYSQL_WRAPPER="${PROXYSQL_WRAPPER:-$SCRIPT_DIR/../common/proxysql_lifecycle.sh}"
 PROXYSQL_DATA_DIR="${PROXYSQL_DATA_DIR:-$(polardb_proxy_sharded_data_dir "$POLARDB_RUNTIME_DIR/proxysql_lsn_session_consistency_tap")}"
 PROXYSQL_START_LOG="${PROXYSQL_DATA_DIR}.start.log"
@@ -137,10 +139,6 @@ set_lsn_wait_timeout_action() {
     set_global_var_runtime "pgsql-polardb_action_lsn_timeout" "$action"
 }
 
-polardb_dcs_set() {
-    polardb_run_dcs "$@"
-}
-
 _backend_setting_is() {
     local current
     current=$(direct_sql "$1" "$2" "SELECT current_setting('$3', true);" 2>/dev/null | tr -d '[:space:]')
@@ -158,12 +156,12 @@ wait_for_backend_setting() {
 set_replay_lag_bytes() {
     local lag_bytes="$1"
 
-    if ! polardb_dcs_set "polar_replay_min_lag_size=$lag_bytes" >/dev/null 2>&1; then
+    if ! polardb_set_guc polar_replay_min_lag_size "$lag_bytes" >/dev/null 2>&1; then
         return 1
     fi
     [ "$lag_bytes" != "0" ] && TIMEOUT_EDGE_LAG_SET=1
     if ! wait_for_backend_setting "$REPLICA_HOST" "$REPLICA_PORT" polar_replay_min_lag_size "$lag_bytes" 15; then
-        diag "polar_replay_min_lag_size=$lag_bytes was pushed through $POLARDB_DCS_MODE DCS but is not visible on $REPLICA_HOST:$REPLICA_PORT"
+        diag "polar_replay_min_lag_size=$lag_bytes was set but is not visible on $REPLICA_HOST:$REPLICA_PORT"
         return 1
     fi
     sleep 1

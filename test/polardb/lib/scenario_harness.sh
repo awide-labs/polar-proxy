@@ -357,7 +357,7 @@ cleanup_all() {
 	stop_wal_generator
 
 	# Reset replica settings
-	polardb_set_local_sighup_guc polar_replay_min_lag_size 0 >/dev/null 2>&1 || true
+	polardb_set_guc polar_replay_min_lag_size 0 >/dev/null 2>&1 || true
 
 	# Drop test table
 	polardb_primary_sql "DROP TABLE IF EXISTS $TEST_TABLE;" 2>/dev/null || true
@@ -367,11 +367,7 @@ cleanup_all() {
 # PolarDB Global Settings (direct to primary/replica)
 #------------------------------------------------------------------------------
 
-polardb_dcs_set() {
-	polardb_run_dcs "$@"
-}
-
-polardb_set_local_sighup_guc() {
+polardb_set_guc() {
 	local key="$1"
 	local value="$2"
 	local current
@@ -382,20 +378,20 @@ polardb_set_local_sighup_guc() {
 		return 0
 	fi
 
-	if [ "${POLARDB_DCS_MODE:-docker}" != "docker" ]; then
-		polardb_dcs_set "$key=$value"
-		return $?
-	fi
+	case "${POLARDB_DCS_MODE:-docker}" in
+	direct)
+		polardb_set_guc_direct_sql "$key" "$value"
+		;;
+	docker)
+		if [ -z "$POLARDB_DOCKER_CONTAINER" ]; then
+			echo "POLARDB_DOCKER_CONTAINER is required when POLARDB_DCS_MODE=docker." >&2
+			return 1
+		fi
 
-	if [ -z "$POLARDB_DOCKER_CONTAINER" ]; then
-		echo "POLARDB_DOCKER_CONTAINER is required when POLARDB_DCS_MODE=docker." >&2
-		return 1
-	fi
-
-	polardb_maybe_sudo "$POLARDB_DOCKER_SUDO" "$POLARDB_DOCKER_BIN" exec \
-		-e POLAR_GUC_KEY="$key" \
-		-e POLAR_GUC_VALUE="$value" \
-		"$POLARDB_DOCKER_CONTAINER" bash -lc '
+		polardb_maybe_sudo "$POLARDB_DOCKER_SUDO" "$POLARDB_DOCKER_BIN" exec \
+			-e POLAR_GUC_KEY="$key" \
+			-e POLAR_GUC_VALUE="$value" \
+			"$POLARDB_DOCKER_CONTAINER" bash -lc '
 set -euo pipefail
 f=/etc/polardb/patroni.scope.d/polardb-cluster/instances/instance1/polardb.d/polardb-local.conf
 tmp="${f}.tmp.$$"
@@ -410,6 +406,11 @@ for member in instance1 instance2 instance3; do
     polarctl reload "$member" --force >/dev/null
 done
 '
+		;;
+	*)
+		polardb_run_dcs "$key=$value"
+		;;
+	esac
 }
 
 wait_for_guc_value() {
@@ -462,8 +463,8 @@ set_polar_proxy_wait_timeout_ms() {
 		return 0
 	fi
 
-	log_info "Setting polar_proxy_wait_timeout_ms=$timeout_ms through Patroni DCS"
-	polardb_dcs_set "polar_proxy_wait_timeout_ms=$timeout_ms" >/dev/null || return 1
+	log_info "Setting polar_proxy_wait_timeout_ms=$timeout_ms"
+	polardb_set_guc polar_proxy_wait_timeout_ms "$timeout_ms" >/dev/null || return 1
 	wait_for_guc_value "$PRIMARY_HOST" "$PRIMARY_PORT" polar_proxy_wait_timeout_ms "${timeout_ms}ms" 10 || return 1
 	wait_for_guc_value "$REPLICA_HOST" "$REPLICA_PORT" polar_proxy_wait_timeout_ms "${timeout_ms}ms" 10 || return 1
 }
@@ -540,8 +541,8 @@ wait_for_polar_query_delay_us() {
 set_polar_query_delay_us() {
 	local delay_us="$1"
 
-	log_info "Setting polar_query_delay_us=$delay_us through Patroni DCS"
-	polardb_dcs_set "polar_query_delay_us=$delay_us" >/dev/null || return 1
+	log_info "Setting polar_query_delay_us=$delay_us"
+	polardb_set_guc polar_query_delay_us "$delay_us" >/dev/null || return 1
 	wait_for_polar_query_delay_us "$PRIMARY_HOST" "$PRIMARY_PORT" "$delay_us" 15 || return 1
 	wait_for_polar_query_delay_us "$REPLICA_HOST" "$REPLICA_PORT" "$delay_us" 15 || return 1
 }
@@ -561,7 +562,7 @@ set_replay_lag_guc() {
 	local attempt
 
 	for ((attempt = 1; attempt <= attempts; attempt++)); do
-		if polardb_set_local_sighup_guc polar_replay_min_lag_size "$lag_bytes" >/dev/null &&
+		if polardb_set_guc polar_replay_min_lag_size "$lag_bytes" >/dev/null &&
 			wait_for_guc_value "$REPLICA_HOST" "$REPLICA_PORT" polar_replay_min_lag_size "$lag_bytes" 15; then
 			return 0
 		fi
