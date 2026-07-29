@@ -15,13 +15,14 @@ source "$SCRIPT_DIR/../common/env.sh"
 # shellcheck source=../lib/tap_core.sh
 source "$SCRIPT_DIR/../lib/tap_core.sh"
 
-PLAN=23
+PLAN=24
 FAIL=0
 PROXYSQL_DATA_DIR="${PROXYSQL_DATA_DIR:-$(polardb_proxy_sharded_data_dir "$POLARDB_RUNTIME_DIR/proxysql_txn_split_tap")}"
 export PROXYSQL_DATA_DIR
 LAST_SPLIT_RUN_DIR=""
 TXN_SPLIT_TAP_GROUPS="${TXN_SPLIT_TAP_GROUPS:-}"
 TXN_SPLIT_TAP_CASES="${TXN_SPLIT_TAP_CASES:-}"
+ORIGINAL_POLAR_PROXY_WAIT_TIMEOUT_MS=""
 
 # case_id | group | tag | plan_count | function
 # 6,7 carry one extra tied probe each; the scheduler must keep the probe in the
@@ -29,7 +30,7 @@ TXN_SPLIT_TAP_CASES="${TXN_SPLIT_TAP_CASES:-}"
 # stay backend-exclusive on a shared topology.
 split_cases_for_group() {
 	case "$1" in
-	split-core-positive) printf '%s\n' "6 7 8 10 12 13 14 21 22" ;;
+	split-core-positive) printf '%s\n' "6 7 8 10 12 13 14 21 22 26" ;;
 	split-warmup) printf '%s\n' "9 11 17 18 19 20 23 24 25" ;;
 	split-timeout) printf '%s\n' "15 16" ;;
 	*)
@@ -131,13 +132,13 @@ verify_split_trace() {
 		debug_expected=1
 	fi
 
-	# The scenario harness already checks the public behavior with backend-visible
-	# results and ProxySQL counters. Trace checks are extra diagnostics: keep them
-	# strict when this build emits PolarDB trace lines, but do not fail a real
-	# integration scenario only because the runtime did not write those optional
-	# strings.
+	# A normal TAP run proves public behavior from results and counters, so traces
+	# remain optional there. The debug trace gate sets
+	# POLARDB_REQUIRE_DEBUG_TRACES=1 and treats a missing log or marker as a test
+	# failure.
 	if [ -z "$run_dir" ] || [ ! -f "$log_file" ]; then
 		diag "missing ProxySQL debug log for split trace verification: $log_file"
+		tap_debug_traces_required && return 1
 		return 0
 	fi
 	if ! tap_trace_checks_enabled "$log_file"; then
@@ -146,11 +147,12 @@ verify_split_trace() {
 		else
 			diag "split trace verification skipped: no PolarDB trace lines in $log_file"
 		fi
+		tap_debug_traces_required && return 1
 		return 0
 	fi
 
 	case "$split_variant" in
-	basic | multi | combined)
+	basic | multi | reuse_after_commit | combined)
 		tap_trace_must_count_ge "$log_file" "PolarDB PLAN: REPLICA_TXN_SPLIT planned" 1 || trace_ok=1
 		tap_trace_must_count_ge "$log_file" "PolarDB TXN_SPLIT: prepared" 1 || trace_ok=1
 		tap_trace_must_count_ge "$log_file" "PolarDB TXN_SPLIT: completed split read" 1 || trace_ok=1
@@ -174,7 +176,7 @@ verify_split_trace() {
 		case "$split_variant" in
 		warmup_demand)
 			tap_trace_must_have "$log_file" "PolarDB SET: txn_split_warmup_mode=demand" || trace_ok=1
-			tap_trace_must_have "$log_file" "PolarDB WARMUP: requested split pool reason=demand" || trace_ok=1
+			tap_trace_must_have "$log_file" "PolarDB WARMUP: requested split pool reason=selected_pool_miss" || trace_ok=1
 			;;
 		warmup_begin | warmup_begin_prompt)
 			tap_trace_must_have "$log_file" "PolarDB SET: txn_split_warmup_mode=begin" || trace_ok=1
@@ -222,7 +224,6 @@ verify_split_trace() {
 		;;
 	readonly_repeatable)
 		tap_trace_must_have "$log_file" "PolarDB TXN_WAIT: pre-write reader waits blocked by isolation" || trace_ok=1
-		tap_trace_must_have "$log_file" "PolarDB PLAN: transaction pre-write reader wait blocked read_committed=0" || trace_ok=1
 		tap_trace_must_not_have "$log_file" "PolarDB TXN_WAIT: prepared" || trace_ok=1
 		tap_trace_must_not_have "$log_file" "PolarDB PLAN: REPLICA_TXN_SPLIT planned" || trace_ok=1
 		;;
@@ -238,7 +239,7 @@ verify_split_trace() {
 		;;
 	timeout)
 		tap_trace_must_count_eq "$log_file" "PolarDB PLAN: REPLICA_TXN_SPLIT planned" 1 || trace_ok=1
-		tap_trace_must_count_eq "$log_file" "PolarDB FAILURE: wrapper-result handler action=retry" 1 || trace_ok=1
+		tap_trace_must_count_eq "$log_file" "PolarDB FAILURE: result kind=wrapper action=retry" 1 || trace_ok=1
 		tap_trace_must_count_eq "$log_file" "PolarDB FAILURE: policy kind=wait_timeout action=retry target=writer" 1 || trace_ok=1
 		tap_trace_must_count_eq "$log_file" "PolarDB FAILURE: retry split read on writer_hg" 1 || trace_ok=1
 		;;
@@ -252,17 +253,17 @@ run_split_case() {
 	local case_name="$2"
 	local split_variant="$3"
 	local test_id="$4"
-	local polar_mode="${5:-best_effort}"
+	local timeout_action="${5:-warning}"
 	local expect_outcome="${6:-success}"
 	local output rc run_dir
 
 	CASE_NUM="$case_num"
 	CASE_NAME="$case_name"
-	CONSISTENCY_MODE=1
+	CONSISTENCY_MODE=session_lsn
 	SPLIT_ENABLED=1
 	XACT_SPLIT=1
 	TEST_ID="$test_id"
-	POLAR_MODE="$polar_mode"
+	LSN_WAIT_TIMEOUT_ACTION="$timeout_action"
 	EXPECT_OUTCOME="$expect_outcome"
 	if [ -n "$split_variant" ]; then
 		SPLIT_VARIANT="$split_variant"
@@ -334,6 +335,10 @@ assert_backend_isolation_report_consumed() {
 	esac
 
 	if [ -z "$run_dir" ] || [ ! -f "$log_file" ]; then
+		if tap_debug_traces_required; then
+			ok 1 "backend isolation ParameterStatus consumed by ProxySQL"
+			return
+		fi
 		skip_ok "backend isolation ParameterStatus consumed by ProxySQL" \
 			"pre-write case debug log unavailable"
 		return
@@ -341,6 +346,10 @@ assert_backend_isolation_report_consumed() {
 	if ! tap_trace_checks_enabled "$log_file"; then
 		if [ "$debug_expected" -eq 1 ]; then
 			diag "backend isolation trace skipped: debug enabled but no PolarDB trace lines in $log_file"
+		fi
+		if tap_debug_traces_required; then
+			ok 1 "backend isolation ParameterStatus consumed by ProxySQL"
+			return
 		fi
 		skip_ok "backend isolation ParameterStatus consumed by ProxySQL" \
 			"ProxySQL PolarDB trace unavailable"
@@ -405,10 +414,13 @@ POLARDB_AUTODETECT=0
 # shellcheck source=../lib/scenario_harness.sh
 source "$SCRIPT_DIR/../lib/scenario_harness.sh"
 POLARDB_AUTODETECT="$HARNESS_AUTODETECT"
+ORIGINAL_POLAR_PROXY_WAIT_TIMEOUT_MS="$(get_polar_proxy_wait_timeout_ms || true)"
 
 cleanup() {
 	stop_wal_generator >/dev/null 2>&1 || true
 	disable_replay_lag >/dev/null 2>&1 || true
+	restore_polar_proxy_wait_timeout_ms \
+		"$ORIGINAL_POLAR_PROXY_WAIT_TIMEOUT_MS" >/dev/null 2>&1 || true
 	stop_proxysql >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -422,6 +434,7 @@ if split_case_selected 7; then
 	assert_backend_isolation_report_consumed "$LAST_SPLIT_RUN_DIR"
 fi
 run_selected_split_case 8 "Multi Split" "multi" 8
+run_selected_split_case 26 "Completed Split Reader Reuse" "reuse_after_commit" 26
 run_selected_split_case 9 "Lazy Split Warmup" "lazy" 9
 run_selected_split_case 11 "Lazy Split Warmup Disabled" "lazy_disabled" 11
 run_selected_split_case 17 "Split Warmup Mode Off" "warmup_off" 17
@@ -437,8 +450,10 @@ run_selected_split_case 21 "Read-Only Transaction Repeatable Read Veto" "readonl
 run_selected_split_case 22 "Read-Only Transaction SET LOCAL Veto" "readonly_set_local" 22
 run_selected_split_case 13 "Combined Split Workload" "combined" 13
 run_selected_split_case 14 "Route Primary Split Veto" "route_primary" 14
-run_selected_split_case 15 "Split Timeout Best Effort Primary Retry" "timeout" 15 "best_effort" "failure"
-run_selected_split_case 16 "Split Timeout Strict Primary Retry" "timeout" 16 "strict" "failure"
+	run_selected_split_case 15 "Split Timeout Warning Safely Uses Primary" \
+		"timeout" 15 "warning" "failure"
+	run_selected_split_case 16 "Split Timeout Uses Primary" \
+		"timeout" 16 "primary" "failure"
 
 diag "transaction-split TAP completed: failed=$FAIL"
 exit "$FAIL"

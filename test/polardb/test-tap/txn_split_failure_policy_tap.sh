@@ -20,13 +20,14 @@ source "$SCRIPT_DIR/../lib/tap_core.sh"
 source "$SCRIPT_DIR/../lib/tap_polardb.sh"
 
 POLICY_SETUP_PLAN=3
-POLICY_CASE_LAST=21
-PLAN=21
+POLICY_CASE_LAST=25
+PLAN=25
 FAIL=0
 PROXYSQL_DATA_DIR="${PROXYSQL_DATA_DIR:-$(polardb_proxy_sharded_data_dir "$POLARDB_RUNTIME_DIR/proxysql_txn_split_failure_policy_tap")}"
 export PROXYSQL_DATA_DIR
 export POLARDB_DEBUG_SPLIT_FAILURE_FAULT_FILE="$PROXYSQL_DATA_DIR/split_failure_fault"
 export POLARDB_DEBUG_POST_SEND_OFFLINE_FILE="$PROXYSQL_DATA_DIR/post_send_offline_fault"
+export POLARDB_DEBUG_READER_ACQUIRE_FAULT_FILE="$PROXYSQL_DATA_DIR/reader_acquire_fault"
 
 WRITER_HG="$POLARDB_WRITER_HG"
 READER_HG="$POLARDB_READER_HG"
@@ -38,6 +39,7 @@ OFFLINE_READER_HOST=""
 OFFLINE_READER_PORT=""
 POLARDB_SPLIT_PREWARM_WAIT_HELPER="$PROXYSQL_DATA_DIR/wait_split_warmup.sh"
 POLARDB_SPLIT_TXN_WAIT_HELPER="$PROXYSQL_DATA_DIR/wait_split_txn_ready.sh"
+ORIGINAL_POLAR_PROXY_WAIT_TIMEOUT_MS=""
 export POLARDB_SPLIT_PREWARM_WAIT_HELPER
 export POLARDB_SPLIT_TXN_WAIT_HELPER
 
@@ -88,11 +90,11 @@ run_selected_session_lsn_timeout_policy_case() {
 	fi
 }
 
-run_selected_session_lsn_best_effort_skips_failure_policy() {
+run_selected_session_lsn_warning_skips_failure_policy() {
 	local case_num="$1"
 
 	if policy_case_selected "$case_num"; then
-		run_session_lsn_best_effort_skips_failure_policy
+		run_session_lsn_warning_skips_failure_policy
 	fi
 }
 
@@ -110,7 +112,7 @@ policy_trace_delta() {
 	local after
 
 	if ! tap_trace_checks_enabled "$(policy_trace_log)"; then
-		echo -1
+		tap_trace_unavailable_delta
 		return 0
 	fi
 	after=$(policy_trace_count "$pattern")
@@ -172,6 +174,36 @@ EOSH
 	chmod +x "$POLARDB_SPLIT_PREWARM_WAIT_HELPER"
 }
 
+prepare_two_reader_retry_connections() {
+	local round connected created_before already_before out
+
+	for round in 1 2 3 4; do
+		connected=$(proxysql_admin \
+			"SELECT COUNT(*) FROM stats_pgsql_connection_pool WHERE hostgroup=$READER_HG AND ConnUsed + ConnFree > 0;" \
+			2>/dev/null | tr -d '[:space:]')
+		if [ "${connected:-0}" -ge 2 ]; then
+			return 0
+		fi
+
+		created_before=$(policy_counter "PolarDB_Split_Warmup_Created")
+		already_before=$(policy_counter "PolarDB_Split_Warmup_Already_Warm")
+		out=$(proxy_script "\\set ON_ERROR_STOP on
+SET proxysql.polardb_txn_split_warmup TO 'begin';
+BEGIN;
+COMMIT;
+\\! \"\$POLARDB_SPLIT_PREWARM_WAIT_HELPER\" $created_before $already_before
+SELECT 1;" 2>&1) || {
+			diag "two-reader retry fixture round $round failed: $out"
+			return 1
+		}
+	done
+
+	connected=$(proxysql_admin \
+		"SELECT COUNT(*) FROM stats_pgsql_connection_pool WHERE hostgroup=$READER_HG AND ConnUsed + ConnFree > 0;" \
+		2>/dev/null | tr -d '[:space:]')
+	[ "${connected:-0}" -ge 2 ]
+}
+
 write_split_txn_wait_helper() {
 	cat >"$POLARDB_SPLIT_TXN_WAIT_HELPER" <<'EOSH'
 #!/usr/bin/env bash
@@ -213,23 +245,29 @@ EOSH
 
 configure_split_policy() {
 	local timeout_action="$1"
-	local death_action="$2"
+	local connection_loss_action="$2"
 	local error_action="$3"
 	local manual_reader_rule="${4:-0}"
 	local warmup_max_connections="${5:-1}"
+	local read_fallback_action="${POLICY_READ_FALLBACK_ACTION:-primary}"
+	local missing_lsn_action="primary"
 	local manual_rule_id=$((SELECT_RULE_ID - 1))
+	[ "$read_fallback_action" = "error" ] &&
+		missing_lsn_action="error"
 
-	proxysql_admin "UPDATE global_variables SET variable_value='lsn' WHERE variable_name='pgsql-polardb_consistency_mode';" >/dev/null
-	proxysql_admin "UPDATE global_variables SET variable_value='strict' WHERE variable_name='pgsql-polardb_wait_timeout_mode';" >/dev/null
+	proxysql_admin "UPDATE global_variables SET variable_value='session_lsn' WHERE variable_name='pgsql-polardb_consistency_mode';" >/dev/null
+	proxysql_admin "UPDATE global_variables SET variable_value='replica' WHERE variable_name='pgsql-polardb_read_target';" >/dev/null
+	proxysql_admin "UPDATE global_variables SET variable_value='$read_fallback_action' WHERE variable_name='pgsql-polardb_action_read_fallback';" >/dev/null
+	proxysql_admin "UPDATE global_variables SET variable_value='$missing_lsn_action' WHERE variable_name='pgsql-polardb_action_missing_lsn';" >/dev/null
 	proxysql_admin "UPDATE global_variables SET variable_value='v15' WHERE variable_name='pgsql-polardb_proxy_protocol';" >/dev/null
 	proxysql_admin "UPDATE global_variables SET variable_value='1' WHERE variable_name='pgsql-polardb_lazy_warmup_split';" >/dev/null
-	proxysql_admin "UPDATE global_variables SET variable_value='$death_action' WHERE variable_name='pgsql-polardb_reader_death_action';" >/dev/null
-	proxysql_admin "UPDATE global_variables SET variable_value='$timeout_action' WHERE variable_name='pgsql-polardb_reader_timeout_action';" >/dev/null
-	proxysql_admin "UPDATE global_variables SET variable_value='$error_action' WHERE variable_name='pgsql-polardb_reader_error_action';" >/dev/null
+	proxysql_admin "UPDATE global_variables SET variable_value='$connection_loss_action' WHERE variable_name='pgsql-polardb_action_replica_loss';" >/dev/null
+	proxysql_admin "UPDATE global_variables SET variable_value='$timeout_action' WHERE variable_name='pgsql-polardb_action_lsn_timeout';" >/dev/null
+	proxysql_admin "UPDATE global_variables SET variable_value='$error_action' WHERE variable_name='pgsql-polardb_action_replica_error';" >/dev/null
 	proxysql_admin "UPDATE global_variables SET variable_value='$warmup_max_connections' WHERE variable_name='pgsql-polardb_split_warmup_max_connections_per_request';" >/dev/null
 	proxysql_admin "LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null
 
-	proxysql_admin "UPDATE pgsql_replication_hostgroups SET txn_split_enabled=1, lsn_wait_timeout_ms=100, consistency_mode='lsn', max_lag_bytes=-1, proxy_protocol='v15' WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
+	proxysql_admin "UPDATE pgsql_replication_hostgroups SET txn_split_enabled=1, lsn_wait_timeout_ms=100, consistency_mode='session_lsn', max_lag_bytes=-1, proxy_protocol='v15' WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
 	proxysql_admin "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
 
 	proxysql_admin "DELETE FROM pgsql_query_rules;" >/dev/null
@@ -251,8 +289,10 @@ run_split_failure_sql() {
 	local warmup_created_before="${4:-0}"
 	local warmup_already_before="${5:-0}"
 	local txn_became_before="${6:-0}"
+	local reader_acquire_fault="${7:--}"
 	local manual_sql=""
 	local fault_sql=""
+	local reader_acquire_fault_sql=""
 	local txn_probe_sql=""
 	local txn_probe_count="${POLARDB_SPLIT_TXN_READY_PROBES:-20}"
 
@@ -264,6 +304,11 @@ run_split_failure_sql() {
 		fault_sql="\\! : > \"\$POLARDB_DEBUG_SPLIT_FAILURE_FAULT_FILE\" || echo POLARDB_SPLIT_FAULT_FILE_WRITE_FAILED"
 	else
 		fault_sql="\\! printf '%s\\n' '$fault' > \"\$POLARDB_DEBUG_SPLIT_FAILURE_FAULT_FILE\" || echo POLARDB_SPLIT_FAULT_FILE_WRITE_FAILED"
+	fi
+	if [ "$reader_acquire_fault" = "-" ]; then
+		reader_acquire_fault_sql="\\! : > \"\$POLARDB_DEBUG_READER_ACQUIRE_FAULT_FILE\" || echo POLARDB_READER_ACQUIRE_FAULT_FILE_WRITE_FAILED"
+	else
+		reader_acquire_fault_sql="\\! printf '%s\\n' '$reader_acquire_fault' > \"\$POLARDB_DEBUG_READER_ACQUIRE_FAULT_FILE\" || echo POLARDB_READER_ACQUIRE_FAULT_FILE_WRITE_FAILED"
 	fi
 	for ((probe_i = 1; probe_i <= txn_probe_count; probe_i++)); do
 		txn_probe_sql="${txn_probe_sql}
@@ -282,9 +327,89 @@ BEGIN;
 INSERT INTO $TEST_TABLE VALUES ($row_id, 'split_failure$row_id') ON CONFLICT (id) DO UPDATE SET data='split_failure$row_id';
 $txn_probe_sql
 $fault_sql
+$reader_acquire_fault_sql
 SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $row_id;
 $manual_sql
 COMMIT;"
+}
+
+run_replica_fallback_error_prepare_decline_case() {
+	local label="replica split pool failure returns an error when read fallback is error"
+	local row_id=47
+	local out committed
+	local warmup_created_before warmup_already_before txn_became_before
+	local required_before writer_fallback_before
+	local required_delta writer_fallback_delta
+	local pass=1
+
+	if ! debug_fault_file_ready \
+			POLARDB_DEBUG_READER_ACQUIRE_FAULT_FILE \
+			"$PROXYSQL_DATA_DIR/proxysql_strings"; then
+		skip_ok "$label" "requires POLARDB_DEBUG reader-acquire fault support"
+		return
+	fi
+	reset_case_table || {
+		ok 1 "$label"
+		return
+	}
+	POLICY_READ_FALLBACK_ACTION=error \
+		configure_split_policy error replica_then_error error 0 1 || {
+			ok 1 "$label"
+			return
+		}
+	if ! set_polar_proxy_wait_timeout_ms 10 >/dev/null 2>&1; then
+		skip_ok "$label" "cannot set polar_proxy_wait_timeout_ms through DCS"
+		return
+	fi
+	if ! enable_replay_lag 50000 >/dev/null 2>&1; then
+		skip_ok "$label" "cannot enable replica replay lag"
+		return
+	fi
+
+	required_before=$(policy_trace_count \
+		"REPLICA_TXN_SPLIT prepare declined; read fallback=error -> RETURN_ERROR")
+	writer_fallback_before=$(policy_trace_count \
+		"REPLICA_TXN_SPLIT prepare declined; using primary_hg")
+	warmup_created_before=$(policy_counter "PolarDB_Split_Warmup_Created")
+	warmup_already_before=$(policy_counter "PolarDB_Split_Warmup_Already_Warm")
+	txn_became_before=$(policy_counter "PolarDB_Txn_Became_Splittable")
+
+	start_wal_generator 0.01 1000
+	out=$(run_split_failure_sql "$row_id" 0 "-" \
+		"$warmup_created_before" "$warmup_already_before" \
+		"$txn_became_before" reader_busy 2>&1)
+	stop_wal_generator
+	disable_replay_lag >/dev/null 2>&1 || true
+	wait_for_replica_lsn_catchup 15 >/dev/null 2>&1 || true
+	clear_debug_fault_file \
+		POLARDB_DEBUG_READER_ACQUIRE_FAULT_FILE >/dev/null 2>&1 || true
+
+	required_delta=$(policy_trace_delta \
+		"REPLICA_TXN_SPLIT prepare declined; read fallback=error -> RETURN_ERROR" \
+		"$required_before")
+	writer_fallback_delta=$(policy_trace_delta \
+		"REPLICA_TXN_SPLIT prepare declined; using primary_hg" \
+		"$writer_fallback_before")
+	committed=$(polardb_primary_sql \
+		"SELECT COUNT(*) FROM $TEST_TABLE WHERE id=$row_id;" 2>/dev/null |
+		tr -d '[:space:]')
+
+	printf '%s\n' "$out" |
+		grep -q "PolarDB read routing requires a usable replica" &&
+		[ "$required_delta" -eq 1 ] &&
+		[ "$writer_fallback_delta" -eq 0 ] &&
+		[ "${committed:-0}" -eq 1 ] &&
+		! printf '%s\n' "$out" |
+			grep -q "POLARDB_READER_ACQUIRE_FAULT_FILE_WRITE_FAILED" &&
+		pass=0
+
+	if [ "$pass" -eq 0 ]; then
+		ok 0 "$label"
+	else
+		diag "$label output: $out"
+		diag "trace required=$required_delta writer_fallback=$writer_fallback_delta committed=${committed:-unknown}"
+		ok 1 "$label"
+	fi
 }
 
 run_policy_case() {
@@ -292,23 +417,25 @@ run_policy_case() {
 	local row_id="$2"
 	local fault="$3"
 	local timeout_action="$4"
-	local death_action="$5"
+	local connection_loss_action="$5"
 	local error_action="$6"
 	local expected_outcome="$7"
 	local include_manual_probe="${8:-0}"
 	local extra_trace="${9:-}"
 	local extra_counter="${10:-}"
+	local reader_acquire_fault="${11:--}"
 	local out rc
 	local retry_before reader_retry_before forward_before term_before
 	local trace_action_before trace_retry_before trace_reader_retry_before trace_forward_before trace_term_before
 	local trace_manual_before trace_extra_before trace_prepare_before trace_decline_before
-	local reader_pool_destroy_failure_before reader_pool_destroy_failure_delta
+	local trace_unused_return_before=0 unused_return_trace_delta=0
 	local extra_counter_before extra_counter_delta
 	local retry_delta reader_retry_delta forward_delta term_delta
 	local action_trace_delta retry_trace_delta reader_retry_trace_delta forward_trace_delta term_trace_delta
 	local manual_trace_delta extra_trace_delta prepare_trace_delta decline_trace_delta
 	local expected_kind="wait_timeout"
-	local expected_action="$timeout_action"
+	local selected_public_action="$timeout_action"
+	local expected_action
 	local warmup_max_connections=1
 	local warmup_created_before warmup_already_before txn_became_before
 	local prewarm_failed=0
@@ -321,16 +448,18 @@ run_policy_case() {
 		return
 	}
 	diag "table reset completed for policy case: $label"
-	if [ "$expected_outcome" = "retry_reader_then_writer" ] ||
+	if [ "$expected_outcome" = "replica_then_primary" ] ||
+			[ "$expected_outcome" = "replica_then_error" ] ||
 			printf '%s\n' "$extra_trace" | grep -q "target=other_reader"; then
 		warmup_max_connections=2
 	fi
-	configure_split_policy "$timeout_action" "$death_action" "$error_action" \
+	configure_split_policy "$timeout_action" "$connection_loss_action" "$error_action" \
 		"$include_manual_probe" "$warmup_max_connections" || {
 		ok 1 "$label"
 		return
 	}
-	if [ "$expected_outcome" = "retry_reader_then_writer" ]; then
+	if [ "$expected_outcome" = "replica_then_primary" ] ||
+			[ "$expected_outcome" = "replica_then_error" ]; then
 		local reader_online_count
 		reader_online_count=$(
 			proxysql_admin "SELECT COUNT(*) FROM runtime_pgsql_servers WHERE hostgroup_id=$READER_HG AND status='ONLINE';" 2>/dev/null |
@@ -340,6 +469,11 @@ run_policy_case() {
 			skip_ok "$label" "requires at least two online reader endpoints"
 			return
 		fi
+	fi
+	if [ "$reader_acquire_fault" = "writer_changed_after_reader_acquire" ] &&
+			! prepare_two_reader_retry_connections; then
+		ok 1 "$label"
+		return
 	fi
 	if ! set_polar_proxy_wait_timeout_ms 10 >/dev/null 2>&1; then
 		skip_ok "$label" "cannot set polar_proxy_wait_timeout_ms through DCS"
@@ -356,11 +490,21 @@ run_policy_case() {
 	term_before=$(policy_counter "PolarDB_Reader_Terminations")
 	if [ "$fault" = "death" ] || [ "$fault" = "death_twice" ]; then
 		expected_kind="connection_lost"
-		expected_action="$death_action"
+		selected_public_action="$connection_loss_action"
 	elif [ "$fault" = "sql_error" ]; then
 		expected_kind="reusable_error"
-		expected_action="$error_action"
+		selected_public_action="$error_action"
 	fi
+	case "$selected_public_action" in
+	primary|replica_then_primary|replica_then_error) expected_action="retry" ;;
+	error|warning) expected_action="error" ;;
+	disconnect) expected_action="disconnect" ;;
+	*)
+		diag "unsupported public action '$selected_public_action'"
+		ok 1 "$label"
+		return
+		;;
+	esac
 	trace_action_before=$(policy_trace_count "PolarDB FAILURE: policy kind=$expected_kind action=$expected_action")
 	trace_retry_before=$(policy_trace_count "PolarDB FAILURE: retry split read on writer_hg")
 	trace_reader_retry_before=$(policy_trace_count "PolarDB FAILURE: retry split read on other_reader_hg")
@@ -371,9 +515,9 @@ run_policy_case() {
 	trace_decline_before=$(policy_trace_count "PolarDB TXN_SPLIT: prepare declined")
 	trace_extra_before=0
 	[ -n "$extra_trace" ] && trace_extra_before=$(policy_trace_count "$extra_trace")
-	reader_pool_destroy_failure_before=0
-	if [ "$extra_trace" = "PolarDB READER_POOL: destroy used" ]; then
-		reader_pool_destroy_failure_before=$(policy_counter "PolarDB_Reader_Pool_Destroy_From_Failure")
+	if [ "$reader_acquire_fault" = "writer_changed_after_reader_acquire" ]; then
+		trace_unused_return_before=$(policy_trace_count \
+			"PolarDB FAILURE: returning unused reader backend after pre-dispatch rejection")
 	fi
 	extra_counter_before=0
 	[ -n "$extra_counter" ] && extra_counter_before=$(policy_counter "$extra_counter")
@@ -384,7 +528,7 @@ run_policy_case() {
 	start_wal_generator 0.01 1000
 	out=$(run_split_failure_sql "$row_id" "$include_manual_probe" "$fault" \
 		"$warmup_created_before" "$warmup_already_before" \
-		"$txn_became_before" 2>&1)
+		"$txn_became_before" "$reader_acquire_fault" 2>&1)
 	rc=$?
 	clear_debug_fault_file POLARDB_DEBUG_SPLIT_FAILURE_FAULT_FILE >/dev/null 2>&1 || true
 	stop_wal_generator
@@ -405,9 +549,10 @@ run_policy_case() {
 	decline_trace_delta=$(policy_trace_delta "PolarDB TXN_SPLIT: prepare declined" "$trace_decline_before")
 	extra_trace_delta=0
 	[ -n "$extra_trace" ] && extra_trace_delta=$(policy_trace_delta "$extra_trace" "$trace_extra_before")
-	reader_pool_destroy_failure_delta=0
-	if [ "$extra_trace" = "PolarDB READER_POOL: destroy used" ]; then
-		reader_pool_destroy_failure_delta=$(($(policy_counter "PolarDB_Reader_Pool_Destroy_From_Failure") - reader_pool_destroy_failure_before))
+	if [ "$reader_acquire_fault" = "writer_changed_after_reader_acquire" ]; then
+		unused_return_trace_delta=$(policy_trace_delta \
+			"PolarDB FAILURE: returning unused reader backend after pre-dispatch rejection" \
+			"$trace_unused_return_before")
 	fi
 	extra_counter_delta=0
 	[ -n "$extra_counter" ] && extra_counter_delta=$(($(policy_counter "$extra_counter") - extra_counter_before))
@@ -419,6 +564,10 @@ run_policy_case() {
 	if printf '%s\n' "$out" | grep -q "POLARDB_SPLIT_FAULT_FILE_WRITE_FAILED"; then
 		prewarm_failed=1
 	fi
+	if printf '%s\n' "$out" |
+			grep -q "POLARDB_READER_ACQUIRE_FAULT_FILE_WRITE_FAILED"; then
+		prewarm_failed=1
+	fi
 	if ! printf '%s\n' "$out" | grep -q "POLARDB_SPLIT_TXN_READY"; then
 		txn_ready_failed=1
 	fi
@@ -426,7 +575,7 @@ run_policy_case() {
 		txn_ready_failed=1
 	fi
 	case "$expected_outcome" in
-	retry)
+	retry_writer)
 		[ "$retry_delta" -ge 1 ] && [ "$forward_delta" -eq 0 ] &&
 			[ "$reader_retry_delta" -eq 0 ] && [ "$term_delta" -eq 0 ] &&
 			[ "$retry_trace_delta" -ge 1 ] &&
@@ -438,7 +587,7 @@ run_policy_case() {
 			{ [ "$retry_trace_delta" -ge 1 ] || [ "$reader_retry_trace_delta" -ge 1 ]; } &&
 			! printf '%s\n' "$out" | grep -q "ERROR" && pass=0
 		;;
-	retry_reader_then_writer)
+	replica_then_primary)
 		[ "$reader_retry_delta" -eq 1 ] &&
 			[ "$retry_delta" -ge 1 ] &&
 			[ "$forward_delta" -eq 0 ] &&
@@ -447,7 +596,16 @@ run_policy_case() {
 			[ "$retry_trace_delta" -ge 1 ] &&
 			! printf '%s\n' "$out" | grep -q "ERROR" && pass=0
 		;;
-	forward)
+	replica_then_error)
+		[ "$reader_retry_delta" -eq 1 ] &&
+			[ "$retry_delta" -eq 0 ] &&
+			[ "$forward_delta" -ge 1 ] &&
+			[ "$term_delta" -eq 0 ] &&
+			[ "$reader_retry_trace_delta" -eq 1 ] &&
+			[ "$retry_trace_delta" -eq 0 ] &&
+			printf '%s\n' "$out" | grep -q "ERROR" && pass=0
+		;;
+	error)
 		[ "$forward_delta" -ge 1 ] && [ "$retry_delta" -eq 0 ] &&
 			[ "$reader_retry_delta" -eq 0 ] &&
 			[ "$term_delta" -eq 0 ] && [ "$forward_trace_delta" -ge 1 ] &&
@@ -457,7 +615,7 @@ run_policy_case() {
 				printf '%s\n' "$out" | grep -qx "42" || pass=1
 		fi
 		;;
-	terminate)
+	disconnect)
 		[ "$term_delta" -ge 1 ] && [ "$retry_delta" -eq 0 ] &&
 			[ "$reader_retry_delta" -eq 0 ] &&
 			[ "$term_trace_delta" -ge 1 ] &&
@@ -471,21 +629,19 @@ run_policy_case() {
 	esac
 	[ "$prewarm_failed" -eq 0 ] || pass=1
 	[ "$txn_ready_failed" -eq 0 ] || pass=1
-	{ [ "$action_trace_delta" -ge 1 ] || [ "$expected_outcome" = "terminate" ]; } || pass=1
+	{ [ "$action_trace_delta" -ge 1 ] || [ "$expected_outcome" = "disconnect" ]; } || pass=1
 	[ "$prepare_trace_delta" -ge 1 ] || pass=1
 	{ [ -z "$extra_trace" ] || [ "$extra_trace_delta" -ge 1 ]; } || pass=1
-	if [ "$extra_trace" = "PolarDB READER_POOL: destroy used" ] &&
-			[ "$reader_pool_destroy_failure_delta" -lt 1 ]; then
-		pass=1
-	fi
 	{ [ -z "$extra_counter" ] || [ "$extra_counter_delta" -ge 1 ]; } || pass=1
+	{ [ "$reader_acquire_fault" != "writer_changed_after_reader_acquire" ] ||
+		[ "$unused_return_trace_delta" -ge 1 ]; } || pass=1
 
 	if [ "$pass" -eq 0 ]; then
 		ok 0 "$label"
 	else
 		diag "$label output: $out"
 		diag "rc=$rc retry_delta=$retry_delta reader_retry_delta=$reader_retry_delta forward_delta=$forward_delta term_delta=$term_delta"
-		diag "trace action=$action_trace_delta retry=$retry_trace_delta reader_retry=$reader_retry_trace_delta forward=$forward_trace_delta terminate=$term_trace_delta manual=$manual_trace_delta prepare=$prepare_trace_delta decline=$decline_trace_delta extra=$extra_trace_delta reader_pool_destroy_failure=$reader_pool_destroy_failure_delta extra_counter=$extra_counter extra_counter_delta=$extra_counter_delta prewarm_failed=$prewarm_failed txn_ready_failed=$txn_ready_failed"
+		diag "trace action=$action_trace_delta retry=$retry_trace_delta reader_retry=$reader_retry_trace_delta forward=$forward_trace_delta terminate=$term_trace_delta manual=$manual_trace_delta prepare=$prepare_trace_delta decline=$decline_trace_delta extra=$extra_trace_delta unused_return=$unused_return_trace_delta extra_counter=$extra_counter extra_counter_delta=$extra_counter_delta prewarm_failed=$prewarm_failed txn_ready_failed=$txn_ready_failed"
 		ok 1 "$label"
 	fi
 }
@@ -499,16 +655,20 @@ run_session_lsn_timeout_policy_case() {
 	local trace_action_before trace_retry_before trace_forward_before trace_term_before
 	local wait_retry_delta term_delta split_retry_delta
 	local split_forward_delta action_trace_delta retry_trace_delta forward_trace_delta term_trace_delta
+	local policy_trace="PolarDB FAILURE: policy kind=wait_timeout action=$timeout_action target=writer"
+
+	[ "$timeout_action" != "primary" ] ||
+		policy_trace="PolarDB FAILURE: policy kind=wait_timeout action=retry target=writer"
 
 	reset_case_table || {
 		ok 1 "$label"
 		return
 	}
-	configure_split_policy "$timeout_action" retry forward 0 || {
+	configure_split_policy "$timeout_action" replica_then_primary error 0 || {
 		ok 1 "$label"
 		return
 	}
-	proxysql_admin "UPDATE pgsql_replication_hostgroups SET txn_split_enabled=0, lsn_wait_timeout_ms=100, consistency_mode='lsn', proxy_protocol='v15' WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
+	proxysql_admin "UPDATE pgsql_replication_hostgroups SET txn_split_enabled=0, lsn_wait_timeout_ms=100, consistency_mode='session_lsn', proxy_protocol='v15' WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
 	proxysql_admin "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
 	if ! set_polar_proxy_wait_timeout_ms 10 >/dev/null 2>&1; then
 		skip_ok "$label" "cannot set polar_proxy_wait_timeout_ms through DCS"
@@ -523,10 +683,10 @@ run_session_lsn_timeout_policy_case() {
 	term_before=$(policy_counter "PolarDB_Reader_Terminations")
 	split_retry_before=$(policy_counter "PolarDB_Split_Reads_Retried")
 	split_forward_before=$(policy_counter "PolarDB_Split_Reads_Forwarded")
-	trace_action_before=$(policy_trace_count "PolarDB WAIT: policy kind=wait_timeout action=$timeout_action")
-	trace_retry_before=$(policy_trace_count "PolarDB WAIT: strict wait timeout before user result; redirecting original")
-	trace_forward_before=$(policy_trace_count "PolarDB WAIT: policy action=forward; normal error path will forward clean reader error")
-	trace_term_before=$(policy_trace_count "PolarDB WAIT: terminating session after reader failure")
+	trace_action_before=$(policy_trace_count "$policy_trace")
+	trace_retry_before=$(policy_trace_count "PolarDB FAILURE: LSN wait timeout before user result; redirecting original query to primary_hg=")
+	trace_forward_before=$(policy_trace_count "PolarDB FAILURE: policy action=error")
+	trace_term_before=$(policy_trace_count "PolarDB FAILURE: terminating session after reader failure")
 
 	start_wal_generator 0.01 1000
 	out=$(proxy_script "INSERT INTO $TEST_TABLE VALUES ($row_id, 'regular_wait') ON CONFLICT (id) DO UPDATE SET data='regular_wait';
@@ -541,14 +701,14 @@ SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $row_id;" 2>&1)
 	term_delta=$(($(policy_counter "PolarDB_Reader_Terminations") - term_before))
 	split_retry_delta=$(($(policy_counter "PolarDB_Split_Reads_Retried") - split_retry_before))
 	split_forward_delta=$(($(policy_counter "PolarDB_Split_Reads_Forwarded") - split_forward_before))
-	action_trace_delta=$(policy_trace_delta "PolarDB WAIT: policy kind=wait_timeout action=$timeout_action" "$trace_action_before")
-	retry_trace_delta=$(policy_trace_delta "PolarDB WAIT: strict wait timeout before user result; redirecting original" "$trace_retry_before")
-	forward_trace_delta=$(policy_trace_delta "PolarDB WAIT: policy action=forward; normal error path will forward clean reader error" "$trace_forward_before")
-	term_trace_delta=$(policy_trace_delta "PolarDB WAIT: terminating session after reader failure" "$trace_term_before")
+	action_trace_delta=$(policy_trace_delta "$policy_trace" "$trace_action_before")
+	retry_trace_delta=$(policy_trace_delta "PolarDB FAILURE: LSN wait timeout before user result; redirecting original query to primary_hg=" "$trace_retry_before")
+	forward_trace_delta=$(policy_trace_delta "PolarDB FAILURE: policy action=error" "$trace_forward_before")
+	term_trace_delta=$(policy_trace_delta "PolarDB FAILURE: terminating session after reader failure" "$trace_term_before")
 
 	local pass=1
 	case "$timeout_action" in
-	retry)
+	primary)
 		[ "$rc" -eq 0 ] &&
 			[ "$wait_retry_delta" -ge 1 ] &&
 			[ "$term_delta" -eq 0 ] &&
@@ -559,7 +719,7 @@ SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $row_id;" 2>&1)
 			! printf '%s\n' "$out" | grep -q "ERROR" &&
 			pass=0
 		;;
-	forward)
+	error)
 		[ "$wait_retry_delta" -eq 0 ] &&
 			[ "$term_delta" -eq 0 ] &&
 			[ "$split_retry_delta" -eq 0 ] &&
@@ -568,7 +728,7 @@ SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $row_id;" 2>&1)
 			printf '%s\n' "$out" | grep -q "ERROR" &&
 			pass=0
 		;;
-	terminate)
+	disconnect)
 		[ "$wait_retry_delta" -eq 0 ] &&
 			[ "$term_delta" -ge 1 ] &&
 			[ "$split_retry_delta" -eq 0 ] &&
@@ -590,8 +750,8 @@ SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $row_id;" 2>&1)
 	fi
 }
 
-run_session_lsn_best_effort_skips_failure_policy() {
-	local label="session LSN best_effort stale warning skips failure policy"
+run_session_lsn_warning_skips_failure_policy() {
+	local label="session LSN warning result skips replica failure policy"
 	local row_id=44
 	local out rc
 	local wait_timeout_before term_before split_forward_before
@@ -601,12 +761,12 @@ run_session_lsn_best_effort_skips_failure_policy() {
 		ok 1 "$label"
 		return
 	}
-	configure_split_policy terminate terminate terminate 0 || {
+	configure_split_policy disconnect disconnect disconnect 0 || {
 		ok 1 "$label"
 		return
 	}
-	proxysql_admin "UPDATE global_variables SET variable_value='best_effort' WHERE variable_name='pgsql-polardb_wait_timeout_mode';" >/dev/null
-	proxysql_admin "UPDATE pgsql_replication_hostgroups SET txn_split_enabled=0, lsn_wait_timeout_ms=100, consistency_mode='lsn', proxy_protocol='v15' WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
+	proxysql_admin "UPDATE global_variables SET variable_value='warning' WHERE variable_name='pgsql-polardb_action_lsn_timeout';" >/dev/null
+	proxysql_admin "UPDATE pgsql_replication_hostgroups SET txn_split_enabled=0, lsn_wait_timeout_ms=100, consistency_mode='session_lsn', proxy_protocol='v15' WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
 	proxysql_admin "LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null
 	proxysql_admin "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
 	if ! set_polar_proxy_wait_timeout_ms 10 >/dev/null 2>&1; then
@@ -705,7 +865,7 @@ run_offline_hard_active_reader_case() {
 		ok 1 "$label"
 		return
 	}
-	configure_split_policy retry retry forward 0 2 || {
+	configure_split_policy primary replica_then_primary error 0 2 || {
 		ok 1 "$label"
 		return
 	}
@@ -780,7 +940,7 @@ run_injected_post_send_offline_case() {
 		ok 1 "$label"
 		return
 	}
-	configure_split_policy retry retry forward 0 2 || {
+	configure_split_policy primary replica_then_primary error 0 2 || {
 		ok 1 "$label"
 		return
 	}
@@ -817,6 +977,12 @@ cleanup() {
 	restore_offline_reader
 	stop_wal_generator >/dev/null 2>&1 || true
 	disable_replay_lag >/dev/null 2>&1 || true
+	if declare -F restore_polar_proxy_wait_timeout_ms >/dev/null; then
+		restore_polar_proxy_wait_timeout_ms \
+			"$ORIGINAL_POLAR_PROXY_WAIT_TIMEOUT_MS" >/dev/null 2>&1 || true
+	fi
+	clear_debug_fault_file \
+		POLARDB_DEBUG_READER_ACQUIRE_FAULT_FILE >/dev/null 2>&1 || true
 	stop_proxysql >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -849,6 +1015,7 @@ POLARDB_AUTODETECT=0
 # shellcheck source=../lib/scenario_harness.sh
 source "$SCRIPT_DIR/../lib/scenario_harness.sh"
 POLARDB_AUTODETECT="$HARNESS_AUTODETECT"
+ORIGINAL_POLAR_PROXY_WAIT_TIMEOUT_MS="$(get_polar_proxy_wait_timeout_ms || true)"
 
 export PROXYSQL_DEBUG=1
 if start_proxysql >/dev/null 2>&1; then
@@ -869,58 +1036,77 @@ else
 	exit 0
 fi
 
-run_selected_policy_case 4 "split timeout policy retry redispatches on writer" \
-	31 "-" retry retry forward retry 0
-run_selected_policy_case 5 "split timeout policy forward keeps transaction on writer and overrides manual reader route" \
-	32 "-" forward retry forward forward 1
-run_selected_policy_case 6 "split timeout policy terminate closes the client session" \
-	33 "-" terminate retry forward terminate 0 \
-	"PolarDB READER_POOL: destroy used"
-run_selected_policy_case 7 "split reader death retry tries another reader before writer fallback" \
-	30 death retry retry forward retry_any 0 \
+run_selected_policy_case 4 "split timeout action primary redispatches on the primary" \
+	31 "-" primary replica_then_primary error retry_writer 0
+run_selected_policy_case 5 "split timeout action error keeps transaction on writer and overrides manual reader route" \
+	32 "-" error replica_then_primary error error 1
+run_selected_policy_case 6 "split timeout action disconnect closes the client session" \
+	33 "-" disconnect replica_then_primary error disconnect 0 \
+	"" "PolarDB_Split_Conn_Cleanup_No_Reuse_Requested"
+run_selected_policy_case 7 "split reader connection loss tries another reader before writer fallback" \
+	30 death primary replica_then_primary error retry_any 0 \
 	"PolarDB FAILURE: policy kind=connection_lost action=retry target=other_reader"
 run_selected_policy_case 8 "split reader retry limit falls back to writer after second death" \
-	45 death_twice retry retry forward retry_reader_then_writer 0 \
+	45 death_twice primary replica_then_primary error replica_then_primary 0 \
 	"PolarDB FAILURE: policy kind=connection_lost action=retry target=writer"
-run_selected_policy_case 9 "split reader death uses death-action policy" \
-	34 death retry forward terminate forward 0 \
-	"PolarDB FAILURE: policy kind=connection_lost action=forward target=writer"
+run_selected_policy_case 9 "split reader connection loss returns the reader error when configured" \
+	34 death primary error disconnect error 0 \
+	"PolarDB FAILURE: policy kind=connection_lost action=error target=writer"
 run_selected_policy_case 10 "split reusable SQL error uses error-action policy" \
-	35 sql_error retry retry terminate terminate 0 \
-	"PolarDB FAILURE: policy kind=reusable_error action=terminate target=writer" \
-	"PolarDB_Reader_Pool_Data_Stream_Active_Transaction_Destroy"
+	35 sql_error primary replica_then_primary disconnect disconnect 0 \
+	"PolarDB FAILURE: policy kind=reusable_error action=disconnect target=writer" \
+	"PolarDB_Split_Conn_Cleanup_No_Reuse_Requested"
 run_selected_policy_case 11 "split retry without retry packet forwards clean reader error" \
-	36 no_retry_packet retry retry forward forward 0 \
+	36 no_retry_packet primary replica_then_primary error error 0 \
 	"PolarDB FAILURE: retry declined reason=no_retry_packet"
 run_selected_policy_case 12 "split retry with busy writer forwards clean reader error" \
-	37 writer_busy retry retry forward forward 0 \
+	37 writer_busy primary replica_then_primary error error 0 \
 	"PolarDB FAILURE: retry declined reason=writer_busy debug=1"
 run_selected_policy_case 13 "split retry after user rows started forwards instead of redispatching" \
-	38 result_started retry retry forward forward 0 \
+	38 result_started primary replica_then_primary error error 0 \
 	"PolarDB FAILURE: forwarding reader error after retry declined (action=retry target=writer writer_state=live result_started=1)"
 run_selected_policy_case 14 "split retry with writer not started forwards and keeps writer hostgroup" \
-	39 writer_not_started retry retry forward forward 0 \
+	39 writer_not_started primary replica_then_primary error error 0 \
 	"PolarDB FAILURE: writer_state=not_started"
 run_selected_policy_case 15 "split writer-state loss terminates before policy action" \
-	40 writer_lost retry retry forward terminate 0 \
+	40 writer_lost primary replica_then_primary error disconnect 0 \
 	"PolarDB FAILURE: terminating because writer transaction state is lost"
 run_selected_session_lsn_timeout_policy_case 16 \
-	"session LSN strict timeout policy retry redispatches on writer" \
-	41 retry
+	"session LSN timeout action primary redispatches on the primary" \
+	41 primary
 run_selected_session_lsn_timeout_policy_case 17 \
-	"session LSN strict timeout policy forward returns clean error" \
-	42 forward
+	"session LSN timeout action error returns a clean error" \
+	42 error
 run_selected_session_lsn_timeout_policy_case 18 \
-	"session LSN strict timeout policy terminate closes the client session" \
-	43 terminate
-run_selected_session_lsn_best_effort_skips_failure_policy 19
+	"session LSN timeout action disconnect closes the client session" \
+	43 disconnect
+run_selected_session_lsn_warning_skips_failure_policy 19
 if policy_case_selected 20; then
 	run_injected_post_send_offline_case
 fi
 if policy_case_selected 21; then
 	run_offline_hard_active_reader_case
 fi
+if policy_case_selected 22; then
+	POLICY_READ_FALLBACK_ACTION=error run_policy_case \
+		"replica target retries one peer and then returns an error" \
+		46 death_twice error replica_then_error error \
+		replica_then_error 0 \
+		"PolarDB FAILURE: policy kind=connection_lost action=error"
+fi
+if policy_case_selected 23; then
+	run_replica_fallback_error_prepare_decline_case
+fi
+run_selected_policy_case 24 \
+	"split retry rejects a writer from a changed writer epoch" \
+	48 writer_epoch_changed primary replica_then_primary error disconnect 0 \
+	"PolarDB FAILURE: writer scope changed before split retry"
+run_selected_policy_case 25 \
+	"split retry rejects a replacement reader after its writer epoch changes" \
+	49 death primary replica_then_primary error error 0 \
+	"PolarDB FAILURE: reader retry declined reason=reader_scope_changed" \
+	"PolarDB_Reader_Pool_Return_To_Core" \
+	writer_changed_after_reader_acquire
 
-set_polar_proxy_wait_timeout_ms 5000 >/dev/null 2>&1 || true
 diag "reader-failure policy TAP completed: failed=$FAIL"
 exit "$FAIL"

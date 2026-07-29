@@ -92,14 +92,17 @@ insert_reader_servers() {
 
 start_proxy() {
     rm -f "$PROXYSQL_START_LOG"
-    PROXYSQL_DEBUG="${PROXYSQL_DEBUG:-1}" \
+    if PROXYSQL_DEBUG="${PROXYSQL_DEBUG:-1}" \
         PROXYSQL_PGSQL_THREADS="${PROXYSQL_PGSQL_THREADS:-1}" \
         PROXYSQL_BINARY="$PROXYSQL_BINARY" "$PROXYSQL_WRAPPER" restart \
         --data-dir "$PROXYSQL_DATA_DIR" \
         --admin-port "$PROXYSQL_ADMIN_PORT" \
         --proxy-port "$PROXYSQL_PORT" \
-        --mysql-admin-port "$PROXYSQL_MYSQL_ADMIN_PORT" >"$PROXYSQL_START_LOG" 2>&1
-    STARTED_PROXY=1
+        --mysql-admin-port "$PROXYSQL_MYSQL_ADMIN_PORT" >"$PROXYSQL_START_LOG" 2>&1; then
+        STARTED_PROXY=1
+        return 0
+    fi
+    return 1
 }
 
 stop_proxy() {
@@ -119,19 +122,19 @@ configure_proxy() {
     insert_reader_servers "$READER_HG"
 
     admin_sql "DELETE FROM pgsql_replication_hostgroups;" >/dev/null
-    admin_sql "INSERT INTO pgsql_replication_hostgroups (writer_hostgroup, reader_hostgroup, check_type, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment) VALUES ($WRITER_HG, $READER_HG, 'polardb', 'lsn', -1, 5000, 'v15', 'rfq_lsn_lifecycle_tap');" >/dev/null
+    admin_sql "INSERT INTO pgsql_replication_hostgroups (writer_hostgroup, reader_hostgroup, check_type, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment) VALUES ($WRITER_HG, $READER_HG, 'polardb', 'session_lsn', -1, 5000, 'v15', 'rfq_lsn_lifecycle_tap');" >/dev/null
 
     admin_sql "DELETE FROM pgsql_users;" >/dev/null
     admin_sql "INSERT INTO pgsql_users (username, password, active, default_hostgroup) VALUES ('$PGUSER', '$PGPASSWORD', 1, $WRITER_HG);" >/dev/null
 
     set_select_rule_auto "rfq_lsn_lifecycle_select"
 
-    admin_sql "UPDATE global_variables SET variable_value='lsn' WHERE variable_name='pgsql-polardb_consistency_mode';" >/dev/null
+    admin_sql "UPDATE global_variables SET variable_value='session_lsn' WHERE variable_name='pgsql-polardb_consistency_mode';" >/dev/null
     admin_sql "UPDATE global_variables SET variable_value='v15' WHERE variable_name='pgsql-polardb_proxy_protocol';" >/dev/null
-    admin_sql "UPDATE global_variables SET variable_value='strict' WHERE variable_name='pgsql-polardb_route_rfq_policy';" >/dev/null
+    admin_sql "UPDATE global_variables SET variable_value='primary' WHERE variable_name='pgsql-polardb_action_missing_lsn';" >/dev/null
     admin_sql "UPDATE global_variables SET variable_value='1' WHERE variable_name='pgsql-polardb_monitor_lsn_updates';" >/dev/null
-    admin_sql "UPDATE global_variables SET variable_value='0' WHERE variable_name IN ('pgsql-polardb_lag_ms','pgsql-polardb_lag_bytes');" >/dev/null
-    admin_sql "UPDATE global_variables SET variable_value='5000' WHERE variable_name='pgsql-polardb_lsn_freshness_ms';" >/dev/null
+    admin_sql "UPDATE global_variables SET variable_value='0' WHERE variable_name IN ('pgsql-polardb_max_reader_lag_ms','pgsql-polardb_max_reader_lsn_gap_bytes');" >/dev/null
+    admin_sql "UPDATE global_variables SET variable_value='5000' WHERE variable_name='pgsql-polardb_reader_lsn_max_age_ms';" >/dev/null
 
     admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
     admin_sql "LOAD PGSQL USERS TO RUNTIME;" >/dev/null
@@ -237,7 +240,11 @@ if tap_trace_checks_enabled "$trace_file"; then
         ok 1 "debug trace records RFQ probe for backend-dispatched setup/read statements"
     fi
 else
-    skip_ok "debug trace records RFQ probe for backend-dispatched setup/read statements" "ProxySQL debug trace unavailable"
+    if tap_debug_traces_required; then
+        ok 1 "debug trace records RFQ probe for backend-dispatched setup/read statements"
+    else
+        skip_ok "debug trace records RFQ probe for backend-dispatched setup/read statements" "ProxySQL debug trace unavailable"
+    fi
 fi
 
 diag "deltas: write_missing=$write_missing_delta read_missing=$read_missing_delta rfq_updates=$rfq_update_delta writer_queries=$writer_query_delta reader_queries=$reader_query_delta"

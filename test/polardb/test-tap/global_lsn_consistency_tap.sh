@@ -2,10 +2,10 @@
 # TAP integration test for PolarDB GLOBAL_LSN consistency.
 #
 # GLOBAL_LSN is stricter than session LSN:
-#   - every automatic read uses max(session target, writer mirror LSN);
-#   - a missing writer mirror fails closed to the writer;
-#   - best_effort timeout/degraded reader paths must not create a stale read;
-#   - transaction-split waits fold in the global writer mirror target;
+#   - every automatic read uses max(session target, group LSN);
+#   - a missing group LSN routes the read to the writer;
+#   - warning is rejected because GLOBAL_LSN must not return stale data;
+#   - transaction-split waits fold in the global group LSN target;
 #   - non-READ COMMITTED transactions remain on the writer.
 
 set -uo pipefail
@@ -31,7 +31,7 @@ READER_HG="$POLARDB_READER_HG"
 MISSING_WRITER_HG="$POLARDB_GLOBAL_LSN_MISSING_WRITER_HG"
 MISSING_READER_HG="$POLARDB_GLOBAL_LSN_MISSING_READER_HG"
 
-PLAN=16
+PLAN=17
 FAIL=0
 STARTED_PROXY=0
 PRIMARY_SERVER_PORT="${PRIMARY_SERVER_PORT:-}"
@@ -44,12 +44,12 @@ GLOBAL_LSN_TAP_GROUPS="${GLOBAL_LSN_TAP_GROUPS:-}"
 GLOBAL_LSN_TAP_CASES="${GLOBAL_LSN_TAP_CASES:-}"
 
 # case_id | group | tag | plan_count | function
-# 1       | global-core    | parallel          | 1 | case_global_variable_alias
-# 2       | global-core    | parallel          | 1 | case_hostgroup_alias
+# 1       | global-core    | parallel          | 1 | case_global_variable_name
+# 2       | global-core    | parallel          | 1 | case_global_hostgroup_name
 # 3       | global-core    | parallel          | 1 | case_session_set_global_lsn
 # 4       | global-core    | parallel          | 1 | case_cross_session_global_read
-# 5       | global-core    | parallel          | 1 | case_missing_writer_mirror_fails_closed
-# 6       | global-timeout | backend_exclusive | 1 | case_global_lsn_best_effort_timeout_is_strict
+# 5       | global-core    | parallel          | 1 | case_missing_group_lsn_fails_closed
+# 6       | global-timeout | backend_exclusive | 1 | case_global_lsn_rejects_stale_timeout_action
 # 7       | global-split   | parallel          | 1 | case_global_lsn_transaction_split_uses_replica
 # 8       | global-split   | parallel          | 1 | case_global_lsn_begin_warmup_requests_reader
 # 9       | global-split   | parallel          | 2 | case_non_read_committed_transaction_stays_primary
@@ -111,7 +111,7 @@ global_lsn_case_selected() {
 
 global_lsn_case_plan() {
 	case "$1" in
-	9) printf '%s\n' 2 ;;
+	9) printf '%s\n' 3 ;;
 	*) printf '%s\n' 1 ;;
 	esac
 }
@@ -306,13 +306,16 @@ detect_backend_ports() {
 
 start_proxy() {
 	rm -f "$PROXYSQL_START_LOG"
-	PROXYSQL_PGSQL_THREADS="${PROXYSQL_PGSQL_THREADS:-1}" \
+	if PROXYSQL_PGSQL_THREADS="${PROXYSQL_PGSQL_THREADS:-1}" \
 		PROXYSQL_BINARY="$PROXYSQL_BINARY" "$PROXYSQL_WRAPPER" restart \
 		--data-dir "$PROXYSQL_DATA_DIR" \
 		--admin-port "$PROXYSQL_ADMIN_PORT" \
 		--proxy-port "$PROXYSQL_PORT" \
-		--mysql-admin-port "$PROXYSQL_MYSQL_ADMIN_PORT" >"$PROXYSQL_START_LOG" 2>&1
-	STARTED_PROXY=1
+		--mysql-admin-port "$PROXYSQL_MYSQL_ADMIN_PORT" >"$PROXYSQL_START_LOG" 2>&1; then
+		STARTED_PROXY=1
+		return 0
+	fi
+	return 1
 }
 
 stop_proxy() {
@@ -328,16 +331,15 @@ cleanup() {
 		wait_for_replica_replay_catchup 20 >/dev/null 2>&1 || true
 	fi
 	if [ "$STARTED_PROXY" -eq 1 ]; then
-		admin_sql "UPDATE global_variables SET variable_value='1' WHERE variable_name='pgsql-polardb_monitor_lsn_updates';" >/dev/null 2>&1 || true
-		admin_sql "UPDATE global_variables SET variable_value='v15' WHERE variable_name='pgsql-polardb_proxy_protocol';" >/dev/null 2>&1 || true
-		admin_sql "UPDATE global_variables SET variable_value='strict' WHERE variable_name='pgsql-polardb_route_rfq_policy';" >/dev/null 2>&1 || true
-		admin_sql "UPDATE global_variables SET variable_value='best_effort' WHERE variable_name='pgsql-polardb_wait_timeout_mode';" >/dev/null 2>&1 || true
+		admin_sql "UPDATE global_variables SET variable_value='session_error' WHERE variable_name='pgsql-polardb_profile';" >/dev/null 2>&1 || true
 		admin_sql "UPDATE pgsql_users SET default_hostgroup=$WRITER_HG WHERE username='$PGUSER';" >/dev/null 2>&1 || true
+		admin_sql "UPDATE pgsql_replication_hostgroups SET consistency_mode='session_lsn' WHERE writer_hostgroup=$WRITER_HG;" >/dev/null 2>&1 || true
 		admin_sql "DELETE FROM pgsql_replication_hostgroups WHERE writer_hostgroup IN ($MISSING_WRITER_HG) OR reader_hostgroup IN ($MISSING_READER_HG);" >/dev/null 2>&1 || true
 		admin_sql "DELETE FROM pgsql_servers WHERE hostgroup_id IN ($MISSING_WRITER_HG,$MISSING_READER_HG);" >/dev/null 2>&1 || true
-		admin_sql "LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null 2>&1 || true
 		admin_sql "LOAD PGSQL USERS TO RUNTIME;" >/dev/null 2>&1 || true
 		admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null 2>&1 || true
+		admin_sql "UPDATE global_variables SET variable_value='warning' WHERE variable_name='pgsql-polardb_action_lsn_timeout';" >/dev/null 2>&1 || true
+		admin_sql "LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null 2>&1 || true
 	fi
 	if [ -n "${PRIMARY_HOST:-}" ] && [ -n "${PRIMARY_PORT:-}" ]; then
 		direct_sql "$PRIMARY_HOST" "$PRIMARY_PORT" "DROP TABLE IF EXISTS $TEST_TABLE;" >/dev/null 2>&1 || true
@@ -368,15 +370,11 @@ set_global_lsn_policy() {
 	set_default_hostgroup "$WRITER_HG"
 	set_select_rule_auto "global_lsn_auto_select"
 	admin_sql "UPDATE pgsql_replication_hostgroups SET consistency_mode='global_lsn', max_lag_bytes=-1, lsn_wait_timeout_ms=5000, proxy_protocol='v15' WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
-	admin_sql "UPDATE global_variables SET variable_value='global_lsn' WHERE variable_name='pgsql-polardb_consistency_mode';" >/dev/null
-	admin_sql "UPDATE global_variables SET variable_value='best_effort' WHERE variable_name='pgsql-polardb_wait_timeout_mode';" >/dev/null
-	admin_sql "UPDATE global_variables SET variable_value='best_effort' WHERE variable_name='pgsql-polardb_route_rfq_policy';" >/dev/null
-	admin_sql "UPDATE global_variables SET variable_value='1' WHERE variable_name='pgsql-polardb_monitor_lsn_updates';" >/dev/null
-	admin_sql "UPDATE global_variables SET variable_value='v15' WHERE variable_name='pgsql-polardb_proxy_protocol';" >/dev/null
-	admin_sql "UPDATE global_variables SET variable_value='0' WHERE variable_name IN ('pgsql-polardb_lag_ms','pgsql-polardb_lag_bytes');" >/dev/null
-	admin_sql "UPDATE global_variables SET variable_value='5000' WHERE variable_name='pgsql-polardb_lsn_freshness_ms';" >/dev/null
-	admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
+	admin_sql "UPDATE global_variables SET variable_value='global_fallback' WHERE variable_name='pgsql-polardb_profile';" >/dev/null
+	admin_sql "UPDATE global_variables SET variable_value='0' WHERE variable_name IN ('pgsql-polardb_max_reader_lag_ms','pgsql-polardb_max_reader_lsn_gap_bytes');" >/dev/null
+	admin_sql "UPDATE global_variables SET variable_value='5000' WHERE variable_name='pgsql-polardb_reader_lsn_max_age_ms';" >/dev/null
 	admin_sql "LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null
+	admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
 }
 
 configure_proxy() {
@@ -391,7 +389,6 @@ configure_proxy() {
 	admin_sql "INSERT INTO pgsql_users (username, password, active, default_hostgroup) VALUES ('$PGUSER', '$PGPASSWORD', 1, $WRITER_HG);" >/dev/null
 
 	set_select_rule_auto "global_lsn_auto_select"
-	admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
 	admin_sql "LOAD PGSQL USERS TO RUNTIME;" >/dev/null
 	set_global_lsn_policy
 }
@@ -410,8 +407,8 @@ snapshot_global_counters() {
 	printf -v "${prefix}_bypass" '%s' "$value"
 	value=$(counter PolarDB_RFQ_Best_Effort_Degraded_Routes)
 	printf -v "${prefix}_degraded" '%s' "$value"
-	value=$(counter PolarDB_Primary_LSN_Unknown)
-	printf -v "${prefix}_primary_unknown" '%s' "$value"
+	value=$(counter PolarDB_Group_LSN_Unknown)
+	printf -v "${prefix}_group_unknown" '%s' "$value"
 }
 
 snapshot_split_counters() {
@@ -502,10 +499,12 @@ global_lsn_transaction_read_script() {
 	local row_id="$2"
 	local marker="$3"
 	local session_sql="${4:-}"
+	local transaction_sql="${5:-}"
 	local i
 
 	[ -n "$session_sql" ] && printf '%s\n' "$session_sql"
 	printf '%s\n' "$begin_sql"
+	[ -n "$transaction_sql" ] && printf '%s\n' "$transaction_sql"
 	printf "INSERT INTO %s VALUES (%s, '%s') ON CONFLICT (id) DO UPDATE SET data='%s';\n" "$TEST_TABLE" "$row_id" "$marker" "$marker"
 	printf '\\! sleep 1\n'
 	for i in 1 2 3 4 5 6; do
@@ -515,33 +514,31 @@ global_lsn_transaction_read_script() {
 	printf 'COMMIT;\n'
 }
 
-case_global_variable_alias() {
+case_global_variable_name() {
 	local runtime_value
 
-	admin_sql "UPDATE global_variables SET variable_value='global' WHERE variable_name='pgsql-polardb_consistency_mode';" >/dev/null
+	admin_sql "UPDATE global_variables SET variable_value='global_lsn' WHERE variable_name='pgsql-polardb_consistency_mode';" >/dev/null
 	admin_sql "LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null
 	runtime_value=$(runtime_var "pgsql-polardb_consistency_mode")
-	set_global_lsn_policy
-	if [ "$runtime_value" = "global" ]; then
-		ok 0 "global variable accepts GLOBAL_LSN alias"
+	if [ "$runtime_value" = "global_lsn" ]; then
+		ok 0 "global variable uses the canonical global_lsn value"
 	else
-		diag "runtime pgsql-polardb_consistency_mode='$runtime_value' expected=global"
-		ok 1 "global variable accepts GLOBAL_LSN alias"
+		diag "runtime pgsql-polardb_consistency_mode='$runtime_value' expected=global_lsn"
+		ok 1 "global variable uses the canonical global_lsn value"
 	fi
 }
 
-case_hostgroup_alias() {
+case_global_hostgroup_name() {
 	local runtime_mode
 
-	admin_sql "UPDATE pgsql_replication_hostgroups SET consistency_mode='lsn_global' WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
+	admin_sql "UPDATE pgsql_replication_hostgroups SET consistency_mode='global_lsn' WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
 	admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
 	runtime_mode=$(admin_sql "SELECT consistency_mode FROM runtime_pgsql_replication_hostgroups WHERE writer_hostgroup=$WRITER_HG;" 2>/dev/null | tr -d '[:space:]')
-	set_global_lsn_policy
-	if [ "$runtime_mode" = "lsn_global" ]; then
-		ok 0 "replication hostgroup accepts GLOBAL_LSN alias"
+	if [ "$runtime_mode" = "global_lsn" ]; then
+		ok 0 "replication hostgroup uses the canonical global_lsn value"
 	else
-		diag "runtime consistency_mode='$runtime_mode' expected=lsn_global"
-		ok 1 "replication hostgroup accepts GLOBAL_LSN alias"
+		diag "runtime consistency_mode='$runtime_mode' expected=global_lsn"
+		ok 1 "replication hostgroup uses the canonical global_lsn value"
 	fi
 }
 
@@ -599,28 +596,26 @@ SQL
 	fi
 }
 
-configure_missing_writer_mirror_pair() {
+configure_missing_group_lsn_pair() {
+	admin_sql "UPDATE global_variables SET variable_value='global_fallback' WHERE variable_name='pgsql-polardb_profile';" >/dev/null
 	admin_sql "UPDATE global_variables SET variable_value='0' WHERE variable_name='pgsql-polardb_monitor_lsn_updates';" >/dev/null
 	admin_sql "UPDATE global_variables SET variable_value='off' WHERE variable_name='pgsql-polardb_proxy_protocol';" >/dev/null
-	admin_sql "UPDATE global_variables SET variable_value='global_lsn' WHERE variable_name='pgsql-polardb_consistency_mode';" >/dev/null
-	admin_sql "UPDATE global_variables SET variable_value='best_effort' WHERE variable_name='pgsql-polardb_route_rfq_policy';" >/dev/null
-	admin_sql "UPDATE global_variables SET variable_value='best_effort' WHERE variable_name='pgsql-polardb_wait_timeout_mode';" >/dev/null
 	admin_sql "LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null
 
 	admin_sql "DELETE FROM pgsql_servers WHERE hostgroup_id IN ($MISSING_WRITER_HG,$MISSING_READER_HG);" >/dev/null
 	admin_sql "INSERT INTO pgsql_servers (hostgroup_id, hostname, port, status, weight, max_connections) VALUES ($MISSING_WRITER_HG, '$PRIMARY_HOST', $PRIMARY_PORT, 'ONLINE', 1000, 100);" >/dev/null
 	insert_reader_servers "$MISSING_READER_HG" 100
 	admin_sql "DELETE FROM pgsql_replication_hostgroups WHERE writer_hostgroup=$MISSING_WRITER_HG;" >/dev/null
-	admin_sql "INSERT INTO pgsql_replication_hostgroups (writer_hostgroup, reader_hostgroup, check_type, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment) VALUES ($MISSING_WRITER_HG, $MISSING_READER_HG, 'polardb', 'global_lsn', -1, 5000, 'off', 'global_lsn_missing_mirror_pair');" >/dev/null
+	admin_sql "INSERT INTO pgsql_replication_hostgroups (writer_hostgroup, reader_hostgroup, check_type, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment) VALUES ($MISSING_WRITER_HG, $MISSING_READER_HG, 'polardb', 'global_lsn', -1, 5000, 'off', 'global_lsn_missing_group_lsn_pair');" >/dev/null
 	admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
 	set_default_hostgroup "$MISSING_WRITER_HG"
-	set_select_rule_auto "global_lsn_missing_mirror_auto_select"
+	set_select_rule_auto "global_lsn_missing_group_lsn_auto_select"
 }
 
-case_missing_writer_mirror_fails_closed() {
-	local out endpoint global_count protect_count degraded_count primary_unknown_count
+case_missing_group_lsn_fails_closed() {
+	local out endpoint global_count protect_count degraded_count group_unknown_count
 
-	configure_missing_writer_mirror_pair
+	configure_missing_group_lsn_pair
 	snapshot_global_counters missing_before
 	out=$(
 		proxy_script 2>&1 <<SQL
@@ -632,36 +627,41 @@ SQL
 	global_count=$(global_delta missing_before missing_after global)
 	protect_count=$(global_protect_delta missing_before missing_after)
 	degraded_count=$(global_delta missing_before missing_after degraded)
-	primary_unknown_count=$(global_delta missing_before missing_after primary_unknown)
+	group_unknown_count=$(global_delta missing_before missing_after group_unknown)
 	set_global_lsn_policy
 
 	if [ "$endpoint" = "$PRIMARY_SERVER_ENDPOINT" ] &&
 		[ "$global_count" -eq 0 ] &&
 		[ "$protect_count" -eq 0 ] &&
 		[ "$degraded_count" -eq 0 ] &&
-		[ "$primary_unknown_count" -ge 1 ]; then
-		ok 0 "GLOBAL_LSN missing writer mirror fails closed without best-effort degradation"
+		[ "$group_unknown_count" -ge 1 ]; then
+		ok 0 "GLOBAL_LSN missing group LSN routes to the writer without best-effort degradation"
 	else
-		diag "missing mirror output: $out"
-		diag "endpoint=$endpoint expected_writer=$PRIMARY_SERVER_ENDPOINT global_delta=$global_count protect_delta=$protect_count degraded_delta=$degraded_count primary_unknown_delta=$primary_unknown_count"
-		ok 1 "GLOBAL_LSN missing writer mirror fails closed without best-effort degradation"
+		diag "missing group LSN output: $out"
+		diag "endpoint=$endpoint expected_writer=$PRIMARY_SERVER_ENDPOINT global_delta=$global_count protect_delta=$protect_count degraded_delta=$degraded_count group_unknown_delta=$group_unknown_count"
+		ok 1 "GLOBAL_LSN missing group LSN routes to the writer without best-effort degradation"
 	fi
 }
 
-case_global_lsn_best_effort_timeout_is_strict() {
+case_global_lsn_rejects_stale_timeout_action() {
 	local marker out rc timeout_before timeout_after lsn_timeout_before lsn_timeout_after
 	local retry_before retry_after degraded_before degraded_after global_count wait_count
 	local timeout_delta lsn_timeout_delta retry_delta degraded_delta warning_count
+	local runtime_action stored_action
 
 	set_global_lsn_policy
 	admin_sql "UPDATE pgsql_replication_hostgroups SET lsn_wait_timeout_ms=100 WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
-	admin_sql "UPDATE global_variables SET variable_value='best_effort' WHERE variable_name='pgsql-polardb_wait_timeout_mode';" >/dev/null
 	admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
+	admin_sql "UPDATE global_variables SET variable_value='warning' WHERE variable_name='pgsql-polardb_action_lsn_timeout';" >/dev/null
 	admin_sql "LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null
+	# The invalid candidate stays in MEMORY so an operator can correct it;
+	# the rejected LOAD must leave the previous safe RUNTIME value unchanged.
+	runtime_action=$(runtime_var pgsql-polardb_action_lsn_timeout)
+	stored_action=$(global_var pgsql-polardb_action_lsn_timeout)
 
 	if ! set_replay_lag_bytes "${POLARDB_GLOBAL_LSN_TIMEOUT_REPLAY_LAG_BYTES:-50000}"; then
 		set_global_lsn_policy
-		skip_ok "GLOBAL_LSN best_effort timeout is forced strict under replay lag" "cannot set polar_replay_min_lag_size through managed DCS"
+		skip_ok "GLOBAL_LSN rejects warning and uses the writer on timeout" "cannot set polar_replay_min_lag_size through managed DCS"
 		return
 	fi
 
@@ -708,12 +708,14 @@ SQL
 		[ "$global_count" -ge 1 ] &&
 		[ "$wait_count" -ge 1 ] &&
 		[ "$degraded_delta" -eq 0 ] &&
-		[ "$warning_count" -eq 0 ]; then
-		ok 0 "GLOBAL_LSN best_effort timeout is forced strict under replay lag"
+		[ "$warning_count" -eq 0 ] &&
+			[ "$runtime_action" = "primary" ] &&
+		[ "$stored_action" = "warning" ]; then
+		ok 0 "GLOBAL_LSN rejects warning and uses the writer on timeout"
 	else
 		diag "global strict-timeout output: $out"
-		diag "rc=$rc timeout_delta=$timeout_delta lsn_timeout_delta=$lsn_timeout_delta retry_delta=$retry_delta degraded_delta=$degraded_delta global_delta=$global_count wait_delta=$wait_count warning_count=$warning_count"
-		ok 1 "GLOBAL_LSN best_effort timeout is forced strict under replay lag"
+		diag "rc=$rc timeout_delta=$timeout_delta lsn_timeout_delta=$lsn_timeout_delta retry_delta=$retry_delta degraded_delta=$degraded_delta global_delta=$global_count wait_delta=$wait_count warning_count=$warning_count runtime_action=$runtime_action stored_action=$stored_action"
+		ok 1 "GLOBAL_LSN rejects warning and uses the writer on timeout"
 	fi
 }
 
@@ -728,7 +730,7 @@ case_global_lsn_transaction_split_uses_replica() {
 	snapshot_split_counters split_before
 	# A transaction write can initially report WAL pending. The small external
 	# WAL pulse lets the backend clear that marker before the later SELECTs assert
-	# split routing; without it this test can validate only fail-closed behavior.
+	# split routing; without it this test can validate only writer routing.
 	tap_start_wal_pulse "$PRIMARY_HOST" "$PRIMARY_PORT" "$TEST_TABLE" 200
 	sleep 0.3
 	out=$(
@@ -849,8 +851,8 @@ case_non_read_committed_transaction_stays_primary() {
 
 	rc_marker="global_rc_split_$$"
 	snapshot_split_counters rc_split_before
-	# Session defaults use SET SESSION CHARACTERISTICS. SET TRANSACTION applies
-	# only to the current transaction; SET SESSION TRANSACTION is not valid SQL.
+	# Session defaults use SET SESSION CHARACTERISTICS. SET TRANSACTION and
+	# SET SESSION TRANSACTION both apply only to the current transaction.
 	tap_start_wal_pulse "$PRIMARY_HOST" "$PRIMARY_PORT" "$TEST_TABLE" 200
 	out=$(
 		global_lsn_transaction_read_script \
@@ -926,6 +928,37 @@ case_non_read_committed_transaction_stays_primary() {
 		diag "split_success_delta=$success_count split_total_delta=$split_total blocked_delta=$(split_delta rr_split_before rr_split_after blocked)"
 		ok 1 "GLOBAL_LSN keeps non-READ COMMITTED transaction reads on writer"
 	fi
+
+	rr_marker="global_session_rr_$$"
+	snapshot_split_counters rr_split_before
+	out=$(
+		global_lsn_transaction_read_script \
+			"BEGIN;" \
+			7 \
+			"$rr_marker" \
+			"" \
+			"SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;" |
+			proxy_script 2>&1
+	)
+	rc=$?
+	snapshot_split_counters rr_split_after
+	result=$(last_endpoint_payload_from_output "$out")
+	endpoint=$(payload_endpoint "$result")
+	value=$(payload_value "$result")
+	success_count=$(split_delta rr_split_before rr_split_after success)
+	split_total=$(split_delta rr_split_before rr_split_after total)
+	if [ "$rc" -eq 0 ] &&
+		[ "$endpoint" = "$PRIMARY_SERVER_ENDPOINT" ] &&
+		[ "$value" = "$rr_marker" ] &&
+		[ "$success_count" -eq 0 ] &&
+		[ "$split_total" -eq 0 ]; then
+		ok 0 "GLOBAL_LSN accepts SET SESSION TRANSACTION as transaction-scoped"
+	else
+		diag "SET SESSION TRANSACTION output: $out"
+		diag "result=$result endpoint=$endpoint value=$value expected_writer=$PRIMARY_SERVER_ENDPOINT"
+		diag "split_success_delta=$success_count split_total_delta=$split_total"
+		ok 1 "GLOBAL_LSN accepts SET SESSION TRANSACTION as transaction-scoped"
+	fi
 }
 
 PLAN="$(global_lsn_selected_plan)"
@@ -958,7 +991,7 @@ if backend_setting_is "$PRIMARY_HOST" "$PRIMARY_PORT" polar_enable_xact_split on
 	BACKEND_TXN_SPLIT_ENABLED=1
 	diag "backend transaction splitting: enabled"
 else
-	diag "backend transaction splitting: disabled; validating fail-closed writer routing"
+	diag "backend transaction splitting: disabled; validating writer routing"
 fi
 
 ok 0 "built POLARDB_PROXY=1 ProxySQL binary exists"
@@ -986,12 +1019,12 @@ else
 	exit 1
 fi
 
-run_selected_global_lsn_case 1 case_global_variable_alias
-run_selected_global_lsn_case 2 case_hostgroup_alias
+run_selected_global_lsn_case 1 case_global_variable_name
+run_selected_global_lsn_case 2 case_global_hostgroup_name
 run_selected_global_lsn_case 3 case_session_set_global_lsn
 run_selected_global_lsn_case 4 case_cross_session_global_read
-run_selected_global_lsn_case 5 case_missing_writer_mirror_fails_closed
-run_selected_global_lsn_case 6 case_global_lsn_best_effort_timeout_is_strict
+run_selected_global_lsn_case 5 case_missing_group_lsn_fails_closed
+run_selected_global_lsn_case 6 case_global_lsn_rejects_stale_timeout_action
 run_selected_global_lsn_case 7 case_global_lsn_transaction_split_uses_replica
 run_selected_global_lsn_case 8 case_global_lsn_begin_warmup_requests_reader
 run_selected_global_lsn_case 9 case_non_read_committed_transaction_stays_primary

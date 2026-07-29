@@ -8,8 +8,8 @@
 #   - same-session read -> read monotonic target protection
 #   - same-session read-only -> write -> protected read transition
 #   - background writes coexist with protected read-only session reads
-#   - same-session off -> lsn -> off mode transition
-#   - mode=off and mode=primary
+#   - same-session off -> session_lsn -> off mode transition
+#   - consistency off and primary read target
 #   - manual hostgroup routes bypass the PolarDB planner
 #   - explicit transaction routing to primary
 #   - transaction-split pre-write routing stays safe before split evidence exists
@@ -26,7 +26,13 @@
 # Requires the writer and reader endpoints configured in `.env` and a built
 # POLARDB_PROXY=1 ProxySQL binary.
 #
-# Strict/best-effort timeout edge checks intentionally alter managed replay lag.
+# ProxySQL configuration changes in this test always use separate MEMORY
+# UPDATE and LOAD ... TO RUNTIME admin requests. The shared layer contract,
+# including the reverse meaning of SAVE ... FROM RUNTIME, is documented in
+# lib/tap_polardb.sh.
+#
+# Primary-fallback and warning timeout edge checks intentionally alter managed
+# replay lag.
 # Enable them explicitly with POLARDB_TIMEOUT_EDGE_TESTS=1.
 
 set -uo pipefail
@@ -46,6 +52,8 @@ POLARDB_DEBUG_READER_ACQUIRE_FAULT_FILE="${POLARDB_DEBUG_READER_ACQUIRE_FAULT_FI
 POLARDB_DEBUG_MONITOR_HEALTH_FILE="${POLARDB_DEBUG_MONITOR_HEALTH_FILE:-${PROXYSQL_DATA_DIR}.monitor_health_fault}"
 POLARDB_DEBUG_STARTUP_IDENTITY_FILE="${POLARDB_DEBUG_STARTUP_IDENTITY_FILE:-${PROXYSQL_DATA_DIR}.startup_identity_fault}"
 POLARDB_DEBUG_WRAP_SET_ERROR_FILE="${POLARDB_DEBUG_WRAP_SET_ERROR_FILE:-${PROXYSQL_DATA_DIR}.wrap_set_error_fault}"
+POLARDB_DEBUG_POST_SEND_OFFLINE_FILE="${POLARDB_DEBUG_POST_SEND_OFFLINE_FILE:-${PROXYSQL_DATA_DIR}.post_send_offline_fault}"
+export POLARDB_DEBUG_POST_SEND_OFFLINE_FILE
 PRIMARY_SERVER_PORT="${PRIMARY_SERVER_PORT:-}"
 REPLICA_SERVER_PORT="${REPLICA_SERVER_PORT:-}"
 REPLICA_SERVER_ENDPOINTS="${REPLICA_SERVER_ENDPOINTS:-}"
@@ -63,7 +71,7 @@ export POLARDB_DEBUG_FAIL_WRAP_FINALIZE_ONCE="${POLARDB_DEBUG_FAIL_WRAP_FINALIZE
 WRITER_HG="$POLARDB_WRITER_HG"
 READER_HG="$POLARDB_READER_HG"
 
-PLAN=67
+PLAN=90
 FAIL=0
 STARTED_PROXY=0
 TIMEOUT_EDGE_LAG_SET=0
@@ -100,13 +108,33 @@ pool_value() {
     printf '%s\n' "${v:-0}"
 }
 
-set_route_rfq_policy() {
-    set_global_var_runtime "pgsql-polardb_route_rfq_policy" "$1"
+reader_servers_with_free_connections() {
+    admin_sql "SELECT COUNT(*) FROM stats_pgsql_connection_pool WHERE hostgroup=$READER_HG AND status='ONLINE' AND ConnFree>0;" \
+        2>/dev/null | tr -d '[:space:]'
 }
 
-set_wait_mode() {
-    local mode="$1"
-    set_global_var_runtime "pgsql-polardb_wait_timeout_mode" "$mode"
+# A post-send failure retry may use an already-pooled peer, but must not create a
+# new backend while handling the failure. Prepare that exact test condition
+# through ordinary reads before injecting the failure.
+prepare_pooled_reader_peers() {
+    local attempt
+
+    clear_debug_fault_file \
+        POLARDB_DEBUG_POST_SEND_OFFLINE_FILE >/dev/null 2>&1 || true
+    for attempt in $(seq 1 20); do
+        proxy_sql "SELECT polar_node_type();" >/dev/null 2>&1 || return 1
+        [ "$(reader_servers_with_free_connections)" -ge 2 ] && return 0
+    done
+    return 1
+}
+
+set_missing_lsn_action() {
+    set_global_var_runtime "pgsql-polardb_action_missing_lsn" "$1"
+}
+
+set_lsn_wait_timeout_action() {
+    local action="$1"
+    set_global_var_runtime "pgsql-polardb_action_lsn_timeout" "$action"
 }
 
 polardb_dcs_set() {
@@ -185,7 +213,7 @@ set_hg_pair_policy() {
     local writer_hg="$1"
     local reader_hg="$2"
     local proxy_protocol="$3"
-    local mode="${4:-lsn}"
+    local mode="${4:-session_lsn}"
     local max_lag_bytes="${5:--1}"
     local timeout_ms="${6:-5000}"
     local max_connections="${7:-100}"
@@ -202,7 +230,7 @@ set_hg_pair_policy_one_reader() {
     local writer_hg="$1"
     local reader_hg="$2"
     local proxy_protocol="$3"
-    local mode="${4:-lsn}"
+    local mode="${4:-session_lsn}"
     local max_lag_bytes="${5:--1}"
     local timeout_ms="${6:-5000}"
     local max_connections="${7:-100}"
@@ -236,6 +264,10 @@ remove_extra_hg_pairs() {
 
 debug_reader_acquire_faults_available() {
     debug_fault_file_available POLARDB_DEBUG_READER_ACQUIRE_FAULT_FILE "$PROXYSQL_DATA_DIR/proxysql_strings"
+}
+
+debug_reset_timeout_fault_available() {
+    debug_fault_available reset_timeout "$PROXYSQL_DATA_DIR/proxysql_strings"
 }
 
 set_debug_reader_acquire_fault() {
@@ -289,11 +321,63 @@ lsn_trace_delta() {
     local after
 
     if ! tap_trace_checks_enabled "$(lsn_trace_log)"; then
-        echo -1
+        tap_trace_unavailable_delta
         return 0
     fi
     after=$(lsn_trace_count "$pattern")
     echo $((after - before))
+}
+
+QUERY_EVENT_BUFFER_OLD=""
+QUERY_EVENT_DEFAULT_OLD=""
+
+enable_query_event_buffer() {
+    QUERY_EVENT_BUFFER_OLD=$(
+        global_var pgsql-eventslog_buffer_history_size
+    ) || return 1
+    QUERY_EVENT_DEFAULT_OLD=$(
+        global_var pgsql-eventslog_default_log
+    ) || return 1
+    admin_sql "UPDATE global_variables
+        SET variable_value=CASE variable_name
+            WHEN 'pgsql-eventslog_buffer_history_size' THEN '1048576'
+            WHEN 'pgsql-eventslog_default_log' THEN '1'
+        END
+        WHERE variable_name IN (
+            'pgsql-eventslog_buffer_history_size',
+            'pgsql-eventslog_default_log'
+        );" >/dev/null || return 1
+    admin_sql "LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null || return 1
+    admin_sql "DELETE FROM stats_pgsql_query_events;" >/dev/null || return 1
+}
+
+disable_query_event_buffer() {
+    [ -n "$QUERY_EVENT_BUFFER_OLD" ] || return 0
+    admin_sql "UPDATE global_variables
+        SET variable_value=CASE variable_name
+            WHEN 'pgsql-eventslog_buffer_history_size'
+                THEN '$QUERY_EVENT_BUFFER_OLD'
+            WHEN 'pgsql-eventslog_default_log'
+                THEN '$QUERY_EVENT_DEFAULT_OLD'
+        END
+        WHERE variable_name IN (
+            'pgsql-eventslog_buffer_history_size',
+            'pgsql-eventslog_default_log'
+        );" >/dev/null || return 1
+    admin_sql "LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null || return 1
+    QUERY_EVENT_BUFFER_OLD=""
+    QUERY_EVENT_DEFAULT_OLD=""
+}
+
+logged_query_for_marker() {
+    local marker="$1"
+    admin_sql "DUMP PGSQL EVENTSLOG FROM BUFFER TO MEMORY;" >/dev/null ||
+        return 1
+    admin_sql "SELECT query
+        FROM stats_pgsql_query_events
+        WHERE query LIKE '%$marker%'
+        ORDER BY id DESC
+        LIMIT 1;" 2>/dev/null
 }
 
 runtime_server_status() {
@@ -301,6 +385,48 @@ runtime_server_status() {
     local host="$2"
     local port="$3"
     admin_sql "SELECT status FROM runtime_pgsql_servers WHERE hostgroup_id=$hg AND hostname='$host' AND port=$port LIMIT 1;" 2>/dev/null | tr -d '[:space:]'
+}
+
+runtime_online_server_count() {
+    local hg="$1"
+    admin_sql "SELECT COUNT(*) FROM runtime_pgsql_servers WHERE hostgroup_id=$hg AND status='ONLINE';" \
+        2>/dev/null | tr -d '[:space:]'
+}
+
+_runtime_online_server_count_is() {
+    [ "$(runtime_online_server_count "$1")" -eq "$2" ]
+}
+
+# The post-send DEBUG hook changes the live server object directly; it does not
+# change the pgsql_servers memory table. Reconcile that deliberate divergence
+# with an explicit OFFLINE_HARD -> ONLINE runtime transition. SAVE is wrong
+# here: runtime is the injected state, while pgsql_servers is the desired state.
+restore_runtime_readers() {
+    local expected
+
+    expected=$(admin_sql "SELECT COUNT(*) FROM pgsql_servers WHERE hostgroup_id=$READER_HG;" \
+        2>/dev/null | tr -d '[:space:]')
+    [ "${expected:-0}" -gt 0 ] || return 1
+
+    admin_sql "UPDATE pgsql_servers SET status='OFFLINE_HARD' WHERE hostgroup_id=$READER_HG;" >/dev/null || return 1
+    admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null || return 1
+    admin_sql "UPDATE pgsql_servers SET status='ONLINE' WHERE hostgroup_id=$READER_HG;" >/dev/null || return 1
+    admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null || return 1
+    wait_until _runtime_online_server_count_is \
+        "$READER_HG" "$expected" -- 10 0.2
+}
+
+keep_only_test_replica_online() {
+    restore_runtime_readers || return 1
+    admin_sql "UPDATE pgsql_servers
+        SET status=CASE
+            WHEN hostname='$REPLICA_HOST' AND port=$REPLICA_PORT
+                THEN 'ONLINE'
+            ELSE 'OFFLINE_HARD'
+        END
+        WHERE hostgroup_id=$READER_HG;" >/dev/null || return 1
+    admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null || return 1
+    wait_until _runtime_online_server_count_is "$READER_HG" 1 -- 10 0.2
 }
 
 _counter_gt() { [ "$(counter "$1")" -gt "$2" ]; }
@@ -326,10 +452,15 @@ restore_reader_online() {
     admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
 }
 
-set_lsn_mode() {
-    local mode="$1"
-    set_global_var_runtime "pgsql-polardb_consistency_mode" "$mode"
-    set_hg_policy "$mode" -1 5000
+set_read_policy() {
+    local consistency="$1"
+    local target="${2:-replica}"
+    local fallback="${3:-primary}"
+    set_global_var "pgsql-polardb_consistency_mode" "$consistency"
+    set_global_var "pgsql-polardb_read_target" "$target"
+    set_global_var "pgsql-polardb_action_read_fallback" "$fallback"
+    admin_sql "LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null
+    set_hg_policy "$consistency" -1 5000
 }
 
 # set_select_rule_auto / set_select_rule_manual_reader come from
@@ -389,7 +520,7 @@ run_protocol_rfq_lsn_scope() {
     local marker out result query_lsn_delta wait_delta bypass_delta protect_delta
 
     set_global_var_runtime "pgsql-polardb_proxy_protocol" "$protocol"
-    set_hg_pair_policy "$writer_hg" "$reader_hg" default lsn -1 5000
+    set_hg_pair_policy "$writer_hg" "$reader_hg" default session_lsn -1 5000
     set_default_hostgroup "$writer_hg"
 
     snapshot_consistency_counters protocol_before
@@ -422,10 +553,14 @@ run_protocol_off_scope() {
     local reader_hg="$2"
     local row_id="$3"
     local write_missing_before write_missing_after wait_before wait_after
-    local marker out endpoint
+    local marker out endpoint saved_missing_lsn_action
 
-    set_global_var_runtime "pgsql-polardb_proxy_protocol" "off"
-    set_hg_pair_policy "$writer_hg" "$reader_hg" default lsn -1 5000
+    saved_missing_lsn_action=$(global_var "pgsql-polardb_action_missing_lsn")
+    set_global_var_runtime "pgsql-polardb_action_missing_lsn" "primary"
+    # An always-on session_lsn policy with RFQ disabled is rejected at LOAD.
+    # Keep the hostgroup policy valid, then enable session consistency only for
+    # this connection to exercise the runtime missing-RFQ action.
+    set_hg_pair_policy "$writer_hg" "$reader_hg" off eventual -1 5000
     set_default_hostgroup "$writer_hg"
 
     write_missing_before=$(counter PolarDB_Write_Missing_LSN)
@@ -433,6 +568,7 @@ run_protocol_off_scope() {
     marker="protocol_off_$$"
     out=$(
         proxy_script 2>&1 <<SQL
+SET proxysql.polardb_consistency_mode TO 'session_lsn';
 INSERT INTO $TEST_TABLE VALUES ($row_id, '$marker') ON CONFLICT (id) DO UPDATE SET data='$marker';
 SELECT host(inet_server_addr()) || ':' || inet_server_port();
 SQL
@@ -449,6 +585,8 @@ SQL
         diag "endpoint=$endpoint expected_writer=$PRIMARY_SERVER_ENDPOINT write_missing_delta=$((write_missing_after - write_missing_before)) wait_delta=$((wait_after - wait_before))"
         ok 1 "protocol off: missing writer RFQ LSN keeps automatic read on writer"
     fi
+    set_global_var_runtime \
+        "pgsql-polardb_action_missing_lsn" "$saved_missing_lsn_action"
 }
 
 run_protocol_hg_override_scope() {
@@ -460,7 +598,7 @@ run_protocol_hg_override_scope() {
     local marker out result query_lsn_delta wait_delta bypass_delta protect_delta
 
     set_global_var_runtime "pgsql-polardb_proxy_protocol" "$global_protocol"
-    set_hg_pair_policy "$writer_hg" "$reader_hg" "$hg_protocol" lsn -1 5000
+    set_hg_pair_policy "$writer_hg" "$reader_hg" "$hg_protocol" session_lsn -1 5000
     set_default_hostgroup "$writer_hg"
 
     snapshot_consistency_counters protocol_override_before
@@ -592,7 +730,8 @@ start_proxy() {
     rm -f "$POLARDB_DEBUG_MONITOR_HEALTH_FILE"
     rm -f "$POLARDB_DEBUG_STARTUP_IDENTITY_FILE"
     rm -f "$POLARDB_DEBUG_WRAP_SET_ERROR_FILE"
-    POLARDB_DEBUG_FAIL_WRAP_FINALIZE_ONCE="$POLARDB_DEBUG_FAIL_WRAP_FINALIZE_ONCE" \
+    rm -f "$POLARDB_DEBUG_POST_SEND_OFFLINE_FILE"
+    if POLARDB_DEBUG_FAIL_WRAP_FINALIZE_ONCE="$POLARDB_DEBUG_FAIL_WRAP_FINALIZE_ONCE" \
         POLARDB_DEBUG_READER_ACQUIRE_FAULT_FILE="$POLARDB_DEBUG_READER_ACQUIRE_FAULT_FILE" \
         POLARDB_DEBUG_MONITOR_HEALTH_FILE="$POLARDB_DEBUG_MONITOR_HEALTH_FILE" \
         POLARDB_DEBUG_STARTUP_IDENTITY_FILE="$POLARDB_DEBUG_STARTUP_IDENTITY_FILE" \
@@ -602,8 +741,11 @@ start_proxy() {
         --data-dir "$PROXYSQL_DATA_DIR" \
         --admin-port "$PROXYSQL_ADMIN_PORT" \
         --proxy-port "$PROXYSQL_PORT" \
-        --mysql-admin-port "$PROXYSQL_MYSQL_ADMIN_PORT" >"$PROXYSQL_START_LOG" 2>&1
-    STARTED_PROXY=1
+        --mysql-admin-port "$PROXYSQL_MYSQL_ADMIN_PORT" >"$PROXYSQL_START_LOG" 2>&1; then
+        STARTED_PROXY=1
+        return 0
+    fi
+    return 1
 }
 
 stop_proxy() {
@@ -620,16 +762,18 @@ cleanup() {
     rm -f "$POLARDB_DEBUG_MONITOR_HEALTH_FILE"
     rm -f "$POLARDB_DEBUG_STARTUP_IDENTITY_FILE"
     rm -f "$POLARDB_DEBUG_WRAP_SET_ERROR_FILE"
+    rm -f "$POLARDB_DEBUG_POST_SEND_OFFLINE_FILE"
     admin_sql "UPDATE global_variables SET variable_value='1' WHERE variable_name='pgsql-polardb_monitor_lsn_updates';" >/dev/null 2>&1 || true
-    admin_sql "UPDATE global_variables SET variable_value='0' WHERE variable_name IN ('pgsql-polardb_lag_ms','pgsql-polardb_lag_bytes');" >/dev/null 2>&1 || true
-    admin_sql "UPDATE global_variables SET variable_value='5000' WHERE variable_name='pgsql-polardb_lsn_freshness_ms';" >/dev/null 2>&1 || true
-    admin_sql "UPDATE global_variables SET variable_value='best_effort' WHERE variable_name='pgsql-polardb_wait_timeout_mode';" >/dev/null 2>&1 || true
-    admin_sql "UPDATE global_variables SET variable_value='strict' WHERE variable_name='pgsql-polardb_route_rfq_policy';" >/dev/null 2>&1 || true
-    admin_sql "UPDATE global_variables SET variable_value='v15' WHERE variable_name='pgsql-polardb_proxy_protocol';" >/dev/null 2>&1 || true
+    admin_sql "UPDATE global_variables SET variable_value='0' WHERE variable_name IN ('pgsql-polardb_max_reader_lag_ms','pgsql-polardb_max_reader_lsn_gap_bytes');" >/dev/null 2>&1 || true
+    admin_sql "UPDATE global_variables SET variable_value='5000' WHERE variable_name='pgsql-polardb_reader_lsn_max_age_ms';" >/dev/null 2>&1 || true
+    admin_sql "UPDATE global_variables SET variable_value='session_warning' WHERE variable_name='pgsql-polardb_profile';" >/dev/null 2>&1 || true
     admin_sql "UPDATE global_variables SET variable_value='' WHERE variable_name='pgsql-polardb_proxy_identity_host';" >/dev/null 2>&1 || true
     admin_sql "UPDATE global_variables SET variable_value='0' WHERE variable_name='pgsql-polardb_proxy_identity_port';" >/dev/null 2>&1 || true
     admin_sql "LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null 2>&1 || true
-    admin_sql "UPDATE pgsql_users SET default_hostgroup=$WRITER_HG WHERE username='$PGUSER'; LOAD PGSQL USERS TO RUNTIME;" >/dev/null 2>&1 || true
+    admin_sql "UPDATE pgsql_servers SET status='ONLINE' WHERE hostgroup_id IN ($WRITER_HG,$READER_HG);" >/dev/null 2>&1 || true
+    admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null 2>&1 || true
+    admin_sql "UPDATE pgsql_users SET default_hostgroup=$WRITER_HG WHERE username='$PGUSER';" >/dev/null 2>&1 || true
+    admin_sql "LOAD PGSQL USERS TO RUNTIME;" >/dev/null 2>&1 || true
     remove_extra_hg_pairs >/dev/null 2>&1 || true
     direct_sql "$PRIMARY_HOST" "$PRIMARY_PORT" "DROP TABLE IF EXISTS $TEST_TABLE;" >/dev/null 2>&1 || true
     stop_proxy
@@ -642,19 +786,17 @@ configure_proxy() {
     insert_reader_servers "$READER_HG" 100
 
     admin_sql "DELETE FROM pgsql_replication_hostgroups;" >/dev/null
-    admin_sql "INSERT INTO pgsql_replication_hostgroups (writer_hostgroup, reader_hostgroup, check_type, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, comment) VALUES ($WRITER_HG, $READER_HG, 'polardb', 'lsn', -1, 5000, 'lsn_session_consistency_tap');" >/dev/null
+    admin_sql "INSERT INTO pgsql_replication_hostgroups (writer_hostgroup, reader_hostgroup, check_type, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, comment) VALUES ($WRITER_HG, $READER_HG, 'polardb', 'session_lsn', -1, 5000, 'lsn_session_consistency_tap');" >/dev/null
 
     admin_sql "DELETE FROM pgsql_users;" >/dev/null
     admin_sql "INSERT INTO pgsql_users (username, password, active, default_hostgroup) VALUES ('$PGUSER', '$PGPASSWORD', 1, $WRITER_HG);" >/dev/null
 
     set_select_rule_auto
 
-    admin_sql "UPDATE global_variables SET variable_value='lsn' WHERE variable_name='pgsql-polardb_consistency_mode';" >/dev/null
-    admin_sql "UPDATE global_variables SET variable_value='best_effort' WHERE variable_name='pgsql-polardb_wait_timeout_mode';" >/dev/null
-    admin_sql "UPDATE global_variables SET variable_value='1' WHERE variable_name='pgsql-polardb_monitor_lsn_updates';" >/dev/null
-    admin_sql "UPDATE global_variables SET variable_value='0' WHERE variable_name IN ('pgsql-polardb_lag_ms','pgsql-polardb_lag_bytes');" >/dev/null
-    admin_sql "UPDATE global_variables SET variable_value='1000' WHERE variable_name='pgsql-polardb_lag_wait_ms';" >/dev/null
-    admin_sql "UPDATE global_variables SET variable_value='5000' WHERE variable_name='pgsql-polardb_lsn_freshness_ms';" >/dev/null
+    admin_sql "UPDATE global_variables SET variable_value='session_warning' WHERE variable_name='pgsql-polardb_profile';" >/dev/null
+    admin_sql "UPDATE global_variables SET variable_value='0' WHERE variable_name IN ('pgsql-polardb_max_reader_lag_ms','pgsql-polardb_max_reader_lsn_gap_bytes');" >/dev/null
+    admin_sql "UPDATE global_variables SET variable_value='1000' WHERE variable_name='pgsql-polardb_lsn_wait_timeout_ms';" >/dev/null
+    admin_sql "UPDATE global_variables SET variable_value='5000' WHERE variable_name='pgsql-polardb_reader_lsn_max_age_ms';" >/dev/null
 
     admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
     admin_sql "LOAD PGSQL USERS TO RUNTIME;" >/dev/null
@@ -696,7 +838,7 @@ case_cf4_replica_eligible_roundtrip() {
 # CF-7: when the LSN wait wrapper cannot be finalized safely, the proxy must
 # return an internal error before any backend dispatch (debug fault).
 case_cf7_wrapper_finalize_fail() {
-    set_lsn_mode lsn
+    set_read_policy session_lsn
     cf7_abort_before=$(counter PolarDB_Wait_Wrap_Safety_Abort)
     cf7_sent_before=$(counter PolarDB_Wait_LSN_Sent)
     cf7_trace_pattern="PolarDB WRAP: finalize failed: debug fault injection"
@@ -750,7 +892,7 @@ SQL
     query_lsn_delta=$(snapshot_counter_delta ryw_before ryw_after query_lsn)
     marker_count=$(printf '%s\n' "$ryw_out" | grep -c "^$marker$" || true)
     if [ "$marker_count" -eq 1 ] &&
-        [ "$prepared_delta" -ge 1 ] &&
+        [ $((prepared_delta + bypass_delta)) -ge 1 ] &&
         [ "$protect_delta" -ge 1 ] &&
         [ "$query_lsn_delta" -ge 1 ]; then
         ok 0 "RYW: write advances LSN and following read is protected on reader"
@@ -778,10 +920,10 @@ case_wrapper_filter() {
 # must move the target-specific selection counters.
 case_route_wait_spec_reader_selection() {
     set_select_rule_auto
-    set_lsn_mode lsn
+    set_read_policy session_lsn
     set_global_var_runtime "pgsql-polardb_proxy_protocol" "v15"
-    set_global_var_runtime "pgsql-polardb_route_rfq_policy" "strict"
-    set_hg_policy lsn -1 5000
+    set_global_var_runtime "pgsql-polardb_action_missing_lsn" "primary"
+    set_hg_policy session_lsn -1 5000
 
     snapshot_consistency_counters route_wait_before
     route_no_wait_before=$(counter PolarDB_Route_No_Wait_Target)
@@ -845,7 +987,7 @@ case_no_write_read() {
 # selected reader that already reached that target.
 case_read_then_read_monotonic() {
     set_select_rule_auto
-    set_lsn_mode lsn
+    set_read_policy session_lsn
     snapshot_consistency_counters read_read_before
     read_read_out=$(proxy_command_sequence \
         "SELECT host(inet_server_addr()) || ':' || inet_server_port();" \
@@ -876,7 +1018,7 @@ case_read_then_read_monotonic() {
 # that write.
 case_read_then_write_then_read() {
     set_select_rule_auto
-    set_lsn_mode lsn
+    set_read_policy session_lsn
     snapshot_consistency_counters transition_before
     transition_marker="read_then_write_$$"
     transition_out=$(proxy_command_sequence \
@@ -910,7 +1052,7 @@ case_read_then_write_then_read() {
 # a wait or by a replica already caught up.
 case_background_writes_read_only_session() {
     set_select_rule_auto
-    set_lsn_mode lsn
+    set_read_policy session_lsn
     snapshot_consistency_counters background_before
     bg_marker="background_read_only_$$"
     (
@@ -952,9 +1094,60 @@ case_background_writes_read_only_session() {
     fi
 }
 
+# A named eventual profile plus inherited hostgroup settings must remain
+# eventual for the whole client session. In particular, the first RFQ has no
+# LSN payload by design and must not poison later reads into the missing-LSN
+# fallback path.
+case_eventual_profile_repeated_reads() {
+    local out endpoints endpoint endpoint_count=0 all_readers=1
+    local reader_before reader_after writer_before writer_after
+    local missing_before missing_after
+
+    set_select_rule_auto
+    admin_sql "UPDATE pgsql_replication_hostgroups SET consistency_mode='default', txn_split_enabled=0, proxy_protocol='default' WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
+    admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
+    set_global_var_runtime "pgsql-polardb_profile" "eventual"
+
+    reader_before=$(counter PolarDB_Route_To_Reader)
+    writer_before=$(counter PolarDB_Route_To_Writer)
+    missing_before=$(counter PolarDB_Read_Missing_LSN)
+    out=$(proxy_command_sequence \
+        "SELECT host(inet_server_addr()) || ':' || inet_server_port();" \
+        "SELECT host(inet_server_addr()) || ':' || inet_server_port();" \
+        "SELECT host(inet_server_addr()) || ':' || inet_server_port();" 2>&1)
+    reader_after=$(counter PolarDB_Route_To_Reader)
+    writer_after=$(counter PolarDB_Route_To_Writer)
+    missing_after=$(counter PolarDB_Read_Missing_LSN)
+    endpoints=$(endpoint_list_from_output "$out")
+
+    for endpoint in $endpoints; do
+        endpoint_count=$((endpoint_count + 1))
+        if ! reader_endpoint_matches "$endpoint"; then
+            all_readers=0
+        fi
+    done
+
+    if [ "$endpoint_count" -eq 3 ] &&
+        [ "$all_readers" -eq 1 ] &&
+        [ $((reader_after - reader_before)) -ge 3 ] &&
+        [ $((writer_after - writer_before)) -eq 0 ] &&
+        [ $((missing_after - missing_before)) -eq 0 ]; then
+        ok 0 "eventual profile: repeated reads in one session remain on replicas"
+    else
+        diag "eventual repeated-read output: $out"
+        diag "endpoints='$endpoints' count=$endpoint_count all_readers=$all_readers"
+        diag "reader_delta=$((reader_after - reader_before)) writer_delta=$((writer_after - writer_before)) missing_lsn_delta=$((missing_after - missing_before))"
+        ok 1 "eventual profile: repeated reads in one session remain on replicas"
+    fi
+
+    set_global_var_runtime "pgsql-polardb_profile" "session_warning"
+    admin_sql "UPDATE pgsql_replication_hostgroups SET consistency_mode='session_lsn', txn_split_enabled=0, proxy_protocol='default' WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
+    admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
+}
+
 # mode=off: PolarDB performs no reroute and no wait override.
 case_mode_off() {
-    set_lsn_mode off
+    set_read_policy off
     wait_before=$(counter PolarDB_Wait_LSN_Sent)
     endpoint=$(backend_endpoint)
     wait_after=$(counter PolarDB_Wait_LSN_Sent)
@@ -966,48 +1159,517 @@ case_mode_off() {
     fi
 }
 
-# mode=primary: an automatically eligible read is forced to the primary with
-# no wait.
-case_mode_primary() {
-    set_lsn_mode primary
+# The named off profile is stronger than consistency_mode=off. Session and
+# hostgroup overrides stay stored, but cannot re-enable PolarDB routing, RFQ
+# startup parameters, waits, split handling, or result tracking.
+case_profile_off_kill_switch() {
+    local lookup_before planner_before route_before wait_before
+    local lookup_delta planner_delta route_delta wait_delta
+    local conn_trace result_trace conn_before result_before
+    local off_out off_endpoint
+
+    set_select_rule_auto
+    set_read_policy session_lsn
+    admin_sql "UPDATE pgsql_replication_hostgroups SET consistency_mode='session_lsn', txn_split_enabled=1, proxy_protocol='v15' WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
+    admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
+    set_global_var_runtime "pgsql-polardb_profile" "off"
+
+    # Remove pooled writer connections so the next request proves the startup
+    # settings selected under profile=off, not merely the route decision.
+    admin_sql "UPDATE pgsql_servers SET status='OFFLINE_HARD' WHERE hostgroup_id=$WRITER_HG;" >/dev/null
+    admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
+    admin_sql "UPDATE pgsql_servers SET status='ONLINE' WHERE hostgroup_id=$WRITER_HG;" >/dev/null
+    admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
+
+    lookup_before=$(counter PolarDB_Reader_Pool_Lookup)
+    planner_before=$(counter PolarDB_Route_Planner_Total)
+    route_before=$(counter PolarDB_Route_To_Reader)
+    wait_before=$(counter PolarDB_Wait_LSN_Sent)
+    conn_trace="PolarDB CONNINFO: hg=$WRITER_HG is_polardb=1 protocol=off request_bits=0x0"
+    result_trace="PolarDB PROCESS_RESULT: skip (request profile=off)"
+    conn_before=$(lsn_trace_count "$conn_trace")
+    result_before=$(lsn_trace_count "$result_trace")
+
+    off_out=$(proxy_command_sequence \
+        "SET proxysql.polardb_consistency_mode TO 'session_lsn';" \
+        "SELECT host(inet_server_addr()) || ':' || inet_server_port();" 2>&1)
+    off_endpoint=$(last_endpoint_from_output "$off_out")
+    lookup_delta=$(($(counter PolarDB_Reader_Pool_Lookup) - lookup_before))
+    planner_delta=$(($(counter PolarDB_Route_Planner_Total) - planner_before))
+    route_delta=$(($(counter PolarDB_Route_To_Reader) - route_before))
+    wait_delta=$(($(counter PolarDB_Wait_LSN_Sent) - wait_before))
+
+    if [ "$off_endpoint" = "$PRIMARY_SERVER_ENDPOINT" ] &&
+        [ "$lookup_delta" -eq 0 ] &&
+        [ "$planner_delta" -eq 0 ] &&
+        [ "$route_delta" -eq 0 ] &&
+        [ "$wait_delta" -eq 0 ]; then
+        ok 0 "profile=off: session and hostgroup overrides cannot re-enable PolarDB routing"
+    else
+        diag "profile-off output: $off_out"
+        diag "endpoint=$off_endpoint expected_writer=$PRIMARY_SERVER_ENDPOINT lookup_delta=$lookup_delta planner_delta=$planner_delta route_delta=$route_delta wait_delta=$wait_delta"
+        ok 1 "profile=off: session and hostgroup overrides cannot re-enable PolarDB routing"
+    fi
+
+    if ! tap_trace_checks_enabled "$(lsn_trace_log)"; then
+        if tap_debug_traces_required; then
+            ok 1 "profile=off: hostgroup RFQ override cannot re-enable startup or result tracking"
+        else
+            skip_ok "profile=off: hostgroup RFQ override cannot re-enable startup or result tracking" "requires POLARDB_DEBUG traces"
+        fi
+    elif [ "$(lsn_trace_delta "$conn_trace" "$conn_before")" -ge 1 ] &&
+        [ "$(lsn_trace_delta "$result_trace" "$result_before")" -ge 1 ]; then
+        ok 0 "profile=off: hostgroup RFQ override cannot re-enable startup or result tracking"
+    else
+        diag "missing profile-off trace: conn='$conn_trace' result='$result_trace'"
+        ok 1 "profile=off: hostgroup RFQ override cannot re-enable startup or result tracking"
+    fi
+
+    admin_sql "UPDATE pgsql_replication_hostgroups SET consistency_mode='session_lsn', txn_split_enabled=0, proxy_protocol='default' WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
+    admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
+    set_global_var_runtime "pgsql-polardb_profile" "session_warning"
+}
+
+# A primary read target keeps an eligible read on the primary with no wait.
+case_primary_target() {
+    set_read_policy session_lsn primary
     wait_before=$(counter PolarDB_Wait_LSN_Sent)
     endpoint=$(backend_endpoint)
     wait_after=$(counter PolarDB_Wait_LSN_Sent)
     if [ "$endpoint" = "$PRIMARY_SERVER_ENDPOINT" ] && [ "$wait_after" -eq "$wait_before" ]; then
-        ok 0 "automatic route: replica_eligible=1 plus mode=primary forces writer without wait"
+        ok 0 "automatic route: primary target keeps an eligible read on the primary"
     else
         diag "endpoint=$endpoint expected_writer=$PRIMARY_SERVER_ENDPOINT wait_delta=$((wait_after - wait_before))"
-        ok 1 "automatic route: replica_eligible=1 plus mode=primary forces writer without wait"
+        ok 1 "automatic route: primary target keeps an eligible read on the primary"
     fi
 }
 
+# A replica target with error fallback never silently uses the primary.
+case_replica_fallback_error() {
+    local execute_trace="PolarDB EXECUTE: PASSTHROUGH target_hg=$READER_HG"
+    local execute_before execute_delta
+
+    set_read_policy eventual replica primary
+    set_global_var_runtime "pgsql-polardb_action_missing_lsn" "error"
+    set_global_var_runtime "pgsql-polardb_action_lsn_timeout" "error"
+    set_global_var_runtime "pgsql-polardb_action_replica_loss" "replica_then_error"
+    set_global_var_runtime "pgsql-polardb_action_replica_error" "error"
+    set_read_policy eventual replica error
+
+    execute_before=$(lsn_trace_count "$execute_trace")
+    required_reader=$(backend_endpoint)
+    execute_delta=$(lsn_trace_delta "$execute_trace" "$execute_before")
+    if reader_endpoint_matches "$required_reader"; then
+        ok 0 "replica target with error fallback uses an eligible reader"
+    else
+        diag "endpoint=$required_reader expected_reader=$(reader_expectation)"
+        ok 1 "replica target with error fallback uses an eligible reader"
+    fi
+    if [ "$execute_delta" -ge 1 ]; then
+        ok 0 "replica target executes before backend acquisition"
+    elif [ "$execute_delta" -eq -1 ]; then
+        skip_ok "replica target executes before backend acquisition" "requires POLARDB_DEBUG traces"
+    else
+        diag "trace_delta=$execute_delta pattern='$execute_trace'"
+        ok 1 "replica target executes before backend acquisition"
+    fi
+
+    writer_queries_before=$(pool_value "$WRITER_HG" Queries)
+    admin_sql "UPDATE pgsql_servers SET status='OFFLINE_HARD' WHERE hostgroup_id=$READER_HG;" >/dev/null
+    admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
+    if [ "$(runtime_online_server_count "$READER_HG")" -eq 0 ]; then
+        execute_before=$(lsn_trace_count "$execute_trace")
+        required_error_out=$(proxy_sql "SELECT 1;" 2>&1)
+        required_error_rc=$?
+        execute_delta=$(lsn_trace_delta "$execute_trace" "$execute_before")
+    else
+        required_error_out="reader MEMORY change was not applied to RUNTIME"
+        required_error_rc=0
+        execute_delta=0
+    fi
+    writer_queries_after=$(pool_value "$WRITER_HG" Queries)
+    admin_sql "UPDATE pgsql_servers SET status='ONLINE' WHERE hostgroup_id=$READER_HG;" >/dev/null
+    admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
+    if [ "$required_error_rc" -ne 0 ] &&
+        printf '%s\n' "$required_error_out" | grep -Fq "PolarDB read routing requires a usable replica" &&
+        [ $((writer_queries_after - writer_queries_before)) -eq 0 ]; then
+        ok 0 "error fallback rejects the primary when readers are unavailable"
+    else
+        diag "replica-required output: $required_error_out"
+        diag "rc=$required_error_rc writer_query_delta=$((writer_queries_after - writer_queries_before))"
+        ok 1 "error fallback rejects the primary when readers are unavailable"
+    fi
+    if [ "$execute_delta" -ge 1 ]; then
+        ok 0 "error fallback remains active when no reader is usable"
+    elif [ "$execute_delta" -eq -1 ]; then
+        skip_ok "error fallback remains active when no reader is usable" "requires POLARDB_DEBUG traces"
+    else
+        diag "trace_delta=$execute_delta pattern='$execute_trace'"
+        ok 1 "error fallback remains active when no reader is usable"
+    fi
+
+    set_read_policy eventual replica primary
+    set_global_var_runtime "pgsql-polardb_action_missing_lsn" "primary"
+    set_global_var_runtime "pgsql-polardb_action_lsn_timeout" "warning"
+    set_global_var_runtime "pgsql-polardb_action_replica_loss" "replica_then_primary"
+    set_global_var_runtime "pgsql-polardb_profile" "session_warning"
+}
+
+# Ordinary replica reads use the same failure policy as wrapped and split reads.
+# The expression fails only on a replica, so primary fallback can be observed
+# without changing the database or relying on trace text.
+case_ordinary_replica_error_actions() {
+    local sql="SELECT 1 / CASE WHEN polar_node_type() = 'primary' THEN 1 ELSE 0 END;"
+    local out rc reader_before reader_after writer_before writer_after
+    local term_before term_after proxy_alive
+
+    set_select_rule_auto
+    set_read_policy eventual replica primary
+
+    set_global_var_runtime "pgsql-polardb_action_replica_error" "error"
+    reader_before=$(pool_value "$READER_HG" Queries)
+    writer_before=$(pool_value "$WRITER_HG" Queries)
+    out=$(proxy_sql "$sql" 2>&1)
+    rc=$?
+    reader_after=$(pool_value "$READER_HG" Queries)
+    writer_after=$(pool_value "$WRITER_HG" Queries)
+    if [ "$rc" -ne 0 ] &&
+        printf '%s\n' "$out" | grep -qi "division by zero" &&
+        [ $((reader_after - reader_before)) -ge 1 ] &&
+        [ $((writer_after - writer_before)) -eq 0 ]; then
+        ok 0 "ordinary replica SQL error: error returns the replica error"
+    else
+        diag "output=$out rc=$rc reader_delta=$((reader_after - reader_before)) writer_delta=$((writer_after - writer_before))"
+        ok 1 "ordinary replica SQL error: error returns the replica error"
+    fi
+
+    set_global_var_runtime "pgsql-polardb_action_replica_error" "primary"
+    reader_before=$(pool_value "$READER_HG" Queries)
+    writer_before=$(pool_value "$WRITER_HG" Queries)
+    out=$(proxy_sql "$sql" 2>&1)
+    rc=$?
+    reader_after=$(pool_value "$READER_HG" Queries)
+    writer_after=$(pool_value "$WRITER_HG" Queries)
+    if [ "$rc" -eq 0 ] &&
+        [ "$(printf '%s\n' "$out" | tr -d '[:space:]')" = "1" ] &&
+        [ $((reader_after - reader_before)) -ge 1 ] &&
+        [ $((writer_after - writer_before)) -ge 1 ]; then
+        ok 0 "ordinary replica SQL error: primary retries the query on the primary"
+    else
+        diag "output=$out rc=$rc reader_delta=$((reader_after - reader_before)) writer_delta=$((writer_after - writer_before))"
+        ok 1 "ordinary replica SQL error: primary retries the query on the primary"
+    fi
+
+    set_global_var_runtime "pgsql-polardb_action_replica_error" "disconnect"
+    term_before=$(counter PolarDB_Reader_Terminations)
+    out=$(proxy_sql "$sql" 2>&1)
+    rc=$?
+    term_after=$(counter PolarDB_Reader_Terminations)
+    proxy_alive=0
+    admin_sql "SELECT 1;" >/dev/null 2>&1 && proxy_alive=1
+    if [ "$rc" -ne 0 ] && [ "$proxy_alive" -eq 1 ] &&
+        [ $((term_after - term_before)) -ge 1 ]; then
+        ok 0 "ordinary replica SQL error: disconnect closes only the client"
+    else
+        diag "output=$out rc=$rc proxy_alive=$proxy_alive termination_delta=$((term_after - term_before))"
+        ok 1 "ordinary replica SQL error: disconnect closes only the client"
+    fi
+
+    set_global_var_runtime "pgsql-polardb_profile" "session_warning"
+}
+
+# A DEBUG build can mark the selected replica offline immediately after send.
+# This creates a deterministic connection-loss event without stopping or
+# reconfiguring the PolarDB cluster.
+case_ordinary_replica_loss_actions() {
+    local label out rc writer_before writer_after online_readers proxy_alive
+    local logged_query
+    local log_marker="ordinary_reader_loss_$$"
+    local sql="SELECT /* $log_marker */ polar_node_type();"
+
+    if ! debug_fault_file_ready \
+            POLARDB_DEBUG_POST_SEND_OFFLINE_FILE \
+            "$PROXYSQL_DATA_DIR/proxysql_strings"; then
+        for label in \
+            "ordinary replica loss: primary retries on the primary" \
+            "ordinary replica loss: error does not use the primary" \
+            "ordinary replica loss: replica_then_error retries one peer" \
+            "ordinary replica loss: replica_then_error safely returns error without a peer"; do
+            skip_ok "$label" "requires POLARDB_DEBUG post-send fault support"
+        done
+        return
+    fi
+
+    set_select_rule_auto
+    set_read_policy eventual replica primary
+
+    if ! enable_query_event_buffer; then
+        ok 1 "ordinary replica loss: replica_then_error safely returns error without a peer"
+        diag "could not enable the in-memory PostgreSQL query event buffer"
+    elif ! keep_only_test_replica_online; then
+        ok 1 "ordinary replica loss: replica_then_error safely returns error without a peer"
+        diag "could not isolate one runtime replica"
+    else
+        set_global_var_runtime \
+            "pgsql-polardb_action_replica_loss" "replica_then_error"
+        writer_before=$(pool_value "$WRITER_HG" Queries)
+        printf '%s\n' offline_no_error >"$POLARDB_DEBUG_POST_SEND_OFFLINE_FILE"
+        out=$(proxy_sql "$sql" 2>&1)
+        rc=$?
+        writer_after=$(pool_value "$WRITER_HG" Queries)
+        proxy_alive=0
+        admin_sql "SELECT 1;" >/dev/null 2>&1 && proxy_alive=1
+        logged_query=$(logged_query_for_marker "$log_marker")
+        restore_runtime_readers ||
+            diag "failed to restore runtime readers after no-peer action"
+        if [ "$rc" -ne 0 ] &&
+            [ "$proxy_alive" -eq 1 ] &&
+            [ "$logged_query" = "$sql" ] &&
+            [ $((writer_after - writer_before)) -eq 0 ]; then
+            ok 0 "ordinary replica loss: replica_then_error safely returns error without a peer"
+        else
+            diag "output=$out rc=$rc proxy_alive=$proxy_alive writer_delta=$((writer_after - writer_before)) logged_query='$logged_query'"
+            ok 1 "ordinary replica loss: replica_then_error safely returns error without a peer"
+        fi
+    fi
+    disable_query_event_buffer ||
+        diag "failed to restore PostgreSQL query event settings"
+
+    set_global_var_runtime "pgsql-polardb_action_replica_loss" "primary"
+    printf '%s\n' offline_no_error >"$POLARDB_DEBUG_POST_SEND_OFFLINE_FILE"
+    out=$(proxy_sql "$sql" 2>&1)
+    rc=$?
+    restore_runtime_readers || diag "failed to restore runtime readers after primary action"
+    if [ "$rc" -eq 0 ] &&
+        [ "$(printf '%s\n' "$out" | tr -d '[:space:]')" = "primary" ]; then
+        ok 0 "ordinary replica loss: primary retries on the primary"
+    else
+        diag "output=$out rc=$rc"
+        ok 1 "ordinary replica loss: primary retries on the primary"
+    fi
+
+    set_global_var_runtime "pgsql-polardb_action_replica_loss" "error"
+    writer_before=$(pool_value "$WRITER_HG" Queries)
+    printf '%s\n' offline_no_error >"$POLARDB_DEBUG_POST_SEND_OFFLINE_FILE"
+    out=$(proxy_sql "$sql" 2>&1)
+    rc=$?
+    writer_after=$(pool_value "$WRITER_HG" Queries)
+    restore_runtime_readers || diag "failed to restore runtime readers after error action"
+    if [ "$rc" -ne 0 ] &&
+        [ $((writer_after - writer_before)) -eq 0 ]; then
+        ok 0 "ordinary replica loss: error does not use the primary"
+    else
+        diag "output=$out rc=$rc writer_delta=$((writer_after - writer_before))"
+        ok 1 "ordinary replica loss: error does not use the primary"
+    fi
+
+    online_readers=$(runtime_online_server_count "$READER_HG")
+    if [ "${online_readers:-0}" -lt 2 ]; then
+        skip_ok "ordinary replica loss: replica_then_error retries one peer" \
+            "requires two online replicas"
+    elif ! prepare_pooled_reader_peers; then
+        ok 1 "ordinary replica loss: replica_then_error retries one peer"
+        diag "could not prepare an exact pooled connection on both online replicas"
+    else
+        set_global_var_runtime \
+            "pgsql-polardb_action_replica_loss" "replica_then_error"
+        writer_before=$(pool_value "$WRITER_HG" Queries)
+        printf '%s\n' offline_no_error >"$POLARDB_DEBUG_POST_SEND_OFFLINE_FILE"
+        out=$(proxy_sql "$sql" 2>&1)
+        rc=$?
+        writer_after=$(pool_value "$WRITER_HG" Queries)
+        restore_runtime_readers || diag "failed to restore runtime readers after peer action"
+        if [ "$rc" -eq 0 ] &&
+            [ "$(printf '%s\n' "$out" | tr -d '[:space:]')" = "replica" ] &&
+            [ $((writer_after - writer_before)) -eq 0 ]; then
+            ok 0 "ordinary replica loss: replica_then_error retries one peer"
+        else
+            diag "output=$out rc=$rc writer_delta=$((writer_after - writer_before))"
+            ok 1 "ordinary replica loss: replica_then_error retries one peer"
+        fi
+    fi
+
+    clear_debug_fault_file \
+        POLARDB_DEBUG_POST_SEND_OFFLINE_FILE >/dev/null 2>&1 || true
+    set_global_var_runtime "pgsql-polardb_profile" "session_warning"
+}
+
+# Extended Parse/Bind/Execute reads use the same captured replica-error policy
+# as simple-query reads. Exercise both the terminal and primary-retry outcomes.
+case_extended_replica_error_actions() {
+    local sql="SELECT 1 / CASE WHEN polar_node_type() = 'primary' THEN 1 ELSE 0 END;"
+    local out rc writer_before writer_after
+
+    if ! ensure_extended_helper; then
+        skip_ok "extended replica SQL error: error returns the replica error" \
+            "cannot build proxysql_extended_protocol_test"
+        skip_ok "extended replica SQL error: primary retries on the primary" \
+            "cannot build proxysql_extended_protocol_test"
+        return
+    fi
+
+    set_select_rule_auto
+    set_read_policy eventual replica primary
+
+    set_global_var_runtime "pgsql-polardb_action_replica_error" "error"
+    writer_before=$(pool_value "$WRITER_HG" Queries)
+    out=$(run_extended_query "$sql" 2>&1)
+    rc=$?
+    writer_after=$(pool_value "$WRITER_HG" Queries)
+    if [ "$rc" -ne 0 ] &&
+        printf '%s\n' "$out" | grep -qi "division by zero" &&
+        [ $((writer_after - writer_before)) -eq 0 ]; then
+        ok 0 "extended replica SQL error: error returns the replica error"
+    else
+        diag "output=$out rc=$rc writer_delta=$((writer_after - writer_before))"
+        ok 1 "extended replica SQL error: error returns the replica error"
+    fi
+
+    set_global_var_runtime "pgsql-polardb_action_replica_error" "primary"
+    out=$(run_extended_query "$sql" 2>&1)
+    rc=$?
+    if [ "$rc" -eq 0 ] &&
+        [ "$(printf '%s\n' "$out" | tr -d '[:space:]')" = "1" ]; then
+        ok 0 "extended replica SQL error: primary retries on the primary"
+    else
+        diag "output=$out rc=$rc"
+        ok 1 "extended replica SQL error: primary retries on the primary"
+    fi
+
+    set_global_var_runtime "pgsql-polardb_profile" "session_warning"
+}
+
+# Inject connection loss after the extended Execute reaches a replica. This
+# proves the retry path preserves the complete extended-protocol request.
+case_extended_replica_loss_actions() {
+    local out rc writer_before writer_after online_readers proxy_alive
+    local logged_query
+    local log_marker="extended_reader_loss_$$"
+    local sql="SELECT /* $log_marker */ polar_node_type();"
+
+    if ! ensure_extended_helper ||
+        ! debug_fault_file_ready \
+            POLARDB_DEBUG_POST_SEND_OFFLINE_FILE \
+            "$PROXYSQL_DATA_DIR/proxysql_strings"; then
+        skip_ok "extended replica loss: replica_then_error safely returns error without a peer" \
+            "requires extended-protocol helper and POLARDB_DEBUG post-send fault support"
+        skip_ok "extended replica loss: primary retries on the primary" \
+            "requires extended-protocol helper and POLARDB_DEBUG post-send fault support"
+        skip_ok "extended replica loss: replica_then_error retries one peer" \
+            "requires extended-protocol helper and POLARDB_DEBUG post-send fault support"
+        return
+    fi
+
+    set_select_rule_auto
+    set_read_policy eventual replica primary
+
+    if ! enable_query_event_buffer; then
+        ok 1 "extended replica loss: replica_then_error safely returns error without a peer"
+        diag "could not enable the in-memory PostgreSQL query event buffer"
+    elif ! keep_only_test_replica_online; then
+        ok 1 "extended replica loss: replica_then_error safely returns error without a peer"
+        diag "could not isolate one runtime replica"
+    else
+        set_global_var_runtime \
+            "pgsql-polardb_action_replica_loss" "replica_then_error"
+        writer_before=$(pool_value "$WRITER_HG" Queries)
+        printf '%s\n' offline_no_error >"$POLARDB_DEBUG_POST_SEND_OFFLINE_FILE"
+        out=$(run_extended_query "$sql" 2>&1)
+        rc=$?
+        writer_after=$(pool_value "$WRITER_HG" Queries)
+        proxy_alive=0
+        admin_sql "SELECT 1;" >/dev/null 2>&1 && proxy_alive=1
+        logged_query=$(logged_query_for_marker "$log_marker")
+        restore_runtime_readers ||
+            diag "failed to restore runtime readers after extended no-peer action"
+        if [ "$rc" -ne 0 ] &&
+            [ "$proxy_alive" -eq 1 ] &&
+            [ "$logged_query" = "$sql" ] &&
+            [ $((writer_after - writer_before)) -eq 0 ]; then
+            ok 0 "extended replica loss: replica_then_error safely returns error without a peer"
+        else
+            diag "output=$out rc=$rc proxy_alive=$proxy_alive writer_delta=$((writer_after - writer_before)) logged_query='$logged_query'"
+            ok 1 "extended replica loss: replica_then_error safely returns error without a peer"
+        fi
+    fi
+    disable_query_event_buffer ||
+        diag "failed to restore PostgreSQL query event settings"
+
+    set_global_var_runtime "pgsql-polardb_action_replica_loss" "primary"
+    printf '%s\n' offline_no_error >"$POLARDB_DEBUG_POST_SEND_OFFLINE_FILE"
+    out=$(run_extended_query "$sql" 2>&1)
+    rc=$?
+    restore_runtime_readers ||
+        diag "failed to restore runtime readers after extended primary action"
+    if [ "$rc" -eq 0 ] &&
+        [ "$(printf '%s\n' "$out" | tr -d '[:space:]')" = "primary" ]; then
+        ok 0 "extended replica loss: primary retries on the primary"
+    else
+        diag "output=$out rc=$rc"
+        ok 1 "extended replica loss: primary retries on the primary"
+    fi
+
+    online_readers=$(runtime_online_server_count "$READER_HG")
+    if [ "${online_readers:-0}" -lt 2 ]; then
+        skip_ok "extended replica loss: replica_then_error retries one peer" \
+            "requires two online replicas"
+    elif ! prepare_pooled_reader_peers; then
+        ok 1 "extended replica loss: replica_then_error retries one peer"
+        diag "could not prepare an exact pooled connection on both online replicas"
+    else
+        set_global_var_runtime \
+            "pgsql-polardb_action_replica_loss" "replica_then_error"
+        writer_before=$(pool_value "$WRITER_HG" Queries)
+        printf '%s\n' offline_no_error >"$POLARDB_DEBUG_POST_SEND_OFFLINE_FILE"
+        out=$(run_extended_query "$sql" 2>&1)
+        rc=$?
+        writer_after=$(pool_value "$WRITER_HG" Queries)
+        restore_runtime_readers ||
+            diag "failed to restore runtime readers after extended peer action"
+        if [ "$rc" -eq 0 ] &&
+            [ "$(printf '%s\n' "$out" | tr -d '[:space:]')" = "replica" ] &&
+            [ $((writer_after - writer_before)) -eq 0 ]; then
+            ok 0 "extended replica loss: replica_then_error retries one peer"
+        else
+            diag "output=$out rc=$rc writer_delta=$((writer_after - writer_before))"
+            ok 1 "extended replica loss: replica_then_error retries one peer"
+        fi
+    fi
+
+    clear_debug_fault_file \
+        POLARDB_DEBUG_POST_SEND_OFFLINE_FILE >/dev/null 2>&1 || true
+    set_global_var_runtime "pgsql-polardb_profile" "session_warning"
+}
+
 # Manual query-rule route: a destination_hostgroup=replica rule bypasses the
-# PolarDB planner (mode=primary) with no wait.
+# PolarDB planner (primary target) with no wait.
 case_manual_rule_route() {
+    set_read_policy session_lsn primary
     set_select_rule_manual_reader
     wait_before=$(counter PolarDB_Wait_LSN_Sent)
     endpoint=$(backend_endpoint)
     wait_after=$(counter PolarDB_Wait_LSN_Sent)
     if reader_endpoint_matches "$endpoint" && [ "$wait_after" -eq "$wait_before" ]; then
-        ok 0 "manual query-rule route: destination_hostgroup reader bypasses mode=primary without wait"
+        ok 0 "manual query-rule route: destination_hostgroup reader bypasses the primary target without wait"
     else
         diag "endpoint=$endpoint expected_reader=$REPLICA_SERVER_ENDPOINT wait_delta=$((wait_after - wait_before))"
-        ok 1 "manual query-rule route: destination_hostgroup reader bypasses mode=primary without wait"
+        ok 1 "manual query-rule route: destination_hostgroup reader bypasses the primary target without wait"
     fi
 }
 
 # Manual SQL hostgroup hint: an inline /* hostgroup=replica */ comment bypasses
-# mode=primary with no wait.
+# the primary target with no wait.
 case_manual_sql_hint() {
+    set_read_policy session_lsn primary
     clear_select_rules
     wait_before=$(counter PolarDB_Wait_LSN_Sent)
     endpoint=$(proxy_sql "/* hostgroup=$READER_HG */ SELECT host(inet_server_addr()) || ':' || inet_server_port();" 2>/dev/null | tr -d '[:space:]')
     wait_after=$(counter PolarDB_Wait_LSN_Sent)
     if reader_endpoint_matches "$endpoint" && [ "$wait_after" -eq "$wait_before" ]; then
-        ok 0 "manual SQL hostgroup hint: reader bypasses mode=primary without wait"
+        ok 0 "manual SQL hostgroup hint: reader bypasses the primary target without wait"
     else
         diag "endpoint=$endpoint expected_reader=$REPLICA_SERVER_ENDPOINT wait_delta=$((wait_after - wait_before))"
-        ok 1 "manual SQL hostgroup hint: reader bypasses mode=primary without wait"
+        ok 1 "manual SQL hostgroup hint: reader bypasses the primary target without wait"
     fi
 }
 
@@ -1040,7 +1702,7 @@ case_cf3_extended_manual_reader() {
 # replica and is not wait-wrapped.
 case_cf3_extended_auto_no_write() {
     set_select_rule_auto
-    set_lsn_mode lsn
+    set_read_policy session_lsn
     prepared_before=$(counter PolarDB_Wait_Wrap_Prepared)
     wait_before=$(counter PolarDB_Wait_LSN_Sent)
     if ensure_extended_helper; then
@@ -1102,7 +1764,7 @@ case_cf3_extended_auto_after_write() {
 # no wait.
 case_explicit_txn_writer() {
     set_select_rule_auto
-    set_lsn_mode lsn
+    set_read_policy session_lsn
     wait_before=$(counter PolarDB_Wait_LSN_Sent)
     txn_out=$(
         proxy_script 2>&1 <<SQL
@@ -1128,13 +1790,14 @@ SQL
 # cold or unavailable reader pool can safely leave it on the primary.
 case_txn_split_prewrite_uses_reader_wait() {
     set_select_rule_auto
-    set_lsn_mode lsn
+    set_read_policy session_lsn
     admin_sql "UPDATE pgsql_replication_hostgroups SET txn_split_enabled=1, proxy_protocol='v15' WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
     admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
 
     row_id=9801
     marker="txn_prewrite_reader_wait"
     prepared_before=$(counter PolarDB_Wait_Wrap_Prepared)
+    bypass_before=$(counter PolarDB_Wait_Wrap_Bypassed)
     split_plan_out=$(
         proxy_script 2>&1 <<SQL
 INSERT INTO $TEST_TABLE VALUES ($row_id, '$marker') ON CONFLICT (id) DO UPDATE SET data='$marker';
@@ -1144,18 +1807,20 @@ COMMIT;
 SQL
     )
     prepared_after=$(counter PolarDB_Wait_Wrap_Prepared)
+    bypass_after=$(counter PolarDB_Wait_Wrap_Bypassed)
     split_plan_result=$(last_endpoint_payload_from_output "$split_plan_out")
 
     admin_sql "UPDATE pgsql_replication_hostgroups SET txn_split_enabled=0, proxy_protocol='default' WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
     admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
 
     if { reader_payload_matches "$split_plan_result" "$marker" &&
-            [ "$prepared_after" -gt "$prepared_before" ]; } ||
+            [ $((prepared_after - prepared_before +
+                bypass_after - bypass_before)) -gt 0 ]; } ||
         [ "$split_plan_result" = "$PRIMARY_SERVER_ENDPOINT|$marker" ]; then
         ok 0 "transaction split: pre-write read is safe before first write"
     else
         diag "split pre-write output: $split_plan_out"
-        diag "result=$split_plan_result expected='$PRIMARY_SERVER_ENDPOINT|$marker or one of: $(reader_expectation)|$marker' prepared_delta=$((prepared_after - prepared_before))"
+        diag "result=$split_plan_result expected='$PRIMARY_SERVER_ENDPOINT|$marker or one of: $(reader_expectation)|$marker' prepared_delta=$((prepared_after - prepared_before)) bypass_delta=$((bypass_after - bypass_before))"
         ok 1 "transaction split: pre-write read is safe before first write"
     fi
 }
@@ -1164,12 +1829,26 @@ SQL
 # variants to confirm RFQ-LSN driven protected replica reads per protocol.
 case_protocol_rfq_scope() {
     set_select_rule_auto
-    set_lsn_mode lsn
+    set_read_policy session_lsn
     run_protocol_rfq_lsn_scope v15 13 14 1301
     run_protocol_rfq_lsn_scope legacy 15 16 1501
     run_protocol_off_scope 17 18 1701
+
+    # Remove the inherited-protocol test pairs before setting the global
+    # protocol to off. Keep the main session_lsn hostgroup explicitly on v15,
+    # so the global change is valid and the next check really tests its HG
+    # override rather than a rejected LOAD.
+    remove_extra_hg_pairs
+    set_default_hostgroup "$WRITER_HG"
+    admin_sql "UPDATE pgsql_replication_hostgroups SET proxy_protocol='v15' WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
+    admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
     run_protocol_hg_override_scope off legacy 19 20 1901
     run_protocol_hg_override_scope v15 default 21 22 2101
+
+    remove_extra_hg_pairs
+    set_default_hostgroup "$WRITER_HG"
+    admin_sql "UPDATE pgsql_replication_hostgroups SET proxy_protocol='default' WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
+    admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
 }
 
 # Startup identity safety: when RFQ startup identity cannot be formed,
@@ -1178,7 +1857,7 @@ case_protocol_rfq_scope() {
 case_startup_identity_safety() {
     if debug_startup_identity_faults_available; then
         set_global_var_runtime "pgsql-polardb_proxy_protocol" "v15"
-        set_hg_pair_policy 35 36 default lsn -1 5000
+        set_hg_pair_policy 35 36 default session_lsn -1 5000
         set_default_hostgroup 35
         set_debug_startup_identity_fault none
         startup_identity_out=$(proxy_sql "SELECT 1;" 2>&1)
@@ -1204,7 +1883,7 @@ case_startup_identity_safety() {
 case_startup_identity_listener() {
     if debug_startup_identity_faults_available; then
         set_global_var_runtime "pgsql-polardb_proxy_protocol" "v15"
-        set_hg_pair_policy 37 38 default lsn -1 5000
+        set_hg_pair_policy 37 38 default session_lsn -1 5000
         set_default_hostgroup 37
         set_debug_startup_identity_fault listener_proxy
         listener_trace_before=$(trace_count "identity_source=2")
@@ -1231,7 +1910,7 @@ case_startup_identity_configured() {
     if debug_startup_identity_faults_available; then
         set_global_var_runtime "pgsql-polardb_proxy_identity_host" "127.0.0.2"
         set_global_var_runtime "pgsql-polardb_proxy_identity_port" "15432"
-        set_hg_pair_policy 39 40 default lsn -1 5000
+        set_hg_pair_policy 39 40 default session_lsn -1 5000
         set_default_hostgroup 39
         set_debug_startup_identity_fault configured_fallback
         configured_trace_before=$(trace_count "identity_source=3 identity=127.0.0.2:15432")
@@ -1254,18 +1933,20 @@ case_startup_identity_configured() {
     fi
 }
 
-# Plan-stage best_effort RFQ degradation: a write whose LSN is unknown degrades
+# Plan-stage warning handling: a write whose LSN is unknown
+# uses a reader without an enforceable wait target and sends one warning.
 # to the replica, warns exactly once, and records the reason.
-case_plan_stage_best_effort_degrade() {
-    set_hg_pair_policy 27 28 off lsn -1 5000
+case_plan_stage_warning() {
+    set_hg_pair_policy 27 28 off eventual -1 5000
     set_default_hostgroup 27
-    set_route_rfq_policy best_effort
+    set_missing_lsn_action warning
     write_missing_before=$(counter PolarDB_Write_Missing_LSN)
     degrade_before=$(counter PolarDB_RFQ_Best_Effort_Degraded_Routes)
     wait_before=$(counter PolarDB_Wait_LSN_Sent)
     plan_degrade_marker="plan_degrade_$$"
     plan_degrade_out=$(
         proxy_script 2>&1 <<SQL
+SET proxysql.polardb_consistency_mode TO 'session_lsn';
 INSERT INTO $TEST_TABLE VALUES (2701, '$plan_degrade_marker') ON CONFLICT (id) DO UPDATE SET data='$plan_degrade_marker';
 SELECT host(inet_server_addr()) || ':' || inet_server_port();
 SQL
@@ -1274,7 +1955,7 @@ SQL
     degrade_after=$(counter PolarDB_RFQ_Best_Effort_Degraded_Routes)
     wait_after=$(counter PolarDB_Wait_LSN_Sent)
     plan_degrade_endpoint=$(last_endpoint_from_output "$plan_degrade_out")
-    plan_degrade_warning_count=$(printf '%s\n' "$plan_degrade_out" | grep -c "PolarDB best_effort RFQ route has no enforceable LSN wait target" || true)
+    plan_degrade_warning_count=$(printf '%s\n' "$plan_degrade_out" | grep -c "PolarDB reader route has no enforceable LSN wait target; read may be stale" || true)
     plan_degrade_detail_count=$(printf '%s\n' "$plan_degrade_out" | grep -c "reason=write_lsn_unknown" || true)
     if reader_endpoint_matches "$plan_degrade_endpoint" &&
         [ $((write_missing_after - write_missing_before)) -ge 1 ] &&
@@ -1282,26 +1963,60 @@ SQL
         [ $((wait_after - wait_before)) -eq 0 ] &&
         [ "$plan_degrade_warning_count" -eq 1 ] &&
         [ "$plan_degrade_detail_count" -eq 1 ]; then
-        ok 0 "plan-stage best_effort RFQ degradation warns once and routes to reader"
+        ok 0 "plan-stage warning degradation warns once and routes to reader"
     else
         diag "plan-degrade output: $plan_degrade_out"
         diag "endpoint=$plan_degrade_endpoint expected_reader=$REPLICA_SERVER_ENDPOINT write_missing_delta=$((write_missing_after - write_missing_before)) degrade_delta=$((degrade_after - degrade_before)) wait_delta=$((wait_after - wait_before)) warning_count=$plan_degrade_warning_count detail_count=$plan_degrade_detail_count"
-        ok 1 "plan-stage best_effort RFQ degradation warns once and routes to reader"
+        ok 1 "plan-stage warning degradation warns once and routes to reader"
     fi
+}
+
+# A missing LSN with action=error ends the read before it reaches any backend.
+case_plan_stage_missing_lsn_error() {
+    set_hg_pair_policy 27 28 off eventual -1 5000
+    set_default_hostgroup 27
+    set_missing_lsn_action error
+    write_missing_before=$(counter PolarDB_Write_Missing_LSN)
+    degrade_before=$(counter PolarDB_RFQ_Best_Effort_Degraded_Routes)
+    wait_before=$(counter PolarDB_Wait_LSN_Sent)
+    missing_error_out=$(
+        proxy_script 2>&1 <<SQL
+SET proxysql.polardb_consistency_mode TO 'session_lsn';
+INSERT INTO $TEST_TABLE VALUES (2702, 'missing_error_$$') ON CONFLICT (id) DO UPDATE SET data='missing_error_$$';
+SELECT host(inet_server_addr()) || ':' || inet_server_port();
+SQL
+    )
+    missing_error_rc=$?
+    write_missing_after=$(counter PolarDB_Write_Missing_LSN)
+    degrade_after=$(counter PolarDB_RFQ_Best_Effort_Degraded_Routes)
+    wait_after=$(counter PolarDB_Wait_LSN_Sent)
+    if [ "$missing_error_rc" -ne 0 ] &&
+        printf '%s\n' "$missing_error_out" | grep -Fq "PolarDB cannot enforce the required LSN because the LSN target is unavailable" &&
+        [ $((write_missing_after - write_missing_before)) -ge 1 ] &&
+        [ $((degrade_after - degrade_before)) -eq 0 ] &&
+        [ $((wait_after - wait_before)) -eq 0 ]; then
+        ok 0 "missing LSN action error stops the read before backend dispatch"
+    else
+        diag "missing-LSN error output: $missing_error_out"
+        diag "rc=$missing_error_rc write_missing_delta=$((write_missing_after - write_missing_before)) degrade_delta=$((degrade_after - degrade_before)) wait_delta=$((wait_after - wait_before))"
+        ok 1 "missing LSN action error stops the read before backend dispatch"
+    fi
+    set_missing_lsn_action primary
 }
 
 # Missing primary RFQ LSN: a write with no RFQ LSN sets a sticky flag so a later
 # automatic read stays on the primary.
 case_missing_writer_rfq_state() {
     set_global_var_runtime "pgsql-polardb_monitor_lsn_updates" "1"
-    set_route_rfq_policy strict
+    set_missing_lsn_action primary
 
-    set_hg_pair_policy 23 24 off lsn -1 5000
+    set_hg_pair_policy 23 24 off eventual -1 5000
     set_default_hostgroup 23
     write_missing_before=$(counter PolarDB_Write_Missing_LSN)
     missing_write_marker="missing_write_$$"
     missing_write_out=$(
         proxy_script 2>&1 <<SQL
+SET proxysql.polardb_consistency_mode TO 'session_lsn';
 INSERT INTO $TEST_TABLE VALUES (2301, '$missing_write_marker') ON CONFLICT (id) DO UPDATE SET data='$missing_write_marker';
 SELECT host(inet_server_addr()) || ':' || inet_server_port();
 SQL
@@ -1321,11 +2036,12 @@ SQL
 # Missing replica RFQ LSN: an observed replica read with no RFQ LSN sets a sticky flag on the
 # session so a later automatic read moves to the primary.
 case_missing_reader_rfq_state() {
-    set_hg_pair_policy 25 26 off lsn -1 5000
+    set_hg_pair_policy 25 26 off eventual -1 5000
     set_default_hostgroup 25
     read_missing_before=$(counter PolarDB_Read_Missing_LSN)
     missing_read_out=$(
         proxy_script 2>&1 <<SQL
+SET proxysql.polardb_consistency_mode TO 'session_lsn';
 SELECT host(inet_server_addr()) || ':' || inet_server_port();
 SELECT host(inet_server_addr()) || ':' || inet_server_port();
 SQL
@@ -1350,8 +2066,8 @@ case_route_primary_hint() {
     set_default_hostgroup "$WRITER_HG"
     remove_extra_hg_pairs
     set_select_rule_auto
-    set_lsn_mode lsn
-    set_route_rfq_policy strict
+    set_read_policy session_lsn
+    set_missing_lsn_action primary
     wait_before=$(counter PolarDB_Wait_LSN_Sent)
     hint_endpoint=$(proxy_sql "/* route=primary */ SELECT host(inet_server_addr()) || ':' || inet_server_port();" 2>/dev/null | tr -d '[:space:]')
     wait_after=$(counter PolarDB_Wait_LSN_Sent)
@@ -1379,14 +2095,14 @@ case_multi_statement() {
     fi
 }
 
-# Session consistency override: SET ... TO 'off'/'primary' overrides the global
-# lsn mode until RESET restores it.
+# A session can disable consistency or choose eventual reads without changing
+# the global placement policy. RESET restores session_lsn.
 case_session_consistency_override() {
     snapshot_consistency_counters override_before
     override_out=$(proxy_command_sequence \
         "SET proxysql.polardb_consistency_mode TO 'off';" \
         "SELECT host(inet_server_addr()) || ':' || inet_server_port();" \
-        "SET proxysql.polardb_consistency_mode TO 'primary';" \
+        "SET proxysql.polardb_consistency_mode TO 'eventual';" \
         "SELECT host(inet_server_addr()) || ':' || inet_server_port();" \
         "RESET proxysql.polardb_consistency_mode;" \
         "SELECT host(inet_server_addr()) || ':' || inet_server_port();" \
@@ -1401,14 +2117,14 @@ case_session_consistency_override() {
     override_second="${2:-}"
     override_third="${3:-}"
     if [ "$override_first" = "$PRIMARY_SERVER_ENDPOINT" ] &&
-        [ "$override_second" = "$PRIMARY_SERVER_ENDPOINT" ] &&
+        reader_endpoint_matches "$override_second" &&
         reader_endpoint_matches "$override_third" &&
         [ "$protect_delta" -ge 1 ]; then
-        ok 0 "session consistency override: off and primary override global lsn until reset"
+        ok 0 "session consistency override: off and eventual apply until reset restores session_lsn"
     else
         diag "override output: $override_out"
-        diag "endpoints='$override_endpoints' expected='$PRIMARY_SERVER_ENDPOINT $PRIMARY_SERVER_ENDPOINT <one of: $(reader_expectation)>' wait_delta=$wait_delta bypass_delta=$bypass_delta"
-        ok 1 "session consistency override: off and primary override global lsn until reset"
+        diag "endpoints='$override_endpoints' expected='$PRIMARY_SERVER_ENDPOINT <reader> <reader>' wait_delta=$wait_delta bypass_delta=$bypass_delta"
+        ok 1 "session consistency override: off and eventual apply until reset restores session_lsn"
     fi
 }
 
@@ -1420,19 +2136,19 @@ case_session_enable_then_disable() {
     set_default_hostgroup "$WRITER_HG"
     remove_extra_hg_pairs
     set_select_rule_auto
-    set_lsn_mode off
+    set_read_policy off
 
     snapshot_consistency_counters mode_toggle_before
     mode_toggle_marker="mode_toggle_$$"
     mode_toggle_out=$(proxy_command_sequence \
-        "SET proxysql.polardb_consistency_mode TO 'lsn';" \
+        "SET proxysql.polardb_consistency_mode TO 'session_lsn';" \
         "INSERT INTO $TEST_TABLE VALUES (9711, '$mode_toggle_marker') ON CONFLICT (id) DO UPDATE SET data='$mode_toggle_marker';" \
         "SELECT host(inet_server_addr()) || ':' || inet_server_port() || '|' || data FROM $TEST_TABLE WHERE id=9711;" \
         "SET proxysql.polardb_consistency_mode TO 'off';" \
         "SELECT host(inet_server_addr()) || ':' || inet_server_port();" \
         2>&1)
     snapshot_consistency_counters mode_toggle_after
-    set_lsn_mode lsn
+    set_read_policy session_lsn
 
     protected_result=$(last_endpoint_payload_from_output "$mode_toggle_out")
     final_endpoint=$(last_endpoint_from_output "$mode_toggle_out")
@@ -1444,12 +2160,12 @@ case_session_enable_then_disable() {
         [ "$protect_delta" -eq 1 ] &&
         [ "$wrap_or_bypass_delta" -ge 1 ] &&
         [ "$query_lsn_delta" -ge 1 ]; then
-        ok 0 "session mode transition: lsn protects read and off disables later wait"
+        ok 0 "session mode transition: session_lsn protects read and off disables later wait"
     else
         diag "mode-toggle output: $mode_toggle_out"
         diag "protected_result='$protected_result' expected_reader_payload='$(reader_expectation)|$mode_toggle_marker' final_endpoint='$final_endpoint' expected_final='$PRIMARY_SERVER_ENDPOINT'"
         diag "protect_delta=$protect_delta wrap_or_bypass_delta=$wrap_or_bypass_delta query_lsn_delta=$query_lsn_delta"
-        ok 1 "session mode transition: lsn protects read and off disables later wait"
+        ok 1 "session mode transition: session_lsn protects read and off disables later wait"
     fi
 }
 
@@ -1460,7 +2176,7 @@ case_session_enable_then_disable() {
 case_query_cache_bypassed_after_session_write() {
     set_default_hostgroup "$WRITER_HG"
     remove_extra_hg_pairs
-    set_lsn_mode lsn
+    set_read_policy session_lsn
 
     local row_id=9731
     local old_marker="cache_old_$$"
@@ -1540,7 +2256,7 @@ case_reset_all_preserves_lsn() {
 # while reader_lsn_unknown forces a primary fallback.
 case_reader_acquire_faults() {
     if debug_reader_acquire_faults_available; then
-        set_hg_pair_policy 33 34 v15 lsn -1 5000
+        set_hg_pair_policy 33 34 v15 session_lsn -1 5000
         set_default_hostgroup 33
         wait_before=$(counter PolarDB_Wait_LSN_Sent)
         reader_busy_marker="reader_busy_retry_$$"
@@ -1554,7 +2270,7 @@ case_reader_acquire_faults() {
         reader_busy_result=$(last_endpoint_payload_from_output "$reader_busy_out")
         if reader_payload_matches "$reader_busy_result" "$reader_busy_marker" &&
             [ $((wait_after - wait_before)) -ge 1 ] &&
-            wait_for_trace "get_MyConn_polardb_reader status=reader_busy" 5; then
+            wait_for_trace "polardb_acquire_reader_connection status=reader_busy" 5; then
             ok 0 "debug reader-busy acquisition falls through to normal retry"
         else
             diag "reader-busy output: $reader_busy_out"
@@ -1578,7 +2294,7 @@ case_reader_acquire_faults() {
         if [ "$reader_unknown_result" = "$expected_reader_unknown" ] &&
             [ $((wait_after - wait_before)) -eq 0 ] &&
             [ $((fallback_after - fallback_before)) -eq 1 ] &&
-            wait_for_trace "get_MyConn_polardb_reader status=reader_lsn_unknown" 5; then
+            wait_for_trace "polardb_acquire_reader_connection status=reader_lsn_unknown" 5; then
             ok 0 "debug reader LSN unknown forces writer fallback"
         else
             diag "reader-lsn-unknown output: $reader_unknown_out"
@@ -1588,12 +2304,129 @@ case_reader_acquire_faults() {
         set_default_hostgroup "$WRITER_HG"
         remove_extra_hg_pairs
         set_select_rule_auto
-        set_lsn_mode lsn
-        set_route_rfq_policy strict
+        set_read_policy session_lsn
+        set_missing_lsn_action primary
     else
         skip_ok "debug reader-busy acquisition falls through to normal retry" "requires POLARDB_DEBUG reader acquisition fault support"
         skip_ok "debug reader LSN unknown forces writer fallback" "requires POLARDB_DEBUG reader acquisition fault support"
     fi
+}
+
+# Keep the reader acquisition result busy until the normal connection deadline
+# expires. The captured read-fallback action must decide the final outcome.
+case_reader_capacity_deadline_actions() {
+    local old_timeout marker out rc result
+
+    if ! debug_reader_acquire_faults_available; then
+        skip_ok "replica capacity deadline: primary falls back to the primary" \
+            "requires POLARDB_DEBUG reader acquisition fault support"
+        skip_ok "replica capacity deadline: error terminates without fallback" \
+            "requires POLARDB_DEBUG reader acquisition fault support"
+        return
+    fi
+
+    old_timeout=$(runtime_var "pgsql-connect_timeout_server_max")
+    set_global_var_runtime "pgsql-connect_timeout_server_max" "50"
+    set_select_rule_auto
+
+    set_read_policy session_lsn replica primary
+    marker="capacity_deadline_primary_$$"
+    set_debug_reader_acquire_fault reader_busy_until_deadline
+    out=$(proxy_command_sequence \
+        "INSERT INTO $TEST_TABLE VALUES (9705, '$marker') ON CONFLICT (id) DO UPDATE SET data='$marker';" \
+        "SELECT host(inet_server_addr()) || ':' || inet_server_port() || '|' || data FROM $TEST_TABLE WHERE id=9705;" \
+        2>&1)
+    rc=$?
+    clear_debug_reader_acquire_fault
+    result=$(last_endpoint_payload_from_output "$out")
+    if [ "$rc" -eq 0 ] &&
+        [ "$result" = "$PRIMARY_SERVER_ENDPOINT|$marker" ] &&
+        wait_for_trace "replica capacity deadline reached" 5; then
+        ok 0 "replica capacity deadline: primary falls back to the primary"
+    else
+        diag "output=$out rc=$rc result=$result expected=$PRIMARY_SERVER_ENDPOINT|$marker"
+        ok 1 "replica capacity deadline: primary falls back to the primary"
+    fi
+
+    set_read_policy session_lsn replica error
+    marker="capacity_deadline_error_$$"
+    set_debug_reader_acquire_fault reader_busy_until_deadline
+    out=$(proxy_command_sequence \
+        "INSERT INTO $TEST_TABLE VALUES (9706, '$marker') ON CONFLICT (id) DO UPDATE SET data='$marker';" \
+        "SELECT data FROM $TEST_TABLE WHERE id=9706;" \
+        2>&1)
+    rc=$?
+    clear_debug_reader_acquire_fault
+    if [ "$rc" -ne 0 ] &&
+        printf '%s\n' "$out" |
+            grep -Fq "PolarDB could not acquire a replica before the connection deadline"; then
+        ok 0 "replica capacity deadline: error terminates without fallback"
+    else
+        diag "output=$out rc=$rc"
+        ok 1 "replica capacity deadline: error terminates without fallback"
+    fi
+
+    set_global_var_runtime "pgsql-connect_timeout_server_max" "$old_timeout"
+    set_global_var_runtime "pgsql-polardb_profile" "session_warning"
+}
+
+# A target-ready reader can skip its LSN wrapper before pooled-connection reset
+# finishes. The debug fault enters that reset state and times it out. The
+# replacement connection must be the writer because the skipped wrapper cannot
+# protect another reader.
+case_reset_timeout_after_wait_bypass() {
+    if ! debug_reset_timeout_fault_available; then
+        skip_ok "reset-compatible reader timeout after wait bypass uses writer" \
+            "requires POLARDB_DEBUG reset timeout support"
+        return
+    fi
+
+    set_hg_pair_policy_one_reader 35 36 v15 session_lsn -1 5000 1
+    set_default_hostgroup 35
+    seed_out=$(
+        proxy_script 2>&1 <<SQL
+SELECT host(inet_server_addr()) || ':' || inet_server_port();
+SQL
+    )
+    seed_endpoint=$(last_endpoint_from_output "$seed_out")
+
+    bypass_before=$(counter PolarDB_Wait_Wrap_Bypassed)
+    fallback_before=$(counter PolarDB_Consistency_Writer_Fallback)
+    set_debug_reader_acquire_fault reset_timeout
+    reset_marker="reset_timeout_bypass_$$"
+    reset_out=$(
+        proxy_script 2>&1 <<SQL
+INSERT INTO $TEST_TABLE VALUES (9704, '$reset_marker') ON CONFLICT (id) DO UPDATE SET data='$reset_marker';
+\! sleep 1
+SELECT host(inet_server_addr()) || ':' || inet_server_port() || '|' || data FROM $TEST_TABLE WHERE id=9704;
+SQL
+    )
+    clear_debug_reader_acquire_fault
+    bypass_after=$(counter PolarDB_Wait_Wrap_Bypassed)
+    fallback_after=$(counter PolarDB_Consistency_Writer_Fallback)
+    reset_result=$(last_endpoint_payload_from_output "$reset_out")
+    expected_result="$PRIMARY_SERVER_ENDPOINT|$reset_marker"
+
+    if reader_endpoint_matches "$seed_endpoint" &&
+        [ "$reset_result" = "$expected_result" ] &&
+        [ $((bypass_after - bypass_before)) -ge 1 ] &&
+        [ $((fallback_after - fallback_before)) -ge 1 ] &&
+        wait_for_trace "forcing reset-compatible reader timeout" 5 &&
+        wait_for_trace "reset-compatible reader timeout; redirecting this query" 5; then
+        ok 0 "reset-compatible reader timeout after wait bypass uses writer"
+    else
+        diag "reset seed output: $seed_out"
+        diag "reset test output: $reset_out"
+        diag "seed_endpoint=$seed_endpoint expected_reader=$REPLICA_SERVER_ENDPOINT"
+        diag "result=$reset_result expected=$expected_result bypass_delta=$((bypass_after - bypass_before)) fallback_delta=$((fallback_after - fallback_before))"
+        ok 1 "reset-compatible reader timeout after wait bypass uses writer"
+    fi
+
+    set_default_hostgroup "$WRITER_HG"
+    remove_extra_hg_pairs
+    set_select_rule_auto
+    set_read_policy session_lsn
+    set_missing_lsn_action primary
 }
 
 # Monitor baseline: with monitor LSN updates enabled, the monitor advances the
@@ -1616,9 +2449,12 @@ case_monitor_baseline() {
 # monitor_lsn_updates=false suppresses monitor LSN cache updates (skipped when
 # PolarDB health functions are unavailable).
 case_monitor_disabled() {
-    monitor_enabled_after=$(counter PolarDB_LSN_Updates_From_Monitor)
     set_global_var_runtime "pgsql-polardb_monitor_lsn_updates" "0"
     if [ "$MONITOR_HEALTH_SUPPORTED" -eq 1 ]; then
+        # A worker may still finish a monitor check submitted before the runtime
+        # update. Let that check finish before recording the disabled baseline.
+        sleep 2
+        monitor_enabled_after=$(counter PolarDB_LSN_Updates_From_Monitor)
         direct_sql "$PRIMARY_HOST" "$PRIMARY_PORT" "INSERT INTO $TEST_TABLE VALUES (902, 'monitor_disabled_$$') ON CONFLICT (id) DO UPDATE SET data='monitor_disabled_$$';" >/dev/null 2>&1 || true
         sleep 8
         monitor_disabled_after=$(counter PolarDB_LSN_Updates_From_Monitor)
@@ -1746,10 +2582,10 @@ case_lag_cap_freshness() {
     # With monitor updates disabled and a tiny freshness window, cached replica LSN
     # data becomes stale. Enabling the byte lag cap must use the primary
     # for a read that follows a write in the same session.
-    set_lsn_mode lsn
-    set_hg_policy lsn 1 5000
-    set_global_var_runtime "pgsql-polardb_lsn_freshness_ms" "1"
-    set_global_var_runtime "pgsql-polardb_lag_ms" "0"
+    set_read_policy session_lsn
+    set_hg_policy session_lsn 1 5000
+    set_global_var_runtime "pgsql-polardb_reader_lsn_max_age_ms" "1"
+    set_global_var_runtime "pgsql-polardb_max_reader_lag_ms" "0"
     sleep 2
     wait_before=$(counter PolarDB_Wait_LSN_Sent)
     fallback_before=$(counter PolarDB_Consistency_Writer_Fallback)
@@ -1781,9 +2617,9 @@ SQL
 # Reset caps: disabling the byte lag cap restores the replica route.
 case_reset_caps() {
     set_global_var_runtime "pgsql-polardb_monitor_lsn_updates" "1"
-    set_global_var_runtime "pgsql-polardb_lag_ms" "0"
-    set_global_var_runtime "pgsql-polardb_lsn_freshness_ms" "5000"
-    set_hg_policy lsn -1 5000
+    set_global_var_runtime "pgsql-polardb_max_reader_lag_ms" "0"
+    set_global_var_runtime "pgsql-polardb_reader_lsn_max_age_ms" "5000"
+    set_hg_policy session_lsn -1 5000
     sleep 2
     endpoint=$(backend_endpoint)
     if reader_endpoint_matches "$endpoint"; then
@@ -1810,15 +2646,15 @@ case_cf1_in_cap() {
     set_default_hostgroup "$WRITER_HG"
     remove_extra_hg_pairs
     set_select_rule_auto
-    set_lsn_mode lsn
+    set_read_policy session_lsn
     set_global_var_runtime "pgsql-polardb_proxy_protocol" "v15"
     set_global_var_runtime "pgsql-polardb_monitor_lsn_updates" "1"
-    set_global_var_runtime "pgsql-polardb_lag_ms" "0"
-    set_global_var_runtime "pgsql-polardb_lag_bytes" "0"
-    set_global_var_runtime "pgsql-polardb_lsn_freshness_ms" "5000"
+    set_global_var_runtime "pgsql-polardb_max_reader_lag_ms" "0"
+    set_global_var_runtime "pgsql-polardb_max_reader_lsn_gap_bytes" "0"
+    set_global_var_runtime "pgsql-polardb_reader_lsn_max_age_ms" "5000"
     set_global_var_runtime "pgsql-polardb_lag_cap_freshness_ms" "5000"
-    set_route_rfq_policy strict
-    set_hg_policy lsn 2147483647 5000
+    set_missing_lsn_action primary
+    set_hg_policy session_lsn 2147483647 5000
     cf1_monitor_before=$(counter PolarDB_LSN_Updates_From_Monitor)
     direct_sql "$PRIMARY_HOST" "$PRIMARY_PORT" "INSERT INTO $TEST_TABLE VALUES (908, 'cf1_monitor_$$') ON CONFLICT (id) DO UPDATE SET data='cf1_monitor_$$';" >/dev/null 2>&1 || true
     if ! wait_for_monitor_increment "$cf1_monitor_before" 20; then
@@ -1876,7 +2712,7 @@ SQL
 case_cf2_cold_reader() {
     admin_sql "DELETE FROM pgsql_servers WHERE hostgroup_id=12;" >/dev/null
     insert_reader_servers 12 100
-    admin_sql "UPDATE pgsql_replication_hostgroups SET reader_hostgroup=12, consistency_mode='lsn', max_lag_bytes=-1, lsn_wait_timeout_ms=5000 WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
+    admin_sql "UPDATE pgsql_replication_hostgroups SET reader_hostgroup=12, consistency_mode='session_lsn', max_lag_bytes=-1, lsn_wait_timeout_ms=5000 WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
     admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
     sleep 1
     pool_ok_before=$(pool_value 12 ConnOK)
@@ -1905,17 +2741,17 @@ SQL
         diag "endpoint=$cf2_endpoint expected_reader=$REPLICA_SERVER_ENDPOINT wait_delta=$wait_delta bypass_delta=$bypass_delta conn_ok_delta=$((pool_ok_after - pool_ok_before)) query_delta=$((pool_queries_after - pool_queries_before))"
         ok 1 "CF-2: smart selector creates backend for cold reader pool"
     fi
-    admin_sql "UPDATE pgsql_replication_hostgroups SET reader_hostgroup=$READER_HG, consistency_mode='lsn', max_lag_bytes=-1, lsn_wait_timeout_ms=5000 WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
+    admin_sql "UPDATE pgsql_replication_hostgroups SET reader_hostgroup=$READER_HG, consistency_mode='session_lsn', max_lag_bytes=-1, lsn_wait_timeout_ms=5000 WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
     admin_sql "DELETE FROM pgsql_servers WHERE hostgroup_id=12;" >/dev/null
     admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
-    set_hg_policy lsn -1 5000
+    set_hg_policy session_lsn -1 5000
 }
 
 # RFQ profile mismatch: a connection stored under the old profile key must not
 # be returned for the new profile. ReaderPool v2 finds only the requested key;
 # it does not scan or remove unrelated free connections.
 case_rfq_profile_mismatch() {
-    set_hg_pair_policy_one_reader 29 30 off lsn -1 5000 1
+    set_hg_pair_policy_one_reader 29 30 legacy session_lsn -1 5000 1
     set_default_hostgroup 29
     rfq_mismatch_warm=$(proxy_sql "SELECT host(inet_server_addr()) || ':' || inet_server_port();" 2>&1)
     rfq_mismatch_warm_endpoint=$(last_endpoint_from_output "$rfq_mismatch_warm")
@@ -1956,7 +2792,7 @@ SQL
 
 # RFQ profile match: a compatible pooled replica is reused without eviction.
 case_rfq_profile_reuse() {
-    set_hg_pair_policy_one_reader 31 32 v15 lsn -1 5000 1
+    set_hg_pair_policy_one_reader 31 32 v15 session_lsn -1 5000 1
     set_default_hostgroup 31
     rfq_skipped_before=$(counter PolarDB_RFQ_Profile_Skipped)
     rfq_evicted_before=$(counter PolarDB_RFQ_Profile_Evicted)
@@ -1993,12 +2829,21 @@ SQL
     set_default_hostgroup "$WRITER_HG"
     remove_extra_hg_pairs
     set_select_rule_auto
-    set_hg_policy lsn -1 5000
+    set_hg_policy session_lsn -1 5000
 }
 
 # CF-6: a user-raised WARNING that looks like a timeout during a wrapped read must
 # not be counted as a wait timeout.
 case_cf6_fake_timeout_notice() {
+    local log_marker="wrapped_query_log_$$"
+    local logged_query
+    local user_query="SELECT /* $log_marker */ ${TEST_TABLE}_fake_timeout_notice();"
+
+    if ! enable_query_event_buffer; then
+        ok 1 "CF-6: user timeout-looking WARNING during wrapped read is not counted"
+        diag "could not enable the in-memory PostgreSQL query event buffer"
+        return
+    fi
     timeout_before=$(counter PolarDB_Wait_Error_Timeout)
     lsn_timeout_before=$(counter PolarDB_Wait_Error_LSN_Wait_Timeout)
     wait_before=$(counter PolarDB_Wait_LSN_Sent)
@@ -2012,21 +2857,25 @@ BEGIN
 END;
 \$\$;
 INSERT INTO $TEST_TABLE VALUES (906, '$cf6_marker') ON CONFLICT (id) DO UPDATE SET data='$cf6_marker';
-SELECT ${TEST_TABLE}_fake_timeout_notice();
+$user_query
 SQL
     )
     timeout_after=$(counter PolarDB_Wait_Error_Timeout)
     lsn_timeout_after=$(counter PolarDB_Wait_Error_LSN_Wait_Timeout)
     wait_after=$(counter PolarDB_Wait_LSN_Sent)
+    logged_query=$(logged_query_for_marker "$log_marker")
+    disable_query_event_buffer ||
+        diag "failed to restore PostgreSQL query event settings"
     if printf '%s\n' "$cf6_out" | grep -q '^cf6_fake_notice_ok$' &&
         printf '%s\n' "$cf6_out" | grep -q 'LSN wait timeout after 777 ms' &&
         [ $((wait_after - wait_before)) -ge 1 ] &&
         [ $((timeout_after - timeout_before)) -eq 0 ] &&
-        [ $((lsn_timeout_after - lsn_timeout_before)) -eq 0 ]; then
+        [ $((lsn_timeout_after - lsn_timeout_before)) -eq 0 ] &&
+        [ "$logged_query" = "$user_query" ]; then
         ok 0 "CF-6: user timeout-looking WARNING during wrapped read is not counted"
     else
         diag "cf6 output: $cf6_out"
-        diag "wait_delta=$((wait_after - wait_before)) timeout_delta=$((timeout_after - timeout_before)) lsn_timeout_delta=$((lsn_timeout_after - lsn_timeout_before))"
+        diag "wait_delta=$((wait_after - wait_before)) timeout_delta=$((timeout_after - timeout_before)) lsn_timeout_delta=$((lsn_timeout_after - lsn_timeout_before)) logged_query='$logged_query'"
         ok 1 "CF-6: user timeout-looking WARNING during wrapped read is not counted"
     fi
 }
@@ -2035,6 +2884,7 @@ SQL
 # not counted as a wait timeout nor retried.
 case_wrapper_set_error() {
     if debug_wrap_set_error_faults_available; then
+        set_global_var_runtime "pgsql-polardb_action_replica_error" "error"
         timeout_before=$(counter PolarDB_Wait_Error_Timeout)
         lsn_timeout_before=$(counter PolarDB_Wait_Error_LSN_Wait_Timeout)
         retry_before=$(counter PolarDB_Wait_Reads_Retried_On_Writer)
@@ -2068,6 +2918,7 @@ SQL
             diag "wrapper_set_error_rc=$wrapper_set_error_rc wait_delta=$((wait_after - wait_before)) timeout_delta=$((timeout_after - timeout_before)) lsn_timeout_delta=$((lsn_timeout_after - lsn_timeout_before)) retry_delta=$((retry_after - retry_before)) trace_delta=$wrapper_set_error_trace_delta pattern='$wrapper_set_error_trace_pattern' (-1 means trace unavailable)"
             ok 1 "debug wrapper SET error is not counted as wait timeout or retried"
         fi
+        set_global_var_runtime "pgsql-polardb_profile" "session_warning"
     else
         skip_ok "debug wrapper SET error is not counted as wait timeout or retried" "requires POLARDB_DEBUG wrapper SET fault support"
     fi
@@ -2080,10 +2931,10 @@ case_timeout_edge_tests() {
     if [ "${POLARDB_TIMEOUT_EDGE_TESTS:-0}" = "1" ]; then
         if set_replay_lag_bytes "${POLARDB_TIMEOUT_EDGE_REPLAY_LAG_BYTES:-104857600}"; then
             set_select_rule_auto
-            set_lsn_mode lsn
-            set_hg_policy lsn -1 1
+            set_read_policy session_lsn
+            set_hg_policy session_lsn -1 1
 
-            set_wait_mode strict
+            set_lsn_wait_timeout_action primary
             timeout_before=$(counter PolarDB_Wait_Error_Timeout)
             lsn_timeout_before=$(counter PolarDB_Wait_Error_LSN_Wait_Timeout)
             retry_before=$(counter PolarDB_Wait_Reads_Retried_On_Writer)
@@ -2106,14 +2957,14 @@ SQL
                 [ "$strict_lsn_timeout_delta" -eq 1 ] &&
                 [ "$strict_retry_delta" -eq 1 ] &&
                 printf '%s\n' "$strict_out" | grep -q "^$strict_marker$"; then
-                ok 0 "strict wait timeout: timed-out reader read retries on writer"
+                ok 0 "primary action: timed-out replica read retries on primary"
             else
                 diag "strict output: $strict_out"
                 diag "strict_rc=$strict_rc timeout_delta=$strict_timeout_delta lsn_timeout_delta=$strict_lsn_timeout_delta retry_delta=$strict_retry_delta"
-                ok 1 "strict wait timeout: timed-out reader read retries on writer"
+                ok 1 "primary action: timed-out replica read retries on primary"
             fi
 
-            set_wait_mode best_effort
+            set_lsn_wait_timeout_action warning
             timeout_before=$(counter PolarDB_Wait_Error_Timeout)
             lsn_timeout_before=$(counter PolarDB_Wait_Error_LSN_Wait_Timeout)
             best_marker="best_effort_timeout_$$"
@@ -2133,11 +2984,11 @@ SQL
                 [ "$best_timeout_delta" -eq 1 ] &&
                 [ "$best_lsn_timeout_delta" -eq 1 ] &&
                 [ "$best_warning_count" -eq 1 ]; then
-                ok 0 "best-effort wait timeout: timeout notice is forwarded and query continues"
+                ok 0 "warning action: timeout notice is forwarded and query continues"
             else
                 diag "best-effort output: $best_out"
                 diag "best_rc=$best_rc timeout_delta=$best_timeout_delta lsn_timeout_delta=$best_lsn_timeout_delta warning_count=$best_warning_count"
-                ok 1 "best-effort wait timeout: timeout notice is forwarded and query continues"
+                ok 1 "warning action: timeout notice is forwarded and query continues"
             fi
 
             wait_before=$(counter PolarDB_Wait_LSN_Sent)
@@ -2159,33 +3010,33 @@ SQL
                     [ "$setup_notice_count" -ge 1 ] &&
                     [ "$final_notice_count" -eq 0 ] &&
                     [ $((wait_after - wait_before)) -ge 1 ]; then
-                    ok 0 "best-effort timeout followed by extended protocol has no leftover LSN wait notice"
+                    ok 0 "warning action followed by extended protocol leaves no LSN wait notice"
                 else
                     diag "best-effort-to-extended output: $extended_transition_out"
                     diag "extended_transition_rc=$extended_transition_rc setup_notices=$setup_notice_count final_notices=$final_notice_count wait_delta=$((wait_after - wait_before))"
-                    ok 1 "best-effort timeout followed by extended protocol has no leftover LSN wait notice"
+                    ok 1 "warning action followed by extended protocol leaves no LSN wait notice"
                 fi
             else
                 sed 's/^/#   /' "$EXTENDED_HELPER_BUILD_LOG" 2>/dev/null || true
-                skip_ok "best-effort timeout followed by extended protocol has no leftover LSN wait notice" "cannot build proxysql_extended_protocol_test"
+                skip_ok "warning action followed by extended protocol leaves no LSN wait notice" "cannot build proxysql_extended_protocol_test"
             fi
 
             set_replay_lag_bytes 0 >/dev/null 2>&1 || true
             TIMEOUT_EDGE_LAG_SET=0
-            set_wait_mode best_effort
-            set_hg_policy lsn -1 5000
+            set_lsn_wait_timeout_action warning
+            set_hg_policy session_lsn -1 5000
             if ! wait_for_replica_replay_catchup 20; then
                 diag "replica did not catch up after disabling polar_replay_min_lag_size"
             fi
         else
-            skip_ok "strict wait timeout: timed-out reader read retries on writer" "cannot set polar_replay_min_lag_size through managed DCS"
-            skip_ok "best-effort wait timeout: timeout notice is forwarded and query continues" "cannot set polar_replay_min_lag_size through managed DCS"
-            skip_ok "best-effort timeout followed by extended protocol has no leftover LSN wait notice" "cannot set polar_replay_min_lag_size through managed DCS"
+            skip_ok "primary action: timed-out replica read retries on primary" "cannot set polar_replay_min_lag_size through managed DCS"
+            skip_ok "warning action: timeout notice is forwarded and query continues" "cannot set polar_replay_min_lag_size through managed DCS"
+            skip_ok "warning action followed by extended protocol leaves no LSN wait notice" "cannot set polar_replay_min_lag_size through managed DCS"
         fi
     else
-        skip_ok "strict wait timeout: timed-out reader read retries on writer" "set POLARDB_TIMEOUT_EDGE_TESTS=1 to alter managed replay lag"
-        skip_ok "best-effort wait timeout: timeout notice is forwarded and query continues" "set POLARDB_TIMEOUT_EDGE_TESTS=1 to alter managed replay lag"
-        skip_ok "best-effort timeout followed by extended protocol has no leftover LSN wait notice" "set POLARDB_TIMEOUT_EDGE_TESTS=1 to alter managed replay lag"
+        skip_ok "primary action: timed-out replica read retries on primary" "set POLARDB_TIMEOUT_EDGE_TESTS=1 to alter managed replay lag"
+        skip_ok "warning action: timeout notice is forwarded and query continues" "set POLARDB_TIMEOUT_EDGE_TESTS=1 to alter managed replay lag"
+        skip_ok "warning action followed by extended protocol leaves no LSN wait notice" "set POLARDB_TIMEOUT_EDGE_TESTS=1 to alter managed replay lag"
     fi
 }
 
@@ -2193,9 +3044,10 @@ SQL
 # timeout nor retried.
 case_user_error_after_wait() {
     set_select_rule_auto
-    set_lsn_mode lsn
-    set_wait_mode best_effort
-    set_hg_policy lsn -1 5000
+    set_read_policy session_lsn
+    set_lsn_wait_timeout_action warning
+    set_global_var_runtime "pgsql-polardb_action_replica_error" "error"
+    set_hg_policy session_lsn -1 5000
     timeout_before=$(counter PolarDB_Wait_Error_Timeout)
     lsn_timeout_before=$(counter PolarDB_Wait_Error_LSN_Wait_Timeout)
     wait_before=$(counter PolarDB_Wait_LSN_Sent)
@@ -2224,11 +3076,13 @@ SQL
         diag "user_error_rc=$user_error_rc wait_delta=$((wait_after - wait_before)) timeout_delta=$((timeout_after - timeout_before)) lsn_timeout_delta=$((lsn_timeout_after - lsn_timeout_before)) retry_delta=$((retry_after - retry_before))"
         ok 1 "user query error after wrapper consumption is not counted or retried"
     fi
+    set_global_var_runtime "pgsql-polardb_profile" "session_warning"
 }
 
-# A best_effort syntax error after wrapper consumption must not be counted nor
-# retried.
-case_best_effort_syntax_error() {
+# A syntax error after a warning-mode wrapper is consumed must not be counted as
+# an LSN timeout or retried.
+case_warning_syntax_error() {
+    set_global_var_runtime "pgsql-polardb_action_replica_error" "error"
     timeout_before=$(counter PolarDB_Wait_Error_Timeout)
     lsn_timeout_before=$(counter PolarDB_Wait_Error_LSN_Wait_Timeout)
     wait_before=$(counter PolarDB_Wait_LSN_Sent)
@@ -2251,45 +3105,49 @@ SQL
         [ $((lsn_timeout_after - lsn_timeout_before)) -eq 0 ] &&
         [ $((retry_after - retry_before)) -eq 0 ] &&
         printf '%s\n' "$syntax_error_out" | grep -Eiq 'syntax error|ERROR'; then
-        ok 0 "best-effort syntax error after wrapper consumption is not counted or retried"
+        ok 0 "warning-mode syntax error after wrapper consumption is not counted or retried"
     else
         diag "syntax-error output: $syntax_error_out"
         diag "syntax_error_rc=$syntax_error_rc wait_delta=$((wait_after - wait_before)) timeout_delta=$((timeout_after - timeout_before)) lsn_timeout_delta=$((lsn_timeout_after - lsn_timeout_before)) retry_delta=$((retry_after - retry_before))"
-        ok 1 "best-effort syntax error after wrapper consumption is not counted or retried"
+        ok 1 "warning-mode syntax error after wrapper consumption is not counted or retried"
     fi
+    set_global_var_runtime "pgsql-polardb_profile" "session_warning"
 }
 
-# A strict syntax error after wrapper consumption must not be counted nor retried.
-case_strict_syntax_error() {
-    set_wait_mode strict
+# A syntax error after a primary-fallback wrapper is consumed must not be counted
+# as an LSN timeout or retried.
+case_writer_syntax_error() {
+    set_lsn_wait_timeout_action primary
+    set_global_var_runtime "pgsql-polardb_action_replica_error" "error"
     timeout_before=$(counter PolarDB_Wait_Error_Timeout)
     lsn_timeout_before=$(counter PolarDB_Wait_Error_LSN_Wait_Timeout)
     wait_before=$(counter PolarDB_Wait_LSN_Sent)
     retry_before=$(counter PolarDB_Wait_Reads_Retried_On_Writer)
-    strict_syntax_error_marker="strict_syntax_error_after_wait_$$"
-    strict_syntax_error_out=$(
+    writer_syntax_error_marker="writer_syntax_error_after_wait_$$"
+    writer_syntax_error_out=$(
         proxy_script 2>&1 <<SQL
-INSERT INTO $TEST_TABLE VALUES (306, '$strict_syntax_error_marker') ON CONFLICT (id) DO UPDATE SET data='$strict_syntax_error_marker';
+INSERT INTO $TEST_TABLE VALUES (306, '$writer_syntax_error_marker') ON CONFLICT (id) DO UPDATE SET data='$writer_syntax_error_marker';
 SELECT data FROM;
 SQL
     )
-    strict_syntax_error_rc=$?
+    writer_syntax_error_rc=$?
     timeout_after=$(counter PolarDB_Wait_Error_Timeout)
     lsn_timeout_after=$(counter PolarDB_Wait_Error_LSN_Wait_Timeout)
     wait_after=$(counter PolarDB_Wait_LSN_Sent)
     retry_after=$(counter PolarDB_Wait_Reads_Retried_On_Writer)
-    if [ "$strict_syntax_error_rc" -ne 0 ] &&
+    if [ "$writer_syntax_error_rc" -ne 0 ] &&
         [ $((wait_after - wait_before)) -ge 1 ] &&
         [ $((timeout_after - timeout_before)) -eq 0 ] &&
         [ $((lsn_timeout_after - lsn_timeout_before)) -eq 0 ] &&
         [ $((retry_after - retry_before)) -eq 0 ] &&
-        printf '%s\n' "$strict_syntax_error_out" | grep -Eiq 'syntax error|ERROR'; then
-        ok 0 "strict syntax error after wrapper consumption is not counted or retried"
+        printf '%s\n' "$writer_syntax_error_out" | grep -Eiq 'syntax error|ERROR'; then
+        ok 0 "primary-fallback syntax error after wrapper consumption is not counted or retried"
     else
-        diag "strict-syntax-error output: $strict_syntax_error_out"
-        diag "strict_syntax_error_rc=$strict_syntax_error_rc wait_delta=$((wait_after - wait_before)) timeout_delta=$((timeout_after - timeout_before)) lsn_timeout_delta=$((lsn_timeout_after - lsn_timeout_before)) retry_delta=$((retry_after - retry_before))"
-        ok 1 "strict syntax error after wrapper consumption is not counted or retried"
+        diag "writer-syntax-error output: $writer_syntax_error_out"
+        diag "writer_syntax_error_rc=$writer_syntax_error_rc wait_delta=$((wait_after - wait_before)) timeout_delta=$((timeout_after - timeout_before)) lsn_timeout_delta=$((lsn_timeout_after - lsn_timeout_before)) retry_delta=$((retry_after - retry_before))"
+        ok 1 "primary-fallback syntax error after wrapper consumption is not counted or retried"
     fi
+    set_global_var_runtime "pgsql-polardb_profile" "session_warning"
 }
 
 plan "$PLAN"
@@ -2330,16 +3188,18 @@ else
     exit 1
 fi
 
-lag_ms_reject_out=$(admin_sql "UPDATE global_variables SET variable_value='1' WHERE variable_name='pgsql-polardb_lag_ms'; LOAD PGSQL VARIABLES TO RUNTIME;" 2>&1)
-lag_ms_runtime=$(admin_sql "SELECT variable_value FROM runtime_global_variables WHERE variable_name='pgsql-polardb_lag_ms';" 2>/dev/null | tr -d '[:space:]')
-lag_ms_admin=$(admin_sql "SELECT variable_value FROM global_variables WHERE variable_name='pgsql-polardb_lag_ms';" 2>/dev/null | tr -d '[:space:]')
-admin_sql "UPDATE global_variables SET variable_value='0' WHERE variable_name='pgsql-polardb_lag_ms'; LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null
+admin_sql "UPDATE global_variables SET variable_value='1' WHERE variable_name='pgsql-polardb_max_reader_lag_ms';" >/dev/null
+lag_ms_reject_out=$(admin_sql "LOAD PGSQL VARIABLES TO RUNTIME;" 2>&1)
+lag_ms_runtime=$(admin_sql "SELECT variable_value FROM runtime_global_variables WHERE variable_name='pgsql-polardb_max_reader_lag_ms';" 2>/dev/null | tr -d '[:space:]')
+lag_ms_admin=$(admin_sql "SELECT variable_value FROM global_variables WHERE variable_name='pgsql-polardb_max_reader_lag_ms';" 2>/dev/null | tr -d '[:space:]')
+admin_sql "UPDATE global_variables SET variable_value='0' WHERE variable_name='pgsql-polardb_max_reader_lag_ms';" >/dev/null
+admin_sql "LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null
 if [ "$lag_ms_runtime" = "0" ]; then
-    ok 0 "T8: pgsql-polardb_lag_ms rejects nonzero value until ms-lag producer exists"
+    ok 0 "T8: pgsql-polardb_max_reader_lag_ms rejects nonzero value until ms-lag producer exists"
 else
     diag "lag_ms=1 load output: $lag_ms_reject_out"
     diag "lag_ms runtime=$lag_ms_runtime admin=$lag_ms_admin expected_runtime=0"
-    ok 1 "T8: pgsql-polardb_lag_ms rejects nonzero value until ms-lag producer exists"
+    ok 1 "T8: pgsql-polardb_max_reader_lag_ms rejects nonzero value until ms-lag producer exists"
 fi
 
 if direct_sql "$PRIMARY_HOST" "$PRIMARY_PORT" "DROP TABLE IF EXISTS $TEST_TABLE; CREATE TABLE $TEST_TABLE(id int PRIMARY KEY, data text);" >/dev/null 2>&1; then
@@ -2361,12 +3221,19 @@ case_no_write_read
 case_read_then_read_monotonic
 case_read_then_write_then_read
 case_background_writes_read_only_session
+case_eventual_profile_repeated_reads
 case_mode_off
-case_mode_primary
+case_profile_off_kill_switch
+case_primary_target
+case_replica_fallback_error
+case_ordinary_replica_error_actions
+case_ordinary_replica_loss_actions
 case_manual_rule_route
 case_manual_sql_hint
 
 # ==== Extended protocol routing ====
+case_extended_replica_error_actions
+case_extended_replica_loss_actions
 case_cf3_extended_manual_reader
 case_cf3_extended_auto_no_write
 case_cf3_extended_auto_after_write
@@ -2382,7 +3249,8 @@ case_startup_identity_listener
 case_startup_identity_configured
 
 # ==== RFQ availability policy ====
-case_plan_stage_best_effort_degrade
+case_plan_stage_warning
+case_plan_stage_missing_lsn_error
 case_missing_writer_rfq_state
 case_missing_reader_rfq_state
 
@@ -2396,6 +3264,8 @@ case_reset_all_preserves_lsn
 
 # ==== Replica acquisition faults ====
 case_reader_acquire_faults
+case_reader_capacity_deadline_actions
+case_reset_timeout_after_wait_bypass
 
 # ==== Monitor LSN updates ====
 case_monitor_baseline
@@ -2418,8 +3288,8 @@ case_cf6_fake_timeout_notice
 case_wrapper_set_error
 case_timeout_edge_tests
 case_user_error_after_wait
-case_best_effort_syntax_error
-case_strict_syntax_error
+case_warning_syntax_error
+case_writer_syntax_error
 
 if [ "$FAIL" -eq 0 ]; then
     diag "all LSN session-consistency checks passed"

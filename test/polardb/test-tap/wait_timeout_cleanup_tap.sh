@@ -2,26 +2,26 @@
 # TAP integration test for PolarDB LSN wait-timeout behavior.
 #
 # This test covers the timeout branches that cannot be confirmed by unit tests:
-#   - finite best_effort/strict wait that reaches the target;
-#   - finite best_effort timeout: exactly one WARNING + stale read. The patched
+#   - finite warning/primary-action wait that reaches the target;
+#   - finite warning timeout: exactly one WARNING + stale read. The patched
 #     PolarDB-15 backend consumes the wait target after the first wait, so there
 #     is no leftover target and the proxy needs no clear-prefix wrapper;
-#   - finite strict timeout: timeout is counted, then the read is retried once
-#     on the writer before any user result is sent;
+#   - finite primary-action timeout: timeout is counted, then the read is retried
+#     once on the primary before any user result is sent;
 #   - lost reader connection during a wait-wrapped read: the read is retried once
-#     on the writer before any user result is sent;
-#   - a straight read after a best_effort timeout runs with no leftover wait;
-#   - finite best_effort timeout followed by strict timeout;
-#   - timeout 0 in best_effort/strict: no PolarDB timeout branch, waits until
-#     catchup, still interruptible by normal PostgreSQL/client/admin paths.
+#     on the primary before any user result is sent;
+#   - a straight read after a warning timeout runs with no leftover wait;
+#   - finite warning timeout followed by a primary-action timeout;
+#   - timeout 0 with warning/primary actions: no PolarDB timeout branch, waits
+#     until catchup, still interruptible by normal PostgreSQL/client/admin paths.
 #
 # Requires a patched (consume-on-wait) PolarDB-15 backend. Run with a
 # POLARDB_DEBUG=1 binary for full request-flow traces:
 #
-#   make -C "$PROXYSQL_ROOT" polardb-debug
+#   make -C "$PROXYSQL_ROOT" -j128 polardb-debug
 #   cp test/polardb/.env.example test/polardb/.env
 #   # edit POLARDB_ENDPOINTS and DCS settings in test/polardb/.env
-#   POLARDB_TIMEOUT_EDGE_TESTS=1 make -C test/polardb tap-wait-timeout
+#   POLARDB_TIMEOUT_EDGE_TESTS=1 make -j128 -C test/polardb tap-wait-timeout
 
 set -uo pipefail
 
@@ -80,7 +80,7 @@ proxy_trace_delta() {
     local after
 
     if ! tap_trace_checks_enabled "$(proxy_trace_log)"; then
-        echo -1
+        tap_trace_unavailable_delta
         return 0
     fi
     after=$(proxy_trace_count "$pattern")
@@ -114,14 +114,33 @@ process_alive_not_zombie() {
 # read counters through the harness get_counter() path, not admin_sql.
 
 configure_wait_policy() {
-    local mode="$1"
+    local timeout_action="$1"
     local timeout_ms="$2"
+    local replica_loss_action="${3:-}"
+    local effective_action
 
-    proxysql_admin "UPDATE global_variables SET variable_value='lsn' WHERE variable_name='pgsql-polardb_consistency_mode';" >/dev/null
-    proxysql_admin "UPDATE global_variables SET variable_value='$mode' WHERE variable_name='pgsql-polardb_wait_timeout_mode';" >/dev/null
-    proxysql_admin "UPDATE global_variables SET variable_value='1000' WHERE variable_name='pgsql-polardb_lag_wait_ms';" >/dev/null
+    proxysql_admin "INSERT OR REPLACE INTO global_variables(variable_name, variable_value) VALUES('pgsql-polardb_consistency_mode', 'session_lsn');" >/dev/null
+    proxysql_admin "INSERT OR REPLACE INTO global_variables(variable_name, variable_value) VALUES('pgsql-polardb_action_lsn_timeout', '$timeout_action');" >/dev/null
+    if [ -n "$replica_loss_action" ]; then
+        proxysql_admin "INSERT OR REPLACE INTO global_variables(variable_name, variable_value) VALUES('pgsql-polardb_action_replica_loss', '$replica_loss_action');" >/dev/null
+    fi
+    proxysql_admin "INSERT OR REPLACE INTO global_variables(variable_name, variable_value) VALUES('pgsql-polardb_lsn_wait_timeout_ms', '1000');" >/dev/null
     proxysql_admin "LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null
-    proxysql_admin "UPDATE pgsql_replication_hostgroups SET consistency_mode='lsn', max_lag_bytes=-1, lsn_wait_timeout_ms=$timeout_ms WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
+    effective_action=$(proxysql_admin "SELECT variable_value FROM runtime_global_variables WHERE variable_name='pgsql-polardb_action_lsn_timeout';" | tr -d '[:space:]')
+    if [ "$effective_action" != "$timeout_action" ]; then
+        printf 'Bail out! requested LSN timeout action %s, runtime kept %s\n' \
+            "$timeout_action" "${effective_action:-<missing>}"
+        exit 1
+    fi
+    if [ -n "$replica_loss_action" ]; then
+        effective_action=$(proxysql_admin "SELECT variable_value FROM runtime_global_variables WHERE variable_name='pgsql-polardb_action_replica_loss';" | tr -d '[:space:]')
+        if [ "$effective_action" != "$replica_loss_action" ]; then
+            printf 'Bail out! requested replica-loss action %s, runtime kept %s\n' \
+                "$replica_loss_action" "${effective_action:-<missing>}"
+            exit 1
+        fi
+    fi
+    proxysql_admin "UPDATE pgsql_replication_hostgroups SET consistency_mode='session_lsn', max_lag_bytes=-1, lsn_wait_timeout_ms=$timeout_ms WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
     proxysql_admin "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
 }
 
@@ -152,25 +171,25 @@ require_replay_lag_enabled() {
 }
 
 run_waiting_query_until_catchup() {
-    local mode="$1"
+    local timeout_action="$1"
     local id="$2"
     local out_file="$3"
     local hold_seconds="${TIMEOUT0_HOLD_SECONDS:-6.2}"
 
-    configure_wait_policy "$mode" 0
+    configure_wait_policy "$timeout_action" 0
     require_replay_lag_enabled 50000 "timeout wait setup"
     start_wal_generator 0 0
 
-    proxy_script "INSERT INTO $TEST_TABLE VALUES ($id, 'timeout0_$mode') ON CONFLICT (id) DO UPDATE SET data='timeout0_$mode';
+    proxy_script "INSERT INTO $TEST_TABLE VALUES ($id, 'timeout0_$timeout_action') ON CONFLICT (id) DO UPDATE SET data='timeout0_$timeout_action';
 \\! sleep 0.5
     SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $id;" >"$out_file" 2>&1 &
     local pid=$!
 
     sleep "$hold_seconds"
     if process_alive_not_zombie "$pid"; then
-        ok 0 "timeout 0/$mode: query remains waiting while replay lag is held for ${hold_seconds}s"
+        ok 0 "timeout 0/$timeout_action: query remains waiting while replay lag is held for ${hold_seconds}s"
     else
-        ok 1 "timeout 0/$mode: query should still be waiting before catchup"
+        ok 1 "timeout 0/$timeout_action: query should still be waiting before catchup"
     fi
 
     stop_wal_generator
@@ -190,10 +209,10 @@ run_waiting_query_until_catchup() {
     if process_alive_not_zombie "$pid"; then
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
-        ok 1 "timeout 0/$mode: query completed after replay catchup"
+        ok 1 "timeout 0/$timeout_action: query completed after replay catchup"
     else
         wait "$pid" 2>/dev/null || true
-        ok 0 "timeout 0/$mode: query completed after replay catchup"
+        ok 0 "timeout 0/$timeout_action: query completed after replay catchup"
     fi
 }
 
@@ -251,11 +270,11 @@ set_debug_retry_fault_or_skip() {
     return 0
 }
 
-run_strict_timeout_no_retry_fault() {
+run_primary_timeout_no_retry_fault() {
     local fault_name="$1"
     local label="$2"
     local row_id="$3"
-    local out timeout_before retry_before out_file rc
+    local out timeout_before retry_before out_file rc terminal_ok
     local delta_timeout delta_retry
     local trace_pattern trace_before trace_delta
 
@@ -263,17 +282,17 @@ run_strict_timeout_no_retry_fault() {
         return 0
     fi
 
-    configure_wait_policy strict 100
+    configure_wait_policy primary 100
     require_replay_lag_enabled 50000 "$label setup"
     start_wal_generator 0 0
     timeout_before=$(counter_value "PolarDB_Wait_Error_Timeout")
     retry_before=$(counter_value "PolarDB_Wait_Reads_Retried_On_Writer")
     case "$fault_name" in
     writer_busy)
-        trace_pattern="PolarDB WAIT: failed wait-read cleaned wrapper; primary retry declined"
+        trace_pattern="PolarDB FAILURE: primary retry declined writer_hg="
         ;;
     *)
-        trace_pattern="PolarDB WAIT: failed wait-read cleaned wrapper; normal error path will not redispatch wrapped packet"
+        trace_pattern="PolarDB FAILURE: primary retry unavailable"
         ;;
     esac
     trace_before=$(proxy_trace_count "$trace_pattern")
@@ -290,11 +309,21 @@ SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $row_id;" >"$out_file" 2>&1
     disable_replay_lag >/dev/null 2>&1 || true
     wait_for_replica_lsn_catchup 15 >/dev/null 2>&1 || true
 
+    terminal_ok=1
+    if [ "$fault_name" = "result_started" ]; then
+        printf '%s\n' "$out" |
+            grep -Eq "server closed the connection|connection to server was lost" &&
+            terminal_ok=0
+    elif printf '%s\n' "$out" | grep -q "ERROR:  LSN wait timeout" &&
+        ! printf '%s\n' "$out" |
+            grep -Eq "polar_xact_split_wait_lsn|polar_proxy_wait_timeout_ms|polar_consistency_mode|^SET$"; then
+        terminal_ok=0
+    fi
+
     if [ "$delta_timeout" -eq 1 ] &&
         [ "$delta_retry" -eq 0 ] &&
         { [ "$trace_delta" -eq 1 ] || [ "$trace_delta" -eq -1 ]; } &&
-        printf '%s\n' "$out" | grep -q "ERROR:  LSN wait timeout" &&
-        ! printf '%s\n' "$out" | grep -Eq "polar_xact_split_wait_lsn|polar_proxy_wait_timeout_ms|polar_consistency_mode|^SET$"; then
+        [ "$terminal_ok" -eq 0 ]; then
         ok 0 "$label"
     else
         diag "$label output: $out"
@@ -303,29 +332,33 @@ SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $row_id;" >"$out_file" 2>&1
     fi
 }
 
-# A reader connection lost mid wait-wrapped read must be retried once on the
-# writer, hiding the backend failure and counting connection-loss (not timeout).
-# Driven with timeout 0 so the only recoverable condition is the terminated
-# reader -- this shows the retry path is independent of the wait_timeout mode
-# (Branch 6 = strict, Branch 6b = best_effort use the same flow). Emits 6 ok().
+# A reader connection lost mid wait-wrapped read first tries another pooled
+# reader and then falls back to the primary. Either safe retry hides the backend
+# failure and counts connection loss, not an LSN wait timeout. Timeout 0 keeps
+# the test focused on the terminated connection. Emits 6 ok().
 run_reader_connection_loss_branch() {
-    local mode="$1"
+    local timeout_action="$1"
     local label_prefix="$2"
     local row_id="$3"
     local marker="$4"
     local out_basename="$5"
-    local conn_lost_before retry_before timeout_before out_file reader_loss_pid
-    local waited out delta_conn_lost delta_retry delta_timeout
-    local trace_pattern trace_before trace_delta
+    local conn_lost_before reader_retry_before writer_retry_before timeout_before
+    local out_file reader_loss_pid waited out delta_conn_lost
+    local delta_reader_retry delta_writer_retry delta_timeout
+    local reader_trace writer_trace reader_trace_before writer_trace_before
+    local reader_trace_delta writer_trace_delta
 
-    configure_wait_policy "$mode" 0
+    configure_wait_policy "$timeout_action" 0 replica_then_primary
     require_replay_lag_enabled 50000 "${label_prefix}reader connection loss setup"
     start_wal_generator 0 0
     conn_lost_before=$(counter_value "PolarDB_Wait_Error_Connection_Lost")
-    retry_before=$(counter_value "PolarDB_Wait_Reads_Retried_On_Writer")
+    reader_retry_before=$(counter_value "PolarDB_Wait_Reads_Retried_On_Reader")
+    writer_retry_before=$(counter_value "PolarDB_Wait_Reads_Retried_On_Writer")
     timeout_before=$(counter_value "PolarDB_Wait_Error_Timeout")
-    trace_pattern="PolarDB WAIT: reader connection lost before user result; redirecting original unwrapped query"
-    trace_before=$(proxy_trace_count "$trace_pattern")
+    reader_trace="PolarDB FAILURE: reader failed before user result; retrying original query on another reader_hg="
+    writer_trace="PolarDB FAILURE: reader connection lost before user result; redirecting original query to primary_hg="
+    reader_trace_before=$(proxy_trace_count "$reader_trace")
+    writer_trace_before=$(proxy_trace_count "$writer_trace")
     out_file="$RUN_DIR/${out_basename}.out"
     proxy_script "INSERT INTO $TEST_TABLE VALUES ($row_id, '$marker') ON CONFLICT (id) DO UPDATE SET data='$marker';
 \\! sleep 0.5
@@ -342,26 +375,31 @@ SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $row_id;" >"$out_file" 2>&1 &
     if process_alive_not_zombie "$reader_loss_pid"; then
         kill "$reader_loss_pid" 2>/dev/null || true
         wait "$reader_loss_pid" 2>/dev/null || true
-        ok 1 "${label_prefix}reader connection loss: query completed after writer retry"
+        ok 1 "${label_prefix}reader connection loss: query completed after safe retry"
     else
         wait "$reader_loss_pid" 2>/dev/null || true
-        ok 0 "${label_prefix}reader connection loss: query completed after writer retry"
+        ok 0 "${label_prefix}reader connection loss: query completed after safe retry"
     fi
     stop_wal_generator
     out=$(cat "$out_file")
     delta_conn_lost=$(counter_delta "PolarDB_Wait_Error_Connection_Lost" "$conn_lost_before")
-    delta_retry=$(counter_delta "PolarDB_Wait_Reads_Retried_On_Writer" "$retry_before")
+    delta_reader_retry=$(counter_delta "PolarDB_Wait_Reads_Retried_On_Reader" "$reader_retry_before")
+    delta_writer_retry=$(counter_delta "PolarDB_Wait_Reads_Retried_On_Writer" "$writer_retry_before")
     delta_timeout=$(counter_delta "PolarDB_Wait_Error_Timeout" "$timeout_before")
-    trace_delta=$(proxy_trace_delta "$trace_pattern" "$trace_before")
+    reader_trace_delta=$(proxy_trace_delta "$reader_trace" "$reader_trace_before")
+    writer_trace_delta=$(proxy_trace_delta "$writer_trace" "$writer_trace_before")
     echo "$out" | grep -q '^1$'
-    ok $? "${label_prefix}reader connection loss: writer retry returns result"
+    ok $? "${label_prefix}reader connection loss: safe retry returns result"
     ! echo "$out" | grep -Eq "ERROR|FATAL|server closed the connection|terminating connection"
     ok $? "${label_prefix}reader connection loss: backend failure is hidden from client"
     [ "$delta_conn_lost" -eq 1 ]
     ok $? "${label_prefix}reader connection loss increments connection-loss counter exactly once"
-    [ "$delta_retry" -eq 1 ] && { [ "$trace_delta" -eq 1 ] || [ "$trace_delta" -eq -1 ]; }
-    ok $? "${label_prefix}reader connection loss increments writer-retry counter exactly once and traces primary retry"
-    [ "$trace_delta" -eq 1 ] || diag "${label_prefix}reader connection loss retry trace_delta=$trace_delta pattern='$trace_pattern' (-1 means trace unavailable)"
+    [ $((delta_reader_retry + delta_writer_retry)) -eq 1 ] &&
+        { [ "$reader_trace_delta" -eq 1 ] || [ "$writer_trace_delta" -eq 1 ] ||
+            { [ "$reader_trace_delta" -eq -1 ] && [ "$writer_trace_delta" -eq -1 ]; }; }
+    ok $? "${label_prefix}reader connection loss records exactly one replica-or-primary retry"
+    { [ "$reader_trace_delta" -eq 1 ] || [ "$writer_trace_delta" -eq 1 ]; } ||
+        diag "${label_prefix}retry traces reader=$reader_trace_delta writer=$writer_trace_delta (-1 means trace unavailable)"
     [ "$delta_timeout" -eq 0 ]
     ok $? "${label_prefix}reader connection loss does not increment timeout counter"
     disable_replay_lag >/dev/null 2>&1 || true
@@ -459,7 +497,7 @@ run_wait_timeout_cleanup_tap() {
     ok $? "spoof warning function created on primary"
     wait_for_replica_lsn_catchup 15 >/dev/null 2>&1
     timeout_before=$(counter_value "PolarDB_Wait_Error_Timeout")
-    configure_wait_policy best_effort 5000
+    configure_wait_policy warning 5000
     out=$(proxy_script "SELECT polardb_lsn_timeout_warning_spoof();")
     delta_timeout=$(counter_delta "PolarDB_Wait_Error_Timeout" "$timeout_before")
     echo "$out" | grep -q "LSN wait timeout after 123 ms"
@@ -469,8 +507,8 @@ run_wait_timeout_cleanup_tap() {
     [ "$delta_timeout" -eq 0 ]
     ok $? "user warning text is not counted as PolarDB wait timeout"
 
-    # Branch 1: finite best_effort success (target reached, no clear).
-    configure_wait_policy best_effort 5000
+    # Branch 1: finite warning-action success (target reached, no clear).
+    configure_wait_policy warning 5000
     timeout_before=$(counter_value "PolarDB_Wait_Error_Timeout")
     snap_all_counters
 
@@ -480,11 +518,11 @@ SELECT COUNT(*) FROM $TEST_TABLE WHERE id = 1201;")
 
     delta_timeout=$(counter_delta "PolarDB_Wait_Error_Timeout" "$timeout_before")
     echo "$out" | grep -q '^1$'
-    ok $? "finite best_effort success returns fresh row"
+    ok $? "finite warning-action success returns fresh row"
     [ "$delta_timeout" -eq 0 ]
-    ok $? "finite best_effort success does not count timeout"
+    ok $? "finite warning-action success does not count timeout"
 
-    # Whole counter-flow vector for one committed best_effort consistency read.
+    # Whole counter-flow vector for one committed warning-action read.
     d_routing=$(counter_delta "PolarDB_Session_LSN_Routing" "$S_ROUTING")
     d_prepared=$(counter_delta "PolarDB_Wait_Wrap_Prepared" "$S_PREPARED")
     d_bypassed=$(counter_delta "PolarDB_Wait_Wrap_Bypassed" "$S_BYPASSED")
@@ -494,33 +532,34 @@ SELECT COUNT(*) FROM $TEST_TABLE WHERE id = 1201;")
     d_rfq_lsn=$(counter_delta "PolarDB_Server_LSN_Updates_From_RFQ" "$S_RFQ_LSN")
     diag "be_success deltas: routing=$d_routing prepared=$d_prepared bypassed=$d_bypassed sent=$d_sent abort=$d_abort eto=$delta_timeout elto=$d_elto rfq_lsn=$d_rfq_lsn"
 
-    [ "$d_routing" -ge 1 ] && [ "$d_routing" -eq "$d_prepared" ]
-    ok $? "be_success: Session_LSN_Routing == Wait_Wrap_Prepared (lockstep)"
-    [ $((d_sent + d_bypassed)) -eq "$d_prepared" ] && [ "$d_abort" -eq 0 ]
-    ok $? "be_success: Wait_LSN_Sent + Wait_Wrap_Bypassed == prepared, no safety abort"
+    [ "$d_routing" -ge 1 ] &&
+        [ "$d_routing" -eq $((d_prepared + d_bypassed)) ]
+    ok $? "be_success: every session-LSN route either activates a wrapper or dispatches directly"
+    [ "$d_sent" -eq "$d_prepared" ] && [ "$d_abort" -eq 0 ]
+    ok $? "be_success: every activated wrapper was sent, with no safety abort"
     [ "$d_rfq_lsn" -ge 1 ]
     ok $? "be_success: Server_LSN_Updates_From_RFQ advanced (writer RFQ + replica RFQ; ~2/cycle)"
     [ "$delta_timeout" -eq "$d_elto" ]
     ok $? "be_success: Wait_Error_Timeout == Wait_Error_LSN_Wait_Timeout (lockstep)"
 
-    # Branch 2: finite strict success (target reached, no clear).
-    configure_wait_policy strict 5000
+    # Branch 2: finite primary-action success (target reached, no clear).
+    configure_wait_policy primary 5000
     timeout_before=$(counter_value "PolarDB_Wait_Error_Timeout")
 
-    out=$(proxy_script "INSERT INTO $TEST_TABLE VALUES (1202, 'strict_success') ON CONFLICT (id) DO UPDATE SET data='strict_success';
+    out=$(proxy_script "INSERT INTO $TEST_TABLE VALUES (1202, 'primary_action_success') ON CONFLICT (id) DO UPDATE SET data='primary_action_success';
 \\! sleep 0.5
 SELECT COUNT(*) FROM $TEST_TABLE WHERE id = 1202;")
 
     delta_timeout=$(counter_delta "PolarDB_Wait_Error_Timeout" "$timeout_before")
     echo "$out" | grep -q '^1$'
-    ok $? "finite strict success returns fresh row"
+    ok $? "finite primary-action success returns fresh row"
     [ "$delta_timeout" -eq 0 ]
-    ok $? "finite strict success does not count timeout"
+    ok $? "finite primary-action success does not count timeout"
 
-    # Branch 3: finite best_effort timeout commits with exactly one WARNING; the next
+    # Branch 3: finite warning timeout commits with exactly one WARNING; the next
     # straight reader query runs with no leftover wait (backend consumed the target).
-    configure_wait_policy best_effort 100
-    require_replay_lag_enabled 50000 "best_effort timeout setup"
+    configure_wait_policy warning 100
+    require_replay_lag_enabled 50000 "warning timeout setup"
     start_wal_generator 0 0
     timeout_before=$(counter_value "PolarDB_Wait_Error_Timeout")
     snap_all_counters
@@ -535,33 +574,36 @@ SELECT COUNT(*) FROM $TEST_TABLE WHERE id = 1203;")
     diag "be_timeout: client-visible 'LSN wait timeout' WARNING count = $warn_count"
 
     [ "$warn_count" -ge 1 ]
-    ok $? "finite best_effort timeout emits WARNING"
+    ok $? "finite warning timeout emits WARNING"
     [ "$warn_count" -eq 1 ]
-    ok $? "best_effort timeout WARNING reaches client exactly once (no duplicate forward)"
+    ok $? "timeout WARNING reaches client exactly once (no duplicate forward)"
     [ "$delta_timeout" -eq 1 ]
-    ok $? "finite best_effort timeout increments timeout counter exactly once"
+    ok $? "finite warning timeout increments timeout counter exactly once"
 
     d_routing=$(counter_delta "PolarDB_Session_LSN_Routing" "$S_ROUTING")
     d_prepared=$(counter_delta "PolarDB_Wait_Wrap_Prepared" "$S_PREPARED")
+    d_bypassed=$(counter_delta "PolarDB_Wait_Wrap_Bypassed" "$S_BYPASSED")
     d_sumus=$(counter_delta "PolarDB_Wait_LSN_Sum_Us" "$S_SUMUS")
     d_elto=$(counter_delta "PolarDB_Wait_Error_LSN_Wait_Timeout" "$S_ELTO")
-    diag "be_timeout deltas: routing=$d_routing prepared=$d_prepared sumus=$d_sumus eto=$delta_timeout elto=$d_elto"
+    diag "be_timeout deltas: routing=$d_routing prepared=$d_prepared bypassed=$d_bypassed sumus=$d_sumus eto=$delta_timeout elto=$d_elto"
 
     [ "$delta_timeout" -eq "$d_elto" ]
     ok $? "be_timeout: Wait_Error_Timeout == Wait_Error_LSN_Wait_Timeout (lockstep)"
-    [ "$d_routing" -ge 1 ] && [ "$d_routing" -eq "$d_prepared" ]
-    ok $? "be_timeout: Session_LSN_Routing == Wait_Wrap_Prepared (lockstep)"
+    [ "$d_routing" -ge 1 ] &&
+        [ "$d_routing" -eq $((d_prepared + d_bypassed)) ] &&
+        [ "$d_prepared" -ge 1 ]
+    ok $? "be_timeout: the behind-reader route activated a real wrapper"
     [ "$d_sumus" -gt 0 ]
     ok $? "be_timeout: Wait_LSN_Sum_Us increased (real wait elapsed)"
 
-    # The best_effort timeout WARNING must be emitted before rows even when the
+    # The timeout WARNING must be emitted before rows even when the
     # result is large enough to stream through threshold_resultset_size.
     old_threshold=$(global_var "pgsql-threshold_resultset_size")
     set_global_var_runtime "pgsql-threshold_resultset_size" "1024"
-    configure_wait_policy best_effort 100
-    require_replay_lag_enabled 50000 "best_effort streamed timeout setup"
+    configure_wait_policy warning 100
+    require_replay_lag_enabled 50000 "streamed warning timeout setup"
     start_wal_generator 0 0
-    out_file="$RUN_DIR/best_effort_stream_notice_order.out"
+    out_file="$RUN_DIR/warning_stream_notice_order.out"
     proxy_script "INSERT INTO $TEST_TABLE VALUES (1215, 'be_stream_notice') ON CONFLICT (id) DO UPDATE SET data='be_stream_notice';
 \\! sleep 0.5
 SELECT g FROM generate_series(1, 3000) AS g;" >"$out_file" 2>&1
@@ -575,36 +617,36 @@ SELECT g FROM generate_series(1, 3000) AS g;" >"$out_file" 2>&1
     stream_first_row_line=$(grep -n '^1$' "$out_file" | head -1 | cut -d: -f1)
     stream_tail_line=$(grep -n '^3000$' "$out_file" | head -1 | cut -d: -f1)
     [ "$stream_warn_count" -eq 1 ]
-    ok $? "best_effort streamed timeout emits WARNING exactly once"
+    ok $? "streamed timeout emits WARNING exactly once"
     [ -n "$stream_warn_line" ] && [ -n "$stream_first_row_line" ] &&
         [ "$stream_warn_line" -lt "$stream_first_row_line" ]
-    ok $? "best_effort streamed timeout WARNING precedes first row"
+    ok $? "streamed timeout WARNING precedes first row"
     [ -n "$stream_tail_line" ] && [ "$stream_first_row_line" -lt "$stream_tail_line" ]
-    ok $? "best_effort streamed timeout returns full large result"
+    ok $? "streamed warning timeout returns full large result"
 
     set_select_rule_manual_reader
     out=$(proxy_script "SELECT 42;")
     set_select_rule_auto
 
     echo "$out" | grep -q '^42$'
-    ok $? "straight reader query after best_effort timeout returns"
+    ok $? "straight reader query after warning timeout returns"
     ! echo "$out" | grep -q "LSN wait timeout"
-    ok $? "straight read after best_effort timeout has no leftover wait (backend consumed target)"
+    ok $? "straight read after warning timeout has no leftover wait (backend consumed target)"
 
     disable_replay_lag >/dev/null 2>&1 || true
     wait_for_replica_lsn_catchup 15 >/dev/null 2>&1 || true
 
-    # Branch 4: finite strict timeout is retried on the writer before any user
+    # Branch 4: finite primary-action timeout retries on the primary before any
     # result is sent; the following straight read runs cleanly.
-    configure_wait_policy strict 100
-    require_replay_lag_enabled 50000 "strict timeout setup"
+    configure_wait_policy primary 100
+    require_replay_lag_enabled 50000 "primary-action timeout setup"
     start_wal_generator 0 0
     timeout_before=$(counter_value "PolarDB_Wait_Error_Timeout")
     retry_before=$(counter_value "PolarDB_Wait_Reads_Retried_On_Writer")
-    retry_trace_pattern="PolarDB WAIT: strict wait timeout before user result; redirecting original unwrapped query"
+    retry_trace_pattern="PolarDB FAILURE: LSN wait timeout before user result; redirecting original query to primary_hg="
     retry_trace_before=$(proxy_trace_count "$retry_trace_pattern")
 
-    out=$(proxy_script "INSERT INTO $TEST_TABLE VALUES (1204, 'strict_timeout') ON CONFLICT (id) DO UPDATE SET data='strict_timeout';
+    out=$(proxy_script "INSERT INTO $TEST_TABLE VALUES (1204, 'primary_action_timeout') ON CONFLICT (id) DO UPDATE SET data='primary_action_timeout';
 \\! sleep 0.5
 SELECT COUNT(*) FROM $TEST_TABLE WHERE id = 1204;")
     stop_wal_generator
@@ -613,36 +655,36 @@ SELECT COUNT(*) FROM $TEST_TABLE WHERE id = 1204;")
     delta_retry=$(counter_delta "PolarDB_Wait_Reads_Retried_On_Writer" "$retry_before")
     retry_trace_delta=$(proxy_trace_delta "$retry_trace_pattern" "$retry_trace_before")
     echo "$out" | grep -q '^1$'
-    ok $? "finite strict timeout retries on writer and returns result"
+    ok $? "finite primary-action timeout retries on the primary and returns result"
     ! echo "$out" | grep -q "ERROR:  LSN wait timeout"
-    ok $? "finite strict timeout does not reach client after retry"
+    ok $? "finite primary-action timeout does not reach client after retry"
     [ "$delta_timeout" -eq 1 ]
-    ok $? "finite strict timeout increments timeout counter exactly once"
+    ok $? "finite primary-action timeout increments timeout counter exactly once"
     [ "$delta_retry" -eq 1 ] && { [ "$retry_trace_delta" -eq 1 ] || [ "$retry_trace_delta" -eq -1 ]; }
-    ok $? "finite strict timeout increments writer-retry counter exactly once and traces primary retry"
-    [ "$retry_trace_delta" -eq 1 ] || diag "strict retry trace_delta=$retry_trace_delta pattern='$retry_trace_pattern' (-1 means trace unavailable)"
+    ok $? "finite primary-action timeout increments primary-retry counter exactly once and traces the retry"
+    [ "$retry_trace_delta" -eq 1 ] || diag "primary retry trace_delta=$retry_trace_delta pattern='$retry_trace_pattern' (-1 means trace unavailable)"
 
     set_select_rule_manual_reader
     out=$(proxy_script "SELECT 43;")
     set_select_rule_auto
 
     echo "$out" | grep -q '^43$'
-    ok $? "straight reader query after strict timeout returns"
+    ok $? "straight reader query after primary-action timeout returns"
 
     disable_replay_lag >/dev/null 2>&1 || true
     wait_for_replica_lsn_catchup 15 >/dev/null 2>&1 || true
 
-    run_strict_timeout_no_retry_fault \
+    run_primary_timeout_no_retry_fault \
         result_started \
-        "strict timeout with result already started does not retry" \
+        "primary-action timeout after result started terminates without retry" \
         1210
-    run_strict_timeout_no_retry_fault \
+    run_primary_timeout_no_retry_fault \
         fallback_unknown \
-        "strict timeout with unknown fallback writer does not retry" \
+        "primary-action timeout with unknown primary does not retry" \
         1211
-	    run_strict_timeout_no_retry_fault \
+	    run_primary_timeout_no_retry_fault \
 	        writer_busy \
-	        "strict timeout with declined primary retry returns clean error without wrapper results" \
+	        "primary-action timeout with declined primary retry returns clean error without wrapper results" \
 	        1212
 
     # A reader can also disappear after the proxy has begun forwarding a result.
@@ -650,7 +692,7 @@ SELECT COUNT(*) FROM $TEST_TABLE WHERE id = 1204;")
     # test can show the hard safety check without depending on packet timing.
     if set_debug_retry_fault_or_skip result_started \
         "reader connection loss after result started is not retried"; then
-        configure_wait_policy strict 0
+        configure_wait_policy primary 0
         require_replay_lag_enabled 50000 "reader connection loss after result-started setup"
         start_wal_generator 0 0
         conn_lost_before=$(counter_value "PolarDB_Wait_Error_Connection_Lost")
@@ -695,31 +737,31 @@ SELECT COUNT(*) FROM $TEST_TABLE WHERE id = 1213;" >"$out_file" 2>&1 &
         fi
     fi
 
-    # Branch 5: best_effort timeout followed by a strict timeout, then a straight
+    # Branch 5: warning timeout followed by a primary-action timeout, then a straight
     # reader query. With the consume-on-wait backend each wait target is consumed per
     # read, so order does not matter and the straight reader query runs cleanly.
-    configure_wait_policy best_effort 100
-    require_replay_lag_enabled 50000 "best_effort precursor timeout setup"
+    configure_wait_policy warning 100
+    require_replay_lag_enabled 50000 "warning precursor timeout setup"
     start_wal_generator 0 0
     timeout_before=$(counter_value "PolarDB_Wait_Error_Timeout")
-    out=$(proxy_script "INSERT INTO $TEST_TABLE VALUES (1205, 'be_timeout_before_strict') ON CONFLICT (id) DO UPDATE SET data='be_timeout_before_strict';
+    out=$(proxy_script "INSERT INTO $TEST_TABLE VALUES (1205, 'warning_before_primary') ON CONFLICT (id) DO UPDATE SET data='warning_before_primary';
 \\! sleep 0.5
 SELECT COUNT(*) FROM $TEST_TABLE WHERE id = 1205;")
     stop_wal_generator
     delta_timeout=$(counter_delta "PolarDB_Wait_Error_Timeout" "$timeout_before")
     echo "$out" | grep -q "WARNING:  LSN wait timeout"
-    ok $? "best_effort precursor timeout emits WARNING"
+    ok $? "warning precursor timeout emits WARNING"
     [ "$delta_timeout" -eq 1 ]
-    ok $? "best_effort precursor timeout increments timeout counter exactly once"
+    ok $? "warning precursor timeout increments timeout counter exactly once"
 
-    configure_wait_policy strict 100
-    require_replay_lag_enabled 50000 "strict after best_effort timeout setup"
+    configure_wait_policy primary 100
+    require_replay_lag_enabled 50000 "primary action after warning timeout setup"
     start_wal_generator 0 0
     timeout_before=$(counter_value "PolarDB_Wait_Error_Timeout")
     retry_before=$(counter_value "PolarDB_Wait_Reads_Retried_On_Writer")
-    retry_trace_pattern="PolarDB WAIT: strict wait timeout before user result; redirecting original unwrapped query"
+    retry_trace_pattern="PolarDB FAILURE: LSN wait timeout before user result; redirecting original query to primary_hg="
     retry_trace_before=$(proxy_trace_count "$retry_trace_pattern")
-    out=$(proxy_script "INSERT INTO $TEST_TABLE VALUES (1206, 'strict_after_be_timeout') ON CONFLICT (id) DO UPDATE SET data='strict_after_be_timeout';
+    out=$(proxy_script "INSERT INTO $TEST_TABLE VALUES (1206, 'primary_after_warning') ON CONFLICT (id) DO UPDATE SET data='primary_after_warning';
 \\! sleep 0.5
 SELECT COUNT(*) FROM $TEST_TABLE WHERE id = 1206;")
     stop_wal_generator
@@ -727,69 +769,69 @@ SELECT COUNT(*) FROM $TEST_TABLE WHERE id = 1206;")
     delta_retry=$(counter_delta "PolarDB_Wait_Reads_Retried_On_Writer" "$retry_before")
     retry_trace_delta=$(proxy_trace_delta "$retry_trace_pattern" "$retry_trace_before")
     echo "$out" | grep -q '^1$'
-    ok $? "strict timeout after best_effort flag retries on writer"
+    ok $? "primary-action timeout after warning retries on the primary"
     ! echo "$out" | grep -q "ERROR:  LSN wait timeout"
-    ok $? "strict timeout after best_effort flag does not reach client"
+    ok $? "primary-action timeout after warning does not reach client"
     [ "$delta_timeout" -eq 1 ]
-    ok $? "strict timeout after best_effort flag increments timeout counter exactly once"
+    ok $? "primary-action timeout after warning increments timeout counter exactly once"
     [ "$delta_retry" -eq 1 ] && { [ "$retry_trace_delta" -eq 1 ] || [ "$retry_trace_delta" -eq -1 ]; }
-    ok $? "strict timeout after best_effort flag increments writer-retry counter exactly once and traces primary retry"
-    [ "$retry_trace_delta" -eq 1 ] || diag "strict-after-best-effort retry trace_delta=$retry_trace_delta pattern='$retry_trace_pattern' (-1 means trace unavailable)"
+    ok $? "primary-action timeout after warning increments primary-retry counter exactly once and traces the retry"
+    [ "$retry_trace_delta" -eq 1 ] || diag "primary-after-warning retry trace_delta=$retry_trace_delta pattern='$retry_trace_pattern' (-1 means trace unavailable)"
 
     set_select_rule_manual_reader
     out=$(proxy_script "SELECT 44;")
     set_select_rule_auto
     echo "$out" | grep -q '^44$'
-    ok $? "straight reader query after strict abort with prior flag returns"
+    ok $? "straight reader query after primary retry returns"
     disable_replay_lag >/dev/null 2>&1 || true
     wait_for_replica_lsn_catchup 15 >/dev/null 2>&1 || true
 
-    # Branch 6: lost reader connection during a wait-wrapped read, strict timeout 0.
+    # Branch 6: lost reader connection during a wait-wrapped read, timeout 0.
     run_reader_connection_loss_branch \
-        strict "" 1209 reader_connection_lost reader_connection_lost
+        primary "" 1209 reader_connection_lost reader_connection_lost
 
-    # Branch 6b: same recovery under best_effort timeout 0 -- the retry is
-    # independent of the wait_timeout mode.
+    # Branch 6b: same recovery under warning timeout 0. Connection-loss recovery
+    # is independent of the timeout action.
     run_reader_connection_loss_branch \
-        best_effort "best_effort " 1214 best_effort_reader_connection_lost \
-        best_effort_reader_connection_lost
+        warning "stale-with-warning " 1214 stale_warning_reader_connection_lost \
+        warning_reader_connection_lost
 
-    # Branch 7: timeout 0 in best_effort waits until catchup; no timeout warning,
+    # Branch 7: timeout 0 with the warning action waits until catchup; no warning,
     # no timeout counter. Hold lag longer than any finite timeout used in this test
     # so the assertion shows timeout 0 reached the backend as "wait indefinitely",
     # without depending on debug query-text traces.
     timeout_before=$(counter_value "PolarDB_Wait_Error_Timeout")
     sumus_before=$(counter_value "PolarDB_Wait_LSN_Sum_Us")
-    out_file="$RUN_DIR/timeout0_best_effort.out"
-    run_waiting_query_until_catchup best_effort 1207 "$out_file"
+    out_file="$RUN_DIR/timeout0_warning.out"
+    run_waiting_query_until_catchup warning 1207 "$out_file"
     out=$(cat "$out_file")
     delta_timeout=$(counter_delta "PolarDB_Wait_Error_Timeout" "$timeout_before")
     d_sumus_timeout0=$(counter_delta "PolarDB_Wait_LSN_Sum_Us" "$sumus_before")
     echo "$out" | grep -q '^1$'
-    ok $? "timeout 0/best_effort returns fresh row after catchup"
+    ok $? "timeout 0/warning returns fresh row after catchup"
     ! echo "$out" | grep -q "LSN wait timeout"
-    ok $? "timeout 0/best_effort emits no timeout warning"
+    ok $? "timeout 0/warning emits no timeout warning"
     [ "$delta_timeout" -eq 0 ]
-    ok $? "timeout 0/best_effort does not increment timeout counter"
+    ok $? "timeout 0/warning does not increment timeout counter"
     [ "$d_sumus_timeout0" -ge "$TIMEOUT0_MIN_WAIT_US" ]
-    ok $? "timeout 0/best_effort waits beyond finite timeout"
+    ok $? "timeout 0/warning waits beyond finite timeout"
 
-    # Branch 8: timeout 0 in strict behaves the same for the wait itself.
+    # Branch 8: timeout 0 with the primary action behaves the same for the wait.
     timeout_before=$(counter_value "PolarDB_Wait_Error_Timeout")
     sumus_before=$(counter_value "PolarDB_Wait_LSN_Sum_Us")
-    out_file="$RUN_DIR/timeout0_strict.out"
-    run_waiting_query_until_catchup strict 1208 "$out_file"
+    out_file="$RUN_DIR/timeout0_primary.out"
+    run_waiting_query_until_catchup primary 1208 "$out_file"
     out=$(cat "$out_file")
     delta_timeout=$(counter_delta "PolarDB_Wait_Error_Timeout" "$timeout_before")
     d_sumus_timeout0=$(counter_delta "PolarDB_Wait_LSN_Sum_Us" "$sumus_before")
     echo "$out" | grep -q '^1$'
-    ok $? "timeout 0/strict returns fresh row after catchup"
+    ok $? "timeout 0/primary returns fresh row after catchup"
     ! echo "$out" | grep -q "LSN wait timeout"
-    ok $? "timeout 0/strict emits no timeout error"
+    ok $? "timeout 0/primary emits no timeout error"
     [ "$delta_timeout" -eq 0 ]
-    ok $? "timeout 0/strict does not increment timeout counter"
+    ok $? "timeout 0/primary does not increment timeout counter"
     [ "$d_sumus_timeout0" -ge "$TIMEOUT0_MIN_WAIT_US" ]
-    ok $? "timeout 0/strict waits beyond finite timeout"
+    ok $? "timeout 0/primary waits beyond finite timeout"
 
     diag "timeout cleanup assertions completed: failed=$FAIL"
     [ "$FAIL" -eq 0 ]
