@@ -8,6 +8,7 @@ using json = nlohmann::json;
 #include <queue>
 #include <cstring>
 #include <cctype>
+#include <mutex>
 #include <functional>
 #include <thread>
 #include <future>
@@ -45,6 +46,47 @@ __thread unsigned int _thr_SQP_version;
 __thread std::vector<QP_rule_t*>* _thr_SQP_rules;
 __thread khash_t(khStrInt)* _thr_SQP_rules_fast_routing;
 __thread char* _thr___rules_fast_routing___keys_values;
+
+static void merge_query_digest_maps(
+	umap_query_digest& destination_stats,
+	umap_query_digest_text& destination_texts,
+	umap_query_digest& source_stats,
+	umap_query_digest_text& source_texts
+) {
+	for (const auto& entry : source_stats) {
+		auto it = destination_stats.find(entry.first);
+		auto* source = static_cast<QP_query_digest_stats*>(entry.second);
+		if (it == destination_stats.end()) {
+			destination_stats.insert(entry);
+		} else {
+			static_cast<QP_query_digest_stats*>(it->second)->merge(*source);
+			delete source;
+		}
+	}
+	source_stats.clear();
+
+	for (const auto& entry : source_texts) {
+		if (!destination_texts.insert(entry).second) {
+			free(entry.second);
+		}
+	}
+	source_texts.clear();
+}
+
+#if POLARDB_PROXY
+static constexpr size_t PGSQL_QUERY_DIGEST_LOCAL_MAX_ENTRIES = 256;
+
+struct PgSQL_Thread_Query_Digests {
+	void* owner{nullptr};
+	std::mutex mutex;
+	umap_query_digest stats;
+	umap_query_digest_text texts;
+};
+
+static std::mutex pgsql_query_digest_workers_mutex;
+static std::vector<PgSQL_Thread_Query_Digests*> pgsql_query_digest_workers;
+__thread PgSQL_Thread_Query_Digests* _thr_pgsql_query_digests;
+#endif
 
 struct __RE2_objects_t {
 	pcrecpp::RE_Options* opt1;
@@ -529,11 +571,36 @@ void Query_Processor<QP_DERIVED>::init_thread() {
 	// per-thread 'rules_fast_routing' structures are created on demand
 	_thr_SQP_rules_fast_routing = nullptr;
 	_thr___rules_fast_routing___keys_values = NULL;
+#if POLARDB_PROXY
+	if constexpr (std::is_same_v<QP_DERIVED, PgSQL_Query_Processor>) {
+		assert(_thr_pgsql_query_digests == nullptr);
+		_thr_pgsql_query_digests = new PgSQL_Thread_Query_Digests();
+		_thr_pgsql_query_digests->owner = this;
+		std::lock_guard<std::mutex> lock(pgsql_query_digest_workers_mutex);
+		pgsql_query_digest_workers.push_back(_thr_pgsql_query_digests);
+	}
+#endif
 }
 
 template <typename QP_DERIVED>
 void Query_Processor<QP_DERIVED>::end_thread() {
 	proxy_debug(PROXY_DEBUG_MYSQL_QUERY_PROCESSOR, 4, "Destroying Per-Thread Query Processor Table with version=%d\n", _thr_SQP_version);
+#if POLARDB_PROXY
+	if constexpr (std::is_same_v<QP_DERIVED, PgSQL_Query_Processor>) {
+		flush_thread_query_digests();
+		{
+			std::lock_guard<std::mutex> lock(pgsql_query_digest_workers_mutex);
+			const auto it = std::find(
+				pgsql_query_digest_workers.begin(),
+				pgsql_query_digest_workers.end(),
+				_thr_pgsql_query_digests);
+			assert(it != pgsql_query_digest_workers.end());
+			pgsql_query_digest_workers.erase(it);
+		}
+		delete _thr_pgsql_query_digests;
+		_thr_pgsql_query_digests = nullptr;
+	}
+#endif
 	__reset_rules(_thr_SQP_rules);
 	delete _thr_SQP_rules;
 	if (_thr_SQP_rules_fast_routing) {
@@ -810,6 +877,43 @@ void * get_query_digests_total_size_parallel(void *_arg) {
 	return NULL;
 }
 
+#if POLARDB_PROXY
+static unsigned long long get_query_digest_maps_size(
+	const umap_query_digest& stats,
+	const umap_query_digest_text& texts
+) {
+	unsigned long long ret = sizeof(QP_query_digest_stats) * stats.size();
+	for (const auto& entry : stats) {
+		const auto* qds = static_cast<const QP_query_digest_stats*>(entry.second);
+		if (qds->username && qds->username != qds->username_buf) {
+			ret += strlen(qds->username) + 1;
+		}
+		if (qds->schemaname && qds->schemaname != qds->schemaname_buf) {
+			ret += strlen(qds->schemaname) + 1;
+		}
+		if (qds->client_address && qds->client_address != qds->client_address_buf) {
+			ret += strlen(qds->client_address) + 1;
+		}
+		if (qds->digest_text) {
+			ret += strlen(qds->digest_text) + 1;
+		}
+	}
+	for (const auto& entry : texts) {
+		if (entry.second) {
+			ret += strlen(entry.second) + 1;
+		}
+	}
+#if !defined(__FreeBSD__) && !defined(__APPLE__)
+	ret += (sizeof(uint64_t) + sizeof(void*) + sizeof(std::_Rb_tree_node_base)) *
+		(stats.size() + texts.size());
+#else
+	ret += (sizeof(uint64_t) + sizeof(void*) + 32) *
+		(stats.size() + texts.size());
+#endif
+	return ret;
+}
+#endif
+
 void * get_query_digests_parallel(void *_arg) {
 	get_query_digests_parallel_args *arg = (get_query_digests_parallel_args *)_arg;
 	unsigned long long i = 0;
@@ -899,6 +1003,7 @@ unsigned long long Query_Processor<QP_DERIVED>::purge_query_digests_async(char *
 	umap_query_digest digest_umap_aux;
 	umap_query_digest_text digest_text_umap_aux;
 	pthread_rwlock_wrlock(&digest_rwlock);
+	merge_worker_query_digests();
 	digest_umap.swap(digest_umap_aux);
 	digest_text_umap.swap(digest_text_umap_aux);
 	pthread_rwlock_unlock(&digest_rwlock);
@@ -940,6 +1045,7 @@ template <typename QP_DERIVED>
 unsigned long long Query_Processor<QP_DERIVED>::purge_query_digests_sync(bool parallel) {
 	unsigned long long ret = 0;
 	pthread_rwlock_wrlock(&digest_rwlock);
+	merge_worker_query_digests();
 	size_t map_size = digest_umap.size();
 	if (parallel && map_size >= DIGEST_STATS_FAST_MINSIZE) { // parallel purge
 		int n=DIGEST_STATS_FAST_THREADS;
@@ -1029,6 +1135,20 @@ unsigned long long Query_Processor<QP_DERIVED>::get_query_digests_total_size() {
 	ret += ((sizeof(uint64_t) + sizeof(void *) + 32) * digest_text_umap.size() );
 #endif
 
+#if POLARDB_PROXY
+	if constexpr (std::is_same_v<QP_DERIVED, PgSQL_Query_Processor>) {
+		std::lock_guard<std::mutex> registry_lock(
+			pgsql_query_digest_workers_mutex);
+		for (auto* worker : pgsql_query_digest_workers) {
+			if (worker->owner != this) {
+				continue;
+			}
+			std::lock_guard<std::mutex> worker_lock(worker->mutex);
+			ret += get_query_digest_maps_size(worker->stats, worker->texts);
+		}
+	}
+#endif
+
 	pthread_rwlock_unlock(&digest_rwlock);
 	return ret;
 }
@@ -1043,6 +1163,7 @@ std::pair<SQLite3_result *, int> Query_Processor<QP_DERIVED>::get_query_digests_
 	umap_query_digest digest_umap_aux, digest_umap_aux_2;
 	umap_query_digest_text digest_text_umap_aux, digest_text_umap_aux_2;
 	pthread_rwlock_wrlock(&digest_rwlock);
+	merge_worker_query_digests();
 	digest_umap.swap(digest_umap_aux);
 	digest_text_umap.swap(digest_text_umap_aux);
 	pthread_rwlock_unlock(&digest_rwlock);
@@ -1144,24 +1265,9 @@ std::pair<SQLite3_result *, int> Query_Processor<QP_DERIVED>::get_query_digests_
 
 	// Once we do the swap, we merge the content of the first auxiliary maps
 	// in the main maps and clear the content of the auxiliary maps.
-	for (const auto& element : digest_umap_aux_2) {
-		uint64_t digest = element.first;
-		QP_query_digest_stats *qds = (QP_query_digest_stats *)element.second;
-		std::unordered_map<uint64_t, void *>::iterator it = digest_umap_aux.find(digest);
-		if (it != digest_umap_aux.end()) {
-			// found
-			QP_query_digest_stats *qds_equal = (QP_query_digest_stats *)it->second;
-			qds_equal->add_time(
-				qds->min_time, qds->last_seen, qds->rows_affected, qds->rows_sent, qds->count_star
-			);
-			delete qds;
-		} else {
-			digest_umap_aux.insert(element);
-		}
-	}
-	digest_text_umap_aux.insert(digest_text_umap_aux_2.begin(), digest_text_umap_aux_2.end());
-	digest_umap_aux_2.clear();
-	digest_text_umap_aux_2.clear();
+	merge_query_digest_maps(
+		digest_umap_aux, digest_text_umap_aux,
+		digest_umap_aux_2, digest_text_umap_aux_2);
 
 	// Once we finish merging the main maps and the first auxiliary maps, we
 	// lock and swap the main maps with the second auxiliary maps. Then, we
@@ -1169,25 +1275,10 @@ std::pair<SQLite3_result *, int> Query_Processor<QP_DERIVED>::get_query_digests_
 	// content of the auxiliary maps.
 	pthread_rwlock_wrlock(&digest_rwlock);
 	digest_umap_aux.swap(digest_umap);
-	for (const auto& element : digest_umap_aux) {
-		uint64_t digest = element.first;
-		QP_query_digest_stats *qds = (QP_query_digest_stats *)element.second;
-		std::unordered_map<uint64_t, void *>::iterator it = digest_umap.find(digest);
-		if (it != digest_umap.end()) {
-			// found
-			QP_query_digest_stats *qds_equal = (QP_query_digest_stats *)it->second;
-			qds_equal->add_time(
-				qds->min_time, qds->last_seen, qds->rows_affected, qds->rows_sent, qds->count_star
-			);
-			delete qds;
-		} else {
-			digest_umap.insert(element);
-		}
-	}
-	digest_text_umap.insert(digest_text_umap_aux.begin(), digest_text_umap_aux.end());
+	merge_query_digest_maps(
+		digest_umap, digest_text_umap,
+		digest_umap_aux, digest_text_umap_aux);
 	pthread_rwlock_unlock(&digest_rwlock);
-	digest_umap_aux.clear();
-	digest_text_umap_aux.clear();
 
 	std::pair<SQLite3_result *, int> res{result, num_rows};
 	return res;
@@ -1197,7 +1288,16 @@ template <typename QP_DERIVED>
 SQLite3_result * Query_Processor<QP_DERIVED>::get_query_digests() {
 	proxy_debug(PROXY_DEBUG_MYSQL_QUERY_PROCESSOR, 4, "Dumping current query digest\n");
 	SQLite3_result *result = NULL;
+#if POLARDB_PROXY
+	if constexpr (std::is_same_v<QP_DERIVED, PgSQL_Query_Processor>) {
+		pthread_rwlock_wrlock(&digest_rwlock);
+		merge_worker_query_digests();
+	} else {
+		pthread_rwlock_rdlock(&digest_rwlock);
+	}
+#else
 	pthread_rwlock_rdlock(&digest_rwlock);
+#endif
 	unsigned long long curtime1;
 	unsigned long long curtime2;
 	size_t map_size = digest_umap.size();
@@ -1345,7 +1445,16 @@ query_digest_topk_result_t Query_Processor<QP_DERIVED>::get_query_digests_topk(
 		std::function<bool(const query_digest_topk_candidate_t&, const query_digest_topk_candidate_t&)>
 	> heap(worse);
 
+#if POLARDB_PROXY
+	if constexpr (std::is_same_v<QP_DERIVED, PgSQL_Query_Processor>) {
+		pthread_rwlock_wrlock(&digest_rwlock);
+		merge_worker_query_digests();
+	} else {
+		pthread_rwlock_rdlock(&digest_rwlock);
+	}
+#else
 	pthread_rwlock_rdlock(&digest_rwlock);
+#endif
 
 	for (const auto& it : digest_umap) {
 		const QP_query_digest_stats* qds = static_cast<const QP_query_digest_stats*>(it.second);
@@ -1434,6 +1543,7 @@ std::pair<SQLite3_result *, int> Query_Processor<QP_DERIVED>::get_query_digests_
 	umap_query_digest digest_umap_aux;
 	umap_query_digest_text digest_text_umap_aux;
 	pthread_rwlock_wrlock(&digest_rwlock);
+	merge_worker_query_digests();
 	digest_umap.swap(digest_umap_aux);
 	digest_text_umap.swap(digest_text_umap_aux);
 	pthread_rwlock_unlock(&digest_rwlock);
@@ -1563,6 +1673,7 @@ std::pair<SQLite3_result *, int> Query_Processor<QP_DERIVED>::get_query_digests_
 template <typename QP_DERIVED>
 void Query_Processor<QP_DERIVED>::get_query_digests_reset(umap_query_digest *uqd, umap_query_digest_text *uqdt) {
 	pthread_rwlock_wrlock(&digest_rwlock);
+	merge_worker_query_digests();
 	digest_umap.swap(*uqd);
 	digest_text_umap.swap(*uqdt);
 	pthread_rwlock_unlock(&digest_rwlock);
@@ -1572,6 +1683,7 @@ template <typename QP_DERIVED>
 SQLite3_result * Query_Processor<QP_DERIVED>::get_query_digests_reset() {
 	SQLite3_result *result = NULL;
 	pthread_rwlock_wrlock(&digest_rwlock);
+	merge_worker_query_digests();
 	unsigned long long curtime1;
 	unsigned long long curtime2;
 	bool free_me = true;
@@ -2113,6 +2225,11 @@ void Query_Processor<QP_DERIVED>::update_query_processor_stats() {
 	// It acquires a read lock to ensure that the rules table doesn't change
 	// Yet, because it has to update vales, it uses atomic operations
 	proxy_debug(PROXY_DEBUG_MYSQL_QUERY_PROCESSOR, 8, "Updating query rules statistics\n");
+#if POLARDB_PROXY
+	if constexpr (std::is_same_v<QP_DERIVED, PgSQL_Query_Processor>) {
+		flush_thread_query_digests();
+	}
+#endif
 	rdlock();
 	if (__sync_add_and_fetch(&version,0) == _thr_SQP_version) {
 		QP_rule_t *qr;
@@ -2226,37 +2343,103 @@ template <typename QP_DERIVED>
 void Query_Processor<QP_DERIVED>::update_query_digest(uint64_t digest_total, uint64_t digest, char* digest_text, int hid, 
 	TypeConnInfo* ui, unsigned long long t, unsigned long long n, const char* client_addr, unsigned long long rows_affected,
 	unsigned long long rows_sent) {
-	QP_query_digest_stats* qds;
-	std::unordered_map<uint64_t, void*>::iterator it;
+	auto add_to_maps = [&](umap_query_digest& stats, umap_query_digest_text& texts) {
+		auto it = stats.find(digest_total);
+		if (it != stats.end()) {
+			static_cast<QP_query_digest_stats*>(it->second)->add_time(
+				t, n, rows_affected, rows_sent);
+			return;
+		}
 
-	pthread_rwlock_wrlock(&digest_rwlock);
-	it=digest_umap.find(digest_total);
-	if (it != digest_umap.end()) {
-		// found
-		qds=(QP_query_digest_stats *)it->second;
-		qds->add_time(t,n,rows_affected,rows_sent);
-	} else {
 		char *dt = NULL;
 		if (GET_THREAD_VARIABLE(query_digests_normalize_digest_text)==false) {
 			dt = digest_text;
 		}
-		qds=new QP_query_digest_stats(ui->username, ui->schemaname, digest, dt, hid, client_addr, GET_THREAD_VARIABLE(query_digests_max_digest_length));
+		auto* qds = new QP_query_digest_stats(
+			ui->username, ui->schemaname, digest, dt, hid, client_addr,
+			GET_THREAD_VARIABLE(query_digests_max_digest_length));
 		qds->add_time(t,n, rows_affected,rows_sent);
-		digest_umap.insert(std::make_pair(digest_total,(void *)qds));
+		stats.insert(std::make_pair(digest_total, static_cast<void*>(qds)));
 		if (GET_THREAD_VARIABLE(query_digests_normalize_digest_text)==true) {
 			const uint64_t dig = digest;
-			std::unordered_map<uint64_t, char *>::iterator it2;
-			it2=digest_text_umap.find(dig);
-			if (it2 != digest_text_umap.end()) {
-				// found
-			} else {
-				dt = strdup(digest_text);
-				digest_text_umap.insert(std::make_pair(dig,dt));
+			if (texts.find(dig) == texts.end()) {
+				texts.insert(std::make_pair(dig, strdup(digest_text)));
 			}
+		}
+	};
+
+	#if POLARDB_PROXY
+	if constexpr (std::is_same_v<QP_DERIVED, PgSQL_Query_Processor>) {
+		if (_thr_pgsql_query_digests) {
+			bool flush = false;
+			{
+				std::lock_guard<std::mutex> lock(
+					_thr_pgsql_query_digests->mutex);
+				add_to_maps(
+					_thr_pgsql_query_digests->stats,
+					_thr_pgsql_query_digests->texts);
+				flush = _thr_pgsql_query_digests->stats.size() >=
+					PGSQL_QUERY_DIGEST_LOCAL_MAX_ENTRIES;
+			}
+			if (flush) {
+				flush_thread_query_digests();
+			}
+			return;
+		}
+	}
+#endif
+
+	pthread_rwlock_wrlock(&digest_rwlock);
+	add_to_maps(digest_umap, digest_text_umap);
+	pthread_rwlock_unlock(&digest_rwlock);
+}
+
+#if POLARDB_PROXY
+template <typename QP_DERIVED>
+void Query_Processor<QP_DERIVED>::flush_thread_query_digests() {
+	if constexpr (!std::is_same_v<QP_DERIVED, PgSQL_Query_Processor>) {
+		return;
+	}
+	if (!_thr_pgsql_query_digests) {
+		return;
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(_thr_pgsql_query_digests->mutex);
+		if (_thr_pgsql_query_digests->stats.empty()) {
+			return;
 		}
 	}
 
+	pthread_rwlock_wrlock(&digest_rwlock);
+	{
+		std::lock_guard<std::mutex> lock(_thr_pgsql_query_digests->mutex);
+		merge_query_digest_maps(
+			digest_umap,
+			digest_text_umap,
+			_thr_pgsql_query_digests->stats,
+			_thr_pgsql_query_digests->texts);
+	}
 	pthread_rwlock_unlock(&digest_rwlock);
+}
+#endif
+
+template <typename QP_DERIVED>
+void Query_Processor<QP_DERIVED>::merge_worker_query_digests() {
+#if POLARDB_PROXY
+	if constexpr (std::is_same_v<QP_DERIVED, PgSQL_Query_Processor>) {
+		std::lock_guard<std::mutex> registry_lock(
+			pgsql_query_digest_workers_mutex);
+		for (auto* worker : pgsql_query_digest_workers) {
+			if (worker->owner == this) {
+				std::lock_guard<std::mutex> worker_lock(worker->mutex);
+				merge_query_digest_maps(
+					digest_umap, digest_text_umap,
+					worker->stats, worker->texts);
+			}
+		}
+	}
+#endif
 }
 
 template <typename QP_DERIVED>

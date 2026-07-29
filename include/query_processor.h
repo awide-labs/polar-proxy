@@ -81,6 +81,7 @@ class QP_query_digest_stats {
 		unsigned long long t, unsigned long long n, unsigned long long ra, unsigned long long rs,
 		unsigned long long cnt = 1
 	);
+	void merge(const QP_query_digest_stats& other);
 	~QP_query_digest_stats();
 	char *get_digest_text(const umap_query_digest_text *digest_text_umap) const;
 	char **get_row(umap_query_digest_text *digest_text_umap, query_digest_stats_pointers_t *qdsp);
@@ -459,6 +460,10 @@ private:
 
 	unsigned long long purge_query_digests_async(char** msg);
 	unsigned long long purge_query_digests_sync(bool parallel);
+	void merge_worker_query_digests();
+#if POLARDB_PROXY
+	void flush_thread_query_digests();
+#endif
 
 	/**
 	 * @brief Searches for a matching rule in the supplied map, returning the destination hostgroup.
