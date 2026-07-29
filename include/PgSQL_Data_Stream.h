@@ -40,12 +40,12 @@ public:
 				assert(pkt.size==0);
 		*/
 		pkt = *_pkt;
-		QuerySize = pkt.size - 5;
+		QuerySize = pkt.size - PGSQL_V3_MESSAGE_HEADER_SIZE;
 		if (QuerySize == 0) {
 			QueryPtr = const_cast<char*>("");
 		}
 		else {
-			QueryPtr = (char*)pkt.ptr + 5;
+			QueryPtr = (char*)pkt.ptr + PGSQL_V3_MESSAGE_HEADER_SIZE;
 		}
 	}
 	void end() {
@@ -90,8 +90,49 @@ private:
 	enum pgsql_sslstatus do_ssl_handshake();
 	void queue_encrypted_bytes(const char* buf, size_t len);
 #if POLARDB_PROXY
+	/**
+	 * @brief Report whether the pending output is worth sending over the direct
+	 *        write path instead of the buffered writer.
+	 *
+	 * Always returns true while polardb_write_head_partial is non-zero: a direct
+	 * write has already handed the front of PSarrayOUT[0] to the kernel, and the
+	 * buffered path does not pick a partially sent packet up, so that transfer
+	 * must be resumed by the direct path. Otherwise this is purely a batching
+	 * heuristic and returns true only when at least two packets are pending, or
+	 * when a single pending packet would not fit in QUEUE_T_DEFAULT_SIZE.
+	 *
+	 * This answers "is it worthwhile", not "is it safe" — combine it with
+	 * polardb_can_writev_direct() before taking the direct path.
+	 *
+	 * @return true when the direct path should be used, false to leave the data
+	 *         to the buffered writer.
+	 */
 	bool polardb_direct_write_batch_ready() const;
-	int polardb_writev_to_net_poll_ready(size_t byte_budget);
+
+	/**
+	 * @brief Send pending PSarrayOUT packets straight to the socket with one
+	 *        sendmsg(), skipping every safety and batching check.
+	 *
+	 * The caller must have already established that direct sending is safe for
+	 * this stream through polardb_can_writev_direct(). Nothing is re-verified
+	 * here, so calling this on an encrypted stream, a backend stream, a stream
+	 * that still holds buffered queueOUT bytes, or another unsafe state emits
+	 * bytes out of order and corrupts the client stream.
+	 *
+	 * On success the fully sent packets are retired from PSarrayOUT, pkts_sent
+	 * and bytes_info are advanced, and polardb_write_head_partial records how far
+	 * into the first surviving packet a short write reached. pollout is re-armed
+	 * on every outcome that leaves the socket usable.
+	 *
+	 * @param byte_budget  Maximum number of bytes to offer the kernel in this
+	 *                     call; 0 means QUEUE_T_DEFAULT_SIZE.
+	 * @return  > 0 the number of bytes the kernel accepted; -1 the write would
+	 *          block (EINTR/EAGAIN/EWOULDBLOCK) and pollout has been re-armed;
+	 *          0 either nothing could be sent or the write failed fatally, in
+	 *          which case shut_soft() has already run — check net_failure rather
+	 *          than retrying.
+	 */
+	int polardb_writev_to_net_poll_unchecked(size_t byte_budget);
 #endif // POLARDB_PROXY
 public:
 	void* operator new(size_t);
@@ -205,8 +246,51 @@ public:
 	int write_to_net();
 	int write_to_net_poll();
 #if POLARDB_PROXY
+	/**
+	 * @brief Report whether the writev direct path may be used on this stream.
+	 *
+	 * This is the complete synchronous direct-send safety gate, including the
+	 * pgsql-polardb_writev_direct admin variable. While
+	 * polardb_write_head_partial is non-zero the variable is ignored and only the
+	 * safety gate applies. A direct write that already put part of a packet on
+	 * the wire has to be finished on the direct path even if an operator turns
+	 * the knob off mid-stream.
+	 *
+	 * @return true when a writev direct send is permitted, false otherwise.
+	 */
 	bool polardb_can_writev_direct() const;
+
+	/**
+	 * @brief Report whether write_to_net_poll() should take the writev direct
+	 *        path for the currently pending output.
+	 *
+	 * Combines the two separate questions: worthwhile
+	 * (polardb_direct_write_batch_ready()) and safe (polardb_can_writev_direct()).
+	 * Both must hold.
+	 *
+	 * @return true when the direct path should be taken, false to fall through to
+	 *         the buffered writer.
+	 */
 	bool polardb_should_writev_direct() const;
+
+	/**
+	 * @brief Send pending output over the writev direct path, checking first that
+	 *        it is both worthwhile and safe.
+	 *
+	 * Re-checks polardb_direct_write_batch_ready() and polardb_can_writev_direct()
+	 * and declines if either fails, then forwards to
+	 * polardb_writev_to_net_poll_unchecked(). On success completed packets are
+	 * retired from PSarrayOUT, pkts_sent and bytes_info advance, and a short write
+	 * leaves polardb_write_head_partial pointing into the first surviving packet.
+	 *
+	 * @param byte_budget  Maximum number of bytes to offer the kernel; 0 selects
+	 *                     polardb_direct_write_budget_bytes().
+	 * @return  > 0 the number of bytes the kernel accepted; -1 the write would
+	 *          block and pollout has been re-armed; 0 either declined (fall back
+	 *          to the buffered path) or a fatal write error, in which case
+	 *          shut_soft() has already run. Callers seeing 0 must re-check
+	 *          net_failure instead of assuming the buffered path is still viable.
+	 */
 	int polardb_writev_to_net_poll(size_t byte_budget);
 #endif // POLARDB_PROXY
 	bool available_data_out();

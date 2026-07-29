@@ -908,7 +908,7 @@ static PgSQL_Thread* polardb_writev_counter_thread(PgSQL_Data_Stream* myds) {
 	return nullptr;
 }
 
-static inline size_t polardb_frontend_direct_write_budget() {
+static inline size_t polardb_direct_write_budget_bytes() {
 	size_t budget = QUEUE_T_DEFAULT_SIZE;
 	if (pgsql_thread___polardb_output_coalesce_bytes > 0 &&
 		static_cast<size_t>(pgsql_thread___polardb_output_coalesce_bytes) > budget) {
@@ -1061,7 +1061,7 @@ static inline void polardb_perf_count_direct_write_shape(
 static inline void polardb_perf_count_writev_skip_reason(PgSQL_Data_Stream*) {}
 #endif // POLARDB_PERF_DEBUG
 
-static void polardb_prepare_direct_frontend_packet(PgSQL_Data_Stream* myds) {
+static void polardb_prepare_direct_frontend_stream(PgSQL_Data_Stream* myds) {
 	if (!myds || myds->DSS != STATE_CLIENT_AUTH_OK) return;
 
 	myds->DSS = STATE_SLEEP;
@@ -1144,7 +1144,7 @@ static bool polardb_build_writev_view(
 	return view.iovcnt > 0;
 }
 
-static unsigned int polardb_advance_after_writev(
+static unsigned int polardb_apply_accepted_write_bytes(
 	PgSQL_Data_Stream* myds,
 	size_t bytes) {
 	unsigned int full_packets = 0;
@@ -1175,7 +1175,7 @@ static unsigned int polardb_advance_after_writev(
 
 int PgSQL_Data_Stream::polardb_writev_to_net_poll(size_t byte_budget) {
 	if (byte_budget == 0) {
-		byte_budget = polardb_frontend_direct_write_budget();
+		byte_budget = polardb_direct_write_budget_bytes();
 	}
 	if (!polardb_direct_write_batch_ready()) {
 		if ((pgsql_thread___polardb_writev_direct ||
@@ -1190,16 +1190,17 @@ int PgSQL_Data_Stream::polardb_writev_to_net_poll(size_t byte_budget) {
 		POLARDB_WRITEV_COUNT(this, writev_buffered_fallback, 1);
 		return 0;
 	}
-	return polardb_writev_to_net_poll_ready(byte_budget);
+	return polardb_writev_to_net_poll_unchecked(byte_budget);
 }
 
-int PgSQL_Data_Stream::polardb_writev_to_net_poll_ready(size_t byte_budget) {
+int PgSQL_Data_Stream::polardb_writev_to_net_poll_unchecked(
+		size_t byte_budget) {
 	PolarDB_WriteVView view;
 	if (!polardb_build_writev_view(this, byte_budget, view)) {
 		return 0;
 	}
 	if (polardb_write_head_partial == 0) {
-		polardb_prepare_direct_frontend_packet(this);
+		polardb_prepare_direct_frontend_stream(this);
 	}
 
 	POLARDB_WRITEV_COUNT(this, writev_attempts, 1);
@@ -1233,13 +1234,16 @@ int PgSQL_Data_Stream::polardb_writev_to_net_poll_ready(size_t byte_budget) {
 	if (accepted < view.total) {
 		POLARDB_WRITEV_COUNT(this, writev_short_writes, 1);
 	}
-	const unsigned int full_packets = polardb_advance_after_writev(this, accepted);
+	const unsigned int full_packets =
+		polardb_apply_accepted_write_bytes(this, accepted);
 	POLARDB_WRITEV_COUNT(this, writev_bytes, accepted);
 	if (full_packets) {
 		POLARDB_WRITEV_COUNT(this, writev_packets, full_packets);
 	}
 
-	if (mypolls) mypolls->last_sent[poll_fds_idx] = sess->thread->curtime;
+	if (mypolls && sess && sess->thread) {
+		mypolls->last_sent[poll_fds_idx] = sess->thread->curtime;
+	}
 	bytes_info.bytes_sent += accepted;
 	if (sess && sess->thread) {
 		sess->thread->status_variables.stvar[st_var_queries_frontends_bytes_sent] += accepted;
@@ -1379,7 +1383,8 @@ int PgSQL_Data_Stream::write_to_net_poll() {
 	}
 #if POLARDB_PROXY
 	if (polardb_should_writev_direct()) {
-		return polardb_writev_to_net_poll_ready(polardb_frontend_direct_write_budget());
+		return polardb_writev_to_net_poll_unchecked(
+			polardb_direct_write_budget_bytes());
 	}
 #endif // POLARDB_PROXY
 	proxy_debug(PROXY_DEBUG_NET, 1, "Session=%p, DataStream=%p --\n", sess, this);
