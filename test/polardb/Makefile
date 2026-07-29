@@ -13,6 +13,7 @@ GCOVR ?= $(shell if command -v gcovr >/dev/null 2>&1; then \
 GCOVR_AVAILABLE ?= $(shell $(GCOVR) --version >/dev/null 2>&1 && echo 1 || echo 0)
 JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 POLARDB_COVERAGE_BUILD_TARGET ?= polardb-coverage-debug
+POLARDB_COVERAGE_OBJECT_DIR ?= obj
 POLARDB_TAKEN_MIN ?= 0
 POLARDB_DEDICATED_TAKEN_MIN ?= $(POLARDB_TAKEN_MIN)
 POLARDB_FUNCTION_TAKEN_MIN ?= 0
@@ -55,6 +56,7 @@ POLARDB_DEDICATED_THRESHOLD_FILES := \
 	PgSQL_PolarDB_Split.cpp \
 	PgSQL_PolarDB.cpp
 POLARDB_SHARED_IMPL_FILES := \
+	PgSQL_Data_Stream.cpp \
 	PgSQL_Session.cpp \
 	PgSQL_Connection.cpp \
 	PgSQL_HostGroups_Manager.cpp \
@@ -71,6 +73,7 @@ POLARDB_GCOVR_FILTERS := \
 	--filter '$(PROXYSQL_ROOT)/include/PgSQL_Session.h' \
 	--filter '$(PROXYSQL_ROOT)/lib/PgSQL_PolarDB.*\.cpp' \
 	--exclude '$(PROXYSQL_ROOT)/lib/PgSQL_PolarDB_Stubs.cpp' \
+	--filter '$(PROXYSQL_ROOT)/lib/PgSQL_Data_Stream.cpp' \
 	--filter '$(PROXYSQL_ROOT)/lib/PgSQL_Session.cpp' \
 	--filter '$(PROXYSQL_ROOT)/lib/PgSQL_Connection.cpp' \
 	--filter '$(PROXYSQL_ROOT)/lib/PgSQL_HostGroups_Manager.cpp' \
@@ -360,7 +363,8 @@ coverage: coverage-tools-unit
 else
 coverage: coverage-tools-unit
 	@mkdir -p "$(COVERAGE_DIR)"
-	@find $(PROXYSQL_ROOT)/lib/obj -maxdepth 1 -name '*.gcda' -delete
+	@find $(PROXYSQL_ROOT)/lib/$(POLARDB_COVERAGE_OBJECT_DIR) -maxdepth 1 \
+		-name '*.gcda' -delete 2>/dev/null || true
 	$(call POLARDB_CLEAN_GCOV,$(POLARDB_LEGACY_UNIT_DIR))
 	@find $(POLARDB_UNIT_BUILD_DIR) -maxdepth 1 \
 		\( -name '*.gcda' -o -name '*.gcno' \) -delete 2>/dev/null || true
@@ -380,7 +384,7 @@ coverage: coverage-tools-unit
 		--txt "$(COVERAGE_DIR)/focused.txt" \
 		--html-details "$(COVERAGE_DIR)/focused.html"
 	@(cd $(PROXYSQL_ROOT)/lib && \
-		gcov -m -f -b -c -o obj $(POLARDB_IMPL_FILES) > "$(COVERAGE_DIR)/gcov-polardb-implementation.txt")
+		gcov -m -f -b -c -o $(POLARDB_COVERAGE_OBJECT_DIR) $(POLARDB_IMPL_FILES) > "$(COVERAGE_DIR)/gcov-polardb-implementation.txt")
 	python3 $(POLARDB_TEST_DIR)/tools/coverage_summary.py \
 		--input "$(COVERAGE_DIR)/gcov-polardb-implementation.txt" \
 		--output "$(COVERAGE_DIR)/implementation-summary.txt" \

@@ -398,6 +398,7 @@ public:
 		unsigned int active_transactions;
 		unsigned long long pgconnpoll_get;
 		unsigned long long pgconnpoll_get_ok;
+		unsigned long long pgconnpoll_push;
 		// tx-poisoned feature counters. Each PgSQL thread maintains its own
 		// (lock-free) and PgSQL_Threads_Handler aggregates across threads for
 		// stats_pgsql_global exposure. See preserve_client_on_broken_backend_in_tx.
@@ -999,6 +1000,13 @@ void polardb_count_reader_target_lsn_gap_bucket(
 	uint64_t target_lsn,
 	uint64_t reader_lsn,
 	bool reader_lsn_fresh);
+void polardb_count_reader_target_selection(
+	PgSQL_Thread* thread,
+	uint64_t target_lsn,
+	uint64_t selected_reader_lsn,
+	bool selected_reader_lsn_fresh,
+	uint64_t best_considered_reader_lsn,
+	bool best_considered_reader_lsn_fresh);
 
 #if POLARDB_PROFILE
 #define POLARDB_PROFILE_THREAD_COUNT(thread, name, value) \
@@ -1301,6 +1309,8 @@ public:
 		int polardb_lsn_freshness_ms;         // max age of a cached per-server LSN to trust
 		int polardb_lag_cap_freshness_ms;     // max LSN-cache age under byte-lag cap + finite wait; 0=wait-fraction only
 		int polardb_reader_lsn_lag_range_bytes; // 0 keeps exact best-behind reader choice
+		bool polardb_reader_prefer_freshest_below_target; // experimental; balanced selection remains the default
+		bool polardb_reader_prefer_less_loaded; // experimental strict freshness/load dominance
 		int polardb_reader_connection_retention; // 0 returns after each pass; 1 retains active readers
 		int polardb_output_coalesce_bytes;   // 0 disables incomplete streaming output coalescing by bytes
 		int polardb_output_coalesce_packets; // 0 disables incomplete streaming output coalescing by packets
@@ -1983,6 +1993,7 @@ public:
 	// Aggregated per-worker counters across all PgSQL threads.
 	unsigned long long get_pgconnpoll_get();
 	unsigned long long get_pgconnpoll_get_ok();
+	unsigned long long get_pgconnpoll_push();
 	unsigned long long get_tx_poisoned_total();
 	unsigned long long get_tx_poisoned_recovered_total();
 	unsigned long long get_tx_poisoned_rejected_statements_total();

@@ -6,6 +6,35 @@ ifndef GIT_VERSION
     $(error GIT_VERSION is not set)
 endif
 
+# Build type describes compiler mode; build variant describes optional product
+# code and instrumentation. Both affect object compatibility. An unclassified
+# direct lib/src build is custom, never assumed compatible with release.
+PROXYSQL_BUILD_TYPE := custom
+ifneq (,$(filter -O1 -O2 -O3 -Os -Oz,$(OPTZ)))
+	PROXYSQL_BUILD_TYPE := release
+endif
+ifneq (,$(filter -O0,$(OPTZ)))
+	PROXYSQL_BUILD_TYPE := debug
+endif
+ifneq (,$(findstring -DDEBUG,$(OPTZ) $(DEBUG)))
+	PROXYSQL_BUILD_TYPE := debug
+endif
+
+POLARDB_BUILD_VARIANT := core
+ifeq ($(POLARDB_PROXY),1)
+	POLARDB_BUILD_VARIANT := polardb
+endif
+ifeq ($(POLARDB_PROFILE),1)
+	POLARDB_BUILD_VARIANT := $(POLARDB_BUILD_VARIANT)-profile
+endif
+ifeq ($(POLARDB_PERF_DEBUG),1)
+	POLARDB_BUILD_VARIANT := $(POLARDB_BUILD_VARIANT)-perf
+endif
+ifeq ($(POLARDB_DEBUG),1)
+	POLARDB_BUILD_VARIANT := $(POLARDB_BUILD_VARIANT)-debug
+endif
+POLARDB_BUILD_VARIANT := $(POLARDB_BUILD_VARIANT)-$(PROXYSQL_BUILD_TYPE)
+
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 

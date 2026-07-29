@@ -64,6 +64,27 @@
 	T(reader_target_no_ready_candidate, "PolarDB_Reader_Target_No_Ready_Candidate", \
 		"proxysql_polardb_reader_target_no_ready_candidate_total", \
 		"Targeted reader acquisitions with no fresh target-reached candidate") \
+	T(reader_target_both_behind_compared, "PolarDB_Reader_Target_Both_Behind_Compared", \
+		"proxysql_polardb_reader_target_both_behind_compared_total", \
+		"Two-reader target selections comparing two fresh readers below target") \
+	T(reader_target_both_behind_equal_lsn, "PolarDB_Reader_Target_Both_Behind_Equal_LSN", \
+		"proxysql_polardb_reader_target_both_behind_equal_lsn_total", \
+		"Both-behind comparisons where the two readers had the same LSN") \
+	T(reader_target_fresher_less_loaded, "PolarDB_Reader_Target_Fresher_Less_Loaded", \
+		"proxysql_polardb_reader_target_fresher_less_loaded_total", \
+		"Both-behind comparisons where the fresher reader had lower weight-normalized load") \
+	T(reader_target_fresher_equal_loaded, "PolarDB_Reader_Target_Fresher_Equal_Loaded", \
+		"proxysql_polardb_reader_target_fresher_equal_loaded_total", \
+		"Both-behind comparisons where the fresher reader had equal weight-normalized load") \
+	T(reader_target_fresher_more_loaded, "PolarDB_Reader_Target_Fresher_More_Loaded", \
+		"proxysql_polardb_reader_target_fresher_more_loaded_total", \
+		"Both-behind comparisons where the fresher reader had higher weight-normalized load") \
+	T(reader_target_fresher_exact_switch, "PolarDB_Reader_Target_Fresher_Exact_Switch", \
+		"proxysql_polardb_reader_target_fresher_exact_switch_total", \
+		"Both-behind selections switched from the weighted first reader by exact-freshest policy") \
+	T(reader_target_fresher_dominance_switch, "PolarDB_Reader_Target_Fresher_Dominance_Switch", \
+		"proxysql_polardb_reader_target_fresher_dominance_switch_total", \
+		"Both-behind selections switched from the weighted first reader by strict dominance") \
 	T(reader_target_lsn_unknown, "PolarDB_Reader_Target_LSN_Unknown", \
 		"proxysql_polardb_reader_target_lsn_unknown_total", \
 		"Reader candidates with no cached LSN while a wait target was present") \
@@ -750,28 +771,43 @@
 		"Reader pool reuse validations that needed core option/reset/session-variable checks") \
 	T(reader_target_selected_lsn_unknown, "PolarDB_Reader_Target_Selected_LSN_Unknown", \
 		"proxysql_polardb_reader_target_selected_lsn_unknown_total", \
-		"Reader acquisitions that still needed a wait and had no selected-reader LSN sample") \
+		"Targeted reader acquisitions with no selected-reader LSN sample") \
 	T(reader_target_selected_lsn_stale, "PolarDB_Reader_Target_Selected_LSN_Stale", \
 		"proxysql_polardb_reader_target_selected_lsn_stale_total", \
-		"Reader acquisitions that still needed a wait because the selected-reader LSN sample was stale") \
+		"Targeted reader acquisitions whose selected-reader LSN sample was stale") \
 	T(reader_target_gap_zero, "PolarDB_Reader_Target_Gap_Zero", \
 		"proxysql_polardb_reader_target_gap_zero_total", \
-		"Wait-required reader acquisitions whose selected-reader LSN was already at the target") \
+		"Targeted reader acquisitions whose selected-reader LSN was already at the target") \
 	T(reader_target_gap_le_4kb, "PolarDB_Reader_Target_Gap_Le_4KB", \
 		"proxysql_polardb_reader_target_gap_le_4kb_total", \
-		"Wait-required reader acquisitions with selected-reader LSN less than 4KB behind target") \
+		"Targeted reader acquisitions with selected-reader LSN less than 4KB behind target") \
 	T(reader_target_gap_le_64kb, "PolarDB_Reader_Target_Gap_Le_64KB", \
 		"proxysql_polardb_reader_target_gap_le_64kb_total", \
-		"Wait-required reader acquisitions with selected-reader LSN less than 64KB behind target") \
+		"Targeted reader acquisitions with selected-reader LSN less than 64KB behind target") \
 	T(reader_target_gap_le_1mb, "PolarDB_Reader_Target_Gap_Le_1MB", \
 		"proxysql_polardb_reader_target_gap_le_1mb_total", \
-		"Wait-required reader acquisitions with selected-reader LSN less than 1MB behind target") \
+		"Targeted reader acquisitions with selected-reader LSN less than 1MB behind target") \
 	T(reader_target_gap_le_16mb, "PolarDB_Reader_Target_Gap_Le_16MB", \
 		"proxysql_polardb_reader_target_gap_le_16mb_total", \
-		"Wait-required reader acquisitions with selected-reader LSN less than 16MB behind target") \
+		"Targeted reader acquisitions with selected-reader LSN less than 16MB behind target") \
 	T(reader_target_gap_gt_16mb, "PolarDB_Reader_Target_Gap_Gt_16MB", \
 		"proxysql_polardb_reader_target_gap_gt_16mb_total", \
-		"Wait-required reader acquisitions with selected-reader LSN more than 16MB behind target") \
+		"Targeted reader acquisitions with selected-reader LSN more than 16MB behind target") \
+	T(reader_target_selected_gap_samples, "PolarDB_Reader_Target_Selected_Gap_Samples", \
+		"proxysql_polardb_reader_target_selected_gap_samples_total", \
+		"Targeted reader acquisitions with a fresh selected-reader LSN sample") \
+	T(reader_target_selected_gap_sum_bytes, "PolarDB_Reader_Target_Selected_Gap_Sum_Bytes", \
+		"proxysql_polardb_reader_target_selected_gap_bytes_total", \
+		"Total target gap in bytes observed on selected readers with fresh LSN samples") \
+	T(reader_target_selection_compared, "PolarDB_Reader_Target_Selection_Compared", \
+		"proxysql_polardb_reader_target_selection_compared_total", \
+		"Targeted acquisitions comparing a fresh selected-reader LSN with the best fresh LSN considered") \
+	T(reader_target_selection_behind_best, "PolarDB_Reader_Target_Selection_Behind_Best", \
+		"proxysql_polardb_reader_target_selection_behind_best_total", \
+		"Targeted acquisitions that selected a reader behind the best fresh reader considered") \
+	T(reader_target_selection_loss_bytes, "PolarDB_Reader_Target_Selection_Loss_Bytes", \
+		"proxysql_polardb_reader_target_selection_loss_bytes_total", \
+		"Total extra target gap caused by selecting behind the best fresh reader considered") \
 	G(session_target_epoch_reset, "PolarDB_Session_Target_Epoch_Reset", \
 		"proxysql_polardb_session_target_epoch_reset_total", \
 		"Session LSN targets cleared after writer epoch changes") \

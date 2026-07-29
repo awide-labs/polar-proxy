@@ -378,9 +378,9 @@ build_tap_tests_debug: build_src_debug
 
 # The simulator links against libproxysql.a from the PREVIOUS lib build in this
 # invocation (release for `make build_cluster_simulator`, debug for the _debug
-# variant, or a TEST_<FAMILY>-flavored debug build when pulled in as a prereq
+# variant, or a TEST_<FAMILY> debug variant when pulled in as a prerequisite
 # of the `test<family>` targets). Keep this rule dependency-free so it does not
-# clobber the caller's lib/src flavor by recursing into a conflicting build.
+# clobber the caller's lib/src variant by recursing into a conflicting build.
 .PHONY: build_cluster_simulator
 build_cluster_simulator:
 	cd test/deps/cluster_simulator && CC=${CC} CXX=${CXX} ${MAKE}
@@ -496,13 +496,20 @@ polardb-coverage-debug:
 	+$(MAKE) POLARDB_PROXY=1 POLARDB_DEBUG=1 build_src_debug
 	@echo "=== Built POLARDB_PROXY=1 POLARDB_DEBUG=1 -O0 (coverage attribution) ==="
 
+# Build core ProxySQL without the PolarDB extension or ClickHouse components.
+# This target gives callers a named alternative to passing feature variables.
+.PHONY: core
+core:
+	+$(MAKE) POLARDB_PROXY=0 PROXYSQLCLICKHOUSE=0 build_src
+	@echo "=== Built core ProxySQL (POLARDB_PROXY=0) ==="
+
 # Build the PolarDB release binary (POLARDB_PROXY=1, optimized, no trace facility).
-# When switching between POLARDB_PROXY tiers, run a clean build first:
-#   make clean && make polardb
+# lib/ and src/ guard their objects and shared outputs against variant switches, so
+# this target does not require a preceding clean build.
 .PHONY: polardb
 polardb:
 	+$(MAKE) POLARDB_PROXY=1 build_src
-	@echo "=== Built POLARDB_PROXY=1 (PolarDB release tier) ==="
+	@echo "=== Built POLARDB_PROXY=1 (PolarDB release variant) ==="
 
 
 # PolarDB-only optimization builds. These targets are explicit so normal
@@ -693,20 +700,20 @@ polardb-opt-report:
 	@$(CURDIR)/test/polardb/tools/opt_remarks_report.py --root "$(CURDIR)" --remarks-dir "$(POLARDB_OPT_REMARKS_DIR)" --pgo-dir "$(POLARDB_OPT_PGO_DIR)" --cs-dir "$(POLARDB_OPT_PGO_CS_DIR)" --bolt-dir "$(POLARDB_OPT_BOLT_DIR)" --output "$(POLARDB_OPT_REMARKS_DIR)/summary.md"
 	@echo "=== Wrote optimization remarks report: $(POLARDB_OPT_REMARKS_DIR)/summary.md ==="
 
-# Verify both tiers with explicit clean builds: feature off first, then on.
+# Verify both variants with explicit clean builds: core first, then PolarDB.
 # The final build is the PolarDB binary used by development and live tests.
 # Usage: make polardb-check
 .PHONY: polardb-check
 polardb-check:
-	@echo "=== polardb-check [1/2]: POLARDB_PROXY=0 (stubs) ==="
+	@echo "=== polardb-check [1/2]: core ==="
 	+$(MAKE) clean
 	+$(MAKE) -C deps postgresql-reset
-	+$(MAKE) POLARDB_PROXY=0 build_src
-	@echo "=== polardb-check [2/2]: POLARDB_PROXY=1 ==="
+	+$(MAKE) core
+	@echo "=== polardb-check [2/2]: polardb ==="
 	+$(MAKE) clean
 	+$(MAKE) -C deps postgresql-reset
-	+$(MAKE) POLARDB_PROXY=1 build_src
-	@echo "=== polardb-check OK: both tiers build; tree left at POLARDB_PROXY=1 ==="
+	+$(MAKE) polardb
+	@echo "=== polardb-check OK: both variants build; tree left at polardb ==="
 
 # Re-extract PostgreSQL, apply the full libpq patch stack, rebuild libpq and
 # bundled pgbench, then build the standalone PolarDB test helpers. Configure

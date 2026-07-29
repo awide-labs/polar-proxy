@@ -1155,6 +1155,8 @@ __thread int pgsql_thread___polardb_lag_wait_ms;             // polar_xact_split
 __thread int pgsql_thread___polardb_lsn_freshness_ms;        // max age of a cached per-server LSN to trust
 __thread int pgsql_thread___polardb_lag_cap_freshness_ms;    // max LSN-cache age under byte-lag cap + finite wait; 0=wait-fraction only
 __thread int pgsql_thread___polardb_reader_lsn_lag_range_bytes; // 0=exact best-behind reader only
+__thread bool pgsql_thread___polardb_reader_prefer_freshest_below_target; // experimental best-behind selection policy
+__thread bool pgsql_thread___polardb_reader_prefer_less_loaded; // experimental strict-dominance policy
 __thread int pgsql_thread___polardb_reader_connection_retention; // 0=end-of-pass return, 1=retain active readers
 __thread int pgsql_thread___polardb_output_coalesce_bytes;   // 0=disabled; hold incomplete streaming output up to byte budget
 __thread int pgsql_thread___polardb_output_coalesce_packets; // 0=disabled; hold incomplete streaming output up to packet budget
@@ -1527,6 +1529,8 @@ extern __thread int pgsql_thread___polardb_lag_wait_ms;
 extern __thread int pgsql_thread___polardb_lsn_freshness_ms;
 extern __thread int pgsql_thread___polardb_lag_cap_freshness_ms;
 extern __thread int pgsql_thread___polardb_reader_lsn_lag_range_bytes;
+extern __thread bool pgsql_thread___polardb_reader_prefer_freshest_below_target;
+extern __thread bool pgsql_thread___polardb_reader_prefer_less_loaded;
 extern __thread int pgsql_thread___polardb_reader_connection_retention;
 extern __thread bool pgsql_thread___polardb_monitor_lsn_updates;
 extern __thread bool pgsql_thread___polardb_lazy_warmup_split;

@@ -373,7 +373,7 @@ static bool pgsql_polardb_prepare_classic_create_locked(
 }
 #endif // POLARDB_PROXY
 
-int PgSQL_SrvConnList::find_idx(PgSQL_Connection* conn) {
+int PgSQL_SrvConnList::find_idx(PgSQL_Connection* conn) const {
 	if (!conn) {
 		return -1;
 	}
@@ -399,11 +399,17 @@ int PgSQL_SrvConnList::find_idx(PgSQL_Connection* conn) {
 
 #if POLARDB_PROXY
 void PgSQL_SrvConnList::unindex_unlocked(PgSQL_Connection* conn) {
-	auto reverse = match_key_by_connection.find(conn);
-	if (reverse == match_key_by_connection.end()) {
+	const int position = find_idx(conn);
+	if (position < 0 ||
+			static_cast<size_t>(position) >= match_keys_by_position.size()) {
 		return;
 	}
-	auto indexed = matching_by_key.find(reverse->second);
+	const PgSQL_PoolMatchKey& key =
+		match_keys_by_position[static_cast<size_t>(position)];
+	if (key.empty()) {
+		return;
+	}
+	auto indexed = matching_by_key.find(key);
 	if (indexed != matching_by_key.end()) {
 		auto& entries = indexed->second;
 		for (size_t i = 0; i < entries.size(); i++) {
@@ -417,7 +423,6 @@ void PgSQL_SrvConnList::unindex_unlocked(PgSQL_Connection* conn) {
 			matching_by_key.erase(indexed);
 		}
 	}
-	match_key_by_connection.erase(reverse);
 }
 #endif // POLARDB_PROXY
 
@@ -432,13 +437,12 @@ void PgSQL_SrvConnList::add_unlocked(
 #endif // POLARDB_PROXY
 	conns->add(conn);
 #if POLARDB_PROXY
-	if (used_list) {
-		mysrvc->pool_used_count.fetch_add(1, std::memory_order_relaxed);
-	} else {
-		mysrvc->pool_free_count.fetch_add(1, std::memory_order_relaxed);
-	}
+	match_keys_by_position.push_back(
+		key ? *key : PgSQL_PoolMatchKey{});
+	std::atomic<unsigned int>& count = used_list
+		? mysrvc->pool_used_count : mysrvc->pool_free_count;
+	count.store(conns->len, std::memory_order_relaxed);
 	if (key && !key->empty()) {
-		match_key_by_connection[conn] = *key;
 		if (!used_list) {
 			matching_by_key[*key].push_back(conn);
 		}
@@ -452,12 +456,13 @@ bool PgSQL_SrvConnList::match_key_unlocked(
 	if (!conn || !key) {
 		return false;
 	}
-	auto found = match_key_by_connection.find(conn);
-	if (found == match_key_by_connection.end()) {
+	const int position = find_idx(conn);
+	if (position < 0 ||
+			static_cast<size_t>(position) >= match_keys_by_position.size()) {
 		return false;
 	}
-	*key = found->second;
-	return true;
+	*key = match_keys_by_position[static_cast<size_t>(position)];
+	return !key->empty();
 }
 #endif // POLARDB_PROXY
 
@@ -469,6 +474,7 @@ PgSQL_Connection* PgSQL_SrvConnList::remove_position_unlocked(
 	PgSQL_Connection* conn =
 		static_cast<PgSQL_Connection*>(conns->index(index));
 #if POLARDB_PROXY
+	assert(match_keys_by_position.size() == conns->len);
 	PgSQL_Connection* last = static_cast<PgSQL_Connection*>(
 		conns->index(conns->len - 1));
 #endif // POLARDB_PROXY
@@ -487,20 +493,15 @@ PgSQL_Connection* PgSQL_SrvConnList::remove_position_unlocked(
 	conn->polardb_core_pool_position = UINT32_MAX;
 	if (index < conns->len) {
 		last->polardb_core_pool_position = index;
+		match_keys_by_position[index] = match_keys_by_position.back();
 	}
+	match_keys_by_position.pop_back();
+	assert(match_keys_by_position.size() == conns->len);
 #endif // POLARDB_PROXY
 #if POLARDB_PROXY
 	std::atomic<unsigned int>& count = used_list
 		? mysrvc->pool_used_count : mysrvc->pool_free_count;
-	const unsigned int current = count.load(std::memory_order_relaxed);
-	if (current > 0) {
-		count.fetch_sub(1, std::memory_order_relaxed);
-	} else {
-		proxy_error(
-			"PostgreSQL core pool count underflow on %s:%u list=%s\n",
-			mysrvc->address ? mysrvc->address : "(null)", mysrvc->port,
-			used_list ? "USED" : "FREE");
-	}
+	count.store(conns->len, std::memory_order_relaxed);
 #endif // POLARDB_PROXY
 	return conn;
 }
@@ -533,14 +534,16 @@ PgSQL_Connection* PgSQL_SrvConnList::remove_matching_unlocked(
 	if (index < 0) {
 		// Repair an impossible stale index entry without returning a pointer
 		// that is not owned by this FREE list.
-		unindex_unlocked(conn);
+		indexed->second.pop_back();
+		if (indexed->second.empty()) {
+			matching_by_key.erase(indexed);
+		}
 		return nullptr;
 	}
 	indexed->second.pop_back();
 	if (indexed->second.empty()) {
 		matching_by_key.erase(indexed);
 	}
-	match_key_by_connection.erase(conn);
 	return remove_position_unlocked(
 		static_cast<unsigned int>(index),
 		PolarDB_ReaderClaimRetireReason::ACQUIRED);
@@ -911,20 +914,20 @@ void PgSQL_SrvC::polardb_retire_claims_unlocked(
 
 bool PgSQL_SrvC::polardb_publish_matching_free_unlocked(
 		PgSQL_Connection* conn, const PgSQL_PoolMatchKey& key,
-		PolarDB_ReaderClaimWake* wake) {
+		PolarDB_ReaderClaimWake* wake,
+		std::shared_ptr<const void>& released_server_snapshot) {
 	if (wake) {
 		*wake = PolarDB_ReaderClaimWake{};
 	}
 	if (!conn || !ConnectionsFree || status != MYSQL_SERVER_STATUS_ONLINE) {
 		return false;
 	}
+	released_server_snapshot =
+		std::move(conn->polardb_selected_server_snapshot);
 	PolarDB_ReaderClaimDemand selected;
 	std::shared_ptr<const void> selected_server_snapshot;
 	if (!myhgc || !myhgc->take_matching_reader_claim_demand(
 			this, key, &selected, UINT_MAX, &selected_server_snapshot)) {
-		std::shared_ptr<const void> released_server_snapshot =
-			std::move(conn->polardb_selected_server_snapshot);
-		(void)released_server_snapshot;
 		ConnectionsFree->add_unlocked(conn, &key);
 		return true;
 	}
@@ -1220,11 +1223,13 @@ bool PgSQL_SrvC::add_matching_connection(
 	if (!conn) {
 		return false;
 	}
+	std::shared_ptr<const void> released_server_snapshot;
 	std::lock_guard<std::recursive_mutex> pool_lock(pool_mutex);
 	if (status != MYSQL_SERVER_STATUS_ONLINE || !ConnectionsFree) {
 		return false;
 	}
-	return polardb_publish_matching_free_unlocked(conn, key, wake);
+	return polardb_publish_matching_free_unlocked(
+		conn, key, wake, released_server_snapshot);
 }
 
 bool PgSQL_SrvC::add_used_matching_connection(
@@ -1254,6 +1259,7 @@ bool PgSQL_SrvC::return_matching_connection(
 	if (lock_hold_us) {
 		*lock_hold_us = 0;
 	}
+	std::shared_ptr<const void> released_server_snapshot;
 #if POLARDB_PROXY && POLARDB_PROFILE
 	const unsigned long long wait_started_at = monotonic_time();
 #endif // POLARDB_PROXY && POLARDB_PROFILE
@@ -1286,7 +1292,8 @@ bool PgSQL_SrvC::return_matching_connection(
 		return false;
 	}
 	const bool published =
-		polardb_publish_matching_free_unlocked(conn, key, wake);
+		polardb_publish_matching_free_unlocked(
+			conn, key, wake, released_server_snapshot);
 #if POLARDB_PROXY && POLARDB_PROFILE
 	if (lock_hold_us) {
 		*lock_hold_us = monotonic_time() - lock_acquired_at;
@@ -1418,6 +1425,7 @@ bool PgSQL_SrvC::cancel_reader_claim(
 	if (myhgc && myhgc->cancel_reader_claim_demand(worker_index, token)) {
 		return true;
 	}
+	std::shared_ptr<const void> released_server_snapshot;
 	std::lock_guard<std::recursive_mutex> pool_lock(pool_mutex);
 	auto claim = polardb_reader_claims.find(token);
 	if (claim == polardb_reader_claims.end() ||
@@ -1444,7 +1452,7 @@ bool PgSQL_SrvC::cancel_reader_claim(
 		static_cast<unsigned int>(index),
 		PolarDB_ReaderClaimRetireReason::RELEASED);
 	const bool published = polardb_publish_matching_free_unlocked(
-		conn, selected.match_key, next_wake);
+		conn, selected.match_key, next_wake, released_server_snapshot);
 	if (published && PgHGM) {
 		PgHGM->status.polardb_reader_claim_released.fetch_add(
 			1, std::memory_order_relaxed);
@@ -1656,6 +1664,16 @@ void pgsql_pool_status_count_get_ok(
 	}
 }
 
+void pgsql_pool_status_count_push(
+	PgSQL_Thread* thread, unsigned long* fallback_counter, unsigned long value
+) {
+	if (thread) {
+		thread->status_variables.pgconnpoll_push += value;
+	} else {
+		pgsql_pool_status_count(fallback_counter, value);
+	}
+}
+
 unsigned long pgsql_pool_status_read(unsigned long* counter) {
 	return __atomic_load_n(counter, __ATOMIC_RELAXED);
 }
@@ -1674,6 +1692,15 @@ unsigned long pgsql_pool_status_read_get_ok(unsigned long* fallback_counter) {
 		__atomic_load_n(fallback_counter, __ATOMIC_RELAXED);
 	if (GloPTH) {
 		total += GloPTH->get_pgconnpoll_get_ok();
+	}
+	return static_cast<unsigned long>(total);
+}
+
+unsigned long pgsql_pool_status_read_push(unsigned long* fallback_counter) {
+	unsigned long long total =
+		__atomic_load_n(fallback_counter, __ATOMIC_RELAXED);
+	if (GloPTH) {
+		total += GloPTH->get_pgconnpoll_push();
 	}
 	return static_cast<unsigned long>(total);
 }
@@ -4027,6 +4054,7 @@ PgSQL_HostGroups_Manager::yield_connection_to_reader_claim(
 
 #if POLARDB_PROXY
 void PgSQL_HostGroups_Manager::return_polardb_reader_connections(
+		PgSQL_Thread* thread,
 		const std::vector<PgSQL_Connection*>& connections,
 		std::vector<PgSQL_Connection*>& detached_connections) {
 	if (connections.empty()) {
@@ -4044,11 +4072,14 @@ void PgSQL_HostGroups_Manager::return_polardb_reader_connections(
 		PgSQL_Connection* connection;
 		PgSQL_PoolMatchKey match_key;
 		bool reusable;
+		std::shared_ptr<const void> released_server_snapshot;
 	};
 	std::vector<PreparedReturn> prepared;
 	prepared.reserve(connections.size());
 	std::vector<PolarDB_ReaderClaimWake> claim_wakes;
-	claim_wakes.reserve(connections.size());
+	if (server->myhgc && server->myhgc->has_reader_claim_demand_fast()) {
+		claim_wakes.reserve(connections.size());
+	}
 	unsigned int return_attempts = 0;
 	for (PgSQL_Connection* connection : connections) {
 		if (!connection || connection->parent != server) {
@@ -4073,8 +4104,10 @@ void PgSQL_HostGroups_Manager::return_polardb_reader_connections(
 		if (reusable) {
 			return_attempts++;
 		}
-		pgsql_pool_status_count(&status.pgconnpoll_push);
-		prepared.push_back(PreparedReturn{connection, match_key, reusable});
+		pgsql_pool_status_count_push(
+			thread, &status.pgconnpoll_push, 1);
+		prepared.push_back(
+			PreparedReturn{connection, match_key, reusable, nullptr});
 	}
 
 #if POLARDB_PROFILE
@@ -4109,10 +4142,11 @@ void PgSQL_HostGroups_Manager::return_polardb_reader_connections(
 			}
 			PolarDB_ReaderClaimWake claim_wake;
 			if (server->polardb_publish_matching_free_unlocked(
-					entry.connection, entry.match_key, &claim_wake)) {
+					entry.connection, entry.match_key, &claim_wake,
+					entry.released_server_snapshot)) {
 				returned++;
 				if (claim_wake.valid()) {
-					claim_wakes.push_back(claim_wake);
+					claim_wakes.push_back(std::move(claim_wake));
 				}
 			} else {
 				detached_connections.push_back(entry.connection);
@@ -4124,6 +4158,7 @@ void PgSQL_HostGroups_Manager::return_polardb_reader_connections(
 			monotonic_time() - lock_acquired_at);
 #endif // POLARDB_PROFILE
 	}
+	prepared.clear();
 #if POLARDB_PROFILE
 	POLARDB_PROFILE_STATUS_COUNT(
 		reader_pool_shared_return_attempt, return_attempts);
@@ -4132,10 +4167,9 @@ void PgSQL_HostGroups_Manager::return_polardb_reader_connections(
 	POLARDB_PROFILE_STATUS_COUNT(
 		reader_pool_shared_return_rejected, return_attempts - returned);
 #endif // POLARDB_PROFILE
-	status.polardb_reader_pool_return_to_core.fetch_add(
-		returned, std::memory_order_relaxed);
-	for (const PolarDB_ReaderClaimWake& claim_wake : claim_wakes) {
-		signal_polardb_reader_claim(server, claim_wake);
+	POLARDB_THREAD_COUNT(thread, reader_pool_return_to_core, returned);
+	for (PolarDB_ReaderClaimWake& claim_wake : claim_wakes) {
+		signal_polardb_reader_claim(server, std::move(claim_wake));
 	}
 }
 
@@ -6186,7 +6220,9 @@ void PgSQL_HostGroups_Manager::p_update_metrics() {
 	p_update_counter(status.p_counter_array[PgSQL_p_hg_counter::pghgm_pgconnpool_get], pgsql_pool_status_read_get(&status.pgconnpoll_get));
 	p_update_counter(status.p_counter_array[PgSQL_p_hg_counter::pghgm_pgconnpool_get_ok], pgsql_pool_status_read_get_ok(&status.pgconnpoll_get_ok));
 	p_update_counter(status.p_counter_array[PgSQL_p_hg_counter::pghgm_pgconnpool_get_ping], pgsql_pool_status_read(&status.pgconnpoll_get_ping));
-	p_update_counter(status.p_counter_array[PgSQL_p_hg_counter::pghgm_pgconnpool_push], status.pgconnpoll_push);
+	p_update_counter(
+		status.p_counter_array[PgSQL_p_hg_counter::pghgm_pgconnpool_push],
+		pgsql_pool_status_read_push(&status.pgconnpoll_push));
 	p_update_counter(status.p_counter_array[PgSQL_p_hg_counter::pghgm_pgconnpool_reset], status.pgconnpoll_reset);
 	p_update_counter(status.p_counter_array[PgSQL_p_hg_counter::pghgm_pgconnpool_destroy], status.pgconnpoll_destroy);
 
@@ -6246,7 +6282,7 @@ SQLite3_result * PgSQL_HostGroups_Manager::SQL3_Get_ConnPool_Stats() {
 	}
     {
 		pta[0]=(char *)"PgHGM_pgconnpoll_push";
-		sprintf(buf,"%lu",status.pgconnpoll_push);
+		sprintf(buf,"%lu",pgsql_pool_status_read_push(&status.pgconnpoll_push));
 		pta[1]=buf;
 		result->add_row(pta);
 	}

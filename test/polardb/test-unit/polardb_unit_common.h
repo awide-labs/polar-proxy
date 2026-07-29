@@ -441,11 +441,13 @@ static inline void stage_polardb_topology_two_readers(
 		int writer_hg, const char *writer_addr, int writer_port,
 		int reader_hg,
 		const char *reader_addr1, int reader_port1,
-		const char *reader_addr2, int reader_port2) {
+		const char *reader_addr2, int reader_port2,
+		int reader_weight1 = 1, int reader_weight2 = 1) {
 	ok(hgm->servers_add(make_pgsql_servers_result_two_readers(
 			writer_hg, writer_addr, writer_port,
 			reader_hg, reader_addr1, reader_port1,
-			reader_addr2, reader_port2)) == 0,
+			reader_addr2, reader_port2,
+			reader_weight1, reader_weight2)) == 0,
 		"%s: writer and two readers staged for commit", label);
 	hgm->save_incoming_pgsql_table(
 		make_polardb_replication_row(writer_hg, reader_hg),

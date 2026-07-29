@@ -2617,6 +2617,13 @@ struct PolarDB_ReaderResult {
     bool wait_bypass_allowed = false;  // selected reader already reached consistency target
     bool server_saturated = false;     // selected snapshot had no free or open capacity
     bool exact_match_claimed = false;  // an eligible exact FREE match was reserved by a claim
+    // Cached LSN observations used only for post-acquisition diagnostics. The
+    // best value is the freshest eligible reader considered by this lookup,
+    // not an assertion about readers that routing did not inspect.
+    uint64_t selected_reader_lsn = 0;
+    uint64_t best_considered_reader_lsn = 0;
+    bool selected_reader_lsn_fresh = false;
+    bool best_considered_reader_lsn_fresh = false;
     // A compact worker-local pacing scope. Hash equality is used only to defer
     // another retry until the next worker pass; pool identity still uses the
     // complete collision-safe match key.

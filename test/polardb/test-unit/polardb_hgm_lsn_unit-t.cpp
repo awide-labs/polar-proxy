@@ -25,6 +25,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
 #include <cstdint>
 #include <limits>
@@ -438,12 +439,44 @@ static void test_polardb_parent_byte_flush_accounting() {
 		"PolarDB parent bytes: destructor flush reason is counted");
 }
 
+static bool polardb_plain_send_denied_by_policy(int* denied_errno) {
+	int probe_fds[2] = {-1, -1};
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, probe_fds) != 0) {
+		return false;
+	}
+
+	const char byte = 'x';
+	errno = 0;
+#ifdef __APPLE__
+	const ssize_t sent = send(probe_fds[0], &byte, 1, 0);
+#else
+	const ssize_t sent = send(probe_fds[0], &byte, 1, MSG_NOSIGNAL);
+#endif
+	const int send_errno = sent < 0 ? errno : 0;
+	close(probe_fds[0]);
+	close(probe_fds[1]);
+
+	if (denied_errno) {
+		*denied_errno = send_errno;
+	}
+	return sent < 0 && (send_errno == EPERM || send_errno == EACCES);
+}
+
 static void test_polardb_writev_direct_send() {
 	{
 		int small_fds[2] = {-1, -1};
 		ok(socketpair(AF_UNIX, SOCK_STREAM, 0, small_fds) == 0,
 			"PolarDB writev: small-batch socketpair fixture is available");
 		if (small_fds[0] >= 0 && small_fds[1] >= 0) {
+			int denied_errno = 0;
+			const bool plain_send_denied =
+				polardb_plain_send_denied_by_policy(&denied_errno);
+			if (plain_send_denied) {
+				const char* denied_name = denied_errno == EPERM ? "EPERM" : "EACCES";
+				diag("Skipping buffered send checks: send() is blocked by execution policy (errno=%d %s)",
+					denied_errno, denied_name);
+			}
+
 			ProxySQL_Poll<PgSQL_Data_Stream> small_polls;
 			std::unique_ptr<PgSQL_Thread> small_worker(new PgSQL_Thread());
 			small_worker->curtime = monotonic_time();
@@ -475,12 +508,16 @@ static void test_polardb_writev_direct_send() {
 			const ssize_t small_read_bytes =
 				recv(small_fds[1], small_received, sizeof(small_received), MSG_DONTWAIT);
 
-			ok(small_read_bytes == 5 &&
-					memcmp(small_received, "abcde", 5) == 0,
-				"PolarDB writev: session writeout sends a small buffered result");
-			ok(small_myds->PSarrayOUT->len == 0 &&
-					small_myds->queueOUT.head == small_myds->queueOUT.tail,
-				"PolarDB writev: small buffered result leaves no queued output");
+			if (plain_send_denied) {
+				skip(2, "send() is unavailable under the current execution policy");
+			} else {
+				ok(small_read_bytes == 5 &&
+						memcmp(small_received, "abcde", 5) == 0,
+					"PolarDB writev: session writeout sends a small buffered result");
+				ok(small_myds->PSarrayOUT->len == 0 &&
+						small_myds->queueOUT.head == small_myds->queueOUT.tail,
+					"PolarDB writev: small buffered result leaves no queued output");
+			}
 			ok(small_worker->polardb_status_variables.stvar[
 					polardb_st_var_writev_small_batch_fallback] ==
 					small_before,
@@ -667,6 +704,10 @@ static void test_polardb_thread_counter_aggregation_and_fold() {
 		polardb_st_var_reader_capacity_wait_max_us] = 250;
 	worker2->polardb_status_variables.stvar[
 		polardb_st_var_reader_capacity_wait_max_us] = 180;
+	worker1->status_variables.pgconnpoll_push = 2;
+	worker2->status_variables.pgconnpoll_push = 3;
+	const unsigned long pgconnpoll_push_before = __atomic_load_n(
+		&PgHGM->status.pgconnpoll_push, __ATOMIC_RELAXED);
 
 	// The enum and metadata list must stay tied together. Do not use a fixed
 	// number here because POLARDB_PROFILE intentionally adds more counters.
@@ -693,6 +734,8 @@ static void test_polardb_thread_counter_aggregation_and_fold() {
 			PgHGM->status.polardb_reader_capacity_wait_max_us) ==
 			EXPECTED_CAPACITY_WAIT_MAX_US,
 		"PolarDB counters: maximum aggregation selects the largest worker wait");
+	ok(GloPTH->get_pgconnpoll_push() == 5,
+		"PostgreSQL pool counters: aggregation includes worker-local pushes");
 
 	const uint64_t GLOBAL_LSN_UPDATES_FROM_MONITOR = 6;
 	PgHGM->status.polardb_lsn_updates_from_monitor.store(
@@ -747,6 +790,9 @@ static void test_polardb_thread_counter_aggregation_and_fold() {
 	GloPTH->pgsql_threads[0].worker = nullptr;
 	delete worker2;
 	GloPTH->pgsql_threads[1].worker = nullptr;
+	ok(__atomic_load_n(&PgHGM->status.pgconnpoll_push, __ATOMIC_RELAXED) ==
+			pgconnpoll_push_before + 5,
+		"PostgreSQL pool counters: worker teardown folds local pushes");
 
 	ok(PgHGM->status.polardb_target_lsn_preferred.load(std::memory_order_relaxed) == 19,
 		"PolarDB counters: worker teardown folds counters into global counter");
@@ -952,6 +998,47 @@ static void test_lsn_observation_refreshes_freshness_timestamp() {
 		"PolarDB LSN freshness: equal sample refreshes observation timestamp");
 }
 
+static void test_reader_target_selection_counter_contract() {
+	std::unique_ptr<PgSQL_Thread> worker(new PgSQL_Thread());
+	const uint64_t TARGET = 0x20000;
+	const uint64_t SELECTED = 0x1F000;
+	const uint64_t BEST = 0x1F800;
+
+	polardb_count_reader_target_selection(
+		worker.get(), TARGET, SELECTED, true, BEST, true);
+	ok(worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_gap_le_4kb] == 1,
+		"PolarDB target counters: selected gap enters exactly one histogram bucket");
+	ok(worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_selected_gap_samples] == 1 &&
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_selected_gap_sum_bytes] == TARGET - SELECTED,
+		"PolarDB target counters: selected gap sample and byte total agree");
+	ok(worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_selection_compared] == 1 &&
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_selection_behind_best] == 1 &&
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_selection_loss_bytes] == BEST - SELECTED,
+		"PolarDB target counters: selected-versus-best loss is classified and measured");
+
+	polardb_count_reader_target_selection(
+		worker.get(), TARGET, 0, false, 0, false);
+	ok(worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_selected_lsn_unknown] == 1 &&
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_selected_gap_samples] == 1,
+		"PolarDB target counters: unknown selected LSN does not create a gap sample");
+
+	polardb_count_reader_target_selection(
+		worker.get(), TARGET, TARGET, false, TARGET, true);
+	ok(worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_selected_lsn_stale] == 1 &&
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_selection_compared] == 1,
+		"PolarDB target counters: stale selected LSN is not compared with the best sample");
+}
+
 static void test_v2_target_reader_keeps_wait_until_lsn_is_reached() {
 	const int writer_hg = 920;
 	const int reader_hg = 921;
@@ -1002,6 +1089,12 @@ static void test_v2_target_reader_keeps_wait_until_lsn_is_reached() {
 	reader->polardb_current_lsn.store(STALE_READER_LSN, std::memory_order_relaxed);
 	reader->lsn_updated_at.store(monotonic_time(), std::memory_order_relaxed);
 	unit_reader_pool_add_matching(reader, cached);
+	const uint64_t stale_gap_bucket_before =
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_gap_le_4kb];
+	const uint64_t stale_gap_sum_before =
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_selected_gap_sum_bytes];
 
 	PolarDB_ReaderResult stale_result =
 		PgHGM->get_MyConn_polardb_reader(
@@ -1011,6 +1104,13 @@ static void test_v2_target_reader_keeps_wait_until_lsn_is_reached() {
 		"PolarDB v2 reader: reader below the target remains usable with the backend wait");
 	ok(!stale_result.wait_bypass_allowed,
 		"PolarDB v2 reader: reader below the target cannot bypass wait wrapping");
+	ok(worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_gap_le_4kb] ==
+			stale_gap_bucket_before + 1 &&
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_selected_gap_sum_bytes] ==
+			stale_gap_sum_before + REQUIRED_READER_LSN - STALE_READER_LSN,
+		"PolarDB v2 reader: acquisition records the selected reader target gap once");
 	if (!stale_result.acquired()) {
 		return;
 	}
@@ -1018,6 +1118,9 @@ static void test_v2_target_reader_keeps_wait_until_lsn_is_reached() {
 
 	reader->polardb_current_lsn.store(FRESH_READER_LSN, std::memory_order_relaxed);
 	reader->lsn_updated_at.store(monotonic_time(), std::memory_order_relaxed);
+	const uint64_t zero_gap_before =
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_gap_zero];
 	PolarDB_ReaderResult hit_result =
 		PgHGM->get_MyConn_polardb_reader(
 			reader_hg, &sess, plan, wait,
@@ -1029,6 +1132,9 @@ static void test_v2_target_reader_keeps_wait_until_lsn_is_reached() {
 		"PolarDB v2 reader: the selected server returns its exact matching connection");
 	ok(hit_result.wait_bypass_allowed,
 		"PolarDB v2 reader: fresh RFQ connection can bypass wait wrapping");
+	ok(worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_gap_zero] == zero_gap_before + 1,
+		"PolarDB v2 reader: target-reached acquisition records a zero selected gap");
 	ok(worker->polardb_status_variables.stvar[
 			polardb_st_var_target_lsn_preferred] == 1,
 		"PolarDB v2 reader: hit increments target-LSN preferred counter");
@@ -1534,9 +1640,22 @@ static void test_core_match_pool_index_and_transfer() {
 	ok(reader->return_matching_connection(used_b, key_b),
 		"PostgreSQL core match pool: second used connection returns after saturation check");
 
-	reader->remove_free_connection(conn_a);
-	reader->remove_free_connection(conn_b);
+	ok(reader->remove_free_connection(conn_a),
+		"PostgreSQL core match pool: removing the first FREE connection compacts the owner list");
 	delete conn_a;
+	conn_b->last_time_used = 1;
+	PgSQL_Connection* ping_conn = reader->take_free_connection_for_ping(
+		conn_b, std::numeric_limits<unsigned long long>::max());
+	PgSQL_PoolMatchKey compacted_key;
+	ok(ping_conn == conn_b &&
+			reader->used_connection_match_key(conn_b, &compacted_key) &&
+			compacted_key == key_b,
+		"PostgreSQL core match pool: fast compaction preserves the moved connection key");
+	if (ping_conn) {
+		reader->polardb_finish_idle_ping(ping_conn, false);
+		reader->return_matching_connection(ping_conn, key_b);
+	}
+	reader->remove_free_connection(conn_b);
 	delete conn_b;
 
 	PgSQL_Connection* offline_conn = make_cached_reader_connection(reader);
@@ -3186,6 +3305,30 @@ static void test_multi_reader_selection_samples_two_servers() {
 			polardb_st_var_reader_pool_p2c_random] == decisions_before + 32,
 		"PolarDB multi-reader selection: each sampled pair makes one decision");
 
+	const uint64_t TARGET_LSN = 0xC100;
+	const uint64_t now = monotonic_time();
+	PgSQL_SrvC* target_ready = entry->servers[2].srv;
+	for (const auto& server_entry : entry->servers) {
+		server_entry.srv->polardb_current_lsn.store(
+			TARGET_LSN - 0x100, std::memory_order_relaxed);
+		server_entry.srv->lsn_updated_at.store(now, std::memory_order_relaxed);
+	}
+	target_ready->polardb_current_lsn.store(
+		TARGET_LSN, std::memory_order_relaxed);
+	plan.primary_lsn = TARGET_LSN + 0x100;
+	plan.max_lag_bytes = 0x1000;
+	PolarDB_WaitSpec target_wait = PolarDB_WaitSpec::lsn(
+		TARGET_LSN, POLARDB_DEFAULT_WAIT_TIMEOUT_MS,
+		PolarDB_WaitMode::BEST_EFFORT);
+	PolarDB_ReaderResult target_result = PgHGM->get_MyConn_polardb_reader(
+		reader_hg, &sess, plan, target_wait, /*only_pooled=*/false);
+	ok(target_result.acquired() && target_result.srv == target_ready &&
+			target_result.wait_bypass_allowed,
+		"PolarDB multi-reader selection: target-ready reader wins across more than two readers");
+	if (target_result.conn) {
+		PgHGM->push_MyConn_to_pool(target_result.conn);
+	}
+
 	for (PgSQL_Connection* conn : fixtures) {
 		PgSQL_SrvC* reader = static_cast<PgSQL_SrvC*>(conn->parent);
 		reader->remove_free_connection(conn);
@@ -4164,6 +4307,7 @@ static void test_reader_pool_batch_rejected_return_defers_destruction() {
 	std::vector<PgSQL_Connection*> connections{conn};
 	std::vector<PgSQL_Connection*> connections_to_delete;
 	PgHGM->return_polardb_reader_connections(
+		nullptr,
 		connections, connections_to_delete);
 	ok(connections_to_delete.size() == 1 &&
 			connections_to_delete.front() == conn,
@@ -4173,6 +4317,67 @@ static void test_reader_pool_batch_rejected_return_defers_destruction() {
 	ok(reader->pool_used_count_value() == 0 &&
 			reader->pool_free_count_value() == 0,
 		"PolarDB batch deferred return destruction: rejected connection leaves core accounting");
+	delete conn;
+}
+
+static void test_reader_pool_batch_return_uses_worker_counters() {
+	const int writer_hg = 1116;
+	const int reader_hg = 1117;
+
+	stage_polardb_topology(PgHGM, "PolarDB batch return worker counters",
+		writer_hg, "polardb-batch-counter-writer", 26600,
+		reader_hg, "polardb-batch-counter-reader", 26601);
+
+	PgSQL_SrvC* reader = find_pgsql_server(
+		PgHGM->MyHGC_lookup(reader_hg),
+		"polardb-batch-counter-reader", 26601);
+	ok(reader != nullptr,
+		"PolarDB batch return counters: reader server container is available");
+	if (!reader) {
+		return;
+	}
+
+	std::unique_ptr<PgSQL_Thread> worker(new PgSQL_Thread());
+	PgSQL_Connection* conn = make_cached_reader_connection(reader);
+	conn->pgsql_conn = unit_connected_pgconn();
+	const PgSQL_PoolMatchKey match_key = unit_reader_pool_match_key(conn);
+	conn->polardb_selected_server_snapshot =
+		PgHGM->get_polardb_server_list_snapshot();
+	ok(reader->add_used_matching_connection(conn, match_key),
+		"PolarDB batch return counters: core USED list owns the connection");
+
+	const unsigned long global_push_before = __atomic_load_n(
+		&PgHGM->status.pgconnpoll_push, __ATOMIC_RELAXED);
+	const unsigned long long global_return_before =
+		PgHGM->status.polardb_reader_pool_return_to_core.load(
+			std::memory_order_relaxed);
+	const unsigned long long local_push_before =
+		worker->status_variables.pgconnpoll_push;
+	const unsigned long long local_return_before =
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_pool_return_to_core];
+
+	std::vector<PgSQL_Connection*> connections{conn};
+	std::vector<PgSQL_Connection*> connections_to_delete;
+	PgHGM->return_polardb_reader_connections(
+		worker.get(), connections, connections_to_delete);
+
+	ok(connections_to_delete.empty() &&
+			reader->pool_used_count_value() == 0 &&
+			reader->pool_free_count_value() == 1,
+		"PolarDB batch return counters: reusable connection reaches core FREE");
+	ok(worker->status_variables.pgconnpoll_push == local_push_before + 1 &&
+			__atomic_load_n(&PgHGM->status.pgconnpoll_push,
+				__ATOMIC_RELAXED) == global_push_before,
+		"PolarDB batch return counters: push is recorded only on the worker");
+	ok(worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_pool_return_to_core] ==
+			local_return_before + 1 &&
+			PgHGM->status.polardb_reader_pool_return_to_core.load(
+				std::memory_order_relaxed) == global_return_before,
+		"PolarDB batch return counters: accepted return is recorded only on the worker");
+
+	reader->remove_free_connection(conn);
 	delete conn;
 }
 
@@ -4819,6 +5024,463 @@ static void test_tied_freshest_behind_reader_can_acquire_second_candidate() {
 	delete result.conn;
 }
 
+static void test_two_reader_freshest_behind_reader_is_preferred() {
+	const int writer_hg = 964;
+	const int reader_hg = 965;
+	const uint64_t LOWER_LSN = 0xD800;
+	const uint64_t HIGHER_LSN = 0xD900;
+	const uint64_t TARGET_LSN = 0xDA00;
+
+	stage_polardb_topology_two_readers(PgHGM,
+		"PolarDB exact best-behind reader",
+		writer_hg, "polardb-exact-writer", 22432,
+		reader_hg,
+		"polardb-exact-reader-a", 22433,
+		"polardb-exact-reader-b", 22434);
+
+	auto snapshot = PgHGM->get_polardb_server_list_snapshot();
+	if (!snapshot) {
+		ok(false,
+			"PolarDB exact best-behind reader: two-reader snapshot is available");
+		return;
+	}
+	auto hostgroup = snapshot->by_hostgroup.find(reader_hg);
+	const bool fixture_ok = hostgroup != snapshot->by_hostgroup.end() &&
+		hostgroup->second.servers.size() == 2 &&
+		hostgroup->second.selection_start;
+	ok(fixture_ok,
+		"PolarDB exact best-behind reader: two-reader snapshot is available");
+	if (!fixture_ok) {
+		return;
+	}
+
+	PgSQL_SrvC *first = hostgroup->second.servers[0].srv;
+	PgSQL_SrvC *second = hostgroup->second.servers[1].srv;
+	hostgroup->second.selection_start->store(0, std::memory_order_relaxed);
+	const uint64_t now = monotonic_time();
+	first->polardb_current_lsn.store(LOWER_LSN, std::memory_order_relaxed);
+	second->polardb_current_lsn.store(HIGHER_LSN, std::memory_order_relaxed);
+	first->lsn_updated_at.store(now, std::memory_order_relaxed);
+	second->lsn_updated_at.store(now, std::memory_order_relaxed);
+
+	PgSQL_Connection *cached = make_cached_reader_connection(second);
+	cached->polardb_startup_client.identity = unit_proxy_identity();
+	cached->pgsql_conn = unit_connected_pgconn();
+	unit_reader_pool_add_matching(second, cached);
+
+	PolarDB_Query_ReaderPlan plan;
+	plan.primary_lsn = TARGET_LSN + 0x100;
+	plan.max_lag_bytes = 0x1000;
+	plan.fallback_writer_hg = writer_hg;
+	PolarDB_WaitSpec wait = PolarDB_WaitSpec::lsn(
+		TARGET_LSN, POLARDB_DEFAULT_WAIT_TIMEOUT_MS,
+		PolarDB_WaitMode::BEST_EFFORT);
+
+	const bool saved_preference =
+		pgsql_thread___polardb_reader_prefer_freshest_below_target;
+	const int saved_range = pgsql_thread___polardb_reader_lsn_lag_range_bytes;
+	const int saved_throttle =
+		pgsql_thread___throttle_connections_per_sec_to_hostgroup;
+	pgsql_thread___polardb_reader_prefer_freshest_below_target = false;
+	pgsql_thread___polardb_reader_lsn_lag_range_bytes = 0;
+	pgsql_thread___throttle_connections_per_sec_to_hostgroup = 0;
+	std::unique_ptr<PgSQL_Thread> balanced_worker(new PgSQL_Thread());
+	PgSQL_Session balanced_sess;
+	balanced_sess.thread = balanced_worker.get();
+	attach_test_frontend(balanced_sess);
+	PolarDB_ReaderResult balanced_result = PgHGM->get_MyConn_polardb_reader(
+		reader_hg, &balanced_sess, plan, wait, /*only_pooled=*/false);
+	ok(!balanced_result.acquired() && balanced_result.srv == first,
+		"PolarDB exact best-behind reader: disabled policy preserves balanced first choice");
+	ok(second->pool_free_count_value() == 1,
+		"PolarDB exact best-behind reader: disabled policy does not consume the fresher peer");
+
+	hostgroup->second.selection_start->store(0, std::memory_order_relaxed);
+	second->polardb_current_lsn.store(TARGET_LSN, std::memory_order_relaxed);
+	std::unique_ptr<PgSQL_Thread> reached_worker(new PgSQL_Thread());
+	PgSQL_Session reached_sess;
+	reached_sess.thread = reached_worker.get();
+	attach_test_frontend(reached_sess);
+	PolarDB_ReaderResult reached_result = PgHGM->get_MyConn_polardb_reader(
+		reader_hg, &reached_sess, plan, wait, /*only_pooled=*/false);
+	ok(reached_result.acquired() && reached_result.srv == second &&
+			reached_result.wait_bypass_allowed,
+		"PolarDB exact best-behind reader: disabled policy still prefers a target-reached peer");
+	if (reached_result.conn && reached_result.srv &&
+			reached_result.srv->ConnectionsUsed) {
+		reached_result.srv->ConnectionsUsed->remove(reached_result.conn);
+	}
+	delete reached_result.conn;
+
+	second->polardb_current_lsn.store(HIGHER_LSN, std::memory_order_relaxed);
+	cached = make_cached_reader_connection(second);
+	cached->polardb_startup_client.identity = unit_proxy_identity();
+	cached->pgsql_conn = unit_connected_pgconn();
+	unit_reader_pool_add_matching(second, cached);
+	hostgroup->second.selection_start->store(0, std::memory_order_relaxed);
+	pgsql_thread___polardb_reader_prefer_freshest_below_target = true;
+	std::unique_ptr<PgSQL_Thread> worker(new PgSQL_Thread());
+	PgSQL_Session sess;
+	sess.thread = worker.get();
+	attach_test_frontend(sess);
+	PolarDB_ReaderResult result = PgHGM->get_MyConn_polardb_reader(
+		reader_hg, &sess, plan, wait, /*only_pooled=*/false);
+	pgsql_thread___throttle_connections_per_sec_to_hostgroup = saved_throttle;
+	pgsql_thread___polardb_reader_lsn_lag_range_bytes = saved_range;
+	pgsql_thread___polardb_reader_prefer_freshest_below_target = saved_preference;
+
+	ok(result.acquired() && result.srv == second,
+		"PolarDB exact best-behind reader: higher fresh LSN wins before pool acquisition");
+	ok(result.acquired() && !result.wait_bypass_allowed &&
+			result.selected_reader_lsn == HIGHER_LSN &&
+			result.best_considered_reader_lsn == HIGHER_LSN,
+		"PolarDB exact best-behind reader: selected observation is the best considered LSN");
+	ok(worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_selection_behind_best] == 0 &&
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_selection_loss_bytes] == 0,
+		"PolarDB exact best-behind reader: selection records no avoidable LSN loss");
+
+	if (result.conn && result.srv && result.srv->ConnectionsUsed) {
+		result.srv->ConnectionsUsed->remove(result.conn);
+	}
+	delete result.conn;
+}
+
+static void test_two_reader_fresher_less_loaded_policy() {
+	const int writer_hg = 966;
+	const int reader_hg = 967;
+	const uint64_t LOWER_LSN = 0xDB00;
+	const uint64_t HIGHER_LSN = 0xDC00;
+	const uint64_t TARGET_LSN = 0xDD00;
+
+	stage_polardb_topology_two_readers(PgHGM,
+		"PolarDB fresher less-loaded reader",
+		writer_hg, "polardb-dominance-writer", 22532,
+		reader_hg,
+		"polardb-dominance-reader-a", 22533,
+		"polardb-dominance-reader-b", 22534);
+
+	auto snapshot = PgHGM->get_polardb_server_list_snapshot();
+	if (!snapshot) {
+		ok(false,
+			"PolarDB fresher less-loaded reader: two-reader snapshot is available");
+		return;
+	}
+	auto hostgroup = snapshot->by_hostgroup.find(reader_hg);
+	const bool fixture_ok = hostgroup != snapshot->by_hostgroup.end() &&
+		hostgroup->second.servers.size() == 2 &&
+		hostgroup->second.selection_start;
+	ok(fixture_ok,
+		"PolarDB fresher less-loaded reader: two-reader snapshot is available");
+	if (!fixture_ok) {
+		return;
+	}
+
+	PgSQL_SrvC* first = hostgroup->second.servers[0].srv;
+	PgSQL_SrvC* second = hostgroup->second.servers[1].srv;
+	const uint64_t now = monotonic_time();
+	first->polardb_current_lsn.store(LOWER_LSN, std::memory_order_relaxed);
+	second->polardb_current_lsn.store(HIGHER_LSN, std::memory_order_relaxed);
+	first->lsn_updated_at.store(now, std::memory_order_relaxed);
+	second->lsn_updated_at.store(now, std::memory_order_relaxed);
+
+	PolarDB_Query_ReaderPlan plan;
+	plan.primary_lsn = TARGET_LSN + 0x100;
+	plan.max_lag_bytes = 0x1000;
+	plan.fallback_writer_hg = writer_hg;
+	PolarDB_WaitSpec wait = PolarDB_WaitSpec::lsn(
+		TARGET_LSN, POLARDB_DEFAULT_WAIT_TIMEOUT_MS,
+		PolarDB_WaitMode::BEST_EFFORT);
+
+	const bool saved_exact =
+		pgsql_thread___polardb_reader_prefer_freshest_below_target;
+	const bool saved_dominance =
+		pgsql_thread___polardb_reader_prefer_less_loaded;
+	const int saved_range = pgsql_thread___polardb_reader_lsn_lag_range_bytes;
+	const int saved_throttle =
+		pgsql_thread___throttle_connections_per_sec_to_hostgroup;
+	pgsql_thread___polardb_reader_prefer_freshest_below_target = false;
+	pgsql_thread___polardb_reader_prefer_less_loaded = true;
+	pgsql_thread___polardb_reader_lsn_lag_range_bytes = 0;
+	pgsql_thread___throttle_connections_per_sec_to_hostgroup = 0;
+
+	std::unique_ptr<PgSQL_Thread> worker(new PgSQL_Thread());
+	PgSQL_Session sess;
+	sess.thread = worker.get();
+	attach_test_frontend(sess);
+
+	auto add_free = [&](PgSQL_SrvC* reader) {
+		PgSQL_Connection* conn = make_cached_reader_connection(reader);
+		conn->polardb_startup_client.identity = unit_proxy_identity();
+		conn->pgsql_conn = unit_connected_pgconn();
+		unit_reader_pool_add_matching(reader, conn);
+		return conn;
+	};
+	auto add_used = [&](PgSQL_SrvC* reader) {
+		PgSQL_Connection* conn = make_cached_reader_connection(reader);
+		const PgSQL_PoolMatchKey key = unit_reader_pool_match_key(conn);
+		return reader->add_used_matching_connection(conn, key) ? conn : nullptr;
+	};
+	auto remove_used = [&](PgSQL_SrvC* reader, PgSQL_Connection* conn) {
+		if (conn) {
+			(void)reader->remove_used_connection(conn);
+			delete conn;
+		}
+	};
+	auto remove_free = [&](PgSQL_SrvC* reader, PgSQL_Connection* conn) {
+		if (conn) {
+			(void)reader->remove_free_connection(conn);
+			delete conn;
+		}
+	};
+
+	PgSQL_Connection* first_used = add_used(first);
+	PgSQL_Connection* second_free = add_free(second);
+	hostgroup->second.selection_start->store(0, std::memory_order_relaxed);
+	PolarDB_ReaderResult less_loaded = PgHGM->get_MyConn_polardb_reader(
+		reader_hg, &sess, plan, wait, /*only_pooled=*/false);
+	ok(first_used && less_loaded.acquired() && less_loaded.srv == second,
+		"PolarDB fresher less-loaded reader: strict dominance selects a fresher peer with lower normalized load");
+	if (less_loaded.conn && less_loaded.srv) {
+		(void)less_loaded.srv->remove_used_connection(less_loaded.conn);
+	}
+	delete less_loaded.conn;
+	remove_used(first, first_used);
+
+	second_free = add_free(second);
+	hostgroup->second.selection_start->store(0, std::memory_order_relaxed);
+	std::unique_ptr<PgSQL_Thread> equal_worker(new PgSQL_Thread());
+	PgSQL_Session equal_sess;
+	equal_sess.thread = equal_worker.get();
+	attach_test_frontend(equal_sess);
+	PolarDB_ReaderResult equal_loaded = PgHGM->get_MyConn_polardb_reader(
+		reader_hg, &equal_sess, plan, wait, /*only_pooled=*/false);
+	ok(!equal_loaded.acquired() && equal_loaded.srv == first &&
+			second->pool_free_count_value() == 1,
+		"PolarDB fresher less-loaded reader: equal normalized load preserves weighted selection");
+	remove_free(second, second_free);
+
+	PgSQL_Connection* second_used = add_used(second);
+	second_free = add_free(second);
+	hostgroup->second.selection_start->store(0, std::memory_order_relaxed);
+	std::unique_ptr<PgSQL_Thread> more_worker(new PgSQL_Thread());
+	PgSQL_Session more_sess;
+	more_sess.thread = more_worker.get();
+	attach_test_frontend(more_sess);
+	PolarDB_ReaderResult more_loaded = PgHGM->get_MyConn_polardb_reader(
+		reader_hg, &more_sess, plan, wait, /*only_pooled=*/false);
+	ok(second_used && !more_loaded.acquired() && more_loaded.srv == first &&
+			second->pool_free_count_value() == 1,
+		"PolarDB fresher less-loaded reader: higher normalized load preserves weighted selection");
+	remove_free(second, second_free);
+	remove_used(second, second_used);
+
+	second_used = add_used(second);
+	second_free = add_free(second);
+	hostgroup->second.selection_start->store(0, std::memory_order_relaxed);
+	pgsql_thread___polardb_reader_prefer_freshest_below_target = true;
+	std::unique_ptr<PgSQL_Thread> exact_worker(new PgSQL_Thread());
+	PgSQL_Session exact_sess;
+	exact_sess.thread = exact_worker.get();
+	attach_test_frontend(exact_sess);
+	PolarDB_ReaderResult exact_precedence = PgHGM->get_MyConn_polardb_reader(
+		reader_hg, &exact_sess, plan, wait, /*only_pooled=*/false);
+	ok(second_used && exact_precedence.acquired() &&
+			exact_precedence.srv == second,
+		"PolarDB fresher less-loaded reader: exact-freshest policy takes precedence when both switches are enabled");
+	if (exact_precedence.conn && exact_precedence.srv) {
+		(void)exact_precedence.srv->remove_used_connection(
+			exact_precedence.conn);
+	}
+	delete exact_precedence.conn;
+	remove_used(second, second_used);
+
+	second->polardb_current_lsn.store(LOWER_LSN, std::memory_order_relaxed);
+	second->lsn_updated_at.store(monotonic_time(), std::memory_order_relaxed);
+	second_free = add_free(second);
+	hostgroup->second.selection_start->store(0, std::memory_order_relaxed);
+	pgsql_thread___polardb_reader_prefer_freshest_below_target = false;
+	std::unique_ptr<PgSQL_Thread> equal_lsn_worker(new PgSQL_Thread());
+	PgSQL_Session equal_lsn_sess;
+	equal_lsn_sess.thread = equal_lsn_worker.get();
+	attach_test_frontend(equal_lsn_sess);
+	PolarDB_ReaderResult equal_lsn = PgHGM->get_MyConn_polardb_reader(
+		reader_hg, &equal_lsn_sess, plan, wait, /*only_pooled=*/false);
+	ok(!equal_lsn.acquired() && equal_lsn.srv == first &&
+			second->pool_free_count_value() == 1,
+		"PolarDB fresher less-loaded reader: equal reader LSN preserves weighted selection");
+	remove_free(second, second_free);
+
+#if POLARDB_PROFILE
+	ok(worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_both_behind_compared] == 1 &&
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_fresher_less_loaded] == 1 &&
+		equal_worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_fresher_equal_loaded] == 1 &&
+		more_worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_fresher_more_loaded] == 1 &&
+		exact_worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_fresher_more_loaded] == 1 &&
+		equal_lsn_worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_both_behind_compared] == 1 &&
+		equal_lsn_worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_both_behind_equal_lsn] == 1 &&
+		equal_lsn_worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_fresher_less_loaded] == 0 &&
+		equal_lsn_worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_fresher_equal_loaded] == 0 &&
+		equal_lsn_worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_fresher_more_loaded] == 0,
+		"PolarDB fresher less-loaded reader: profile counters classify normalized load relations");
+	ok(worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_fresher_dominance_switch] == 1 &&
+		exact_worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_fresher_exact_switch] == 1,
+		"PolarDB fresher less-loaded reader: profile counters classify policy switches");
+#endif // POLARDB_PROFILE
+
+	pgsql_thread___throttle_connections_per_sec_to_hostgroup = saved_throttle;
+	pgsql_thread___polardb_reader_lsn_lag_range_bytes = saved_range;
+	pgsql_thread___polardb_reader_prefer_less_loaded =
+		saved_dominance;
+	pgsql_thread___polardb_reader_prefer_freshest_below_target = saved_exact;
+}
+
+static void test_two_reader_less_loaded_weight_scale_invariance() {
+	const uint64_t LOWER_LSN = 0xDE00;
+	const uint64_t HIGHER_LSN = 0xDF00;
+	const uint64_t TARGET_LSN = 0xE000;
+	const int saved_throttle =
+		pgsql_thread___throttle_connections_per_sec_to_hostgroup;
+	const bool saved_exact =
+		pgsql_thread___polardb_reader_prefer_freshest_below_target;
+	const bool saved_dominance =
+		pgsql_thread___polardb_reader_prefer_less_loaded;
+	pgsql_thread___throttle_connections_per_sec_to_hostgroup = 0;
+	pgsql_thread___polardb_reader_prefer_freshest_below_target = false;
+	pgsql_thread___polardb_reader_prefer_less_loaded = true;
+
+	struct WeightCase {
+		int writer_hg;
+		int reader_hg;
+		int first_weight;
+		int second_weight;
+		const char* label;
+	};
+	const WeightCase cases[] = {
+		{1966, 1967, 2, 1, "unequal weights"},
+		{1968, 1969, 200, 100, "equivalent scaled weights"},
+	};
+	bool selected_fresher[2] = {false, false};
+
+	for (size_t case_idx = 0; case_idx < 2; ++case_idx) {
+		const WeightCase& weight_case = cases[case_idx];
+		const int port_base = 22600 + static_cast<int>(case_idx) * 10;
+		stage_polardb_topology_two_readers(PgHGM,
+			"PolarDB less-loaded weight scaling",
+			weight_case.writer_hg, "polardb-weight-writer", port_base,
+			weight_case.reader_hg,
+			"polardb-weight-reader-a", port_base + 1,
+			"polardb-weight-reader-b", port_base + 2,
+			weight_case.first_weight, weight_case.second_weight);
+
+		auto snapshot = PgHGM->get_polardb_server_list_snapshot();
+		if (!snapshot) {
+			ok(false,
+				"PolarDB less-loaded weight scaling: %s topology is available",
+				weight_case.label);
+			continue;
+		}
+		auto hostgroup = snapshot->by_hostgroup.find(weight_case.reader_hg);
+		const bool fixture_ok =
+			hostgroup != snapshot->by_hostgroup.end() &&
+			hostgroup->second.servers.size() == 2 &&
+			hostgroup->second.selection_start;
+		ok(fixture_ok,
+			"PolarDB less-loaded weight scaling: %s topology is available",
+			weight_case.label);
+		if (!fixture_ok) {
+			continue;
+		}
+
+		PgSQL_SrvC* first = hostgroup->second.servers[0].srv;
+		PgSQL_SrvC* second = hostgroup->second.servers[1].srv;
+		const uint64_t now = monotonic_time();
+		first->polardb_current_lsn.store(LOWER_LSN, std::memory_order_relaxed);
+		second->polardb_current_lsn.store(HIGHER_LSN, std::memory_order_relaxed);
+		first->lsn_updated_at.store(now, std::memory_order_relaxed);
+		second->lsn_updated_at.store(now, std::memory_order_relaxed);
+
+		std::vector<PgSQL_Connection*> first_used;
+		for (int i = 0; i < 4; ++i) {
+			PgSQL_Connection* conn = make_cached_reader_connection(first);
+			const PgSQL_PoolMatchKey key = unit_reader_pool_match_key(conn);
+			if (first->add_used_matching_connection(conn, key)) {
+				first_used.push_back(conn);
+			} else {
+				delete conn;
+			}
+		}
+		PgSQL_Connection* second_used = make_cached_reader_connection(second);
+		const PgSQL_PoolMatchKey second_used_key =
+			unit_reader_pool_match_key(second_used);
+		if (!second->add_used_matching_connection(
+				second_used, second_used_key)) {
+			delete second_used;
+			second_used = nullptr;
+		}
+		PgSQL_Connection* second_free = make_cached_reader_connection(second);
+		second_free->polardb_startup_client.identity = unit_proxy_identity();
+		second_free->pgsql_conn = unit_connected_pgconn();
+		unit_reader_pool_add_matching(second, second_free);
+
+		PolarDB_Query_ReaderPlan plan;
+		plan.primary_lsn = TARGET_LSN + 0x100;
+		plan.max_lag_bytes = 0x1000;
+		plan.fallback_writer_hg = weight_case.writer_hg;
+		PolarDB_WaitSpec wait = PolarDB_WaitSpec::lsn(
+			TARGET_LSN, POLARDB_DEFAULT_WAIT_TIMEOUT_MS,
+			PolarDB_WaitMode::BEST_EFFORT);
+		std::unique_ptr<PgSQL_Thread> worker(new PgSQL_Thread());
+		PgSQL_Session sess;
+		sess.thread = worker.get();
+		attach_test_frontend(sess);
+		hostgroup->second.selection_start->store(0, std::memory_order_relaxed);
+		PolarDB_ReaderResult result = PgHGM->get_MyConn_polardb_reader(
+			weight_case.reader_hg, &sess, plan, wait,
+			/*only_pooled=*/false);
+		selected_fresher[case_idx] = result.acquired() && result.srv == second;
+		ok(first_used.size() == 4 && second_used &&
+				selected_fresher[case_idx],
+			"PolarDB less-loaded weight scaling: %s preserves normalized-load dominance",
+			weight_case.label);
+
+		if (result.conn && result.srv) {
+			(void)result.srv->remove_used_connection(result.conn);
+			delete result.conn;
+		} else {
+			(void)second->remove_free_connection(second_free);
+			delete second_free;
+		}
+		for (PgSQL_Connection* conn : first_used) {
+			(void)first->remove_used_connection(conn);
+			delete conn;
+		}
+		if (second_used) {
+			(void)second->remove_used_connection(second_used);
+			delete second_used;
+		}
+	}
+
+	ok(selected_fresher[0] && selected_fresher[1],
+		"PolarDB less-loaded weight scaling: multiplying all weights by the same factor preserves the decision");
+	pgsql_thread___polardb_reader_prefer_less_loaded = saved_dominance;
+	pgsql_thread___polardb_reader_prefer_freshest_below_target = saved_exact;
+	pgsql_thread___throttle_connections_per_sec_to_hostgroup = saved_throttle;
+}
+
 static void test_lag_range_best_behind_reader_can_acquire_lower_lsn_candidate() {
 	const int writer_hg = 962;
 	const int reader_hg = 963;
@@ -4872,6 +5534,15 @@ static void test_lag_range_best_behind_reader_can_acquire_lower_lsn_candidate() 
 
 	const int saved_range = pgsql_thread___polardb_reader_lsn_lag_range_bytes;
 	const int saved_throttle = pgsql_thread___throttle_connections_per_sec_to_hostgroup;
+	const uint64_t compared_before =
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_selection_compared];
+	const uint64_t behind_best_before =
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_selection_behind_best];
+	const uint64_t loss_bytes_before =
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_selection_loss_bytes];
 	pgsql_thread___polardb_reader_lsn_lag_range_bytes = 0x20;
 	pgsql_thread___throttle_connections_per_sec_to_hostgroup = 0;
 	PolarDB_ReaderResult first_result =
@@ -4888,6 +5559,16 @@ static void test_lag_range_best_behind_reader_can_acquire_lower_lsn_candidate() 
 		"PolarDB best-behind range: byte range can acquire a lower-LSN candidate");
 	ok(!result.wait_bypass_allowed,
 		"PolarDB best-behind range: lower-LSN acquisition still requires wait wrapper");
+	ok(worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_selection_compared] ==
+			compared_before + 1 &&
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_selection_behind_best] ==
+			behind_best_before + 1 &&
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_reader_target_selection_loss_bytes] ==
+			loss_bytes_before + BEST_LSN - LOWER_LSN_IN_RANGE,
+		"PolarDB best-behind range: acquisition records avoidable selected LSN loss");
 	if (result.conn && result.srv && result.srv->ConnectionsUsed) {
 		result.srv->ConnectionsUsed->remove(result.conn);
 	}
@@ -5799,11 +6480,11 @@ static void test_collect_is_const_stable_snapshot() {
 	const bool before_local_state =
 		sess.polardb_txn_wait_safety.local_state_changed;
 	const PgSQL_Session& const_sess = sess;
-	PolarDB_Query_RouteCtx first;
-	PolarDB_Query_RouteCtx second;
-	const_sess.polardb_collect(first, writer_hg, /*qpo_replica_eligible=*/1,
+	const PolarDB_Query_RouteCtx first = const_sess.polardb_collect(
+		writer_hg, /*qpo_replica_eligible=*/1,
 		/*qpo_force_primary_hint=*/false);
-	const_sess.polardb_collect(second, writer_hg, /*qpo_replica_eligible=*/1,
+	const PolarDB_Query_RouteCtx second = const_sess.polardb_collect(
+		writer_hg, /*qpo_replica_eligible=*/1,
 		/*qpo_force_primary_hint=*/false);
 
 	ok(first.is_polar_hg && second.is_polar_hg,
@@ -5900,6 +6581,9 @@ int main() {
 	test_hostgroup_config_cache_refreshes_after_reload();
 	test_monitor_lsn_update_skips_non_online_servers();
 	test_lsn_observation_refreshes_freshness_timestamp();
+	test_reader_target_selection_counter_contract();
+	test_two_reader_fresher_less_loaded_policy();
+	test_two_reader_less_loaded_weight_scale_invariance();
 	test_v2_target_reader_keeps_wait_until_lsn_is_reached();
 	test_server_selection_snapshot_refresh_and_immutability();
 	test_reader_selection_reload_concurrency();
@@ -5937,6 +6621,7 @@ int main() {
 	test_reader_pool_destroy_used_connection_updates_accounting();
 	test_reader_pool_rejected_return_defers_destruction();
 	test_reader_pool_batch_rejected_return_defers_destruction();
+	test_reader_pool_batch_return_uses_worker_counters();
 	test_classic_worker_local_cache_policy();
 	test_reader_pool_key_invalidates_on_variable_change();
 	test_classic_free_profile_mismatch_drops_backend();
@@ -5949,6 +6634,7 @@ int main() {
 	test_reader_lsn_lag_range_predicate();
 	test_txn_reader_state_clear_contract();
 	test_tied_freshest_behind_reader_can_acquire_second_candidate();
+	test_two_reader_freshest_behind_reader_is_preferred();
 	test_lag_range_best_behind_reader_can_acquire_lower_lsn_candidate();
 	test_split_warmup_request_dedup();
 	test_startup_config_commit_contract();

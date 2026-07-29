@@ -172,6 +172,40 @@ void polardb_count_reader_target_lsn_gap_bucket(
 	}
 }
 
+void polardb_count_reader_target_selection(
+		PgSQL_Thread* thread,
+		uint64_t target_lsn,
+		uint64_t selected_reader_lsn,
+		bool selected_reader_lsn_fresh,
+		uint64_t best_considered_reader_lsn,
+		bool best_considered_reader_lsn_fresh) {
+	if (target_lsn == 0) {
+		return;
+	}
+	polardb_count_reader_target_lsn_gap_bucket(
+		thread, target_lsn, selected_reader_lsn,
+		selected_reader_lsn_fresh);
+	if (!selected_reader_lsn_fresh || selected_reader_lsn == 0) {
+		return;
+	}
+	const uint64_t selected_gap = selected_reader_lsn < target_lsn
+		? target_lsn - selected_reader_lsn : 0;
+	POLARDB_THREAD_COUNT_ONE(thread, reader_target_selected_gap_samples);
+	POLARDB_THREAD_COUNT(
+		thread, reader_target_selected_gap_sum_bytes, selected_gap);
+	if (!best_considered_reader_lsn_fresh ||
+			best_considered_reader_lsn == 0) {
+		return;
+	}
+	POLARDB_THREAD_COUNT_ONE(thread, reader_target_selection_compared);
+	if (selected_reader_lsn < best_considered_reader_lsn) {
+		POLARDB_THREAD_COUNT_ONE(thread, reader_target_selection_behind_best);
+		POLARDB_THREAD_COUNT(
+			thread, reader_target_selection_loss_bytes,
+			best_considered_reader_lsn - selected_reader_lsn);
+	}
+}
+
 static bool polardb_parse_proxy_identity_port(const char* value, int* port) {
 	if (!value || !*value || !port) return false;
 
@@ -514,6 +548,8 @@ static char* pgsql_thread_variables_names[] = {
 	(char*)"polardb_lsn_freshness_ms",
 	(char*)"polardb_lag_cap_freshness_ms",
 	(char*)"polardb_reader_lsn_lag_range_bytes",
+	(char*)"polardb_reader_prefer_freshest_below_target",
+	(char*)"polardb_reader_prefer_less_loaded",
 	(char*)"polardb_reader_connection_retention",
 	(char*)"polardb_output_coalesce_bytes",
 	(char*)"polardb_output_coalesce_packets",
@@ -1279,6 +1315,8 @@ PgSQL_Threads_Handler::PgSQL_Threads_Handler() {
 	variables.polardb_lsn_freshness_ms = 5000;                   // 5s max age for a trusted cached LSN
 	variables.polardb_lag_cap_freshness_ms = 250;                // cap trusted LSN age under byte-lag + finite wait
 	variables.polardb_reader_lsn_lag_range_bytes = 0;            // 0 = exact best-behind reader only
+	variables.polardb_reader_prefer_freshest_below_target = false; // preserve balanced selection unless testing best-behind preference
+	variables.polardb_reader_prefer_less_loaded = false; // preserve weighted selection unless testing strict dominance
 	variables.polardb_reader_connection_retention = 0;           // return readers to shared storage after every worker pass
 	variables.polardb_output_coalesce_bytes = 0;                 // 0 = disabled; hold incomplete streaming output up to this byte budget
 	variables.polardb_output_coalesce_packets = 0;               // 0 = disabled; hold incomplete streaming output up to this packet budget
@@ -2576,6 +2614,8 @@ char** PgSQL_Threads_Handler::get_variables_list() {
 		// PolarDB bool toggles.
 		VariablesPointers_bool["polardb_monitor_lsn_updates"] = make_tuple(&variables.polardb_monitor_lsn_updates, false);
 		VariablesPointers_bool["polardb_lazy_warmup_split"] = make_tuple(&variables.polardb_lazy_warmup_split, false);
+		VariablesPointers_bool["polardb_reader_prefer_freshest_below_target"] = make_tuple(&variables.polardb_reader_prefer_freshest_below_target, false);
+		VariablesPointers_bool["polardb_reader_prefer_less_loaded"] = make_tuple(&variables.polardb_reader_prefer_less_loaded, false);
 		VariablesPointers_bool["polardb_writev_direct"] = make_tuple(&variables.polardb_writev_direct, false);
 		VariablesPointers_bool["polardb_result_fast_forward"] = make_tuple(&variables.polardb_result_fast_forward, false);
 #endif // POLARDB_PROXY
@@ -3227,6 +3267,11 @@ PgSQL_Thread::~PgSQL_Thread() {
 			__sync_fetch_and_add(
 				&PgHGM->status.pgconnpoll_get_ok,
 				static_cast<unsigned long>(status_variables.pgconnpoll_get_ok));
+		}
+		if (status_variables.pgconnpoll_push) {
+			__sync_fetch_and_add(
+				&PgHGM->status.pgconnpoll_push,
+				static_cast<unsigned long>(status_variables.pgconnpoll_push));
 		}
 	}
 
@@ -5071,6 +5116,12 @@ void PgSQL_Thread::refresh_variables() {
 		GloPTH->get_variable_int((char*)"polardb_lag_cap_freshness_ms");
 	pgsql_thread___polardb_reader_lsn_lag_range_bytes =
 		GloPTH->get_variable_int((char*)"polardb_reader_lsn_lag_range_bytes");
+	pgsql_thread___polardb_reader_prefer_freshest_below_target = (bool)
+		GloPTH->get_variable_int(
+			(char*)"polardb_reader_prefer_freshest_below_target");
+	pgsql_thread___polardb_reader_prefer_less_loaded = (bool)
+		GloPTH->get_variable_int(
+			(char*)"polardb_reader_prefer_less_loaded");
 	pgsql_thread___polardb_reader_connection_retention =
 		GloPTH->get_variable_int((char*)"polardb_reader_connection_retention");
 	pgsql_thread___polardb_output_coalesce_bytes =
@@ -5394,6 +5445,7 @@ PgSQL_Thread::PgSQL_Thread() {
 	status_variables.active_transactions = 0;
 	status_variables.pgconnpoll_get = 0;
 	status_variables.pgconnpoll_get_ok = 0;
+	status_variables.pgconnpoll_push = 0;
 	status_variables.tx_poisoned_total = 0;
 	status_variables.tx_poisoned_recovered_total = 0;
 	status_variables.tx_poisoned_rejected_statements_total = 0;
@@ -6803,6 +6855,7 @@ unsigned int PgSQL_Threads_Handler::get_active_transations() {
 
 DEFINE_PG_THREAD_COUNTER_GETTER(pgconnpoll_get)
 DEFINE_PG_THREAD_COUNTER_GETTER(pgconnpoll_get_ok)
+DEFINE_PG_THREAD_COUNTER_GETTER(pgconnpoll_push)
 DEFINE_PG_THREAD_COUNTER_GETTER(tx_poisoned_total)
 DEFINE_PG_THREAD_COUNTER_GETTER(tx_poisoned_recovered_total)
 DEFINE_PG_THREAD_COUNTER_GETTER(tx_poisoned_rejected_statements_total)
@@ -7311,7 +7364,6 @@ void PgSQL_Thread::return_local_connections(bool return_polardb_connections) {
 #if POLARDB_PROXY
 	struct ReaderReturnGroup {
 		PgSQL_SrvC* server;
-		std::vector<unsigned int> indexes;
 		std::vector<PgSQL_Connection*> connections;
 	};
 	std::vector<ReaderReturnGroup> reader_groups;
@@ -7373,27 +7425,25 @@ void PgSQL_Thread::return_local_connections(bool return_polardb_connections) {
 		auto group = std::find_if(reader_groups.begin(), reader_groups.end(),
 			[server](const ReaderReturnGroup& candidate) {
 				return candidate.server == server;
-			});
+		});
 		if (group == reader_groups.end()) {
-			reader_groups.push_back(ReaderReturnGroup{server, {}, {}});
+			reader_groups.push_back(ReaderReturnGroup{server, {}});
 			group = reader_groups.end() - 1;
 		}
-		group->indexes.push_back(index);
 		group->connections.push_back(connection);
+		cached_connections->pdata[index] = nullptr;
 	}
 	unsigned int polardb_reader_connections = debt_yielded_connections;
+	std::vector<PgSQL_Connection*> connections_to_delete;
 	for (ReaderReturnGroup& group : reader_groups) {
 		polardb_reader_connections += group.connections.size();
-		std::vector<PgSQL_Connection*> connections_to_delete;
-		connections_to_delete.reserve(group.connections.size());
 		PgHGM->return_polardb_reader_connections(
+			this,
 			group.connections, connections_to_delete);
-		for (unsigned int index : group.indexes) {
-			cached_connections->pdata[index] = nullptr;
-		}
 		for (PgSQL_Connection* connection : connections_to_delete) {
 			delete connection;
 		}
+		connections_to_delete.clear();
 	}
 	assert(polardb_reader_local_connection_count >=
 		polardb_reader_connections);

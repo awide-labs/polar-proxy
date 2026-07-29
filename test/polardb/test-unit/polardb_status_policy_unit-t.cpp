@@ -383,7 +383,7 @@ static void test_server_lsn_cache_reset_policy() {
 
 int main() {
 	// 102 ok() in this file = 102.
-	plan(105);
+	plan(108);
 	test_degraded_rfq_notice_packet_helpers();
 	test_failure_action_names();
 	test_reader_action_policy_mapping();

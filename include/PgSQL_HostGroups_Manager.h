@@ -290,9 +290,9 @@ class PgSQL_SrvConnList {
 #if POLARDB_PROXY
 	std::unordered_map<PgSQL_PoolMatchKey,
 		std::vector<PgSQL_Connection*>, PgSQL_PoolMatchKeyHash> matching_by_key;
-	std::unordered_map<PgSQL_Connection*, PgSQL_PoolMatchKey> match_key_by_connection;
+	std::vector<PgSQL_PoolMatchKey> match_keys_by_position;
 #endif // POLARDB_PROXY
-	int find_idx(PgSQL_Connection* c);
+	int find_idx(PgSQL_Connection* c) const;
 	void add_unlocked(PgSQL_Connection*, const PgSQL_PoolMatchKey* key = nullptr);
 	PgSQL_Connection* remove_position_unlocked(
 		unsigned int index,
@@ -433,7 +433,8 @@ class PgSQL_SrvC {	// MySQL Server Container
 		polardb_reader_claim_retired;
 	bool polardb_publish_matching_free_unlocked(
 		PgSQL_Connection* conn, const PgSQL_PoolMatchKey& key,
-		PolarDB_ReaderClaimWake* wake);
+		PolarDB_ReaderClaimWake* wake,
+		std::shared_ptr<const void>& released_server_snapshot);
 	void polardb_forget_claimed_connection_unlocked(
 		PgSQL_Connection* conn, PolarDB_ReaderClaimRetireReason reason);
 	void polardb_retire_claims_unlocked(
@@ -448,7 +449,7 @@ class PgSQL_SrvC {	// MySQL Server Container
 	// The FREE and USED lists have one owner and one lock per server. The global
 	// HGM lock may take this lock; code must never take them in reverse order.
 	mutable std::recursive_mutex pool_mutex;
-	std::atomic<unsigned int> pool_free_count{0};
+	alignas(64) std::atomic<unsigned int> pool_free_count{0};
 	std::atomic<unsigned int> pool_used_count{0};
 	std::atomic<unsigned int> polardb_idle_ping_count{0};
 	PgSQL_Connection* take_matching_connection(const PgSQL_PoolMatchKey& key);
@@ -1215,6 +1216,11 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 		std::atomic<unsigned long long> polardb_reader_target_gap_le_1mb{0};  // selected wait reader was less than 1MB behind target
 		std::atomic<unsigned long long> polardb_reader_target_gap_le_16mb{0}; // selected wait reader was less than 16MB behind target
 		std::atomic<unsigned long long> polardb_reader_target_gap_gt_16mb{0}; // selected wait reader was more than 16MB behind target
+		std::atomic<unsigned long long> polardb_reader_target_selected_gap_samples{0}; // fresh selected-reader LSN samples
+		std::atomic<unsigned long long> polardb_reader_target_selected_gap_sum_bytes{0}; // selected-reader target gap total
+		std::atomic<unsigned long long> polardb_reader_target_selection_compared{0}; // selected LSN compared with best considered
+		std::atomic<unsigned long long> polardb_reader_target_selection_behind_best{0}; // selected reader behind best considered
+		std::atomic<unsigned long long> polardb_reader_target_selection_loss_bytes{0}; // extra selected-reader gap total
 		std::atomic<unsigned long long> polardb_session_target_epoch_reset{0}; // session LSN targets/sticky flags cleared after writer group/epoch change
 		std::atomic<unsigned long long> polardb_query_parser_init{0}; // PgSQL queries submitted to parser/digest initializer
 		std::atomic<unsigned long long> polardb_query_parser_init_bytes{0}; // query bytes submitted to parser/digest initializer
@@ -1430,6 +1436,13 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 		std::atomic<unsigned long long> polardb_selected_server_pool_lock_hold_count{0}; // selected-server pool-lock hold samples
 		std::atomic<unsigned long long> polardb_reader_target_ready_candidate{0}; // fresh reader candidates already at target
 		std::atomic<unsigned long long> polardb_reader_target_no_ready_candidate{0}; // targeted acquisitions with no ready reader
+		std::atomic<unsigned long long> polardb_reader_target_both_behind_compared{0}; // compared two fresh below-target readers
+		std::atomic<unsigned long long> polardb_reader_target_both_behind_equal_lsn{0}; // both fresh below-target readers had the same LSN
+		std::atomic<unsigned long long> polardb_reader_target_fresher_less_loaded{0}; // fresher reader had lower normalized load
+		std::atomic<unsigned long long> polardb_reader_target_fresher_equal_loaded{0}; // fresher reader had equal normalized load
+		std::atomic<unsigned long long> polardb_reader_target_fresher_more_loaded{0}; // fresher reader had higher normalized load
+		std::atomic<unsigned long long> polardb_reader_target_fresher_exact_switch{0}; // exact-freshest changed weighted selection
+		std::atomic<unsigned long long> polardb_reader_target_fresher_dominance_switch{0}; // strict dominance changed weighted selection
 		std::atomic<unsigned long long> polardb_reader_target_lsn_unknown{0}; // targeted candidates with unknown reader LSN
 		std::atomic<unsigned long long> polardb_reader_target_lsn_stale{0}; // targeted candidates with stale reader LSN
 		std::atomic<unsigned long long> polardb_reader_target_lsn_behind{0}; // fresh targeted candidates behind target
@@ -1742,6 +1755,7 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 		PgSQL_Connection* conn, const PgSQL_PoolMatchKey& expected_match_key,
 		unsigned int donor_worker_index);
 	void return_polardb_reader_connections(
+		PgSQL_Thread* thread,
 		const std::vector<PgSQL_Connection*>& connections,
 		std::vector<PgSQL_Connection*>& detached_connections);
 #endif // POLARDB_PROXY

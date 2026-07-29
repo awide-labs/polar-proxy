@@ -150,6 +150,8 @@ ok $? "worker-local connection cache switches between 3.0.9 and 3.0.7 behavior"
 	[ "$(global_var pgsql-polardb_proxy_identity_port)" = "0" ] &&
 	[ "$(global_var pgsql-polardb_lag_cap_freshness_ms)" = "250" ] &&
 	[ "$(global_var pgsql-polardb_reader_lsn_lag_range_bytes)" = "0" ] &&
+	[ "$(global_var pgsql-polardb_reader_prefer_freshest_below_target)" = "false" ] &&
+	[ "$(global_var pgsql-polardb_reader_prefer_less_loaded)" = "false" ] &&
 	[ "$(global_var pgsql-polardb_reader_connection_retention)" = "0" ] &&
 	[ "$(global_var pgsql-polardb_output_coalesce_bytes)" = "0" ] &&
 	[ "$(global_var pgsql-polardb_output_coalesce_packets)" = "0" ] &&
@@ -165,6 +167,8 @@ set_global_var pgsql-polardb_proxy_identity_host 127.0.0.2
 set_global_var pgsql-polardb_proxy_identity_port 15432
 set_global_var pgsql-polardb_lag_cap_freshness_ms 125
 set_global_var pgsql-polardb_reader_lsn_lag_range_bytes 4096
+set_global_var pgsql-polardb_reader_prefer_freshest_below_target 1
+set_global_var pgsql-polardb_reader_prefer_less_loaded 1
 set_global_var pgsql-polardb_reader_connection_retention 1
 set_global_var pgsql-polardb_output_coalesce_bytes 262144
 set_global_var pgsql-polardb_output_coalesce_packets 64
@@ -179,6 +183,8 @@ admin_sql "LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null
 	[ "$(runtime_var pgsql-polardb_proxy_identity_port)" = "15432" ] &&
 	[ "$(runtime_var pgsql-polardb_lag_cap_freshness_ms)" = "125" ] &&
 	[ "$(runtime_var pgsql-polardb_reader_lsn_lag_range_bytes)" = "4096" ] &&
+	[ "$(runtime_var pgsql-polardb_reader_prefer_freshest_below_target)" = "true" ] &&
+	[ "$(runtime_var pgsql-polardb_reader_prefer_less_loaded)" = "true" ] &&
 	[ "$(runtime_var pgsql-polardb_reader_connection_retention)" = "1" ] &&
 	[ "$(runtime_var pgsql-polardb_output_coalesce_bytes)" = "262144" ] &&
 	[ "$(runtime_var pgsql-polardb_output_coalesce_packets)" = "64" ] &&

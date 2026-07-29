@@ -933,11 +933,12 @@ public:
 	/**
 	 * @brief Collect all routing inputs for one query into an immutable snapshot.
 	 *
-	 * Reads session, HostGroups_Manager, and thread state into @p route_ctx, which
+	 * Reads session, HostGroups_Manager, and thread state into a new context, which
 	 * polardb_plan() then decides from. Call polardb_observe_route_inputs() first
 	 * so durable session state is already reconciled before the snapshot is copied.
 	 */
-	void polardb_collect(PolarDB_Query_RouteCtx& route_ctx, int current_hg, int qpo_replica_eligible, bool qpo_force_primary_hint) const;
+	PolarDB_Query_RouteCtx polardb_collect(int current_hg, int qpo_replica_eligible,
+		bool qpo_force_primary_hint) const;
 	/**
 	 * @brief Apply durable session observations needed before building a route snapshot.
 	 *

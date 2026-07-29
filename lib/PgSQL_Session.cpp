@@ -2812,9 +2812,9 @@ __implicit_sync:
 											replica_eligible, dest_hg, manual_scope_hg);
 									}
 									if (!manual_mode) {
-										PolarDB_Query_RouteCtx polardb_route_ctx;
 										polardb_observe_route_inputs(current_hostgroup);
-										polardb_collect(polardb_route_ctx, current_hostgroup, replica_eligible,
+										PolarDB_Query_RouteCtx polardb_route_ctx = polardb_collect(
+											current_hostgroup, replica_eligible,
 											qpo ? qpo->force_primary_hint : false);
 										if (polardb_route_ctx.is_polar_hg) {
 											const int warmup_mode =
@@ -6351,9 +6351,11 @@ void PgSQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 				polardb_reader_capacity_wait.active &&
 				polardb_reader_capacity_wait.retry_admitted;
 			PolarDB_ReaderResult reader_result;
+			bool reader_claim_acquired = false;
 			if (thread) {
 				reader_result.conn = thread->take_polardb_reader_claim(this);
 				if (reader_result.conn) {
+					reader_claim_acquired = true;
 					reader_result.srv = static_cast<PgSQL_SrvC*>(
 						reader_result.conn->parent);
 					reader_result.status = PolarDB_ReaderStatus::ACQUIRED;
@@ -6364,6 +6366,27 @@ void PgSQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 					mybe->hostgroup_id, this,
 					polardb_query.reader_plan, polardb_wait_spec, false,
 					nullptr, -1, confirm_reader_group_capacity);
+			}
+			if (reader_claim_acquired && polardb_wait_spec.has_wait() &&
+					reader_result.srv) {
+				const uint32_t fresh_ms = polardb_effective_lsn_freshness_ms(
+					pgsql_thread___polardb_lsn_freshness_ms,
+					polardb_wait_spec.timeout_ms,
+					polardb_query.reader_plan.max_lag_bytes,
+					pgsql_thread___polardb_lag_cap_freshness_ms,
+					nullptr);
+				const uint64_t now_us = monotonic_time();
+				const uint64_t reader_lsn =
+					reader_result.srv->polardb_current_lsn.load(
+						std::memory_order_relaxed);
+				const bool reader_lsn_fresh = polardb_lsn_cache_fresh(
+					reader_result.srv->lsn_updated_at.load(
+						std::memory_order_relaxed),
+					now_us, fresh_ms);
+				polardb_count_reader_target_selection(
+					thread, polardb_wait_spec.target,
+					reader_lsn, reader_lsn_fresh,
+					0, false);
 			}
 			if (reader_result.acquired() &&
 					polardb_reader_capacity_wait.active) {

@@ -202,13 +202,15 @@ ifeq ($(PROXYSQL40),1)
 endif
 
 ODIR := obj
+OBJECT_BUILD_VARIANT_FILE := $(ODIR)/.polardb-build-variant
 
 EXECUTABLE := proxysql
+.PHONY: default
 
 _OBJ := main.o proxysql_global.o SQLite3_Server.o proxy_tls.o
 OBJ := $(patsubst %,$(ODIR)/%,$(_OBJ))
 
-$(ODIR)/%.o: %.cpp
+$(ODIR)/%.o: %.cpp $(OBJECT_BUILD_VARIANT_FILE)
 	$(CXX) -c -o $@ $< $(MYCXXFLAGS) $(CXXFLAGS) -Wall
 
 $(EXECUTABLE): $(ODIR) $(OBJ) $(LIBPROXYSQLAR)
@@ -228,8 +230,20 @@ endif
 $(ODIR):
 	mkdir -p $(ODIR)
 
-$(LIBPROXYSQLAR):
-	cd $(PROXYSQL_LDIR) && ${MAKE}
+.PHONY: FORCE_POLARDB_BUILD_VARIANT FORCE_LIBPROXYSQL
+FORCE_POLARDB_BUILD_VARIANT:
+FORCE_LIBPROXYSQL:
+
+$(OBJECT_BUILD_VARIANT_FILE): FORCE_POLARDB_BUILD_VARIANT | $(ODIR)
+	@if test "$$(cat "$@" 2>/dev/null)" != "$(POLARDB_BUILD_VARIANT)"; then \
+		printf '%s\n' "$(POLARDB_BUILD_VARIANT)" > "$@.tmp"; \
+		mv -f "$@.tmp" "$@"; \
+	fi
+
+# Always let lib/ perform its cheap variant check. It rebuilds the archive only
+# when inputs changed or the requested PolarDB build variant differs.
+$(PROXYSQL_LDIR)/libproxysql.a: FORCE_LIBPROXYSQL
+	+$(MAKE) -C $(PROXYSQL_LDIR) libproxysql.a
 
 
 ### main targets
@@ -237,4 +251,4 @@ $(LIBPROXYSQLAR):
 default: $(EXECUTABLE)
 
 clean:
-	rm -rf *.pid $(ODIR)/*.o $(ODIR)/*.gcno $(ODIR)/*.gcda *~ core perf.data* heaptrack.proxysql.* $(EXECUTABLE) $(EXECUTABLE).sha1 $(ODIR)
+	rm -rf *.pid obj *~ core perf.data* heaptrack.proxysql.* $(EXECUTABLE) $(EXECUTABLE).sha1

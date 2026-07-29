@@ -456,24 +456,23 @@ void PgSQL_Session::polardb_observe_route_inputs(int current_hg)
  * polardb_observe_route_inputs(); polardb_plan() then decides routing from this
  * snapshot.
  *
- * @param route_ctx               Output context; every field is filled on return.
  * @param current_hg              Current hostgroup from the query processor.
  * @param qpo_replica_eligible    replica_eligible from the matched query rule (-1/0/1).
  * @param qpo_force_primary_hint  true if the query carried a leading SQL comment with route=primary.
+ * @return Immutable routing inputs for the current query.
  */
-void PgSQL_Session::polardb_collect(PolarDB_Query_RouteCtx& route_ctx,
-                                    int current_hg,
-                                    int qpo_replica_eligible,
-                                    bool qpo_force_primary_hint) const
+PolarDB_Query_RouteCtx PgSQL_Session::polardb_collect(
+		int current_hg, int qpo_replica_eligible,
+		bool qpo_force_primary_hint) const
 {
-	route_ctx = PolarDB_Query_RouteCtx{};  // zero-init all fields
+	PolarDB_Query_RouteCtx route_ctx{};
 
 	const auto* hg_config = PgHGM->find_polardb_hg_config(current_hg);
 	route_ctx.is_polar_hg = hg_config && hg_config->is_polardb_hostgroup;
 	if (!route_ctx.is_polar_hg) {
 		POLARDB_TRACE(
 			"PolarDB COLLECT: hg=%d is_polar=false, skip\n", current_hg);
-		return;  // fast path — non-PolarDB HG
+		return route_ctx;  // fast path — non-PolarDB HG
 	}
 
 	// Hostgroup topology
@@ -602,6 +601,7 @@ void PgSQL_Session::polardb_collect(PolarDB_Query_RouteCtx& route_ctx,
 			route_ctx.writer_scope.hg, (unsigned long)route_ctx.writer_scope.epoch,
 			query_len, query_text);
 	}
+	return route_ctx;
 }
 
 // ======================================================================
@@ -1405,11 +1405,9 @@ void PgSQL_Session::polardb_apply_extended_route()
 	polardb_query.reset_reader_target();
 	polardb_query.reset_wait();
 
-	PolarDB_Query_RouteCtx polardb_route_ctx;
 	polardb_observe_route_inputs(current_hostgroup);
-	polardb_collect(
-		polardb_route_ctx, current_hostgroup, replica_eligible,
-		qpo->force_primary_hint);
+	PolarDB_Query_RouteCtx polardb_route_ctx = polardb_collect(
+		current_hostgroup, replica_eligible, qpo->force_primary_hint);
 	if (!polardb_route_ctx.is_polar_hg) {
 		return;
 	}

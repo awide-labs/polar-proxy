@@ -47,6 +47,8 @@ LDIRS :=	-L$(JEMALLOC_LDIR) \
 #LIBS := -Wl,--export-dynamic -Wl,-Bstatic -ljemalloc_pic -lre2 -Wl,-Bdynamic -ldl -lpthread -lm -lz -lrt $(EXTRALINK)
 
 ODIR := obj
+OBJECT_BUILD_VARIANT_FILE := $(ODIR)/.polardb-build-variant
+ACTIVE_BUILD_VARIANT_FILE := .polardb-active-variant
 
 PSQLCH :=
 ifeq ($(PROXYSQLCLICKHOUSE),1)
@@ -151,23 +153,44 @@ HEADERS := ../include/*.h ../include/*.hpp
 %.ko: %.cpp $(HEADERS)
 	$(CXX) -fPIC -c -o $@ $< $(MYCXXFLAGS) $(CXXFLAGS)
 
-$(ODIR)/proxy_sqlite3_symbols.oo: proxy_sqlite3_symbols.cpp $(HEADERS)
+$(ODIR)/proxy_sqlite3_symbols.oo: proxy_sqlite3_symbols.cpp $(HEADERS) $(OBJECT_BUILD_VARIANT_FILE)
 	$(CXX) -fPIC -c -o $@ $< $(MYCXXFLAGS) $(CXXFLAGS) -DSQLITE_CORE -DSQLITE_VEC_STATIC
 
-$(ODIR)/%.oo: %.cpp $(HEADERS)
+$(ODIR)/%.oo: %.cpp $(HEADERS) $(OBJECT_BUILD_VARIANT_FILE)
 	$(CXX) -fPIC -c -o $@ $< $(MYCXXFLAGS) $(CXXFLAGS)
 
-libproxysql.a: $(ODIR) $(OBJ) $(OBJ_CXX) $(SQLITE3_LDIR)/sqlite3.o
+libproxysql.a: $(ACTIVE_BUILD_VARIANT_FILE) $(ODIR) $(OBJ) $(OBJ_CXX) $(SQLITE3_LDIR)/sqlite3.o
 	$(POLARDB_OPT_AR) rcs $@ $(OBJ) $(OBJ_CXX) $(SQLITE3_LDIR)/sqlite3.o
 
 $(ODIR):
 	mkdir -p $(ODIR)
 
+.PHONY: FORCE_POLARDB_BUILD_VARIANT
+FORCE_POLARDB_BUILD_VARIANT:
+
+# Recompile objects when their PolarDB build variant changes, even though their
+# filenames do not. The write is skipped when the variant is unchanged,
+# preserving normal incremental builds.
+$(OBJECT_BUILD_VARIANT_FILE): FORCE_POLARDB_BUILD_VARIANT | $(ODIR)
+	@if test "$$(cat "$@" 2>/dev/null)" != "$(POLARDB_BUILD_VARIANT)"; then \
+		printf '%s\n' "$(POLARDB_BUILD_VARIANT)" > "$@.tmp"; \
+		mv -f "$@.tmp" "$@"; \
+	fi
+
+# libproxysql.a has a shared pathname. Remove it only when its active variant
+# changes so switching back to older objects cannot reuse the wrong archive.
+$(ACTIVE_BUILD_VARIANT_FILE): FORCE_POLARDB_BUILD_VARIANT
+	@if test "$$(cat "$@" 2>/dev/null)" != "$(POLARDB_BUILD_VARIANT)"; then \
+		rm -f libproxysql.a; \
+		printf '%s\n' "$(POLARDB_BUILD_VARIANT)" > "$@.tmp"; \
+		mv -f "$@.tmp" "$@"; \
+	fi
+
 #all: $(EXECUTABLE)
 
 
 clean:
-	rm -rf *.pid $(ODIR)/*.oo $(ODIR)/*.o $(ODIR)/*.gcno $(ODIR)/*.gcda *.ko *.so *~ core libproxysql.a $(ODIR) \
+	rm -rf *.pid obj *.ko *.so *~ core libproxysql.a $(ACTIVE_BUILD_VARIANT_FILE) \
 		MySQL_Lexer.yy.c MySQL_Parser.output MySQL_Parser.tab.c MySQL_Parser.tab.h
 
 
