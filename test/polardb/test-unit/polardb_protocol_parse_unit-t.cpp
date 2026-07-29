@@ -58,17 +58,42 @@ static void test_monitor_health_parse_helpers() {
 	ok(!PolarDB_Protocol::parse_is_available("unexpected"),
 		"availability parser treats non-true values as unavailable");
 
-	ok(PolarDB_Protocol::parse_lsn_string(nullptr) == 0,
+	uint64_t parsed_lsn = 0;
+	ok(!PolarDB_Protocol::parse_lsn(nullptr, parsed_lsn) &&
+			parsed_lsn == 0,
 		"LSN parser maps missing value to zero");
-	ok(PolarDB_Protocol::parse_lsn_string("0/1234ABCD") == 0x1234ABCDULL,
+	ok(PolarDB_Protocol::parse_lsn(
+			"0/1234ABCD", parsed_lsn) &&
+			parsed_lsn == 0x1234ABCDULL,
 		"LSN parser accepts ordinary PostgreSQL LSN text");
-	ok(PolarDB_Protocol::parse_lsn_string("1/5") ==
-			((1ULL << 32) | 5ULL),
+	ok(PolarDB_Protocol::parse_lsn("1/5", parsed_lsn) &&
+			parsed_lsn == ((1ULL << 32) | 5ULL),
 		"LSN parser combines high and low WAL halves");
-	ok(PolarDB_Protocol::parse_lsn_string("not-an-lsn") == 0,
+	ok(!PolarDB_Protocol::parse_lsn("not-an-lsn", parsed_lsn) &&
+			parsed_lsn == 0,
 		"LSN parser maps malformed text to zero");
-	ok(PolarDB_Protocol::parse_lsn_string("1/5junk") == 0,
+	ok(!PolarDB_Protocol::parse_lsn("1/5junk", parsed_lsn) &&
+			parsed_lsn == 0,
 		"LSN parser rejects partially parsed LSN text");
+
+	const PolarDB_HealthCheck valid_health =
+		PolarDB_Protocol::parse_health_check("primary", "t", "1/5");
+	ok(valid_health.role_valid && valid_health.availability_valid &&
+			valid_health.lsn_valid && valid_health.is_available &&
+			valid_health.current_lsn == ((1ULL << 32) | 5ULL),
+		"health parser validates and decodes a complete primary row");
+	const PolarDB_HealthCheck invalid_health =
+		PolarDB_Protocol::parse_health_check("unknown", "x", "1/5junk");
+	ok(!invalid_health.role_valid && !invalid_health.availability_valid &&
+			!invalid_health.lsn_valid && invalid_health.is_available &&
+			invalid_health.current_lsn == 0,
+		"health parser reports each invalid field and applies safe defaults");
+	const PolarDB_HealthCheck zero_health =
+		PolarDB_Protocol::parse_health_check("replica", "f", "0/0");
+	ok(zero_health.role_valid && zero_health.availability_valid &&
+			zero_health.lsn_valid && !zero_health.is_available &&
+			zero_health.current_lsn == 0,
+		"health parser distinguishes a valid zero LSN from invalid text");
 
 	ok(!polardb_should_update_monitor_lsn(false, 500),
 		"monitor LSN update condition respects disabled monitor updates");
@@ -121,8 +146,7 @@ static void test_simple_query_multi_statement_detection() {
 }
 
 int main() {
-	// 36 ok() in this file = 36.
-	plan(36);
+	plan(39);
 	test_parse_node_type_names();
 	test_monitor_health_parse_helpers();
 	test_simple_query_multi_statement_detection();

@@ -13,65 +13,55 @@
 
 #include <cstring>
 
+template <typename Value>
+struct PolarDB_NameCase {
+	Value value;
+	const char* expected;
+};
+
+template <typename Value, size_t Count>
+static void check_name_cases(
+		const PolarDB_NameCase<Value> (&cases)[Count],
+		const char* (*name_function)(Value),
+		const char* category) {
+	for (const PolarDB_NameCase<Value>& test_case : cases) {
+		ok(strcmp(name_function(test_case.value), test_case.expected) == 0,
+			"%s helper names %s", category, test_case.expected);
+	}
+}
+
 // ---- route-action-reason names & NoticeResponse packet helpers ----
 
 static void test_degraded_rfq_notice_packet_helpers() {
-	ok(strcmp(polardb_route_action_reason_name(
-		PolarDB_Query_RoutePlan::RouteActionReason::NONE), "none") == 0,
-		"action reason helper names none");
-	ok(strcmp(polardb_route_action_reason_name(
-		PolarDB_Query_RoutePlan::RouteActionReason::EXTENDED_PROTOCOL), "extended_protocol") == 0,
-		"action reason helper names extended protocol");
-	ok(strcmp(polardb_route_action_reason_name(
-		PolarDB_Query_RoutePlan::RouteActionReason::IN_TRANSACTION), "in_transaction") == 0,
-		"action reason helper names transaction check");
-	ok(strcmp(polardb_route_action_reason_name(
-		PolarDB_Query_RoutePlan::RouteActionReason::MULTI_STATEMENT), "multi_statement") == 0,
-		"action reason helper names multi-statement check");
-	ok(strcmp(polardb_route_action_reason_name(
-		PolarDB_Query_RoutePlan::RouteActionReason::MODE_PRIMARY), "mode_primary") == 0,
-		"action reason helper names primary mode");
-	ok(strcmp(polardb_route_action_reason_name(
-		PolarDB_Query_RoutePlan::RouteActionReason::HINT_PRIMARY), "hint_primary") == 0,
-		"action reason helper names primary hint");
-	ok(strcmp(polardb_route_action_reason_name(
-		PolarDB_Query_RoutePlan::RouteActionReason::WRITE_LSN_UNKNOWN), "write_lsn_unknown") == 0,
-		"action reason helper names missing write LSN");
-	ok(strcmp(polardb_route_action_reason_name(
-		PolarDB_Query_RoutePlan::RouteActionReason::OBSERVED_LSN_UNKNOWN), "observed_lsn_unknown") == 0,
-		"action reason helper names missing observed LSN");
-	ok(strcmp(polardb_route_action_reason_name(
-		PolarDB_Query_RoutePlan::RouteActionReason::PRIMARY_LSN_UNKNOWN), "primary_lsn_unknown") == 0,
-		"action reason helper names missing primary mirror LSN");
-	ok(strcmp(polardb_route_action_reason_name(
-		PolarDB_Query_RoutePlan::RouteActionReason::READER_FAILURE_FORCE_WRITER), "reader_failure_force_writer") == 0,
-		"action reason helper names reader-failure writer route");
-	ok(strcmp(polardb_route_action_reason_name(
-		PolarDB_Query_RoutePlan::RouteActionReason::WAL_PENDING), "wal_pending") == 0,
-		"action reason helper names split WAL-pending veto");
-	ok(strcmp(polardb_route_action_reason_name(
-		PolarDB_Query_RoutePlan::RouteActionReason::SPLIT_BLOCKED), "split_blocked") == 0,
-		"action reason helper names split-blocked veto");
-	ok(strcmp(polardb_route_action_reason_name(
-		PolarDB_Query_RoutePlan::RouteActionReason::SPLIT_WRITE_LSN_UNKNOWN), "split_write_lsn_unknown") == 0,
-		"action reason helper names split write-LSN unknown veto");
-	ok(strcmp(polardb_route_action_reason_name(
-		PolarDB_Query_RoutePlan::RouteActionReason::SPLIT_OBSERVED_LSN_UNKNOWN), "split_observed_lsn_unknown") == 0,
-		"action reason helper names split observed-LSN unknown veto");
-	ok(strcmp(polardb_route_action_reason_name(
-		PolarDB_Query_RoutePlan::RouteActionReason::NO_TXN_LSN), "no_txn_lsn") == 0,
-		"action reason helper names missing transaction LSN");
-	ok(strcmp(polardb_route_action_reason_name(
-		PolarDB_Query_RoutePlan::RouteActionReason::INVARIANT_VIOLATION), "invariant_violation") == 0,
-		"action reason helper names invariant fallback");
-	ok(strcmp(polardb_route_action_reason_name(
-		PolarDB_Query_RoutePlan::RouteActionReason::HG_SPLIT_DISABLED), "hg_split_disabled") == 0,
-		"action reason helper names hostgroup split-disabled veto");
+	using Reason = PolarDB_Query_RoutePlan::RouteActionReason;
+	const PolarDB_NameCase<Reason> reason_cases[] = {
+		{Reason::NONE, "none"},
+		{Reason::EXTENDED_PROTOCOL, "extended_protocol"},
+		{Reason::IN_TRANSACTION, "in_transaction"},
+		{Reason::MULTI_STATEMENT, "multi_statement"},
+		{Reason::READ_TARGET_PRIMARY, "read_target_primary"},
+		{Reason::HINT_PRIMARY, "hint_primary"},
+		{Reason::WRITE_LSN_UNKNOWN, "write_lsn_unknown"},
+		{Reason::OBSERVED_LSN_UNKNOWN, "observed_lsn_unknown"},
+		{Reason::GROUP_LSN_UNKNOWN, "group_lsn_unknown"},
+		{Reason::INVALID_POLICY, "invalid_policy"},
+		{Reason::READER_RFQ_UNAVAILABLE, "reader_rfq_unavailable"},
+		{Reason::READ_FALLBACK_ERROR, "read_fallback_error"},
+		{Reason::READER_FAILURE_FORCE_WRITER, "reader_failure_force_writer"},
+		{Reason::WAL_PENDING, "wal_pending"},
+		{Reason::SPLIT_BLOCKED, "split_blocked"},
+		{Reason::SPLIT_WRITE_LSN_UNKNOWN, "split_write_lsn_unknown"},
+		{Reason::SPLIT_OBSERVED_LSN_UNKNOWN, "split_observed_lsn_unknown"},
+		{Reason::NO_TXN_LSN, "no_txn_lsn"},
+		{Reason::INVARIANT_VIOLATION, "invariant_violation"},
+		{Reason::HG_SPLIT_DISABLED, "hg_split_disabled"},
+	};
+	check_name_cases(reason_cases, polardb_route_action_reason_name, "action reason");
 
 	const char* severity = "WARNING";
 	const char* severity_nonlocalized = "WARNING";
 	const char* sqlstate = "01000";
-	const char* message = "PolarDB best_effort RFQ route has no enforceable LSN wait target; read may be stale";
+	const char* message = "PolarDB reader route has no enforceable LSN wait target; read may be stale";
 	const char* detail = "reason=write_lsn_unknown reader_hg=20 writer_hg=10";
 	const unsigned int size = polardb_notice_response_packet_size(
 		severity, sqlstate, message, detail, severity_nonlocalized);
@@ -97,106 +87,62 @@ static void test_degraded_rfq_notice_packet_helpers() {
 }
 
 static void test_failure_action_names() {
-	ok(strcmp(polardb_failure_action_name(
-			PolarDB_FailureAction::PASSTHROUGH), "passthrough") == 0,
-		"failure action helper names passthrough");
-	ok(strcmp(polardb_failure_action_name(
-			PolarDB_FailureAction::RETRY), "retry") == 0,
-		"failure action helper names retry");
-	ok(strcmp(polardb_failure_action_name(
-			PolarDB_FailureAction::FORWARD), "forward") == 0,
-		"failure action helper names forward");
-	ok(strcmp(polardb_failure_action_name(
-			PolarDB_FailureAction::TERMINATE), "terminate") == 0,
-		"failure action helper names terminate");
+	const PolarDB_NameCase<PolarDB_FailureAction> cases[] = {
+		{PolarDB_FailureAction::PASSTHROUGH, "passthrough"},
+		{PolarDB_FailureAction::RETRY, "retry"},
+		{PolarDB_FailureAction::FORWARD, "forward"},
+		{PolarDB_FailureAction::TERMINATE, "terminate"},
+	};
+	check_name_cases(cases, polardb_failure_action_name, "failure action");
 }
 
 static void test_reader_action_policy_mapping() {
-	ok(polardb_reader_action_from_string("retry", -1) ==
-			static_cast<int>(PolarDB_ReaderAction::RETRY),
-		"reader action parser accepts retry");
-	ok(polardb_reader_action_from_string("forward", -1) ==
-			static_cast<int>(PolarDB_ReaderAction::FORWARD),
-		"reader action parser accepts forward");
-	ok(polardb_reader_action_from_string("terminate", -1) ==
-			static_cast<int>(PolarDB_ReaderAction::TERMINATE),
-		"reader action parser accepts terminate");
-	ok(polardb_reader_action_from_string("invalid", 7) == 7,
-		"reader action parser returns default for invalid value");
-	ok(strcmp(polardb_reader_action_name(
-			PolarDB_ReaderAction::RETRY), "retry") == 0,
-		"reader action name helper names retry");
-	ok(strcmp(polardb_reader_action_name(
-			PolarDB_ReaderAction::FORWARD), "forward") == 0,
-		"reader action name helper names forward");
-	ok(strcmp(polardb_reader_action_name(
-			PolarDB_ReaderAction::TERMINATE), "terminate") == 0,
-		"reader action name helper names terminate");
-	ok(strcmp(polardb_reader_failure_kind_name(
-			PolarDB_ReaderFailureKind::CONNECTION_LOST), "connection_lost") == 0,
-		"reader failure kind names connection_lost");
-	ok(strcmp(polardb_reader_failure_kind_name(
-			PolarDB_ReaderFailureKind::WAIT_TIMEOUT), "wait_timeout") == 0,
-		"reader failure kind names wait_timeout");
-	ok(strcmp(polardb_reader_failure_kind_name(
-			PolarDB_ReaderFailureKind::REUSABLE_ERROR), "reusable_error") == 0,
-		"reader failure kind names reusable_error");
-	ok(strcmp(polardb_retry_target_name(
-			PolarDB_RetryTarget::WRITER), "writer") == 0,
-		"retry target names writer");
-	ok(strcmp(polardb_retry_target_name(
-			PolarDB_RetryTarget::OTHER_READER), "other_reader") == 0,
-		"retry target names other_reader");
-	ok(strcmp(polardb_reader_failure_route_name(
-			PolarDB_ReaderFailureRoute::NONE), "none") == 0,
-		"reader-failure route names none");
-	ok(strcmp(polardb_reader_failure_route_name(
-			PolarDB_ReaderFailureRoute::FORCE_WRITER), "force_writer") == 0,
-		"reader-failure route names force_writer");
-	ok(strcmp(polardb_reader_failure_route_name(
-			PolarDB_ReaderFailureRoute::SKIP_READER), "skip_reader") == 0,
-		"reader-failure route names skip_reader");
+	const PolarDB_NameCase<PolarDB_ReaderAction> action_cases[] = {
+		{PolarDB_ReaderAction::RETRY, "retry"},
+		{PolarDB_ReaderAction::RETURN_ERROR, "error"},
+		{PolarDB_ReaderAction::DISCONNECT_CLIENT, "disconnect"},
+	};
+	check_name_cases(action_cases, polardb_reader_action_name, "reader action");
+
+	const PolarDB_NameCase<PolarDB_ReaderFailureKind> failure_cases[] = {
+		{PolarDB_ReaderFailureKind::CONNECTION_LOST, "connection_lost"},
+		{PolarDB_ReaderFailureKind::WAIT_TIMEOUT, "wait_timeout"},
+		{PolarDB_ReaderFailureKind::REUSABLE_ERROR, "reusable_error"},
+	};
+	check_name_cases(
+		failure_cases, polardb_reader_failure_kind_name, "reader failure kind");
+
+	const PolarDB_NameCase<PolarDB_RetryTarget> target_cases[] = {
+		{PolarDB_RetryTarget::WRITER, "writer"},
+		{PolarDB_RetryTarget::OTHER_READER, "other_reader"},
+	};
+	check_name_cases(target_cases, polardb_retry_target_name, "retry target");
+
+	const PolarDB_NameCase<PolarDB_ReaderFailureRoute> route_cases[] = {
+		{PolarDB_ReaderFailureRoute::NONE, "none"},
+		{PolarDB_ReaderFailureRoute::FORCE_WRITER, "force_writer"},
+		{PolarDB_ReaderFailureRoute::SKIP_READER, "skip_reader"},
+	};
+	check_name_cases(
+		route_cases, polardb_reader_failure_route_name, "reader-failure route");
 }
 
 // ---- reader-status names ----
 
 static void test_reader_status_names() {
-	ok(strcmp(polardb_reader_status_name(
-			PolarDB_ReaderStatus::ACQUIRED),
-			"acquired") == 0,
-		"acquired status has stable lowercase name");
-	ok(strcmp(polardb_reader_status_name(
-			PolarDB_ReaderStatus::READER_UNAVAILABLE),
-			"reader_unavailable") == 0,
-		"reader unavailable status has stable lowercase name");
-	ok(strcmp(polardb_reader_status_name(
-			PolarDB_ReaderStatus::READER_BUSY),
-			"reader_busy") == 0,
-		"reader busy status has stable lowercase name");
-	ok(strcmp(polardb_reader_status_name(
-			PolarDB_ReaderStatus::RETRY_CURRENT_STATE),
-			"retry_current_state") == 0,
-		"current-state retry status has stable lowercase name");
-	ok(strcmp(polardb_reader_status_name(
-			PolarDB_ReaderStatus::RFQ_UNAVAILABLE),
-			"rfq_unavailable") == 0,
-		"RFQ unavailable status has stable lowercase name");
-	ok(strcmp(polardb_reader_status_name(
-			PolarDB_ReaderStatus::PRIMARY_LSN_UNKNOWN),
-			"primary_lsn_unknown") == 0,
-		"primary LSN unknown status has stable lowercase name");
-	ok(strcmp(polardb_reader_status_name(
-			PolarDB_ReaderStatus::READER_LSN_UNKNOWN),
-			"reader_lsn_unknown") == 0,
-		"reader LSN unknown status has stable lowercase name");
-	ok(strcmp(polardb_reader_status_name(
-			PolarDB_ReaderStatus::READER_LSN_STALE),
-			"reader_lsn_stale") == 0,
-		"reader LSN stale status has stable lowercase name");
-	ok(strcmp(polardb_reader_status_name(
-			PolarDB_ReaderStatus::READER_LAG_EXCEEDED),
-			"reader_lag_exceeded") == 0,
-		"reader lag cap status has stable lowercase name");
+	const PolarDB_NameCase<PolarDB_ReaderStatus> cases[] = {
+		{PolarDB_ReaderStatus::ACQUIRED, "acquired"},
+		{PolarDB_ReaderStatus::READER_UNAVAILABLE, "reader_unavailable"},
+		{PolarDB_ReaderStatus::READER_BUSY, "reader_busy"},
+		{PolarDB_ReaderStatus::RETRY_AFTER_CONFIG_CHANGE,
+			"retry_after_config_change"},
+		{PolarDB_ReaderStatus::RFQ_UNAVAILABLE, "rfq_unavailable"},
+		{PolarDB_ReaderStatus::GROUP_LSN_UNKNOWN, "group_lsn_unknown"},
+		{PolarDB_ReaderStatus::READER_LSN_UNKNOWN, "reader_lsn_unknown"},
+		{PolarDB_ReaderStatus::READER_LSN_STALE, "reader_lsn_stale"},
+		{PolarDB_ReaderStatus::READER_LAG_EXCEEDED, "reader_lag_exceeded"},
+	};
+	check_name_cases(cases, polardb_reader_status_name, "reader status");
 	ok(!polardb_reader_status_redirects_to_writer(
 			PolarDB_ReaderStatus::READER_UNAVAILABLE),
 		"reader unavailable uses normal no-connection handling");
@@ -204,11 +150,11 @@ static void test_reader_status_names() {
 			PolarDB_ReaderStatus::READER_BUSY),
 		"reader busy uses normal no-connection handling");
 	ok(!polardb_reader_status_redirects_to_writer(
-			PolarDB_ReaderStatus::RETRY_CURRENT_STATE),
-		"current-state retry returns through normal no-connection handling");
+			PolarDB_ReaderStatus::RETRY_AFTER_CONFIG_CHANGE),
+		"configuration-change retry uses normal no-connection handling");
 	ok(polardb_reader_status_redirects_to_writer(
-			PolarDB_ReaderStatus::PRIMARY_LSN_UNKNOWN),
-		"unknown primary LSN redirects this consistency read to writer");
+			PolarDB_ReaderStatus::GROUP_LSN_UNKNOWN),
+		"unknown group LSN redirects this consistency read to writer");
 	ok(polardb_reader_status_redirects_to_writer(
 			PolarDB_ReaderStatus::READER_LSN_UNKNOWN),
 		"unknown reader LSN redirects this consistency read to writer");
@@ -231,11 +177,11 @@ static void test_reader_status_names() {
 			PolarDB_ReaderStatus::RFQ_UNAVAILABLE),
 		"split warmup can help when no RFQ-LSN-capable reader backend is available");
 	ok(!polardb_reader_status_split_warmup_can_help(
-			PolarDB_ReaderStatus::RETRY_CURRENT_STATE),
+			PolarDB_ReaderStatus::RETRY_AFTER_CONFIG_CHANGE),
 		"split warmup is not requested for configuration churn");
 	ok(!polardb_reader_status_split_warmup_can_help(
-			PolarDB_ReaderStatus::PRIMARY_LSN_UNKNOWN),
-		"split warmup cannot fix a missing primary LSN sample");
+			PolarDB_ReaderStatus::GROUP_LSN_UNKNOWN),
+		"split warmup cannot fix a missing group LSN sample");
 	ok(!polardb_reader_status_split_warmup_can_help(
 			PolarDB_ReaderStatus::READER_LSN_UNKNOWN),
 		"split warmup cannot fix a missing reader LSN sample");
@@ -382,8 +328,7 @@ static void test_server_lsn_cache_reset_policy() {
 }
 
 int main() {
-	// 102 ok() in this file = 102.
-	plan(108);
+	plan(107);
 	test_degraded_rfq_notice_packet_helpers();
 	test_failure_action_names();
 	test_reader_action_policy_mapping();

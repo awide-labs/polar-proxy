@@ -112,44 +112,102 @@ static void test_polardb_lsn_ready_for_query_shape() {
 	ok(pkt != nullptr && read_be64(pkt + 6) == LSN,
 		"client RFQ: LSN path appends backend LSN in network byte order");
 	release_packets(out);
+
+	PgSQL_Query_Result zero_result;
+	zero_result.init(&proto, nullptr, &conn);
+	const unsigned int zero_bytes =
+		zero_result.add_ready_status(PQTRANS_IDLE, true, 0);
+	PtrSizeArray zero_out;
+	const bool zero_complete = zero_result.get_resultset(&zero_out);
+	const unsigned char *zero_pkt = single_result_packet(zero_out);
+	ok(zero_complete && zero_bytes == 14 &&
+			single_result_packet_size(zero_out) == 14,
+		"client RFQ: present-zero LSN keeps the PolarDB packet shape");
+	ok(zero_pkt != nullptr && read_be64(zero_pkt + 6) == 0,
+		"client RFQ: present-zero LSN remains distinct from a missing payload");
+	release_packets(zero_out);
 }
 
 static void test_polardb_client_rfq_decision() {
 	PolarDB_ClientRfqDecision d = polardb_client_rfq_decision(
-		true, true, 100, 200, false, 0);
+		true, true, 100, 200, false, false, 0);
 	ok(d.include_lsn && d.lsn == 100 && !d.raised_to_target,
 		"client RFQ decision: no-wait replica preserves backend LSN");
 
-	d = polardb_client_rfq_decision(true, true, 100, 200, true, 0);
+	d = polardb_client_rfq_decision(
+		true, true, 100, 200, false, true, 0);
 	ok(d.include_lsn && d.lsn == 200 && d.raised_to_target &&
 			d.raised_by_writer && !d.raised_by_wait,
 		"client RFQ decision: writer response raises to session target");
 
-	d = polardb_client_rfq_decision(true, true, 300, 200, true, 0);
+	d = polardb_client_rfq_decision(
+		true, true, 300, 200, false, true, 0);
 	ok(d.include_lsn && d.lsn == 300 && !d.raised_to_target,
 		"client RFQ decision: writer response preserves newer backend LSN");
 
-	d = polardb_client_rfq_decision(true, true, 0, 0, false, 300);
+	d = polardb_client_rfq_decision(
+		true, true, 0, 0, false, true, 0);
+	ok(d.include_lsn && d.lsn == 0 && !d.raised_to_target,
+		"client RFQ decision: present-zero remains an explicit LSN payload");
+
+	d = polardb_client_rfq_decision(
+		true, true, 0, 0, false, false, 300, 300);
 	ok(d.include_lsn && d.lsn == 300 && d.raised_to_target &&
 			!d.raised_by_writer && d.raised_by_wait,
 		"client RFQ decision: successful wait raises zero backend LSN");
 
-	d = polardb_client_rfq_decision(true, true, 100, 300, true, 300);
+	d = polardb_client_rfq_decision(
+		true, true, 100, 0, false, false, 300);
+	ok(d.include_lsn && d.lsn == 300 && d.raised_to_target &&
+			!d.raised_by_writer && !d.raised_by_wait,
+		"client RFQ decision: cached-reader bypass is not counted as a completed wait");
+
+	d = polardb_client_rfq_decision(
+		true, true, 100, 300, false, true, 300, 300);
 	ok(d.include_lsn && d.lsn == 300 && d.raised_to_target &&
 			d.raised_by_writer && d.raised_by_wait,
 		"client RFQ decision: equal writer and wait checks record both reasons");
 
-	d = polardb_client_rfq_decision(true, false, 0, 200, true, 0);
+	d = polardb_client_rfq_decision(
+		true, false, 0, 200, false, true, 0);
 	ok(!d.include_lsn && d.lsn == 0,
 		"client RFQ decision: missing backend payload does not emit LSN");
 
-	d = polardb_client_rfq_decision(false, true, 100, 200, true, 0);
+	d = polardb_client_rfq_decision(
+		false, true, 100, 200, false, true, 0);
 	ok(!d.include_lsn,
 		"client RFQ decision: client opt-in is required");
+
+	d = polardb_client_rfq_decision(
+		true, true, 100, 200, true, true, 0);
+	ok(d.include_lsn && d.lsn == 200 && d.raised_to_target &&
+			d.raised_by_writer && !d.raised_by_wait,
+		"client RFQ decision: saved session baseline records a writer raise");
+
+	d = polardb_client_rfq_decision(
+		true, true, 100, 200, true, true, 300, 300);
+	ok(d.include_lsn && d.lsn == 300 && d.raised_to_target &&
+			!d.raised_by_writer && d.raised_by_wait,
+		"client RFQ decision: higher wait target supersedes saved session baseline");
+
+	d = polardb_client_rfq_decision(
+		true, true, 300, 200, true, true, 0);
+	ok(d.include_lsn && d.lsn == 200 && !d.raised_to_target,
+		"client RFQ decision: saved session baseline can suppress unrelated backend LSN");
+
+	d = polardb_client_rfq_decision(
+		true, true, 300, 200, true, true, 250, 250);
+	ok(d.include_lsn && d.lsn == 250 && !d.raised_to_target,
+		"client RFQ decision: raise accounting remains relative to raw backend LSN");
+
+	d = polardb_client_rfq_decision(
+		true, true, 300, 200, true, false, 0);
+	ok(d.include_lsn && d.lsn == 300 && !d.raised_to_target,
+		"client RFQ decision: saved session baseline requires a writer response");
 }
 
 int main() {
-	plan(20);
+	plan(29);
 	test_standard_ready_for_query_shape();
 	test_polardb_lsn_ready_for_query_shape();
 	test_polardb_client_rfq_decision();

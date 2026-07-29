@@ -10,34 +10,52 @@
 #include "PgSQL_PolarDB.h"
 #include "polardb_unit_common.h"
 
+struct PolarDB_StringConversionCase {
+	const char* input;
+	int expected;
+};
+
+template <size_t Count>
+static void check_string_conversions(
+		const PolarDB_StringConversionCase (&cases)[Count],
+		int (*converter)(const char*, int),
+		int fallback,
+		const char* category) {
+	for (const PolarDB_StringConversionCase& test_case : cases) {
+		ok(converter(test_case.input, fallback) == test_case.expected,
+			"%s converter maps %s", category,
+			test_case.input ? test_case.input : "null");
+	}
+}
+
 static void test_protocol_request_bits() {
 	PolarDB_StartupProfile off =
 		PolarDB_StartupProfile::from_protocol(PolarDB_ProxyProtocol::OFF);
-	ok(!off.has_rfq_lsn(), "off profile does not request RFQ LSN");
+	ok(!off.requests_rfq_lsn(), "off profile does not request RFQ LSN");
 	ok(!off.emits_startup_params(), "off profile emits no startup params");
 	ok(off.protocol == PolarDB_ProxyProtocol::OFF, "off profile records OFF protocol");
 	off.request_rfq_xid();
-	ok(!off.has_rfq_xid(), "off profile does not accept RFQ XID requests");
+	ok(!off.requests_rfq_xid(), "off profile does not request RFQ XID data");
 
 	PolarDB_StartupProfile legacy =
 		PolarDB_StartupProfile::from_protocol(PolarDB_ProxyProtocol::LEGACY);
-	ok(legacy.has_rfq_lsn(), "legacy profile requests RFQ LSN");
-	ok(legacy.has_rfq_xid(), "legacy profile requests RFQ XID");
+	ok(legacy.requests_rfq_lsn(), "legacy profile requests RFQ LSN");
+	ok(legacy.requests_rfq_xid(), "legacy profile requests RFQ XID");
 	ok(legacy.emits_startup_params(), "legacy profile emits startup params");
 	ok(!legacy.requests(REQUEST_RFQ_CSN), "legacy profile does not request RFQ CSN");
 
 	PolarDB_StartupProfile v15 = make_v15_profile();
-	ok(v15.has_rfq_lsn(), "v15 profile requests RFQ LSN");
-	ok(v15.has_rfq_xid(), "v15 profile requests RFQ XID");
+	ok(v15.requests_rfq_lsn(), "v15 profile requests RFQ LSN");
+	ok(v15.requests_rfq_xid(), "v15 profile requests RFQ XID");
 	ok(v15.emits_startup_params(), "v15 profile emits startup params");
 	ok(!v15.requests(REQUEST_RFQ_CSN), "v15 profile does not request RFQ CSN");
 	v15.request_rfq_xid();
-	ok(v15.has_rfq_lsn(), "v15 profile keeps RFQ LSN when RFQ XID is requested again");
-	ok(v15.has_rfq_xid(), "v15 profile keeps RFQ XID when requested again");
+	ok(v15.requests_rfq_lsn(), "v15 profile keeps RFQ LSN when RFQ XID is requested again");
+	ok(v15.requests_rfq_xid(), "v15 profile keeps RFQ XID when requested again");
 
 	PolarDB_StartupProfile csn_only = make_v15_profile();
 	csn_only.request_bits = REQUEST_RFQ_CSN;
-	ok(!csn_only.has_rfq_lsn(),
+	ok(!csn_only.requests_rfq_lsn(),
 		"CSN-only reserved profile does not request RFQ LSN");
 }
 
@@ -275,78 +293,365 @@ static void test_configured_fallback_identity_set_validation() {
 static void test_string_converters() {
 	const int fallback = -7;
 
-	ok(polardb_consistency_mode_from_string(nullptr, fallback) == fallback,
-		"consistency converter maps null to caller default");
-	ok(polardb_consistency_mode_from_string("", fallback) == fallback,
-		"consistency converter maps empty string to caller default");
-	ok(polardb_consistency_mode_from_string("default", fallback) == fallback,
-		"consistency converter maps default sentinel to caller default");
-	ok(polardb_consistency_mode_from_string("off", fallback) ==
-			static_cast<int>(PolarDB_ConsistencyMode::OFF),
-		"consistency converter maps off");
-	ok(polardb_consistency_mode_from_string("lsn", fallback) ==
-			static_cast<int>(PolarDB_ConsistencyMode::SESSION_LSN),
-		"consistency converter maps lsn");
-	ok(polardb_consistency_mode_from_string("global_lsn", fallback) ==
-			static_cast<int>(PolarDB_ConsistencyMode::GLOBAL_LSN),
-		"consistency converter maps global_lsn");
-	ok(polardb_consistency_mode_from_string("lsn_global", fallback) ==
-			static_cast<int>(PolarDB_ConsistencyMode::GLOBAL_LSN),
-		"consistency converter maps lsn_global alias");
-	ok(polardb_consistency_mode_from_string("global", fallback) ==
-			static_cast<int>(PolarDB_ConsistencyMode::GLOBAL_LSN),
-		"consistency converter maps global alias");
-	ok(polardb_consistency_mode_from_string("primary", fallback) ==
-			static_cast<int>(PolarDB_ConsistencyMode::PRIMARY_ONLY),
-		"consistency converter maps primary");
-	ok(polardb_consistency_mode_from_string("bad", fallback) == fallback,
-		"consistency converter maps unknown value to caller default");
+	const PolarDB_StringConversionCase consistency_cases[] = {
+		{nullptr, fallback},
+		{"", fallback},
+		{"default", fallback},
+		{"off", static_cast<int>(PolarDB_ConsistencyMode::OFF)},
+		{"eventual", static_cast<int>(PolarDB_ConsistencyMode::EVENTUAL)},
+		{"session_lsn", static_cast<int>(PolarDB_ConsistencyMode::SESSION_LSN)},
+		{"global_lsn", static_cast<int>(PolarDB_ConsistencyMode::GLOBAL_LSN)},
+		{"bad", fallback},
+	};
+	check_string_conversions(
+		consistency_cases, polardb_consistency_mode_from_string, fallback,
+		"consistency");
 
-	ok(polardb_proxy_protocol_from_string(nullptr, fallback) == fallback,
-		"proxy protocol converter maps null to caller default");
-	ok(polardb_proxy_protocol_from_string("default", fallback) == fallback,
-		"proxy protocol converter maps default sentinel to caller default");
-	ok(polardb_proxy_protocol_from_string("off", fallback) ==
-			static_cast<int>(PolarDB_ProxyProtocol::OFF),
-		"proxy protocol converter maps off");
-	ok(polardb_proxy_protocol_from_string("legacy", fallback) ==
-			static_cast<int>(PolarDB_ProxyProtocol::LEGACY),
-		"proxy protocol converter maps legacy");
-	ok(polardb_proxy_protocol_from_string("v15", fallback) ==
-			static_cast<int>(PolarDB_ProxyProtocol::V15),
-		"proxy protocol converter maps v15");
-	ok(polardb_proxy_protocol_from_string("bad", fallback) == fallback,
-		"proxy protocol converter maps unknown value to caller default");
+	const PolarDB_StringConversionCase protocol_cases[] = {
+		{nullptr, fallback},
+		{"default", fallback},
+		{"off", static_cast<int>(PolarDB_ProxyProtocol::OFF)},
+		{"legacy", static_cast<int>(PolarDB_ProxyProtocol::LEGACY)},
+		{"v15", static_cast<int>(PolarDB_ProxyProtocol::V15)},
+		{"bad", fallback},
+	};
+	check_string_conversions(
+		protocol_cases, polardb_proxy_protocol_from_string, fallback,
+		"proxy protocol");
 
-	ok(polardb_wait_mode_from_string(nullptr, fallback) == fallback,
-		"wait mode converter maps null to caller default");
-	ok(polardb_wait_mode_from_string("best_effort", fallback) ==
-			static_cast<int>(PolarDB_WaitMode::BEST_EFFORT),
-		"wait mode converter maps best_effort");
-	ok(polardb_wait_mode_from_string("strict", fallback) ==
-			static_cast<int>(PolarDB_WaitMode::STRICT),
-		"wait mode converter maps strict");
-	ok(polardb_wait_mode_from_string("bad", fallback) == fallback,
-		"wait mode converter maps unknown value to caller default");
+	const PolarDB_StringConversionCase missing_lsn_cases[] = {
+		{nullptr, fallback},
+		{"primary", static_cast<int>(PolarDB_MissingLsnAction::PRIMARY)},
+		{"warning",
+			static_cast<int>(PolarDB_MissingLsnAction::WARNING)},
+		{"error",
+			static_cast<int>(PolarDB_MissingLsnAction::ERROR)},
+		{"bad", fallback},
+	};
+	check_string_conversions(
+		missing_lsn_cases, polardb_missing_lsn_action_from_string, fallback,
+		"missing LSN action");
 
-	ok(polardb_route_rfq_policy_from_string(nullptr, fallback) == fallback,
-		"RFQ policy converter maps null to caller default");
-	ok(polardb_route_rfq_policy_from_string("best_effort", fallback) ==
-			static_cast<int>(PolarDB_RfqRoutePolicy::BEST_EFFORT),
-		"RFQ policy converter maps best_effort");
-	ok(polardb_route_rfq_policy_from_string("strict", fallback) ==
-			static_cast<int>(PolarDB_RfqRoutePolicy::STRICT),
-		"RFQ policy converter maps strict");
-	ok(polardb_route_rfq_policy_from_string("bad", fallback) == fallback,
-		"RFQ policy converter maps unknown value to caller default");
-	ok(polardb_route_rfq_policy_from_string("bad") ==
-			static_cast<int>(PolarDB_RfqRoutePolicy::STRICT),
-		"RFQ policy converter default fallback is strict");
+	const PolarDB_StringConversionCase wait_timeout_cases[] = {
+		{nullptr, fallback},
+		{"warning",
+			static_cast<int>(
+				PolarDB_LsnWaitTimeoutAction::WARNING)},
+		{"primary",
+			static_cast<int>(PolarDB_LsnWaitTimeoutAction::PRIMARY)},
+		{"error",
+			static_cast<int>(PolarDB_LsnWaitTimeoutAction::ERROR)},
+		{"disconnect",
+			static_cast<int>(
+				PolarDB_LsnWaitTimeoutAction::DISCONNECT)},
+		{"bad", fallback},
+	};
+	check_string_conversions(
+		wait_timeout_cases, polardb_lsn_wait_timeout_action_from_string,
+		fallback, "LSN wait timeout action");
+	ok(strcmp(polardb_lsn_wait_timeout_action_name(
+			PolarDB_LsnWaitTimeoutAction::WARNING), "warning") == 0,
+		"warning timeout action has a stable name");
+	ok(strcmp(polardb_lsn_wait_timeout_action_name(
+			PolarDB_LsnWaitTimeoutAction::PRIMARY), "primary") == 0,
+		"primary timeout action has a stable name");
+	ok(strcmp(polardb_lsn_wait_timeout_action_name(
+			PolarDB_LsnWaitTimeoutAction::ERROR), "error") == 0,
+		"error timeout action has a stable name");
+	ok(strcmp(polardb_lsn_wait_timeout_action_name(
+			PolarDB_LsnWaitTimeoutAction::DISCONNECT), "disconnect") == 0,
+		"disconnect timeout action has a stable name");
 
+	const PolarDB_StringConversionCase connection_loss_cases[] = {
+		{nullptr, fallback},
+		{"replica_then_primary",
+			static_cast<int>(
+				PolarDB_ReplicaLossAction::
+					REPLICA_THEN_PRIMARY)},
+		{"replica_then_error",
+			static_cast<int>(
+				PolarDB_ReplicaLossAction::
+					REPLICA_THEN_ERROR)},
+		{"primary",
+			static_cast<int>(
+				PolarDB_ReplicaLossAction::PRIMARY)},
+		{"error",
+			static_cast<int>(
+				PolarDB_ReplicaLossAction::ERROR)},
+		{"disconnect",
+			static_cast<int>(
+				PolarDB_ReplicaLossAction::DISCONNECT)},
+		{"bad", fallback},
+	};
+	check_string_conversions(
+		connection_loss_cases,
+		polardb_replica_loss_action_from_string,
+		fallback, "replica connection loss action");
+
+	const PolarDB_StringConversionCase reader_error_cases[] = {
+		{nullptr, fallback},
+		{"primary",
+			static_cast<int>(PolarDB_ReplicaErrorAction::PRIMARY)},
+		{"error",
+			static_cast<int>(PolarDB_ReplicaErrorAction::ERROR)},
+		{"disconnect",
+			static_cast<int>(PolarDB_ReplicaErrorAction::DISCONNECT)},
+		{"bad", fallback},
+	};
+	check_string_conversions(
+		reader_error_cases, polardb_replica_error_action_from_string,
+		fallback, "replica error action");
+
+	ok(!polardb_timeout_action_allows_global_lsn(
+			PolarDB_LsnWaitTimeoutAction::WARNING),
+		"global_lsn rejects warning");
+	ok(polardb_timeout_action_allows_global_lsn(
+			PolarDB_LsnWaitTimeoutAction::PRIMARY),
+		"global_lsn accepts primary");
+	ok(polardb_timeout_action_allows_global_lsn(
+			PolarDB_LsnWaitTimeoutAction::ERROR),
+		"global_lsn accepts error");
+	ok(polardb_timeout_action_allows_global_lsn(
+			PolarDB_LsnWaitTimeoutAction::DISCONNECT),
+		"global_lsn accepts disconnect");
+	ok(polardb_consistency_policy_error(
+			PolarDB_ConsistencyMode::GLOBAL_LSN,
+			PolarDB_MissingLsnAction::WARNING,
+			PolarDB_LsnWaitTimeoutAction::PRIMARY) != nullptr,
+		"global_lsn rejects a missing-LSN warning");
+	ok(polardb_hostgroup_lsn_source_error(
+			PolarDB_ConsistencyMode::SESSION_LSN,
+			PolarDB_ProxyProtocol::OFF) != nullptr,
+		"session_lsn rejects a hostgroup without RFQ LSN replies");
+	ok(polardb_hostgroup_lsn_source_error(
+			PolarDB_ConsistencyMode::SESSION_LSN,
+			PolarDB_ProxyProtocol::V15) == nullptr &&
+			polardb_hostgroup_lsn_source_error(
+				PolarDB_ConsistencyMode::SESSION_LSN,
+				PolarDB_ProxyProtocol::LEGACY) == nullptr,
+		"session_lsn accepts both RFQ-capable startup protocols");
+	ok(polardb_hostgroup_lsn_source_error(
+			PolarDB_ConsistencyMode::GLOBAL_LSN,
+			PolarDB_ProxyProtocol::OFF) == nullptr,
+		"global_lsn may use monitor group LSN without RFQ replies");
+	ok(polardb_wait_mode_for_timeout_action(
+			PolarDB_LsnWaitTimeoutAction::WARNING) ==
+			PolarDB_WaitMode::BEST_EFFORT,
+		"warning selects the backend best_effort wait mode");
+	ok(polardb_wait_mode_for_timeout_action(
+			PolarDB_LsnWaitTimeoutAction::PRIMARY) ==
+			PolarDB_WaitMode::STRICT,
+		"primary selects the backend strict wait mode");
+	ok(polardb_wait_mode_for_timeout_action(
+			PolarDB_LsnWaitTimeoutAction::ERROR) ==
+			PolarDB_WaitMode::STRICT,
+		"error selects the backend strict wait mode");
+	ok(polardb_wait_mode_for_timeout_action(
+			PolarDB_LsnWaitTimeoutAction::DISCONNECT) ==
+			PolarDB_WaitMode::STRICT,
+		"disconnect selects the backend strict wait mode");
+	ok(polardb_transaction_split_timeout_action(
+			PolarDB_LsnWaitTimeoutAction::WARNING, true) ==
+			PolarDB_LsnWaitTimeoutAction::PRIMARY,
+		"transaction split promotes warning to primary");
+	ok(polardb_transaction_split_timeout_action(
+			PolarDB_LsnWaitTimeoutAction::WARNING, false) ==
+			PolarDB_LsnWaitTimeoutAction::ERROR,
+		"transaction split without primary fallback promotes warning to error");
+	ok(polardb_transaction_split_timeout_action(
+			PolarDB_LsnWaitTimeoutAction::PRIMARY, true) ==
+			PolarDB_LsnWaitTimeoutAction::PRIMARY,
+		"transaction split keeps primary");
+	ok(polardb_transaction_split_timeout_action(
+			PolarDB_LsnWaitTimeoutAction::ERROR, true) ==
+			PolarDB_LsnWaitTimeoutAction::ERROR,
+		"transaction split keeps error");
+	ok(polardb_transaction_split_timeout_action(
+			PolarDB_LsnWaitTimeoutAction::DISCONNECT, true) ==
+			PolarDB_LsnWaitTimeoutAction::DISCONNECT,
+		"transaction split keeps disconnect");
+}
+
+static void test_read_target_and_fallback() {
+	const int fallback = -7;
+	const PolarDB_StringConversionCase target_cases[] = {
+		{nullptr, fallback}, {"default", fallback},
+		{"primary", static_cast<int>(PolarDB_ReadTarget::PRIMARY)},
+		{"replica", static_cast<int>(PolarDB_ReadTarget::REPLICA)},
+		{"bad", fallback},
+	};
+	check_string_conversions(
+		target_cases, polardb_read_target_from_string, fallback,
+		"read target");
+
+	ok(polardb_read_target_from_int(0) ==
+			PolarDB_ReadTarget::PRIMARY,
+		"read target value 0 is primary");
+	ok(polardb_read_target_from_int(1) ==
+			PolarDB_ReadTarget::REPLICA,
+		"read target value 1 is replica");
+	ok(polardb_read_target_from_int(99) ==
+			PolarDB_ReadTarget::PRIMARY,
+		"unknown read target value fails closed to primary");
+
+	const PolarDB_StringConversionCase fallback_cases[] = {
+		{nullptr, fallback}, {"default", fallback},
+		{"primary", static_cast<int>(PolarDB_ReadFallbackAction::PRIMARY)},
+		{"error", static_cast<int>(PolarDB_ReadFallbackAction::ERROR)},
+		{"bad", fallback},
+	};
+	check_string_conversions(
+		fallback_cases, polardb_read_fallback_action_from_string, fallback,
+		"read fallback action");
+
+	struct AcquireCase {
+		PolarDB_ReadFallbackAction fallback;
+		PolarDB_ReaderStatus status;
+		PolarDB_ReaderAcquireAction action;
+		const char* description;
+	};
+	const AcquireCase acquire_cases[] = {
+		{PolarDB_ReadFallbackAction::PRIMARY,
+			PolarDB_ReaderStatus::READER_BUSY,
+			PolarDB_ReaderAcquireAction::RETRY_READER,
+			"capacity waits before applying fallback"},
+		{PolarDB_ReadFallbackAction::ERROR,
+			PolarDB_ReaderStatus::READER_GROUP_BUSY,
+			PolarDB_ReaderAcquireAction::RETRY_READER,
+			"group capacity waits before applying fallback"},
+		{PolarDB_ReadFallbackAction::ERROR,
+			PolarDB_ReaderStatus::READER_UNAVAILABLE,
+			PolarDB_ReaderAcquireAction::RETURN_ERROR,
+			"error fallback rejects primary routing"},
+		{PolarDB_ReadFallbackAction::PRIMARY,
+			PolarDB_ReaderStatus::READER_UNAVAILABLE,
+			PolarDB_ReaderAcquireAction::USE_PRIMARY,
+			"primary fallback routes an unavailable replica read to primary"},
+	};
+	for (const auto& test_case : acquire_cases) {
+		ok(polardb_reader_acquire_action(
+				test_case.fallback, test_case.status) == test_case.action,
+			"%s", test_case.description);
+	}
+}
+
+static void test_policy_profiles() {
+	ok(polardb_profile_definitions().size() == 7,
+		"the public profile table contains seven named profiles");
+	ok(POLARDB_DEFAULT_PROFILE_DEFINITION.profile ==
+			PolarDB_Profile::SESSION_FALLBACK,
+		"the factory profile is session_fallback");
+
+	const PolarDB_ParsedGlobalConfigValue factory;
+	ok(factory.profile == static_cast<int>(
+				POLARDB_DEFAULT_PROFILE_DEFINITION.profile) &&
+			polardb_config_matches_profile(
+				factory, POLARDB_DEFAULT_PROFILE_DEFINITION.profile),
+		"the default configuration exactly matches the factory profile");
+
+	for (const PolarDB_ProfileDefinition& definition :
+			polardb_profile_definitions()) {
+		PolarDB_ParsedGlobalConfigValue config;
+		config.profile = static_cast<int>(PolarDB_Profile::CUSTOM);
+		config.lsn_wait_timeout_ms = 4321;
+		config.split_warmup_max_connections_per_request = 7;
+		config.startup.generation = 42;
+		config.startup.identity_mode = PolarDB_ProxyIdentityMode::CLIENT;
+		config.startup.configured_identity = {
+			"192.0.2.90", 15432, PolarDB_StartupIdentitySource::CONFIGURED_FALLBACK};
+
+		ok(polardb_apply_profile(definition.profile, &config),
+			"profile %s expands", definition.name);
+		ok(config.profile == static_cast<int>(definition.profile) &&
+				config.consistency_mode ==
+					static_cast<int>(definition.consistency) &&
+				config.read_target ==
+					static_cast<int>(definition.read_target) &&
+				config.read_fallback_action ==
+					static_cast<int>(definition.read_fallback),
+			"profile %s expands consistency and read placement", definition.name);
+		ok(config.missing_lsn_action ==
+					static_cast<int>(definition.missing_lsn) &&
+				config.lsn_wait_timeout_action ==
+					static_cast<int>(definition.lsn_timeout) &&
+				config.replica_error_action ==
+					static_cast<int>(definition.replica_error) &&
+				config.replica_loss_action ==
+					static_cast<int>(definition.replica_loss),
+			"profile %s expands all failure actions", definition.name);
+		ok(config.startup.proxy_protocol == definition.rfq_protocol &&
+				config.monitor_lsn_updates == definition.monitor_lsn_updates &&
+				config.split_warmup == definition.split_warmup,
+			"profile %s expands RFQ monitoring and warmup", definition.name);
+		ok(config.lsn_wait_timeout_ms == 4321 &&
+				config.split_warmup_max_connections_per_request == 7,
+			"profile %s preserves numeric tuning", definition.name);
+		ok(config.startup.generation == 42 &&
+				config.startup.identity_mode == PolarDB_ProxyIdentityMode::CLIENT &&
+				config.startup.configured_identity.host == "192.0.2.90" &&
+				config.startup.configured_identity.port == 15432,
+			"profile %s preserves startup identity", definition.name);
+		ok(polardb_config_matches_profile(config, definition.profile),
+			"profile %s matches its expanded bundle", definition.name);
+		ok(polardb_profile_from_string(definition.name, -1) ==
+				static_cast<int>(definition.profile) &&
+				strcmp(polardb_profile_name(definition.profile),
+					definition.name) == 0,
+			"profile %s has one parse/display spelling", definition.name);
+	}
+
+	ok(polardb_profile_from_string("custom", -1) ==
+			static_cast<int>(PolarDB_Profile::CUSTOM) &&
+			strcmp(polardb_profile_name(PolarDB_Profile::CUSTOM), "custom") == 0,
+		"custom is the derived profile name");
+
+	PolarDB_ParsedGlobalConfigValue custom;
+	ok(polardb_apply_profile(PolarDB_Profile::SESSION_FALLBACK, &custom),
+		"session_fallback expands before an override");
+	PolarDB_ParsedGlobalConfigValue changed = custom;
+	ok(polardb_update_profile_setting(
+			&changed, "polardb_action_lsn_timeout", "error") ==
+			PolarDB_ProfileSettingResult::UPDATED &&
+			!polardb_same_profile_owned_settings(custom, changed),
+		"an individual action changes the profile-owned bundle");
+	changed.profile = static_cast<int>(PolarDB_Profile::CUSTOM);
+	ok(polardb_global_policy_error(changed) == nullptr,
+		"a valid individual override is represented as custom");
+
+	PolarDB_ParsedGlobalConfigValue named_mismatch = changed;
+	named_mismatch.profile =
+		static_cast<int>(PolarDB_Profile::SESSION_FALLBACK);
+	ok(polardb_global_policy_error(named_mismatch) != nullptr,
+		"a named profile cannot describe a mismatched bundle");
+
+	PolarDB_ParsedGlobalConfigValue global_warning;
+	polardb_apply_profile(PolarDB_Profile::GLOBAL_FALLBACK, &global_warning);
+	global_warning.profile = static_cast<int>(PolarDB_Profile::CUSTOM);
+	global_warning.lsn_wait_timeout_action =
+		static_cast<int>(PolarDB_LsnWaitTimeoutAction::WARNING);
+	ok(polardb_global_policy_error(global_warning) != nullptr,
+		"global_lsn cannot return stale data after a timeout warning");
+	global_warning.lsn_wait_timeout_action =
+		static_cast<int>(PolarDB_LsnWaitTimeoutAction::PRIMARY);
+	global_warning.missing_lsn_action =
+		static_cast<int>(PolarDB_MissingLsnAction::WARNING);
+	ok(polardb_global_policy_error(global_warning) != nullptr,
+		"global_lsn cannot use a reader without an LSN target");
+
+	for (const PolarDB_ProfileSettingDefinition& setting :
+			polardb_profile_settings()) {
+		ok(polardb_profile_owns_setting(setting.name),
+			"profile owns %s", setting.name);
+	}
+	ok(!polardb_profile_owns_setting("polardb_lsn_wait_timeout_ms") &&
+			!polardb_profile_owns_setting(
+				"polardb_split_warmup_max_connections_per_request") &&
+			!polardb_profile_owns_setting("polardb_proxy_identity_host"),
+		"profiles preserve numeric tuning and startup identity");
 }
 
 int main() {
-	plan(111);
+	plan(NO_PLAN);
 	test_protocol_request_bits();
 	test_profile_components_distinguish_protocol_and_bits();
 	test_startup_parameters_consumed_by_proxy();
@@ -355,5 +660,7 @@ int main() {
 	test_startup_client_context_reuse_key();
 	test_configured_fallback_identity_set_validation();
 	test_string_converters();
+	test_read_target_and_fallback();
+	test_policy_profiles();
 	return exit_status();
 }

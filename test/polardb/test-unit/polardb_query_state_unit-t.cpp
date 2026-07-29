@@ -2,9 +2,9 @@
  * @file polardb_query_state_unit-t.cpp
  * @brief Unit tests for PolarDB_QueryState named-reset semantics.
  *
- * Domain: scoped per-query reset helpers (reset_reader_target, reset_wait,
- * reset_dispatch_wrapper, reset_for_new_query) and exactly which fields each one
- * clears versus preserves.
+ * Domain: scoped per-query reset helpers (reset_reader_plan, reset_wait,
+ * clear_reader_route, reset_dispatch_wrapper, reset_for_new_query) and exactly
+ * which fields each one clears versus preserves.
  */
 
 #include "tap.h"
@@ -19,11 +19,15 @@ static void test_query_state_named_reset_subsets() {
 	const int fallback_writer_hg = 20;
 
 	PolarDB_QueryState query;
-	query.reader_plan.primary_lsn = 700;
+	query.reader_plan.group_lsn = 700;
 	query.reader_plan.max_lag_bytes = 100;
 	query.reader_plan.fallback_writer_hg = fallback_writer_hg;
+	query.reader_plan.require_replica = true;
+	query.reader_wait_spec = PolarDB_WaitSpec::from_lsn(
+		500, POLARDB_DEFAULT_WAIT_TIMEOUT_MS,
+		PolarDB_WaitMode::BEST_EFFORT);
 	query.request_writer_scope = PolarDB_WriterScope{10, 7};
-	query.wait.prepare_from_spec(PolarDB_WaitSpec::lsn(
+	query.wait.prepare_from_spec(PolarDB_WaitSpec::from_lsn(
 		500, POLARDB_DEFAULT_WAIT_TIMEOUT_MS, PolarDB_WaitMode::BEST_EFFORT));
 	query.wait.timeout_error = true;
 	query.wait.fallback_writer_hg = fallback_writer_hg;
@@ -35,14 +39,19 @@ static void test_query_state_named_reset_subsets() {
 	query.wait_profile.target_source =
 		PolarDB_WaitProfileTargetSource::OBSERVED;
 #endif // POLARDB_PROFILE
+	query.original_query = "SELECT original";
 	query.wrapped_query_buf = "wrapped";
 	query.dispatch_wrapper_stmts = 3;
 	query.dispatch_wrapper_kind = PolarDB_Query_WrapperKind::CONSISTENCY_WAIT;
 	query.keep_session_lsn = true;
+	query.wait_bypass_target = 500;
 
-	query.reset_reader_target();
-	ok(query.reader_plan.fallback_writer_hg == -1,
+	query.reset_reader_plan();
+	ok(query.reader_plan.fallback_writer_hg == -1 &&
+			!query.reader_plan.require_replica,
 		"reader-target reset clears reader plan");
+	ok(!query.reader_wait_spec.has_wait(),
+		"reader-target reset clears pending reader wait input");
 	ok(query.request_writer_scope.valid(),
 		"reader-target reset preserves request writer scope");
 	// reader-target reset preserves staged wait state (each field separately).
@@ -73,13 +82,33 @@ static void test_query_state_named_reset_subsets() {
 		"wait reset preserves request writer scope");
 	ok(query.keep_session_lsn,
 		"wait reset keeps the per-query LSN choice");
+	ok(query.wait_bypass_target == 500,
+		"wait reset preserves the target already confirmed by the backend");
+	ok(query.original_query == "SELECT original",
+		"wait reset preserves the original SQL through RequestEnd");
 #if POLARDB_PROFILE
 	ok(!query.wait_profile.active,
 		"wait reset clears profile-only wait correlation state");
 	ok(query.wait_profile.target_source ==
 			PolarDB_WaitProfileTargetSource::UNKNOWN,
 		"wait reset clears profile-only target attribution");
-#endif // POLARDB_PROFILE
+	#endif // POLARDB_PROFILE
+
+	query.reader_plan.fallback_writer_hg = fallback_writer_hg;
+	query.reader_wait_spec = PolarDB_WaitSpec::from_lsn(
+		500, POLARDB_DEFAULT_WAIT_TIMEOUT_MS,
+		PolarDB_WaitMode::BEST_EFFORT);
+	query.wait.prepare_from_spec(PolarDB_WaitSpec::from_lsn(
+		500, POLARDB_DEFAULT_WAIT_TIMEOUT_MS, PolarDB_WaitMode::BEST_EFFORT));
+	query.wait_bypass_target = 500;
+	query.clear_reader_route();
+	ok(query.reader_plan.fallback_writer_hg == -1 &&
+			!query.reader_wait_spec.has_wait() &&
+			!query.wait.spec.has_wait() &&
+			query.wait_bypass_target == 0,
+		"reader-route clear removes the reader plan, wait, and bypass proof");
+	ok(query.request_writer_scope.valid() && query.keep_session_lsn,
+		"reader-route clear preserves request scope and response LSN choice");
 
 	query.reset_dispatch_wrapper();
 	// dispatch-wrapper reset clears only wrapper handoff metadata.
@@ -102,12 +131,68 @@ static void test_query_state_named_reset_subsets() {
 		"full query reset clears request writer scope");
 	ok(query.wrapped_query_buf.empty(),
 		"full query reset clears wrapper buffer");
+	ok(query.original_query.empty(),
+		"full query reset clears the stable original SQL");
 	ok(query.wait.wait_stage == PolarDB_WaitStage::IDLE,
 		"full query reset clears wait state");
 	ok(query.dispatch_wrapper_kind == PolarDB_Query_WrapperKind::NONE,
 		"full query reset clears dispatch state");
 	ok(!query.keep_session_lsn,
 		"full query reset clears the per-query LSN choice");
+	ok(query.wait_bypass_target == 0,
+		"full query reset clears the confirmed backend target");
+}
+
+static void test_query_state_extended_message_reset() {
+	PolarDB_QueryState query;
+	query.request_writer_scope = PolarDB_WriterScope{10, 7};
+	query.reader_plan.fallback_writer_hg = 10;
+	query.reader_plan.read_target =
+		static_cast<int>(PolarDB_ReadTarget::REPLICA);
+	query.reader_plan.consistency_mode =
+		PolarDB_ConsistencyMode::SESSION_LSN;
+	query.reader_wait_spec = PolarDB_WaitSpec::from_lsn(
+		500, POLARDB_DEFAULT_WAIT_TIMEOUT_MS,
+		PolarDB_WaitMode::BEST_EFFORT);
+	query.effective_consistency_mode =
+		static_cast<int>(PolarDB_ConsistencyMode::SESSION_LSN);
+	query.profile_enabled = true;
+	query.txn_split_enabled = true;
+	query.backend_isolation_status_needed = true;
+	query.reader_retry_attempts = 1;
+	query.wait.prepare_from_spec(PolarDB_WaitSpec::from_lsn(
+		500, POLARDB_DEFAULT_WAIT_TIMEOUT_MS,
+		PolarDB_WaitMode::BEST_EFFORT));
+	query.original_query = "SELECT original";
+	query.wrapped_query_buf = "temporary";
+	query.keep_session_lsn = true;
+	query.wait_bypass_target = 500;
+
+	query.reset_between_extended_messages();
+
+	ok(query.request_writer_scope.matches(PolarDB_WriterScope{10, 7}),
+		"extended-message reset preserves writer scope");
+	ok(query.reader_plan.fallback_writer_hg == 10 &&
+			query.reader_plan.read_target ==
+				static_cast<int>(PolarDB_ReadTarget::REPLICA),
+		"extended-message reset preserves selected reader policy");
+	ok(query.reader_wait_spec.has_wait() &&
+			query.reader_wait_spec.target == 500,
+		"extended-message reset preserves reader-selection wait input");
+	ok(query.effective_consistency_mode ==
+			static_cast<int>(PolarDB_ConsistencyMode::SESSION_LSN) &&
+			query.profile_enabled,
+		"extended-message reset preserves response consistency policy");
+	ok(query.txn_split_enabled &&
+			query.backend_isolation_status_needed,
+		"extended-message reset preserves request policy flags");
+	ok(query.reader_retry_attempts == 0,
+		"extended-message reset clears retry progress");
+	ok(!query.wait.spec.has_wait() && query.original_query.empty() &&
+			query.wrapped_query_buf.empty(),
+		"extended-message reset clears wait and query buffers");
+	ok(!query.keep_session_lsn && query.wait_bypass_target == 0,
+		"extended-message reset clears response-only state");
 }
 
 static void test_reader_plan_lag_cap_helpers() {
@@ -116,7 +201,7 @@ static void test_reader_plan_lag_cap_helpers() {
 	ok(plan.within_byte_cap(0),
 		"reader plan: byte cap disabled accepts missing replica LSN");
 
-	plan.primary_lsn = 200;
+	plan.group_lsn = 200;
 	plan.max_lag_bytes = 50;
 	ok(!plan.within_byte_cap(0),
 		"reader plan: byte cap rejects missing replica LSN");
@@ -125,9 +210,9 @@ static void test_reader_plan_lag_cap_helpers() {
 	ok(plan.within_byte_cap(150),
 		"reader plan: byte cap accepts replica at cap boundary");
 	ok(plan.within_byte_cap(200),
-		"reader plan: byte cap accepts replica at primary LSN");
+		"reader plan: byte cap accepts replica at group LSN");
 	ok(plan.within_byte_cap(201),
-		"reader plan: byte cap accepts replica ahead of primary LSN");
+		"reader plan: byte cap accepts replica ahead of group LSN");
 }
 
 static void test_transaction_split_state_reset_contract() {
@@ -265,16 +350,32 @@ static void test_transaction_split_state_rfq_observation() {
 		"transaction split observation: idle RFQ clears XIDs");
 }
 
+static void test_no_write_xids_marker() {
+	ok(polardb_rfq_is_prewrite_split_candidate('T', "", true, false),
+		"no-write-XID marker: active split-safe transaction with empty XIDs matches");
+	ok(!polardb_rfq_is_prewrite_split_candidate('I', "", true, false),
+		"no-write-XID marker: idle status does not match");
+	ok(!polardb_rfq_is_prewrite_split_candidate('T', nullptr, true, false),
+		"no-write-XID marker: missing XID payload does not match");
+	ok(!polardb_rfq_is_prewrite_split_candidate('T', "10", true, false),
+		"no-write-XID marker: a write XID does not match");
+	ok(!polardb_rfq_is_prewrite_split_candidate('T', "", false, false),
+		"no-write-XID marker: split denial does not match");
+	ok(!polardb_rfq_is_prewrite_split_candidate('T', "", true, true),
+		"no-write-XID marker: pending WAL does not match");
+}
+
 int main() {
-	// 25 named-reset + 6 reader-plan + 13 reset + 34 RFQ-observation checks = 78.
 #if POLARDB_PROFILE
-	plan(80);
+	plan(101);
 #else
-	plan(78);
+	plan(99);
 #endif // POLARDB_PROFILE
 	test_query_state_named_reset_subsets();
+	test_query_state_extended_message_reset();
 	test_reader_plan_lag_cap_helpers();
 	test_transaction_split_state_reset_contract();
 	test_transaction_split_state_rfq_observation();
+	test_no_write_xids_marker();
 	return exit_status();
 }

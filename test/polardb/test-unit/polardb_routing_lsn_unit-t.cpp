@@ -34,12 +34,12 @@ static void test_session_lsn_target_uses_max_position() {
 	PolarDB_SessionConsistency session;
 	ok(session.target() == 0,
 		"empty session has no monotonic LSN target");
-	session.write_lsn = 120;
-	ok(session.target() == 120,
-		"write LSN is the target when no observed LSN exists");
 	session.observed_lsn = 140;
+	ok(session.write_lsn == 0 && session.target() == 140,
+		"read-only autocommit session uses its last observed LSN");
+	session.write_lsn = 120;
 	ok(session.target() == 140,
-		"observed LSN can advance the monotonic target beyond write LSN");
+		"older write LSN cannot lower the observed read target");
 	session.write_lsn = 160;
 	ok(session.target() == 160,
 		"write LSN remains the target when it is newer than observed LSN");
@@ -47,7 +47,7 @@ static void test_session_lsn_target_uses_max_position() {
 
 static void test_wait_plan_uses_monotonic_session_lsn() {
 	PolarDB_SessionConsistency session;
-	session.write_lsn = 200;
+	session.write_lsn = 0;
 	session.observed_lsn = 240;
 
 	PolarDB_Query_WaitPlan wait_plan = PolarDB_Query_WaitPlan::build_consistency(
@@ -59,30 +59,31 @@ static void test_wait_plan_uses_monotonic_session_lsn() {
 
 	ok(wait_plan.has_wait(), "SESSION_LSN with monotonic target builds an LSN wait");
 	ok(wait_plan.spec.type == PolarDB_WaitType::LSN, "wait plan uses LSN wait type");
-	ok(wait_plan.spec.target == 240, "wait target is max(write_lsn, observed_lsn)");
+	ok(wait_plan.spec.target == 240,
+		"later autocommit read waits for the read-only session observation");
 	ok(wait_plan.spec.timeout_ms == 750, "wait plan preserves resolved timeout");
 	ok(wait_plan.spec.mode == PolarDB_WaitMode::STRICT, "wait plan preserves wait mode");
 	ok(wait_plan.route_hint == PolarDB_Query_ConsistencyRouteHint::REPLICA,
 		"wait plan keeps replica route hint when preferred");
 }
 
-static void test_global_lsn_target_uses_session_and_writer_max() {
+static void test_global_lsn_target_uses_session_and_group_max() {
 	PolarDB_SessionConsistency session;
 	session.write_lsn = 120;
 	session.observed_lsn = 140;
 
-	bool primary_lsn_unknown = true;
-	uint64_t target = session.target_with_global_lsn(200, &primary_lsn_unknown);
-	ok(!primary_lsn_unknown, "GLOBAL_LSN has a known target when writer mirror exists");
-	ok(target == 200, "GLOBAL_LSN target can advance to writer mirror LSN");
+	bool group_lsn_unknown = true;
+	uint64_t target = session.target_with_global_lsn(200, &group_lsn_unknown);
+	ok(!group_lsn_unknown, "GLOBAL_LSN has a target when the group LSN is known");
+	ok(target == 200, "GLOBAL_LSN target can advance to the group LSN");
 
-	target = session.target_with_global_lsn(130, &primary_lsn_unknown);
-	ok(!primary_lsn_unknown, "GLOBAL_LSN keeps known state with older writer mirror");
+	target = session.target_with_global_lsn(130, &group_lsn_unknown);
+	ok(!group_lsn_unknown, "GLOBAL_LSN stays valid when the group LSN is older");
 	ok(target == 140, "GLOBAL_LSN target preserves newer session-observed LSN");
 
-	target = session.target_with_global_lsn(0, &primary_lsn_unknown);
-	ok(primary_lsn_unknown, "GLOBAL_LSN reports unknown when writer mirror is missing");
-	ok(target == 0, "GLOBAL_LSN missing writer mirror does not invent a target");
+	target = session.target_with_global_lsn(0, &group_lsn_unknown);
+	ok(group_lsn_unknown, "GLOBAL_LSN reports a missing group LSN");
+	ok(target == 0, "GLOBAL_LSN does not invent a missing group LSN");
 
 	PolarDB_Query_WaitPlan wait_plan = PolarDB_Query_WaitPlan::build_consistency(
 		PolarDB_ConsistencyMode::GLOBAL_LSN,
@@ -99,17 +100,17 @@ static void test_global_lsn_target_uses_session_and_writer_max() {
 			PolarDB_ConsistencyMode::SESSION_LSN),
 		"SESSION_LSN can still use configured RFQ best-effort degradation");
 
-	target = polardb_target_with_global_lsn(900, 1200, &primary_lsn_unknown);
-	ok(!primary_lsn_unknown, "GLOBAL_LSN helper has a known writer mirror target");
-	ok(target == 1200, "GLOBAL_LSN helper advances split target to writer mirror");
+	target = polardb_target_with_global_lsn(900, 1200, &group_lsn_unknown);
+	ok(!group_lsn_unknown, "GLOBAL_LSN helper accepts a known group LSN");
+	ok(target == 1200, "GLOBAL_LSN helper advances a split target to the group LSN");
 
-	target = polardb_target_with_global_lsn(1300, 1200, &primary_lsn_unknown);
-	ok(!primary_lsn_unknown, "GLOBAL_LSN helper keeps known state with older mirror");
+	target = polardb_target_with_global_lsn(1300, 1200, &group_lsn_unknown);
+	ok(!group_lsn_unknown, "GLOBAL_LSN helper accepts an older group LSN");
 	ok(target == 1300, "GLOBAL_LSN helper preserves newer local split target");
 
-	target = polardb_target_with_global_lsn(900, 0, &primary_lsn_unknown);
-	ok(primary_lsn_unknown, "GLOBAL_LSN helper reports unknown missing mirror");
-	ok(target == 0, "GLOBAL_LSN helper does not route split with missing mirror");
+	target = polardb_target_with_global_lsn(900, 0, &group_lsn_unknown);
+	ok(group_lsn_unknown, "GLOBAL_LSN helper reports a missing group LSN");
+	ok(target == 0, "GLOBAL_LSN helper does not route a split without a group LSN");
 }
 
 static void test_wait_plan_modes_and_zero_target() {
@@ -123,15 +124,15 @@ static void test_wait_plan_modes_and_zero_target() {
 	ok(off_plan.route_hint == PolarDB_Query_ConsistencyRouteHint::NONE,
 		"OFF mode with no reader preference has no route hint");
 
-	PolarDB_Query_WaitPlan primary_plan = PolarDB_Query_WaitPlan::build_consistency(
-		PolarDB_ConsistencyMode::PRIMARY_ONLY,
+	PolarDB_Query_WaitPlan eventual_plan = PolarDB_Query_WaitPlan::build_consistency(
+		PolarDB_ConsistencyMode::EVENTUAL,
 		700,
 		750,
 		PolarDB_WaitMode::STRICT,
 		/*prefer_replica=*/true);
-	ok(!primary_plan.has_wait(), "PRIMARY mode builds no wait");
-	ok(primary_plan.route_hint == PolarDB_Query_ConsistencyRouteHint::PRIMARY,
-		"PRIMARY mode returns primary route hint");
+	ok(!eventual_plan.has_wait(), "EVENTUAL mode builds no wait");
+	ok(eventual_plan.route_hint == PolarDB_Query_ConsistencyRouteHint::REPLICA,
+		"EVENTUAL mode keeps the placement-selected reader hint");
 
 	PolarDB_Query_WaitPlan zero_target = PolarDB_Query_WaitPlan::build_consistency(
 		PolarDB_ConsistencyMode::SESSION_LSN,
@@ -146,45 +147,103 @@ static void test_wait_plan_modes_and_zero_target() {
 		"SESSION_LSN zero target remains reader-eligible");
 }
 
-// ---- RFQ-unavailable route policy ----
+// ---- missing-LSN action ----
 
-static void test_rfq_unavailable_route_policy() {
-	PolarDB_Query_RoutePlan strict = PolarDB_Query_RoutePlan::rfq_unavailable(
+static void test_missing_lsn_action() {
+	PolarDB_Query_RoutePlan primary = PolarDB_Query_RoutePlan::missing_lsn(
 		PolarDB_Query_RoutePlan::RouteActionReason::WRITE_LSN_UNKNOWN,
-		(int)PolarDB_RfqRoutePolicy::STRICT,
+		static_cast<int>(PolarDB_MissingLsnAction::PRIMARY),
+		static_cast<int>(PolarDB_ReadFallbackAction::ERROR),
 		10,
 		20);
-	ok(strict.action == PolarDB_Query_RoutePlan::RouteAction::FORCE_PRIMARY,
-		"STRICT RFQ-unavailable policy forces primary");
-	ok(strict.target_hg == 10, "STRICT RFQ-unavailable policy targets writer");
-	ok(strict.action_reason == PolarDB_Query_RoutePlan::RouteActionReason::WRITE_LSN_UNKNOWN,
-		"STRICT RFQ-unavailable policy preserves action reason");
-	ok(!strict.degraded_rfq_route, "STRICT RFQ-unavailable policy is not degraded");
+	ok(primary.action == PolarDB_Query_RoutePlan::RouteAction::FORCE_PRIMARY,
+		"primary action sends a missing-LSN read to the primary");
+	ok(primary.target_hg == 10, "primary action targets the primary hostgroup");
+	ok(primary.action_reason ==
+			PolarDB_Query_RoutePlan::RouteActionReason::WRITE_LSN_UNKNOWN,
+		"primary action preserves the missing-LSN reason");
+	ok(!primary.degraded_rfq_route,
+		"primary action does not mark a degraded reader route");
 
-	PolarDB_Query_RoutePlan best_effort = PolarDB_Query_RoutePlan::rfq_unavailable(
+	PolarDB_Query_RoutePlan warning =
+		PolarDB_Query_RoutePlan::missing_lsn(
 		PolarDB_Query_RoutePlan::RouteActionReason::OBSERVED_LSN_UNKNOWN,
-		(int)PolarDB_RfqRoutePolicy::BEST_EFFORT,
+		static_cast<int>(PolarDB_MissingLsnAction::WARNING),
+		static_cast<int>(PolarDB_ReadFallbackAction::ERROR),
 		10,
 		20);
-	ok(best_effort.action == PolarDB_Query_RoutePlan::RouteAction::PASSTHROUGH,
-		"BEST_EFFORT RFQ-unavailable policy routes without wait");
-	ok(best_effort.target_hg == 20, "BEST_EFFORT RFQ-unavailable policy targets reader");
-	ok(best_effort.action_reason == PolarDB_Query_RoutePlan::RouteActionReason::OBSERVED_LSN_UNKNOWN,
-		"BEST_EFFORT RFQ-unavailable policy preserves observed-unknown reason");
-	ok(best_effort.degraded_rfq_route, "BEST_EFFORT RFQ-unavailable policy marks degraded route");
+	ok(warning.action ==
+			PolarDB_Query_RoutePlan::RouteAction::PASSTHROUGH,
+		"warning routes without an LSN wait");
+	ok(warning.target_hg == 20,
+		"warning targets the reader hostgroup");
+	ok(warning.action_reason ==
+			PolarDB_Query_RoutePlan::RouteActionReason::OBSERVED_LSN_UNKNOWN,
+		"warning preserves the missing-LSN reason");
+	ok(warning.degraded_rfq_route,
+		"warning marks the degraded reader route");
 
-	PolarDB_Query_RoutePlan best_effort_no_degrade = PolarDB_Query_RoutePlan::rfq_unavailable(
-		PolarDB_Query_RoutePlan::RouteActionReason::WRITE_LSN_UNKNOWN,
-		(int)PolarDB_RfqRoutePolicy::BEST_EFFORT,
-		10,
+	PolarDB_Query_RoutePlan reader_disallowed =
+		PolarDB_Query_RoutePlan::missing_lsn(
+			PolarDB_Query_RoutePlan::RouteActionReason::WRITE_LSN_UNKNOWN,
+			static_cast<int>(PolarDB_MissingLsnAction::WARNING),
+			static_cast<int>(PolarDB_ReadFallbackAction::PRIMARY),
+			10,
 		20,
 		false);
-	ok(best_effort_no_degrade.action == PolarDB_Query_RoutePlan::RouteAction::FORCE_PRIMARY,
-		"BEST_EFFORT RFQ-unavailable policy can use writer when degradation is disabled");
-	ok(best_effort_no_degrade.target_hg == 10,
-		"BEST_EFFORT no-degrade path targets writer");
-	ok(!best_effort_no_degrade.degraded_rfq_route,
-		"BEST_EFFORT no-degrade path does not mark degraded route");
+	ok(reader_disallowed.action ==
+			PolarDB_Query_RoutePlan::RouteAction::FORCE_PRIMARY,
+		"warning uses the writer when a reader without a target is forbidden");
+	ok(reader_disallowed.target_hg == 10,
+		"reader-disallowed path targets the writer");
+	ok(!reader_disallowed.degraded_rfq_route,
+		"reader-disallowed path is not marked as a degraded reader route");
+
+	PolarDB_Query_RoutePlan reader_disallowed_error =
+		PolarDB_Query_RoutePlan::missing_lsn(
+			PolarDB_Query_RoutePlan::RouteActionReason::WRITE_LSN_UNKNOWN,
+			static_cast<int>(PolarDB_MissingLsnAction::WARNING),
+			static_cast<int>(PolarDB_ReadFallbackAction::ERROR),
+			10,
+			20,
+			false);
+	ok(reader_disallowed_error.action ==
+			PolarDB_Query_RoutePlan::RouteAction::RETURN_ERROR,
+		"unsafe warning returns an error when primary fallback is disabled");
+	ok(reader_disallowed_error.target_hg == -1,
+		"unsafe warning error does not select a backend hostgroup");
+
+	PolarDB_Query_RoutePlan primary_action_with_unsafe_reader =
+		PolarDB_Query_RoutePlan::missing_lsn(
+			PolarDB_Query_RoutePlan::RouteActionReason::WRITE_LSN_UNKNOWN,
+			static_cast<int>(PolarDB_MissingLsnAction::PRIMARY),
+			static_cast<int>(PolarDB_ReadFallbackAction::ERROR),
+			10,
+			20,
+			false);
+	ok(primary_action_with_unsafe_reader.action ==
+			PolarDB_Query_RoutePlan::RouteAction::FORCE_PRIMARY,
+		"the missing-LSN primary action is independent of reader availability policy");
+	ok(primary_action_with_unsafe_reader.target_hg == 10,
+		"the missing-LSN primary action selects the primary");
+
+	PolarDB_Query_RoutePlan error_plan =
+		PolarDB_Query_RoutePlan::missing_lsn(
+			PolarDB_Query_RoutePlan::RouteActionReason::GROUP_LSN_UNKNOWN,
+			static_cast<int>(PolarDB_MissingLsnAction::ERROR),
+			static_cast<int>(PolarDB_ReadFallbackAction::PRIMARY),
+			10,
+			20);
+	ok(error_plan.action ==
+			PolarDB_Query_RoutePlan::RouteAction::RETURN_ERROR,
+		"error ends a request whose LSN target is unavailable");
+	ok(error_plan.target_hg == -1,
+		"error does not select a backend hostgroup");
+	ok(error_plan.action_reason ==
+			PolarDB_Query_RoutePlan::RouteActionReason::GROUP_LSN_UNKNOWN,
+		"error preserves the missing-LSN reason");
+	ok(!error_plan.degraded_rfq_route,
+		"error is not marked as a degraded reader route");
 }
 
 // ---- query shapes that require primary ----
@@ -270,6 +329,12 @@ static void test_txn_split_query_shape_classifier() {
 			"SELECT * FROM t FOR -- comment\n UPDATE"),
 		"transaction split classifier accepts line comment inside locking clause");
 	ok(PolarDB_Protocol::is_locking_select_query(
+			"/* route comment */ SELECT * FROM t FOR UPDATE"),
+		"locking SELECT classifier accepts ProxySQL's SELECT command classification after a leading comment");
+	ok(PolarDB_Protocol::is_locking_select_query(
+			"WITH q AS (SELECT 1) SELECT * FROM t FOR SHARE"),
+		"locking SELECT classifier finds a locking clause after a WITH query prefix");
+	ok(PolarDB_Protocol::is_locking_select_query(
 			"SELECT * FROM t WHERE note=$tag$x for$tag$ FOR UPDATE"),
 		"transaction split classifier finds locking FOR after dollar quote");
 	ok(!PolarDB_Protocol::is_locking_select_query("SELECT 'for update'"),
@@ -286,13 +351,24 @@ static void test_txn_split_query_shape_classifier() {
 	ok(PolarDB_Protocol::is_write_query(
 			"SELECT * FROM t FOR UPDATE", PGSQL_QUERY_SELECT),
 		"routing write classifier treats locking SELECT as writer-only");
-	ok(!PolarDB_Protocol::is_write_lsn_query(
+	ok(!PolarDB_Protocol::should_advance_session_write_lsn(
 			"SELECT * FROM t FOR UPDATE", PGSQL_QUERY_SELECT),
 		"result LSN classifier keeps locking SELECT out of write LSN state");
-	ok(PolarDB_Protocol::is_write_lsn_query(
+	ok(PolarDB_Protocol::should_advance_session_write_lsn(
 			"UPDATE t SET v = 1", PGSQL_QUERY_UPDATE),
 		"result LSN classifier accepts UPDATE as write-producing");
-	ok(!PolarDB_Protocol::is_write_lsn_query(
+	const char* modifying_cte =
+		"WITH changed AS (UPDATE t SET v = 2 RETURNING v) SELECT * FROM changed";
+	ok(!PolarDB_Protocol::is_write_query(
+			modifying_cte, PGSQL_QUERY_SELECT),
+		"routing classifier documents the current parser limitation for a data-modifying CTE");
+	ok(!PolarDB_Protocol::should_advance_session_write_lsn(
+			modifying_cte, PGSQL_QUERY_SELECT),
+		"result classifier documents that parser-classified CTE does not advance write LSN");
+	ok(PolarDB_Protocol::should_advance_session_write_lsn(
+			modifying_cte, PGSQL_QUERY_UNKNOWN),
+		"result classifier treats the same CTE as a write when command type is unknown");
+	ok(!PolarDB_Protocol::should_advance_session_write_lsn(
 			"/* comment */ SELECT * FROM t FOR UPDATE",
 			PGSQL_QUERY_SELECT),
 		"result LSN classifier trusts ProxySQL SELECT command classification");
@@ -444,21 +520,23 @@ static void test_txn_split_route_plan_factory() {
 		"transaction split plan carries XID view");
 	ok(plan.reader.fallback_writer_hg == 10,
 		"transaction split plan records writer fallback");
+	ok(plan.reader.require_replica,
+		"transaction split plan excludes the physical writer endpoint");
 }
 
-// ---- positioned-RFQ source classification & writer-scope match matrix ----
+// ---- backend hostgroup classification & writer-scope match matrix ----
 
-static void test_positioned_rfq_primary_source_classification() {
-	ok(polardb_positioned_rfq_from_primary(true, 10, 10),
-		"positioned RFQ from writer hostgroup is primary-sourced");
-	ok(!polardb_positioned_rfq_from_primary(true, 20, 10),
-		"positioned RFQ from reader hostgroup is not primary-sourced");
-	ok(!polardb_positioned_rfq_from_primary(false, 10, 10),
-		"non-PolarDB hostgroup is not primary-sourced for sticky flag repair");
-	ok(!polardb_positioned_rfq_from_primary(true, -1, 10),
-		"missing backend hostgroup is not primary-sourced");
-	ok(!polardb_positioned_rfq_from_primary(true, 10, -1),
-		"missing writer hostgroup is not primary-sourced");
+static void test_backend_writer_hostgroup_classification() {
+	ok(polardb_backend_is_writer_hostgroup(true, 10, 10),
+		"writer hostgroup classification accepts the configured writer");
+	ok(!polardb_backend_is_writer_hostgroup(true, 20, 10),
+		"writer hostgroup classification rejects a reader hostgroup");
+	ok(!polardb_backend_is_writer_hostgroup(false, 10, 10),
+		"writer hostgroup classification rejects a non-PolarDB hostgroup");
+	ok(!polardb_backend_is_writer_hostgroup(true, -1, 10),
+		"writer hostgroup classification rejects a missing backend hostgroup");
+	ok(!polardb_backend_is_writer_hostgroup(true, 10, -1),
+		"writer hostgroup classification rejects a missing writer hostgroup");
 }
 
 static void test_rfq_result_update_group_epoch_check() {
@@ -474,19 +552,19 @@ static void test_session_lsn_scope_check() {
 }
 
 int main() {
-	plan(144);
+	plan(164);
 	test_route_action_values_are_append_only();
 	test_session_lsn_target_uses_max_position();
 	test_wait_plan_uses_monotonic_session_lsn();
-	test_global_lsn_target_uses_session_and_writer_max();
+	test_global_lsn_target_uses_session_and_group_max();
 	test_wait_plan_modes_and_zero_target();
-	test_rfq_unavailable_route_policy();
+	test_missing_lsn_action();
 	test_query_shapes_require_primary_without_degradation();
 	test_txn_split_query_shape_classifier();
 	test_zero_lsn_safe_statement_classifier();
 	test_txn_split_rejection_reason();
 	test_txn_split_route_plan_factory();
-	test_positioned_rfq_primary_source_classification();
+	test_backend_writer_hostgroup_classification();
 	test_rfq_result_update_group_epoch_check();
 	test_session_lsn_scope_check();
 	return exit_status();
