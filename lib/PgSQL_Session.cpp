@@ -5218,7 +5218,6 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 #endif // POLARDB_PROXY
 #if POLARDB_PROXY
 	std::string session_default_isolation;
-	std::string session_transaction_scope;
 	bool session_default_update = false;
 	if (RE2::FullMatch(nq,
 			"(?i)\\s*SET\\s+SESSION\\s+CHARACTERISTICS\\s+AS\\s+"
@@ -5227,11 +5226,11 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 			&session_default_isolation)) {
 		session_default_update = true;
 	} else if (RE2::FullMatch(nq,
-			"(?i)\\s*SET\\s+(SESSION\\s+)?TRANSACTION\\s+"
+			"(?i)\\s*SET\\s+TRANSACTION\\s+"
 			"ISOLATION\\s+LEVEL\\s+"
 			"(READ\\s+UNCOMMITTED|READ\\s+COMMITTED|REPEATABLE\\s+READ|SERIALIZABLE)\\s*;?\\s*",
-			&session_transaction_scope, &session_default_isolation)) {
-		session_default_update = !session_transaction_scope.empty();
+			&session_default_isolation)) {
+		session_default_update = false;
 	}
 	if (!session_default_isolation.empty()) {
 		if (session_default_update && is_in_transaction()) {
@@ -6387,6 +6386,11 @@ void PgSQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 					thread, polardb_wait_spec.target,
 					reader_lsn, reader_lsn_fresh,
 					0, false);
+#if POLARDB_PROFILE
+				polardb_profile_note_reader_connection(
+					polardb_wait_spec, polardb_query.reader_plan,
+					reader_result.conn);
+#endif // POLARDB_PROFILE
 			}
 			if (reader_result.acquired() &&
 					polardb_reader_capacity_wait.active) {

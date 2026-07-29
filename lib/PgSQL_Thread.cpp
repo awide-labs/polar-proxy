@@ -206,6 +206,146 @@ void polardb_count_reader_target_selection(
 	}
 }
 
+#if POLARDB_PROFILE
+static void polardb_count_txn_wait_elapsed_bucket(
+		PgSQL_Thread* thread, unsigned long long elapsed_us) {
+	if (elapsed_us <= 1000) {
+		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, txn_wait_lsn_elapsed_le_1ms);
+	} else if (elapsed_us <= 5000) {
+		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, txn_wait_lsn_elapsed_le_5ms);
+	} else if (elapsed_us <= 10000) {
+		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, txn_wait_lsn_elapsed_le_10ms);
+	} else if (elapsed_us <= 50000) {
+		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, txn_wait_lsn_elapsed_le_50ms);
+	} else if (elapsed_us <= 100000) {
+		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, txn_wait_lsn_elapsed_le_100ms);
+	} else if (elapsed_us <= 500000) {
+		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, txn_wait_lsn_elapsed_le_500ms);
+	} else if (elapsed_us <= 1000000) {
+		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, txn_wait_lsn_elapsed_le_1s);
+	} else {
+		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, txn_wait_lsn_elapsed_gt_1s);
+	}
+}
+
+void polardb_count_wait_profile_completion(
+		PgSQL_Thread* thread,
+		const PolarDB_WaitProfileState& state,
+		unsigned long long elapsed_us) {
+	if (!state.active) {
+		return;
+	}
+
+	if (state.target_mismatch) {
+		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, wait_profile_target_mismatch);
+	}
+
+	switch (state.context) {
+	case PolarDB_WaitProfileContext::TXN_PREWRITE:
+		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, txn_wait_lsn_count);
+		POLARDB_PROFILE_THREAD_COUNT(thread, txn_wait_lsn_sum_us, elapsed_us);
+		polardb_count_txn_wait_elapsed_bucket(thread, elapsed_us);
+		break;
+	case PolarDB_WaitProfileContext::ORDINARY:
+		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, wait_profile_ordinary_count);
+		POLARDB_PROFILE_THREAD_COUNT(thread, wait_profile_ordinary_sum_us, elapsed_us);
+		break;
+	case PolarDB_WaitProfileContext::TXN_SPLIT:
+	case PolarDB_WaitProfileContext::UNKNOWN:
+		break;
+	}
+
+#define POLARDB_COUNT_WAIT_PROFILE_PAIR(name) do { \
+	POLARDB_PROFILE_THREAD_COUNT_ONE(thread, wait_profile_##name##_count); \
+	POLARDB_PROFILE_THREAD_COUNT(thread, wait_profile_##name##_sum_us, elapsed_us); \
+} while (0)
+
+	switch (state.target_source) {
+	case PolarDB_WaitProfileTargetSource::WRITE:
+		POLARDB_COUNT_WAIT_PROFILE_PAIR(target_write);
+		break;
+	case PolarDB_WaitProfileTargetSource::OBSERVED:
+		POLARDB_COUNT_WAIT_PROFILE_PAIR(target_observed);
+		break;
+	case PolarDB_WaitProfileTargetSource::SESSION_EQUAL:
+		POLARDB_COUNT_WAIT_PROFILE_PAIR(target_session_equal);
+		break;
+	case PolarDB_WaitProfileTargetSource::GLOBAL:
+		POLARDB_COUNT_WAIT_PROFILE_PAIR(target_global);
+		break;
+	case PolarDB_WaitProfileTargetSource::TXN_PRIMARY:
+		POLARDB_COUNT_WAIT_PROFILE_PAIR(target_txn_primary);
+		break;
+	case PolarDB_WaitProfileTargetSource::UNKNOWN:
+		POLARDB_COUNT_WAIT_PROFILE_PAIR(target_unknown);
+		break;
+	}
+
+	if (!state.selection_compared) {
+		POLARDB_COUNT_WAIT_PROFILE_PAIR(selection_unknown);
+	} else if (state.selected_behind_best) {
+		POLARDB_COUNT_WAIT_PROFILE_PAIR(selected_behind_best);
+	} else {
+		POLARDB_COUNT_WAIT_PROFILE_PAIR(selected_best);
+	}
+
+	if (state.target_source == PolarDB_WaitProfileTargetSource::OBSERVED) {
+		if (state.observed_source_server_token == 0 ||
+				state.selected_server_token == 0) {
+			POLARDB_COUNT_WAIT_PROFILE_PAIR(observed_reader_unknown);
+		} else if (state.observed_source_server_token ==
+				state.selected_server_token) {
+			POLARDB_COUNT_WAIT_PROFILE_PAIR(observed_same_reader);
+		} else {
+			POLARDB_COUNT_WAIT_PROFILE_PAIR(observed_cross_reader);
+		}
+	}
+
+	if (!state.selection_recorded || !state.selected_lsn_known) {
+		POLARDB_COUNT_WAIT_PROFILE_PAIR(gap_unknown);
+	} else if (!state.selected_lsn_fresh) {
+		POLARDB_COUNT_WAIT_PROFILE_PAIR(gap_stale);
+	} else if (state.selected_gap_bytes == 0) {
+		POLARDB_COUNT_WAIT_PROFILE_PAIR(gap_zero);
+	} else if (state.selected_gap_bytes <= 4ULL * 1024ULL) {
+		POLARDB_COUNT_WAIT_PROFILE_PAIR(gap_le_4kb);
+	} else if (state.selected_gap_bytes <= 64ULL * 1024ULL) {
+		POLARDB_COUNT_WAIT_PROFILE_PAIR(gap_le_64kb);
+	} else if (state.selected_gap_bytes <= 1024ULL * 1024ULL) {
+		POLARDB_COUNT_WAIT_PROFILE_PAIR(gap_le_1mb);
+	} else if (state.selected_gap_bytes <= 16ULL * 1024ULL * 1024ULL) {
+		POLARDB_COUNT_WAIT_PROFILE_PAIR(gap_le_16mb);
+	} else {
+		POLARDB_COUNT_WAIT_PROFILE_PAIR(gap_gt_16mb);
+	}
+
+	if (!state.selected_lsn_age_known) {
+		POLARDB_COUNT_WAIT_PROFILE_PAIR(lsn_age_unknown);
+	} else if (state.selected_lsn_age_us <= 100) {
+		POLARDB_COUNT_WAIT_PROFILE_PAIR(lsn_age_le_100us);
+	} else if (state.selected_lsn_age_us <= 1000) {
+		POLARDB_COUNT_WAIT_PROFILE_PAIR(lsn_age_le_1ms);
+	} else if (state.selected_lsn_age_us <= 5000) {
+		POLARDB_COUNT_WAIT_PROFILE_PAIR(lsn_age_le_5ms);
+	} else {
+		POLARDB_COUNT_WAIT_PROFILE_PAIR(lsn_age_gt_5ms);
+	}
+
+	if (state.selection_recorded && state.selected_lsn_fresh) {
+		POLARDB_PROFILE_THREAD_COUNT(
+			thread, wait_profile_selected_gap_sum_bytes,
+			state.selected_gap_bytes);
+	}
+	if (state.selected_behind_best) {
+		POLARDB_PROFILE_THREAD_COUNT(
+			thread, wait_profile_selection_loss_sum_bytes,
+			state.selection_loss_bytes);
+	}
+
+#undef POLARDB_COUNT_WAIT_PROFILE_PAIR
+}
+#endif // POLARDB_PROFILE
+
 static bool polardb_parse_proxy_identity_port(const char* value, int* port) {
 	if (!value || !*value || !port) return false;
 

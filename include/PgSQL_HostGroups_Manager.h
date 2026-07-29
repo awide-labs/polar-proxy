@@ -1465,6 +1465,77 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 		std::atomic<unsigned long long> polardb_split_reader_acquire_count{0}; // split reader acquisition latency samples
 		std::atomic<unsigned long long> polardb_split_wrapper_build_sum_us{0}; // split wrapper build latency total
 		std::atomic<unsigned long long> polardb_split_wrapper_build_count{0}; // split wrapper build latency samples
+		std::atomic<unsigned long long> polardb_wait_profile_plan_dispatch_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_plan_dispatch_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_dispatch_wait_set_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_dispatch_wait_set_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_wait_set_query_end_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_wait_set_query_end_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_target_mismatch{0};
+		std::atomic<unsigned long long> polardb_txn_wait_lsn_count{0};
+		std::atomic<unsigned long long> polardb_txn_wait_lsn_sum_us{0};
+		std::atomic<unsigned long long> polardb_txn_wait_lsn_elapsed_le_1ms{0};
+		std::atomic<unsigned long long> polardb_txn_wait_lsn_elapsed_le_5ms{0};
+		std::atomic<unsigned long long> polardb_txn_wait_lsn_elapsed_le_10ms{0};
+		std::atomic<unsigned long long> polardb_txn_wait_lsn_elapsed_le_50ms{0};
+		std::atomic<unsigned long long> polardb_txn_wait_lsn_elapsed_le_100ms{0};
+		std::atomic<unsigned long long> polardb_txn_wait_lsn_elapsed_le_500ms{0};
+		std::atomic<unsigned long long> polardb_txn_wait_lsn_elapsed_le_1s{0};
+		std::atomic<unsigned long long> polardb_txn_wait_lsn_elapsed_gt_1s{0};
+		std::atomic<unsigned long long> polardb_wait_profile_ordinary_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_ordinary_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_target_unknown_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_target_unknown_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_target_write_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_target_write_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_target_observed_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_target_observed_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_target_session_equal_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_target_session_equal_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_target_global_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_target_global_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_target_txn_primary_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_target_txn_primary_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_selected_best_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_selected_best_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_selected_behind_best_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_selected_behind_best_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_selection_unknown_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_selection_unknown_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_observed_same_reader_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_observed_same_reader_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_observed_cross_reader_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_observed_cross_reader_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_observed_reader_unknown_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_observed_reader_unknown_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_gap_unknown_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_gap_unknown_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_gap_stale_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_gap_stale_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_gap_zero_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_gap_zero_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_gap_le_4kb_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_gap_le_4kb_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_gap_le_64kb_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_gap_le_64kb_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_gap_le_1mb_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_gap_le_1mb_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_gap_le_16mb_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_gap_le_16mb_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_gap_gt_16mb_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_gap_gt_16mb_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_lsn_age_unknown_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_lsn_age_unknown_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_lsn_age_le_100us_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_lsn_age_le_100us_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_lsn_age_le_1ms_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_lsn_age_le_1ms_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_lsn_age_le_5ms_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_lsn_age_le_5ms_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_lsn_age_gt_5ms_count{0};
+		std::atomic<unsigned long long> polardb_wait_profile_lsn_age_gt_5ms_sum_us{0};
+		std::atomic<unsigned long long> polardb_wait_profile_selected_gap_sum_bytes{0};
+		std::atomic<unsigned long long> polardb_wait_profile_selection_loss_sum_bytes{0};
 #endif // POLARDB_PROFILE
 		std::atomic<unsigned long long> polardb_split_lsn_wait_count{0};      // split LSN wait wrappers prepared
 		std::atomic<unsigned long long> polardb_split_lsn_wait_sum_us{0};     // split LSN wait latency total

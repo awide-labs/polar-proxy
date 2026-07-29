@@ -534,6 +534,9 @@ public:
 	// new client connection (a fresh session object) starts it at zero.
 	// See doc/polardb-arch/10-SESSION-INTEGRATION.md section 6.4.
 	PolarDB_SessionConsistency polardb_session_consistency;
+	// True when the writer reports an active transaction with no writes
+	// (T + x + empty XIDs).
+	bool polardb_txn_has_no_writes = false;
 
 	// Observed transaction-split RFQ state. The planner reads it to decide
 	// whether one in-transaction read can be sent to a replica with exported
@@ -1157,6 +1160,25 @@ public:
 	 * the per-query wait state is reset, or the elapsed time is lost.
 	 */
 	void record_wait_latency(PolarDB_Query_WaitState& state);
+#if POLARDB_PROFILE
+	void polardb_profile_prepare_wait(
+		const PolarDB_Query_RoutePlan& plan,
+		const PolarDB_Query_RouteCtx& route_ctx,
+		PolarDB_WaitProfileContext context);
+	void polardb_profile_note_reader_selection(
+		const PolarDB_WaitSpec& wait_spec,
+		const PolarDB_ReaderResult& result);
+	void polardb_profile_note_reader_connection(
+		const PolarDB_WaitSpec& wait_spec,
+		const PolarDB_Query_ReaderPlan& reader_plan,
+		PgSQL_Connection* conn);
+	void polardb_profile_note_wait_dispatched(
+		PolarDB_Query_WrapperKind wrapper_kind);
+	void polardb_profile_note_wait_set_completed(
+		PolarDB_Query_WrapperKind wrapper_kind);
+	void polardb_profile_record_wait_completion(
+		unsigned long long fallback_elapsed_us);
+#endif // POLARDB_PROFILE
 	/**
 	 * @brief Advance the selected reader's cached LSN after a successful wait.
 	 *

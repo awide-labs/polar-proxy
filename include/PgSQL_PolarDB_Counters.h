@@ -156,7 +156,220 @@
 		"Total time spent building transaction-split wrapper SQL") \
 	T(split_wrapper_build_count, "PolarDB_Split_Wrapper_Build_Count", \
 		"proxysql_polardb_split_wrapper_build_count_total", \
-		"Transaction-split wrapper build latency samples")
+		"Transaction-split wrapper build latency samples") \
+	T(wait_profile_plan_dispatch_sum_us, "PolarDB_Wait_Profile_Plan_Dispatch_Sum_Us", \
+		"proxysql_polardb_wait_profile_plan_dispatch_microseconds_total", \
+		"Profiled time from wait planning through backend dispatch") \
+	T(wait_profile_plan_dispatch_count, "PolarDB_Wait_Profile_Plan_Dispatch_Count", \
+		"proxysql_polardb_wait_profile_plan_dispatch_count_total", \
+		"Profiled wait plan-to-dispatch latency samples") \
+	T(wait_profile_dispatch_wait_set_sum_us, "PolarDB_Wait_Profile_Dispatch_Wait_Set_Sum_Us", \
+		"proxysql_polardb_wait_profile_dispatch_wait_set_microseconds_total", \
+		"Profiled time from backend dispatch through the final wait SET result") \
+	T(wait_profile_dispatch_wait_set_count, "PolarDB_Wait_Profile_Dispatch_Wait_Set_Count", \
+		"proxysql_polardb_wait_profile_dispatch_wait_set_count_total", \
+		"Profiled dispatch-to-wait-SET latency samples") \
+	T(wait_profile_wait_set_query_end_sum_us, "PolarDB_Wait_Profile_Wait_Set_Query_End_Sum_Us", \
+		"proxysql_polardb_wait_profile_wait_set_query_end_microseconds_total", \
+		"Profiled time from the final wait SET result through user-query completion") \
+	T(wait_profile_wait_set_query_end_count, "PolarDB_Wait_Profile_Wait_Set_Query_End_Count", \
+		"proxysql_polardb_wait_profile_wait_set_query_end_count_total", \
+		"Profiled wait-SET-to-query-end latency samples") \
+	T(wait_profile_target_mismatch, "PolarDB_Wait_Profile_Target_Mismatch", \
+		"proxysql_polardb_wait_profile_target_mismatch_total", \
+		"Profiled waits whose route target could not be derived from captured consistency state") \
+	T(txn_wait_lsn_count, "PolarDB_Txn_Wait_LSN_Count", \
+		"proxysql_polardb_txn_wait_lsn_count_total", \
+		"Pre-write transaction reader LSN waits completed or failed") \
+	T(txn_wait_lsn_sum_us, "PolarDB_Txn_Wait_LSN_Sum_Us", \
+		"proxysql_polardb_txn_wait_lsn_microseconds_total", \
+		"Correlated wrapper-prefix time for pre-write transaction reader LSN waits") \
+	T(txn_wait_lsn_elapsed_le_1ms, "PolarDB_Txn_Wait_LSN_Elapsed_Le_1ms", \
+		"proxysql_polardb_txn_wait_lsn_elapsed_le_1ms_total", \
+		"Pre-write transaction reader waits completed within 1ms") \
+	T(txn_wait_lsn_elapsed_le_5ms, "PolarDB_Txn_Wait_LSN_Elapsed_Le_5ms", \
+		"proxysql_polardb_txn_wait_lsn_elapsed_le_5ms_total", \
+		"Pre-write transaction reader waits completed within 5ms") \
+	T(txn_wait_lsn_elapsed_le_10ms, "PolarDB_Txn_Wait_LSN_Elapsed_Le_10ms", \
+		"proxysql_polardb_txn_wait_lsn_elapsed_le_10ms_total", \
+		"Pre-write transaction reader waits completed within 10ms") \
+	T(txn_wait_lsn_elapsed_le_50ms, "PolarDB_Txn_Wait_LSN_Elapsed_Le_50ms", \
+		"proxysql_polardb_txn_wait_lsn_elapsed_le_50ms_total", \
+		"Pre-write transaction reader waits completed within 50ms") \
+	T(txn_wait_lsn_elapsed_le_100ms, "PolarDB_Txn_Wait_LSN_Elapsed_Le_100ms", \
+		"proxysql_polardb_txn_wait_lsn_elapsed_le_100ms_total", \
+		"Pre-write transaction reader waits completed within 100ms") \
+	T(txn_wait_lsn_elapsed_le_500ms, "PolarDB_Txn_Wait_LSN_Elapsed_Le_500ms", \
+		"proxysql_polardb_txn_wait_lsn_elapsed_le_500ms_total", \
+		"Pre-write transaction reader waits completed within 500ms") \
+	T(txn_wait_lsn_elapsed_le_1s, "PolarDB_Txn_Wait_LSN_Elapsed_Le_1s", \
+		"proxysql_polardb_txn_wait_lsn_elapsed_le_1s_total", \
+		"Pre-write transaction reader waits completed within 1s") \
+	T(txn_wait_lsn_elapsed_gt_1s, "PolarDB_Txn_Wait_LSN_Elapsed_Gt_1s", \
+		"proxysql_polardb_txn_wait_lsn_elapsed_gt_1s_total", \
+		"Pre-write transaction reader waits taking more than 1s") \
+	T(wait_profile_ordinary_count, "PolarDB_Wait_Profile_Ordinary_Count", \
+		"proxysql_polardb_wait_profile_ordinary_count_total", \
+		"Profiled ordinary autocommit reader waits") \
+	T(wait_profile_ordinary_sum_us, "PolarDB_Wait_Profile_Ordinary_Sum_Us", \
+		"proxysql_polardb_wait_profile_ordinary_microseconds_total", \
+		"Correlated wrapper-prefix time for ordinary autocommit reader waits") \
+	T(wait_profile_target_unknown_count, "PolarDB_Wait_Profile_Target_Unknown_Count", \
+		"proxysql_polardb_wait_profile_target_unknown_count_total", \
+		"Profiled waits with an unclassified target source") \
+	T(wait_profile_target_unknown_sum_us, "PolarDB_Wait_Profile_Target_Unknown_Sum_Us", \
+		"proxysql_polardb_wait_profile_target_unknown_microseconds_total", \
+		"Correlated wrapper-prefix time for waits with an unclassified target source") \
+	T(wait_profile_target_write_count, "PolarDB_Wait_Profile_Target_Write_Count", \
+		"proxysql_polardb_wait_profile_target_write_count_total", \
+		"Profiled waits whose target came from the session write LSN") \
+	T(wait_profile_target_write_sum_us, "PolarDB_Wait_Profile_Target_Write_Sum_Us", \
+		"proxysql_polardb_wait_profile_target_write_microseconds_total", \
+		"Correlated wrapper-prefix time for session-write targets") \
+	T(wait_profile_target_observed_count, "PolarDB_Wait_Profile_Target_Observed_Count", \
+		"proxysql_polardb_wait_profile_target_observed_count_total", \
+		"Profiled waits whose target came from the session observed LSN") \
+	T(wait_profile_target_observed_sum_us, "PolarDB_Wait_Profile_Target_Observed_Sum_Us", \
+		"proxysql_polardb_wait_profile_target_observed_microseconds_total", \
+		"Correlated wrapper-prefix time for session-observed targets") \
+	T(wait_profile_target_session_equal_count, "PolarDB_Wait_Profile_Target_Session_Equal_Count", \
+		"proxysql_polardb_wait_profile_target_session_equal_count_total", \
+		"Profiled waits where write and observed LSNs equally supplied the session target") \
+	T(wait_profile_target_session_equal_sum_us, "PolarDB_Wait_Profile_Target_Session_Equal_Sum_Us", \
+		"proxysql_polardb_wait_profile_target_session_equal_microseconds_total", \
+		"Correlated wrapper-prefix time for equal write and observed session targets") \
+	T(wait_profile_target_global_count, "PolarDB_Wait_Profile_Target_Global_Count", \
+		"proxysql_polardb_wait_profile_target_global_count_total", \
+		"Profiled waits whose target was raised by the global writer-group LSN") \
+	T(wait_profile_target_global_sum_us, "PolarDB_Wait_Profile_Target_Global_Sum_Us", \
+		"proxysql_polardb_wait_profile_target_global_microseconds_total", \
+		"Correlated wrapper-prefix time for global writer-group targets") \
+	T(wait_profile_target_txn_primary_count, "PolarDB_Wait_Profile_Target_Txn_Primary_Count", \
+		"proxysql_polardb_wait_profile_target_txn_primary_count_total", \
+		"Profiled transaction-split waits whose target came from the primary transaction LSN") \
+	T(wait_profile_target_txn_primary_sum_us, "PolarDB_Wait_Profile_Target_Txn_Primary_Sum_Us", \
+		"proxysql_polardb_wait_profile_target_txn_primary_microseconds_total", \
+		"Correlated wrapper-prefix time for primary transaction targets") \
+	T(wait_profile_selected_best_count, "PolarDB_Wait_Profile_Selected_Best_Count", \
+		"proxysql_polardb_wait_profile_selected_best_count_total", \
+		"Profiled waits whose selected reader was not behind the best considered reader") \
+	T(wait_profile_selected_best_sum_us, "PolarDB_Wait_Profile_Selected_Best_Sum_Us", \
+		"proxysql_polardb_wait_profile_selected_best_microseconds_total", \
+		"Correlated wrapper-prefix time after selecting the best considered reader") \
+	T(wait_profile_selected_behind_best_count, "PolarDB_Wait_Profile_Selected_Behind_Best_Count", \
+		"proxysql_polardb_wait_profile_selected_behind_best_count_total", \
+		"Profiled waits whose selected reader was behind the best considered reader") \
+	T(wait_profile_selected_behind_best_sum_us, "PolarDB_Wait_Profile_Selected_Behind_Best_Sum_Us", \
+		"proxysql_polardb_wait_profile_selected_behind_best_microseconds_total", \
+		"Correlated wrapper-prefix time after selecting behind the best considered reader") \
+	T(wait_profile_selection_unknown_count, "PolarDB_Wait_Profile_Selection_Unknown_Count", \
+		"proxysql_polardb_wait_profile_selection_unknown_count_total", \
+		"Profiled waits lacking a comparable selected and best reader LSN") \
+	T(wait_profile_selection_unknown_sum_us, "PolarDB_Wait_Profile_Selection_Unknown_Sum_Us", \
+		"proxysql_polardb_wait_profile_selection_unknown_microseconds_total", \
+		"Correlated wrapper-prefix time for waits lacking a comparable reader selection") \
+	T(wait_profile_observed_same_reader_count, "PolarDB_Wait_Profile_Observed_Same_Reader_Count", \
+		"proxysql_polardb_wait_profile_observed_same_reader_count_total", \
+		"Observed-target waits routed back to the reader that supplied the target") \
+	T(wait_profile_observed_same_reader_sum_us, "PolarDB_Wait_Profile_Observed_Same_Reader_Sum_Us", \
+		"proxysql_polardb_wait_profile_observed_same_reader_microseconds_total", \
+		"Correlated wrapper-prefix time for same-reader observed targets") \
+	T(wait_profile_observed_cross_reader_count, "PolarDB_Wait_Profile_Observed_Cross_Reader_Count", \
+		"proxysql_polardb_wait_profile_observed_cross_reader_count_total", \
+		"Observed-target waits routed to a different reader from the target source") \
+	T(wait_profile_observed_cross_reader_sum_us, "PolarDB_Wait_Profile_Observed_Cross_Reader_Sum_Us", \
+		"proxysql_polardb_wait_profile_observed_cross_reader_microseconds_total", \
+		"Correlated wrapper-prefix time for cross-reader observed targets") \
+	T(wait_profile_observed_reader_unknown_count, "PolarDB_Wait_Profile_Observed_Reader_Unknown_Count", \
+		"proxysql_polardb_wait_profile_observed_reader_unknown_count_total", \
+		"Observed-target waits lacking source or selected-reader identity") \
+	T(wait_profile_observed_reader_unknown_sum_us, "PolarDB_Wait_Profile_Observed_Reader_Unknown_Sum_Us", \
+		"proxysql_polardb_wait_profile_observed_reader_unknown_microseconds_total", \
+		"Correlated wrapper-prefix time for observed targets with unknown reader relation") \
+	T(wait_profile_gap_unknown_count, "PolarDB_Wait_Profile_Gap_Unknown_Count", \
+		"proxysql_polardb_wait_profile_gap_unknown_count_total", \
+		"Profiled waits with no selected-reader LSN sample") \
+	T(wait_profile_gap_unknown_sum_us, "PolarDB_Wait_Profile_Gap_Unknown_Sum_Us", \
+		"proxysql_polardb_wait_profile_gap_unknown_microseconds_total", \
+		"Correlated wrapper-prefix time for waits with no selected-reader LSN sample") \
+	T(wait_profile_gap_stale_count, "PolarDB_Wait_Profile_Gap_Stale_Count", \
+		"proxysql_polardb_wait_profile_gap_stale_count_total", \
+		"Profiled waits whose selected-reader LSN sample was stale") \
+	T(wait_profile_gap_stale_sum_us, "PolarDB_Wait_Profile_Gap_Stale_Sum_Us", \
+		"proxysql_polardb_wait_profile_gap_stale_microseconds_total", \
+		"Correlated wrapper-prefix time for stale selected-reader LSN samples") \
+	T(wait_profile_gap_zero_count, "PolarDB_Wait_Profile_Gap_Zero_Count", \
+		"proxysql_polardb_wait_profile_gap_zero_count_total", \
+		"Profiled waits whose selected reader was already at or beyond target") \
+	T(wait_profile_gap_zero_sum_us, "PolarDB_Wait_Profile_Gap_Zero_Sum_Us", \
+		"proxysql_polardb_wait_profile_gap_zero_microseconds_total", \
+		"Correlated wrapper-prefix time for zero selected-reader target gaps") \
+	T(wait_profile_gap_le_4kb_count, "PolarDB_Wait_Profile_Gap_Le_4KB_Count", \
+		"proxysql_polardb_wait_profile_gap_le_4kb_count_total", \
+		"Profiled waits with selected-reader target gap at most 4KB") \
+	T(wait_profile_gap_le_4kb_sum_us, "PolarDB_Wait_Profile_Gap_Le_4KB_Sum_Us", \
+		"proxysql_polardb_wait_profile_gap_le_4kb_microseconds_total", \
+		"Correlated wrapper-prefix time for target gaps at most 4KB") \
+	T(wait_profile_gap_le_64kb_count, "PolarDB_Wait_Profile_Gap_Le_64KB_Count", \
+		"proxysql_polardb_wait_profile_gap_le_64kb_count_total", \
+		"Profiled waits with selected-reader target gap at most 64KB") \
+	T(wait_profile_gap_le_64kb_sum_us, "PolarDB_Wait_Profile_Gap_Le_64KB_Sum_Us", \
+		"proxysql_polardb_wait_profile_gap_le_64kb_microseconds_total", \
+		"Correlated wrapper-prefix time for target gaps at most 64KB") \
+	T(wait_profile_gap_le_1mb_count, "PolarDB_Wait_Profile_Gap_Le_1MB_Count", \
+		"proxysql_polardb_wait_profile_gap_le_1mb_count_total", \
+		"Profiled waits with selected-reader target gap at most 1MB") \
+	T(wait_profile_gap_le_1mb_sum_us, "PolarDB_Wait_Profile_Gap_Le_1MB_Sum_Us", \
+		"proxysql_polardb_wait_profile_gap_le_1mb_microseconds_total", \
+		"Correlated wrapper-prefix time for target gaps at most 1MB") \
+	T(wait_profile_gap_le_16mb_count, "PolarDB_Wait_Profile_Gap_Le_16MB_Count", \
+		"proxysql_polardb_wait_profile_gap_le_16mb_count_total", \
+		"Profiled waits with selected-reader target gap at most 16MB") \
+	T(wait_profile_gap_le_16mb_sum_us, "PolarDB_Wait_Profile_Gap_Le_16MB_Sum_Us", \
+		"proxysql_polardb_wait_profile_gap_le_16mb_microseconds_total", \
+		"Correlated wrapper-prefix time for target gaps at most 16MB") \
+	T(wait_profile_gap_gt_16mb_count, "PolarDB_Wait_Profile_Gap_Gt_16MB_Count", \
+		"proxysql_polardb_wait_profile_gap_gt_16mb_count_total", \
+		"Profiled waits with selected-reader target gap above 16MB") \
+	T(wait_profile_gap_gt_16mb_sum_us, "PolarDB_Wait_Profile_Gap_Gt_16MB_Sum_Us", \
+		"proxysql_polardb_wait_profile_gap_gt_16mb_microseconds_total", \
+		"Correlated wrapper-prefix time for target gaps above 16MB") \
+	T(wait_profile_lsn_age_unknown_count, "PolarDB_Wait_Profile_LSN_Age_Unknown_Count", \
+		"proxysql_polardb_wait_profile_lsn_age_unknown_count_total", \
+		"Profiled waits lacking a selected-reader LSN sample timestamp") \
+	T(wait_profile_lsn_age_unknown_sum_us, "PolarDB_Wait_Profile_LSN_Age_Unknown_Sum_Us", \
+		"proxysql_polardb_wait_profile_lsn_age_unknown_microseconds_total", \
+		"Correlated wrapper-prefix time for waits lacking an LSN sample timestamp") \
+	T(wait_profile_lsn_age_le_100us_count, "PolarDB_Wait_Profile_LSN_Age_Le_100us_Count", \
+		"proxysql_polardb_wait_profile_lsn_age_le_100us_count_total", \
+		"Profiled waits with selected-reader LSN sample age at most 100us") \
+	T(wait_profile_lsn_age_le_100us_sum_us, "PolarDB_Wait_Profile_LSN_Age_Le_100us_Sum_Us", \
+		"proxysql_polardb_wait_profile_lsn_age_le_100us_microseconds_total", \
+		"Correlated wrapper-prefix time for selected-reader LSN age at most 100us") \
+	T(wait_profile_lsn_age_le_1ms_count, "PolarDB_Wait_Profile_LSN_Age_Le_1ms_Count", \
+		"proxysql_polardb_wait_profile_lsn_age_le_1ms_count_total", \
+		"Profiled waits with selected-reader LSN sample age at most 1ms") \
+	T(wait_profile_lsn_age_le_1ms_sum_us, "PolarDB_Wait_Profile_LSN_Age_Le_1ms_Sum_Us", \
+		"proxysql_polardb_wait_profile_lsn_age_le_1ms_microseconds_total", \
+		"Correlated wrapper-prefix time for selected-reader LSN age at most 1ms") \
+	T(wait_profile_lsn_age_le_5ms_count, "PolarDB_Wait_Profile_LSN_Age_Le_5ms_Count", \
+		"proxysql_polardb_wait_profile_lsn_age_le_5ms_count_total", \
+		"Profiled waits with selected-reader LSN sample age at most 5ms") \
+	T(wait_profile_lsn_age_le_5ms_sum_us, "PolarDB_Wait_Profile_LSN_Age_Le_5ms_Sum_Us", \
+		"proxysql_polardb_wait_profile_lsn_age_le_5ms_microseconds_total", \
+		"Correlated wrapper-prefix time for selected-reader LSN age at most 5ms") \
+	T(wait_profile_lsn_age_gt_5ms_count, "PolarDB_Wait_Profile_LSN_Age_Gt_5ms_Count", \
+		"proxysql_polardb_wait_profile_lsn_age_gt_5ms_count_total", \
+		"Profiled waits with selected-reader LSN sample age above 5ms") \
+	T(wait_profile_lsn_age_gt_5ms_sum_us, "PolarDB_Wait_Profile_LSN_Age_Gt_5ms_Sum_Us", \
+		"proxysql_polardb_wait_profile_lsn_age_gt_5ms_microseconds_total", \
+		"Correlated wrapper-prefix time for selected-reader LSN age above 5ms") \
+	T(wait_profile_selected_gap_sum_bytes, "PolarDB_Wait_Profile_Selected_Gap_Sum_Bytes", \
+		"proxysql_polardb_wait_profile_selected_gap_bytes_total", \
+		"Selected-reader target-gap bytes correlated with completed profiled waits") \
+	T(wait_profile_selection_loss_sum_bytes, "PolarDB_Wait_Profile_Selection_Loss_Sum_Bytes", \
+		"proxysql_polardb_wait_profile_selection_loss_bytes_total", \
+		"Extra target-gap bytes from selecting behind the best considered reader")
 
 #define POLARDB_PROFILE_GLOBAL_COUNTER_LIST(G) \
 	G(reader_pool_shared_take_attempt, "PolarDB_Reader_Pool_Shared_Take_Attempt", \

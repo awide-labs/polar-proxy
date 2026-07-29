@@ -189,7 +189,7 @@
 +	return conn->polar_xact_splittable ? 1 : 0;
 +}
 +
-+/* PQisXactWalPending - WAL not flushed but xids available ('w' marker) */
++/* PQisXactWalPending - last RFQ carried 'w'; XID string may be empty */
 +int
 +PQisXactWalPending(const PGconn *conn)
 +{
@@ -241,7 +241,16 @@
  {
 --- src/interfaces/libpq/fe-protocol3.c
 +++ src/interfaces/libpq/fe-protocol3.c
-@@ -1655,6 +1655,91 @@
+@@ -1636,6 +1636,8 @@
+ getReadyForQuery(PGconn *conn)
+ {
+ 	char		xact_status;
++	uint32		raw_len;
++	int			msg_end;
+ 
+ 	if (pqGetc(&xact_status, conn))
+ 		return EOF;
+@@ -1655,6 +1657,88 @@
  			break;
  	}
  
@@ -250,9 +259,6 @@
 +	 * The length field (at inStart+1, 4 bytes, network order) includes itself
 +	 * but not the type byte.  msg_end = inStart + 1 (type) + length_value.
 +	 */
-+	uint32		raw_len;
-+	int			msg_end;
-+
 +	memcpy(&raw_len, conn->inBuffer + conn->inStart + 1, 4);
 +	msg_end = conn->inStart + 1 + (int) pg_ntoh32(raw_len);
 +
@@ -278,8 +284,9 @@
 +	 * PolarDB extension: parse transaction split info if present.
 +	 *
 +	 * Marker byte meanings:
-+	 *   'x' - splittable: WAL flushed, xids follow
-+	 *   'w' - WAL pending: xids follow but replica wait is not safe yet
++	 *   'x' - splittable: WAL flushed; XID string follows (and may be empty)
++	 *   'w' - WAL pending: XID string follows (and may be empty), replica wait
++	 *         is not safe yet
 +	 *   absent/other - not splittable; remaining extension bytes are skipped
 +	 */
 +	conn->polar_xact_splittable = false;
@@ -308,13 +315,12 @@
 +					memcpy(conn->polar_xact_xids, conn->inBuffer + conn->inCursor, len);
 +					conn->polar_xact_xids[len] = '\0';
 +					conn->inCursor += len + 1;
-+					if (len > 0)
-+					{
-+						if (marker == 'x')
-+							conn->polar_xact_splittable = true;
-+						else
-+							conn->polar_xact_wal_pending = true;
-+					}
++					/* Marker state is independent of XID-list length.  An empty
++					 * string is the valid pre-write state for both 'x' and 'w'. */
++					if (marker == 'x')
++						conn->polar_xact_splittable = true;
++					else
++						conn->polar_xact_wal_pending = true;
 +				}
 +			}
 +		}
@@ -333,7 +339,7 @@
  	return 0;
  }
  
-@@ -2340,6 +2425,39 @@
+@@ -2340,6 +2424,39 @@
  		}
  	}
  
@@ -373,7 +379,7 @@
  	/* Add trailing terminator */
  	if (packet)
  		packet[packet_len] = '\0';
-@@ -2453,3 +2571,247 @@
+@@ -2453,3 +2570,247 @@
  	return 1;
  }
  
@@ -674,7 +680,7 @@
 +	bool		polar_proxy_send_xact;	/* request xact info in ReadyForQuery? */
 +	char	   *polar_xact_xids;		/* "cmdId,xid1,xid2,..." from RFQ */
 +	bool		polar_xact_splittable;	/* 'x' marker: WAL flushed, safe to split */
-+	bool		polar_xact_wal_pending;	/* 'w' marker: WAL not flushed, xids cached */
++	bool		polar_xact_wal_pending;	/* 'w' marker: WAL not flushed; XIDs may be empty */
 +
 +	/* PolarDB connection string options (passed directly in startup packet) */
 +	/* PG11 style names - work with both PolarDB 11 and 15 */

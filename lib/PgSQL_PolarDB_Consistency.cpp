@@ -219,12 +219,19 @@ void PgSQL_Session::polardb_observe_transaction_split(PgSQL_Connection* conn,
 		return;
 	}
 
+	const char transaction_status = conn->get_transaction_status_char();
+	const char* xids = conn->get_polardb_txn_xids();
+	const bool splittable = conn->is_polardb_txn_splittable();
+	const bool wal_pending = conn->is_polardb_txn_wal_pending();
+	polardb_txn_has_no_writes =
+		transaction_status == 'T' && splittable && !wal_pending &&
+		xids && xids[0] == '\0';
+
 	if (!split_enabled) {
 		polardb_clear_transaction_split_state("observation_disabled", true);
 		return;
 	}
 
-	const char transaction_status = conn->get_transaction_status_char();
 	if (transaction_status == 'I') {
 		if (polardb_transaction_split.did_split) {
 			POLARDB_THREAD_COUNT_ONE(thread, txn_committed_with_split);
@@ -235,9 +242,6 @@ void PgSQL_Session::polardb_observe_transaction_split(PgSQL_Connection* conn,
 		return;
 	}
 
-	const char* xids = conn->get_polardb_txn_xids();
-	const bool splittable = conn->is_polardb_txn_splittable();
-	const bool wal_pending = conn->is_polardb_txn_wal_pending();
 	const PolarDB_TransactionSplitStage old_stage = polardb_transaction_split.stage;
 	const bool old_was_split_readable =
 		old_stage == PolarDB_TransactionSplitStage::TXN_SPLITTABLE;

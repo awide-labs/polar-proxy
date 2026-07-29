@@ -322,6 +322,47 @@ static int test_xact_startup_and_rfq(void) {
     return 0;
 }
 
+static int test_xact_prewrite_marker_capability(void) {
+    SECTION("Pre-write xact RFQ marker");
+
+    char conninfo[2048];
+    build_conninfo_base_suffixed(conninfo, sizeof(conninfo),
+                                 " _polar_send_xact=true" PROXY_IDENTITY);
+
+    PGconn* conn = PQconnectdb(conninfo);
+    if (PQstatus(conn) != CONNECTION_OK) {
+        SKIP("_polar_send_xact=true not accepted for pre-write marker check: %s",
+             PQerrorMessage(conn));
+        PQfinish(conn);
+        return 0;
+    }
+    if (!backend_xact_split_enabled(conn)) {
+        SKIP("backend transaction splitting is disabled; pre-write marker unavailable");
+        PQfinish(conn);
+        return 0;
+    }
+
+    if (!exec_sql_ok(conn, "BEGIN")) {
+        PQfinish(conn);
+        return 1;
+    }
+
+    const char* xids = PQgetXactSplitXids(conn);
+    if (xids != NULL && xids[0] == '\0' &&
+            PQisXactSplittable(conn) == 1 &&
+            PQisXactWalPending(conn) == 0) {
+        PASS("BEGIN RFQ carries explicit splittable marker with empty XIDs");
+    } else {
+        FAIL("BEGIN RFQ marker mismatch: xids=%s splittable=%d wal_pending=%d",
+             xids ? xids : "<null>",
+             PQisXactSplittable(conn), PQisXactWalPending(conn));
+    }
+
+    (void)exec_sql_quiet(conn, "ROLLBACK");
+    PQfinish(conn);
+    return tests_failed == 0 ? 0 : 1;
+}
+
 static int test_isolation_parameter_status(const char* conninfo_base) {
     SECTION("Isolation ParameterStatus");
 
@@ -470,6 +511,7 @@ int main(int argc, char** argv) {
     int rc = 0;
     rc |= test_xact_api_defaults(base);
     rc |= test_xact_startup_and_rfq();
+    rc |= test_xact_prewrite_marker_capability();
     rc |= (test_xact_w_marker_capability(0) == W_MARKER_ERROR);
     rc |= test_isolation_parameter_status(base);
 

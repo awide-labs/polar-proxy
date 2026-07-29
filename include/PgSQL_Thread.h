@@ -50,6 +50,9 @@ constexpr const char* AUTHENTICATION_METHOD_STR[] = {
 class PgSQL_HGC;
 struct PolarDB_Query_ReaderPlan;
 struct PolarDB_WaitSpec;
+#if POLARDB_PROFILE
+struct PolarDB_WaitProfileState;
+#endif // POLARDB_PROFILE
 
 // PolarDB consistency-mode integer constants used where an int plus -1 sentinel
 // is needed (thread variables, HG policy, admin SQL). The values align with
@@ -1007,6 +1010,13 @@ void polardb_count_reader_target_selection(
 	bool selected_reader_lsn_fresh,
 	uint64_t best_considered_reader_lsn,
 	bool best_considered_reader_lsn_fresh);
+
+#if POLARDB_PROFILE
+void polardb_count_wait_profile_completion(
+	PgSQL_Thread* thread,
+	const PolarDB_WaitProfileState& state,
+	unsigned long long elapsed_us);
+#endif // POLARDB_PROFILE
 
 #if POLARDB_PROFILE
 #define POLARDB_PROFILE_THREAD_COUNT(thread, name, value) \

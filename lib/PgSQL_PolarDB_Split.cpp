@@ -424,6 +424,12 @@ bool PgSQL_Session::polardb_prepare_txn_wait_read(
 		request_warmup_after_miss();
 		return false;
 	}
+#if POLARDB_PROFILE
+	if (needs_wait) {
+		polardb_profile_note_reader_connection(
+			plan.wait_spec, plan.reader, reader_myds->myconn);
+	}
+#endif // POLARDB_PROFILE
 
 	if (needs_wait && polardb_query.wait.wait_stage != PolarDB_WaitStage::IDLE) {
 		// Defensive: execute resets the wait state before calling us. Keeping this
@@ -599,6 +605,10 @@ bool PgSQL_Session::polardb_prepare_txn_split_read(
 		POLARDB_THREAD_COUNT_ONE(thread, split_no_backend);
 		return finish_prepare(false);
 	}
+#if POLARDB_PROFILE
+	polardb_profile_note_reader_connection(
+		plan.wait_spec, plan.reader, split_myds->myconn);
+#endif // POLARDB_PROFILE
 
 	// Build the wrapper only after a viable reader exists. This avoids doing
 	// string work on the hot fallback path when no pooled reader can be used.
@@ -919,6 +929,9 @@ void PgSQL_Session::polardb_record_txn_split_wait_latency() {
 		POLARDB_THREAD_COUNT(thread, split_lsn_wait_sum_us, elapsed_us);
 		polardb_count_lsn_wait_elapsed_bucket(
 			thread, elapsed_us, /*transaction_split=*/true);
+#if POLARDB_PROFILE
+		polardb_profile_record_wait_completion(elapsed_us);
+#endif // POLARDB_PROFILE
 	}
 	polardb_txn_reader.wait_start_us = 0;
 }

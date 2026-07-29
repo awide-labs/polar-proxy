@@ -814,9 +814,22 @@ handler_again:
 					fetch_result_end_st == ASYNC_QUERY_END) {
 					if (exec_status_type == PGRES_COMMAND_OK ||
 						exec_status_type == PGRES_EMPTY_QUERY) {
+#if POLARDB_PROFILE
+						const bool completed_wait_set =
+							polardb_query_wrap_state.is_polar_wait_wrapper() &&
+							polardb_query_wrap_state.stmt_pending == 1;
+						const PolarDB_Query_WrapperKind wrapper_kind =
+							polardb_query_wrap_state.wrapper_kind;
+#endif // POLARDB_PROFILE
 						const bool consumed_xids_reset =
 							polardb_query_wrap_state.consuming_txn_split_xids_reset();
 						polardb_query_wrap_state.consume_successful_wrapper_set();
+#if POLARDB_PROFILE
+						if (completed_wait_set && myds && myds->sess) {
+							myds->sess->polardb_profile_note_wait_set_completed(
+								wrapper_kind);
+						}
+#endif // POLARDB_PROFILE
 						if (consumed_xids_reset) {
 							// Clear the dirty flag later, when the whole reset-wrapped
 							// query completes without error. Until then the physical
@@ -850,6 +863,14 @@ handler_again:
 								"PolarDB TXN_SPLIT: xids reset SET failed conn=%p\n",
 								(void*)this);
 						}
+#if POLARDB_PROFILE
+						if (polardb_query_wrap_state.is_polar_wait_wrapper() &&
+								polardb_query_wrap_state.stmt_pending == 1 &&
+								myds && myds->sess) {
+							myds->sess->polardb_profile_note_wait_set_completed(
+								polardb_query_wrap_state.wrapper_kind);
+						}
+#endif // POLARDB_PROFILE
 						POLARDB_TRACE("PolarDB: wrapper result error: status=%d pending=%u\n",
 							(int)exec_status_type, polardb_query_wrap_state.stmt_pending);
 						polardb_account_wrapper_set_error(this, result.get(), PQresultErrorMessage(result.get()));
@@ -2099,6 +2120,12 @@ void PgSQL_Connection::query_start() {
 			dispatch_state.wrapper_stmts, (int)dispatch_state.wrapper_kind,
 			dispatch_state.txn_split_xids_reset ? 1 : 0);
 	}
+#if POLARDB_PROFILE
+	if (myds && myds->sess) {
+		myds->sess->polardb_profile_note_wait_dispatched(
+			dispatch_state.wrapper_kind);
+	}
+#endif // POLARDB_PROFILE
 	POLARDB_TRACE("PolarDB QUERY_START: wrapper_stmts=%u kind=%d pending=%u reset_xids=%d "
 		"wait_active=%d query='%s'\n",
 		dispatch_state.wrapper_stmts, (int)dispatch_state.wrapper_kind,

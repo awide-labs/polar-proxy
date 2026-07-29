@@ -1613,6 +1613,9 @@ struct PolarDB_WriterScope {
 struct PolarDB_SessionConsistency {
     uint64_t write_lsn = 0;
     uint64_t observed_lsn = 0;
+#if POLARDB_PROFILE
+    uintptr_t observed_lsn_source_server_token = 0;
+#endif // POLARDB_PROFILE
     bool write_unknown = false;
     bool observed_unknown = false;
     PolarDB_WriterScope writer_scope;
@@ -1650,6 +1653,9 @@ struct PolarDB_SessionConsistency {
     void reset_lsn_state() {
         write_lsn = 0;
         observed_lsn = 0;
+#if POLARDB_PROFILE
+        observed_lsn_source_server_token = 0;
+#endif // POLARDB_PROFILE
         write_unknown = false;
         observed_unknown = false;
     }
@@ -1779,12 +1785,17 @@ struct PolarDB_TransactionSplitState {
         if (rfq_primary_lsn > primary_lsn) {
             primary_lsn = rfq_primary_lsn;
         }
-        if (rfq_xids && rfq_xids[0]) {
+        if (rfq_xids) {
             xids = rfq_xids;
         }
         splittable = rfq_splittable;
         wal_pending = rfq_wal_pending;
 
+        // A failed transaction cannot authorize reads on another backend,
+        // even if its RFQ still carries an otherwise valid split marker.
+        if (transaction_status == 'E') {
+            splittable = false;
+        }
         if (blocked || transaction_status == 'E') {
             stage = PolarDB_TransactionSplitStage::TXN_ON_PRIMARY;
             return;
@@ -1985,6 +1996,75 @@ struct PolarDB_Query_WaitState {
         original_query.clear();
     }
 };
+
+#if POLARDB_PROFILE
+enum class PolarDB_WaitProfileContext : uint8_t {
+    UNKNOWN = 0,
+    ORDINARY,
+    TXN_PREWRITE,
+    TXN_SPLIT,
+};
+
+enum class PolarDB_WaitProfileTargetSource : uint8_t {
+    UNKNOWN = 0,
+    WRITE,
+    OBSERVED,
+    SESSION_EQUAL,
+    GLOBAL,
+    TXN_PRIMARY,
+};
+
+/**
+ * @brief Profile-only correlation state for one LSN-wrapped reader query.
+ *
+ * The release build contains none of this state. Profiling builds carry the
+ * reader observation selected during acquisition through wrapper completion so
+ * target gaps can be correlated with the time spent in the wrapper prefix.
+ */
+struct PolarDB_WaitProfileState {
+    uint64_t prepared_at_us = 0;
+    uint64_t dispatched_at_us = 0;
+    uint64_t wait_set_completed_at_us = 0;
+    uint64_t selected_gap_bytes = 0;
+    uint64_t selection_loss_bytes = 0;
+    uint64_t selected_lsn_age_us = 0;
+    uintptr_t observed_source_server_token = 0;
+    uintptr_t selected_server_token = 0;
+    PolarDB_WaitProfileContext context =
+        PolarDB_WaitProfileContext::UNKNOWN;
+    PolarDB_WaitProfileTargetSource target_source =
+        PolarDB_WaitProfileTargetSource::UNKNOWN;
+    bool active = false;
+    bool target_mismatch = false;
+    bool selection_recorded = false;
+    bool selected_lsn_known = false;
+    bool selected_lsn_fresh = false;
+    bool selection_compared = false;
+    bool selected_behind_best = false;
+    bool selected_lsn_age_known = false;
+
+    void reset() {
+        prepared_at_us = 0;
+        dispatched_at_us = 0;
+        wait_set_completed_at_us = 0;
+        selected_gap_bytes = 0;
+        selection_loss_bytes = 0;
+        selected_lsn_age_us = 0;
+        observed_source_server_token = 0;
+        selected_server_token = 0;
+        context = PolarDB_WaitProfileContext::UNKNOWN;
+        target_source = PolarDB_WaitProfileTargetSource::UNKNOWN;
+        active = false;
+        target_mismatch = false;
+        selection_recorded = false;
+        selected_lsn_known = false;
+        selected_lsn_fresh = false;
+        selection_compared = false;
+        selected_behind_best = false;
+        selected_lsn_age_known = false;
+    }
+};
+#endif // POLARDB_PROFILE
 
 /**
  * @brief Actions to apply after an error while processing a wrapped query.
@@ -2568,10 +2648,15 @@ struct PolarDB_QueryState {
     PolarDB_WriterScope request_writer_scope;
     PolarDB_Query_ReaderPlan reader_plan;
     PolarDB_Query_WaitState wait;
+#if POLARDB_PROFILE
+    PolarDB_WaitProfileState wait_profile;
+#endif // POLARDB_PROFILE
     std::string wrapped_query_buf;
     uint8_t reader_retry_attempts = 0;
     uint32_t dispatch_wrapper_stmts = 0;
     bool backend_isolation_status_needed = false;
+    // Use the existing session LSN when this RFQ ends a read-only transaction.
+    bool keep_session_lsn = false;
     PolarDB_Query_WrapperKind dispatch_wrapper_kind =
         PolarDB_Query_WrapperKind::NONE;
 
@@ -2581,6 +2666,9 @@ struct PolarDB_QueryState {
 
     void reset_wait() {
         wait.reset();
+#if POLARDB_PROFILE
+        wait_profile.reset();
+#endif // POLARDB_PROFILE
     }
 
     void reset_dispatch_wrapper() {
@@ -2595,6 +2683,7 @@ struct PolarDB_QueryState {
         wrapped_query_buf.clear();
         reader_retry_attempts = 0;
         backend_isolation_status_needed = false;
+        keep_session_lsn = false;
         reset_dispatch_wrapper();
     }
 };

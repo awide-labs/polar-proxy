@@ -38,6 +38,7 @@ PRIMARY_SERVER_PORT="${PRIMARY_SERVER_PORT:-}"
 REPLICA_SERVER_PORT="${REPLICA_SERVER_PORT:-}"
 REPLICA_SERVER_ENDPOINTS=""
 REPLAY_LAG_SET=0
+BACKEND_TXN_SPLIT_ENABLED=0
 GLOBAL_LSN_SETUP_PLAN=6
 GLOBAL_LSN_TAP_GROUPS="${GLOBAL_LSN_TAP_GROUPS:-}"
 GLOBAL_LSN_TAP_CASES="${GLOBAL_LSN_TAP_CASES:-}"
@@ -717,7 +718,7 @@ SQL
 }
 
 case_global_lsn_transaction_split_uses_replica() {
-	local marker out result endpoint value success_count wait_count
+	local marker out result endpoint value rc success_count wait_count split_total
 
 	set_global_lsn_policy
 	admin_sql "UPDATE pgsql_replication_hostgroups SET txn_split_enabled=1, proxy_protocol='v15' WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
@@ -758,6 +759,7 @@ SELECT host(inet_server_addr()) || ':' || inet_server_port() || '|' || data FROM
 COMMIT;
 SQL
 	)
+	rc=$?
 	tap_stop_wal_pulse
 	snapshot_split_counters split_after
 	admin_sql "UPDATE pgsql_replication_hostgroups SET txn_split_enabled=0 WHERE writer_hostgroup=$WRITER_HG;" >/dev/null
@@ -771,8 +773,26 @@ SQL
 	value=$(payload_value "$result")
 	success_count=$(split_delta split_before split_after success)
 	wait_count=$(split_delta split_before split_after wait)
+	split_total=$(split_delta split_before split_after total)
 
-	if endpoint_in_list "$endpoint" "$REPLICA_SERVER_ENDPOINTS" &&
+	if [ "$BACKEND_TXN_SPLIT_ENABLED" -eq 0 ]; then
+		if [ "$rc" -eq 0 ] &&
+			[ "$endpoint" = "$PRIMARY_SERVER_ENDPOINT" ] &&
+			[ "$value" = "$marker" ] &&
+			[ "$success_count" -eq 0 ] &&
+			[ "$split_total" -eq 0 ]; then
+			ok 0 "GLOBAL_LSN keeps post-write reads on writer when backend transaction splitting is disabled"
+		else
+			diag "GLOBAL_LSN disabled-split output: $out"
+			diag "rc=$rc result=$result endpoint=$endpoint value=$value expected_writer=$PRIMARY_SERVER_ENDPOINT"
+			diag "split_success_delta=$success_count split_total_delta=$split_total"
+			ok 1 "GLOBAL_LSN keeps post-write reads on writer when backend transaction splitting is disabled"
+		fi
+		return
+	fi
+
+	if [ "$rc" -eq 0 ] &&
+		endpoint_in_list "$endpoint" "$REPLICA_SERVER_ENDPOINTS" &&
 		[ "$value" = "$marker" ] &&
 		[ "$success_count" -ge 1 ] &&
 		[ "$wait_count" -ge 1 ]; then
@@ -829,16 +849,15 @@ case_non_read_committed_transaction_stays_primary() {
 
 	rc_marker="global_rc_split_$$"
 	snapshot_split_counters rc_split_before
-	# This uses the common PostgreSQL spelling that previously fell through to
-	# lock_hostgroup. If that parser regresses, the read stays on the writer and
-	# this positive-control split assertion fails.
+	# Session defaults use SET SESSION CHARACTERISTICS. SET TRANSACTION applies
+	# only to the current transaction; SET SESSION TRANSACTION is not valid SQL.
 	tap_start_wal_pulse "$PRIMARY_HOST" "$PRIMARY_PORT" "$TEST_TABLE" 200
 	out=$(
 		global_lsn_transaction_read_script \
 			"BEGIN;" \
 			5 \
 			"$rc_marker" \
-			"SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;" |
+			"SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED;" |
 			proxy_script 2>&1
 	)
 	rc=$?
@@ -851,7 +870,21 @@ case_non_read_committed_transaction_stays_primary() {
 	endpoint=$(payload_endpoint "$result")
 	value=$(payload_value "$result")
 	success_count=$(split_delta rc_split_before rc_split_after success)
-	if [ "$rc" -eq 0 ] &&
+	split_total=$(split_delta rc_split_before rc_split_after total)
+	if [ "$BACKEND_TXN_SPLIT_ENABLED" -eq 0 ]; then
+		if [ "$rc" -eq 0 ] &&
+			[ "$endpoint" = "$PRIMARY_SERVER_ENDPOINT" ] &&
+			[ "$value" = "$rc_marker" ] &&
+			[ "$success_count" -eq 0 ] &&
+			[ "$split_total" -eq 0 ]; then
+			ok 0 "GLOBAL_LSN READ COMMITTED transaction stays on writer when backend splitting is disabled"
+		else
+			diag "READ COMMITTED disabled-split output: $out"
+			diag "rc=$rc result=$result endpoint=$endpoint value=$value expected_writer=$PRIMARY_SERVER_ENDPOINT"
+			diag "split_success_delta=$success_count split_total_delta=$split_total"
+			ok 1 "GLOBAL_LSN READ COMMITTED transaction stays on writer when backend splitting is disabled"
+		fi
+	elif [ "$rc" -eq 0 ] &&
 		endpoint_in_list "$endpoint" "$REPLICA_SERVER_ENDPOINTS" &&
 		[ "$value" = "$rc_marker" ] &&
 		[ "$success_count" -ge 1 ]; then
@@ -919,6 +952,13 @@ if detect_backend_ports; then
 else
 	ok 1 "detect backend ports reported by PostgreSQL"
 	exit 1
+fi
+
+if backend_setting_is "$PRIMARY_HOST" "$PRIMARY_PORT" polar_enable_xact_split on; then
+	BACKEND_TXN_SPLIT_ENABLED=1
+	diag "backend transaction splitting: enabled"
+else
+	diag "backend transaction splitting: disabled; validating fail-closed writer routing"
 fi
 
 ok 0 "built POLARDB_PROXY=1 ProxySQL binary exists"

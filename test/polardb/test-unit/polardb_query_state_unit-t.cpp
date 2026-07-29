@@ -29,9 +29,16 @@ static void test_query_state_named_reset_subsets() {
 	query.wait.fallback_writer_hg = fallback_writer_hg;
 	query.wait.wait_stage = PolarDB_WaitStage::WAITING;
 	query.wait.wait_started_at_us = 42;
+#if POLARDB_PROFILE
+	query.wait_profile.active = true;
+	query.wait_profile.prepared_at_us = 41;
+	query.wait_profile.target_source =
+		PolarDB_WaitProfileTargetSource::OBSERVED;
+#endif // POLARDB_PROFILE
 	query.wrapped_query_buf = "wrapped";
 	query.dispatch_wrapper_stmts = 3;
 	query.dispatch_wrapper_kind = PolarDB_Query_WrapperKind::CONSISTENCY_WAIT;
+	query.keep_session_lsn = true;
 
 	query.reset_reader_target();
 	ok(query.reader_plan.fallback_writer_hg == -1,
@@ -47,6 +54,8 @@ static void test_query_state_named_reset_subsets() {
 		"reader-target reset preserves staged timeout-error flag");
 	ok(query.wait.fallback_writer_hg == fallback_writer_hg,
 		"reader-target reset preserves staged fallback writer hostgroup");
+	ok(query.keep_session_lsn,
+		"reader-target reset keeps the per-query LSN choice");
 
 	query.reset_wait();
 	// wait reset clears wait spec and runtime wait state (each field separately).
@@ -62,6 +71,15 @@ static void test_query_state_named_reset_subsets() {
 		"wait reset clears fallback writer hostgroup");
 	ok(query.request_writer_scope.valid(),
 		"wait reset preserves request writer scope");
+	ok(query.keep_session_lsn,
+		"wait reset keeps the per-query LSN choice");
+#if POLARDB_PROFILE
+	ok(!query.wait_profile.active,
+		"wait reset clears profile-only wait correlation state");
+	ok(query.wait_profile.target_source ==
+			PolarDB_WaitProfileTargetSource::UNKNOWN,
+		"wait reset clears profile-only target attribution");
+#endif // POLARDB_PROFILE
 
 	query.reset_dispatch_wrapper();
 	// dispatch-wrapper reset clears only wrapper handoff metadata.
@@ -73,6 +91,8 @@ static void test_query_state_named_reset_subsets() {
 		"dispatch-wrapper reset preserves request writer scope");
 	ok(query.wrapped_query_buf == "wrapped",
 		"dispatch-wrapper reset preserves wrapped query buffer");
+	ok(query.keep_session_lsn,
+		"dispatch-wrapper reset keeps the per-query LSN choice");
 
 	query.reset_for_new_query();
 	// full query reset clears target, request scope, and wrapper buffer.
@@ -86,6 +106,8 @@ static void test_query_state_named_reset_subsets() {
 		"full query reset clears wait state");
 	ok(query.dispatch_wrapper_kind == PolarDB_Query_WrapperKind::NONE,
 		"full query reset clears dispatch state");
+	ok(!query.keep_session_lsn,
+		"full query reset clears the per-query LSN choice");
 }
 
 static void test_reader_plan_lag_cap_helpers() {
@@ -168,6 +190,16 @@ static void test_transaction_split_state_rfq_observation() {
 	ok(!state.splittable,
 		"transaction split observation: absent splittable marker stays false");
 
+	state.observe_primary_rfq('T', "", true, false, 150, true);
+	ok(state.stage == PolarDB_TransactionSplitStage::TXN_ON_PRIMARY,
+		"transaction split observation: empty-XID marker remains in pre-write stage");
+	ok(state.xids.empty(),
+		"transaction split observation: empty-XID marker does not invent transaction IDs");
+	ok(state.splittable,
+		"transaction split observation: explicit empty-XID marker is preserved");
+	ok(state.primary_lsn == 150,
+		"transaction split observation: pre-write marker advances the primary LSN");
+
 	state.observe_primary_rfq('T', "10,11", true, false, 200, true);
 	ok(state.stage == PolarDB_TransactionSplitStage::TXN_SPLITTABLE,
 		"transaction split observation: XIDs plus splittable marker allow split state");
@@ -198,6 +230,16 @@ static void test_transaction_split_state_rfq_observation() {
 	ok(state.xids == "12",
 		"transaction split observation: later XID list replaces earlier list");
 
+	state.observe_primary_rfq('T', "", true, false, 255, true);
+	ok(state.stage == PolarDB_TransactionSplitStage::TXN_ON_PRIMARY,
+		"transaction split observation: explicit empty XIDs return to pre-write stage");
+	ok(state.xids.empty(),
+		"transaction split observation: explicit empty XIDs clear an older list");
+	ok(state.splittable,
+		"transaction split observation: empty-XID split authorization is retained");
+	ok(state.primary_lsn == 255,
+		"transaction split observation: empty-XID RFQ advances the primary LSN");
+
 	state.blocked = true;
 	state.observe_primary_rfq('T', "12", true, false, 260, true);
 	ok(state.stage == PolarDB_TransactionSplitStage::TXN_ON_PRIMARY,
@@ -206,11 +248,15 @@ static void test_transaction_split_state_rfq_observation() {
 		"transaction split observation: blocked marker is preserved");
 
 	state.blocked = false;
-	state.observe_primary_rfq('E', "13", true, false, 270, true);
+	state.observe_primary_rfq('E', "", true, false, 270, true);
 	ok(state.stage == PolarDB_TransactionSplitStage::TXN_ON_PRIMARY,
 		"transaction split observation: failed transaction stays primary-only");
 	ok(state.primary_lsn == 270,
 		"transaction split observation: failed transaction still records primary LSN");
+	ok(state.xids.empty(),
+		"transaction split observation: failed empty-XID RFQ clears older XIDs");
+	ok(!state.splittable,
+		"transaction split observation: failed RFQ cannot authorize reader routing");
 
 	state.observe_primary_rfq('I', nullptr, false, false, 0, true);
 	ok(!state.active(),
@@ -220,8 +266,12 @@ static void test_transaction_split_state_rfq_observation() {
 }
 
 int main() {
-	// 21 named-reset + 6 reader-plan + 13 reset + 24 RFQ-observation checks = 64.
-	plan(64);
+	// 25 named-reset + 6 reader-plan + 13 reset + 34 RFQ-observation checks = 78.
+#if POLARDB_PROFILE
+	plan(80);
+#else
+	plan(78);
+#endif // POLARDB_PROFILE
 	test_query_state_named_reset_subsets();
 	test_reader_plan_lag_cap_helpers();
 	test_transaction_split_state_reset_contract();

@@ -1931,16 +1931,21 @@ static void polardb_set_reader_lsn_observation(
 }
 
 static void polardb_count_reader_target_result(
-		PgSQL_Thread* thread, const PolarDB_WaitSpec& wait_spec,
+		PgSQL_Session* sess, const PolarDB_WaitSpec& wait_spec,
 		const PolarDB_ReaderResult& result) {
 	if (!result.acquired() || !wait_spec.has_wait()) {
 		return;
 	}
 	polardb_count_reader_target_selection(
-		thread, wait_spec.target,
+		sess ? sess->thread : nullptr, wait_spec.target,
 		result.selected_reader_lsn, result.selected_reader_lsn_fresh,
 		result.best_considered_reader_lsn,
 		result.best_considered_reader_lsn_fresh);
+#if POLARDB_PROFILE
+	if (sess) {
+		sess->polardb_profile_note_reader_selection(wait_spec, result);
+	}
+#endif // POLARDB_PROFILE
 }
 
 static void polardb_count_reader_both_behind_load(
@@ -2979,8 +2984,7 @@ PolarDB_ReaderResult PgSQL_PolarDB_ReaderPool::get_MyConn_polardb_reader(
 	if (result.acquired()) {
 		result.conn->polardb_selected_server_snapshot =
 			std::move(result.selected_server_snapshot);
-		polardb_count_reader_target_result(
-			sess ? sess->thread : nullptr, wait_spec, result);
+		polardb_count_reader_target_result(sess, wait_spec, result);
 	}
 	if (result.status == PolarDB_ReaderStatus::READER_BUSY ||
 			result.status == PolarDB_ReaderStatus::READER_GROUP_BUSY) {
@@ -3092,8 +3096,7 @@ PolarDB_ReaderResult PgSQL_PolarDB_ReaderPool::get_MyConn_polardb_reader(
 		POLARDB_THREAD_COUNT_ONE(
 			sess ? sess->thread : nullptr, target_lsn_fallback_wait);
 	}
-	polardb_count_reader_target_result(
-		sess ? sess->thread : nullptr, wait_spec, result);
+	polardb_count_reader_target_result(sess, wait_spec, result);
 	return result;
 }
 

@@ -18,8 +18,10 @@
 #include "PgSQL_Data_Stream.h"
 #include "PgSQL_ExplicitTxnStateMgr.h"
 #include "PgSQL_PolarDB_ReaderPool.h"
+extern "C" {
 #include "postgres_fe.h"
 #include "libpq-int.h"
+}
 #undef snprintf
 #undef vsnprintf
 
@@ -4909,6 +4911,193 @@ static void test_successful_wait_cache_advance_requires_active_wait() {
 	delete backend_conn;
 }
 
+static void unit_parse_xact_rfq(PGconn* conn, char marker,
+		const char* xids, uint64_t lsn, char transaction_status = 'T') {
+	assert(!marker || xids != nullptr);
+	const size_t xids_len = xids ? strlen(xids) : 0;
+	const size_t xact_len = marker ? 1 + xids_len + 1 : 0;
+	const size_t payload_len = 1 + sizeof(uint64_t) + xact_len;
+	const size_t frame_len = 1 + sizeof(uint32_t) + payload_len;
+	assert(conn != nullptr && frame_len <= static_cast<size_t>(conn->inBufSize));
+
+	char* p = conn->inBuffer;
+	*p++ = 'Z';
+	const uint32_t wire_len = static_cast<uint32_t>(
+		sizeof(uint32_t) + payload_len);
+	for (int shift = 24; shift >= 0; shift -= 8) {
+		*p++ = static_cast<char>((wire_len >> shift) & 0xff);
+	}
+	*p++ = transaction_status;
+	for (int shift = 56; shift >= 0; shift -= 8) {
+		*p++ = static_cast<char>((lsn >> shift) & 0xff);
+	}
+	if (marker) {
+		*p++ = marker;
+		memcpy(p, xids, xids_len + 1);
+	}
+
+	conn->inStart = 0;
+	conn->inCursor = 0;
+	conn->inEnd = static_cast<int>(frame_len);
+	conn->asyncStatus = PGASYNC_BUSY;
+	conn->pipelineStatus = PQ_PIPELINE_OFF;
+	conn->polar_proxy_send_lsn = true;
+	conn->polar_proxy_send_xact = true;
+	pqParseInput3(conn);
+}
+
+static void test_libpq_empty_xact_markers() {
+	PGconn* conn = unit_connected_pgconn();
+	ok(conn != nullptr,
+		"PolarDB libpq RFQ parser: connection-state fixture is available");
+	if (!conn) {
+		return;
+	}
+
+	unit_parse_xact_rfq(conn, 'x', "", 0xE100);
+	ok(PQgetLSN(conn) == 0xE100 && PQhasLSN(conn) == 1 &&
+			PQtransactionStatus(conn) == PQTRANS_INTRANS,
+		"PolarDB libpq RFQ parser: positioned ReadyForQuery state is decoded");
+	ok(PQisXactSplittable(conn) == 1 && PQisXactWalPending(conn) == 0 &&
+			PQgetXactSplitXids(conn) != nullptr &&
+			PQgetXactSplitXids(conn)[0] == '\0',
+		"PolarDB libpq RFQ parser: x+empty is explicit splittable pre-write state");
+
+	unit_parse_xact_rfq(conn, 'w', "", 0xE200);
+	ok(PQgetLSN(conn) == 0xE200 && PQisXactSplittable(conn) == 0 &&
+			PQisXactWalPending(conn) == 1 &&
+			PQgetXactSplitXids(conn) != nullptr &&
+			PQgetXactSplitXids(conn)[0] == '\0',
+		"PolarDB libpq RFQ parser: w+empty preserves WAL-pending state");
+
+	unit_parse_xact_rfq(conn, 'x', "7,100,101", 0xE300);
+	ok(PQisXactSplittable(conn) == 1 && PQisXactWalPending(conn) == 0 &&
+			strcmp(PQgetXactSplitXids(conn), "7,100,101") == 0,
+		"PolarDB libpq RFQ parser: nonempty split XIDs remain intact");
+
+	unit_parse_xact_rfq(conn, 0, nullptr, 0xE400);
+	ok(PQgetLSN(conn) == 0xE400 && PQisXactSplittable(conn) == 0 &&
+			PQisXactWalPending(conn) == 0 &&
+			PQgetXactSplitXids(conn) == nullptr,
+		"PolarDB libpq RFQ parser: absent marker clears prior split state and means hard-unsplittable");
+
+	PQfinish(conn);
+}
+
+static void unit_set_current_query(PgSQL_Session& sess,
+		const char* query, PGSQL_QUERY_command command) {
+	sess.polardb_query.keep_session_lsn = false;
+	sess.status = PROCESSING_QUERY;
+	sess.CurrentQuery.QueryPointer = reinterpret_cast<unsigned char*>(
+		const_cast<char*>(query));
+	sess.CurrentQuery.QueryLength = static_cast<int>(strlen(query));
+	sess.CurrentQuery.PgQueryCmd = command;
+}
+
+static void test_read_only_txn_end_keeps_session_lsn() {
+	static constexpr int WRITER_HG = 1280;
+	static constexpr int READER_HG = 1281;
+	stage_polardb_topology_with_txn_split(
+		PgHGM, "PolarDB read-only transaction RFQ",
+		WRITER_HG, "polardb-read-only-writer", 19532,
+		READER_HG, "polardb-read-only-reader", 19533);
+	PgSQL_SrvC* writer = find_pgsql_server(
+		PgHGM->MyHGC_lookup(WRITER_HG),
+		"polardb-read-only-writer", 19532);
+	const auto* writer_cfg = PgHGM->find_polardb_hg_config(WRITER_HG);
+	ok(writer && writer_cfg && writer_cfg->writer_epoch,
+		"PolarDB read-only transaction RFQ: writer fixture is available");
+	if (!writer || !writer_cfg || !writer_cfg->writer_epoch) {
+		return;
+	}
+
+	PgSQL_Thread worker;
+	worker.curtime = monotonic_time();
+	PgSQL_Session sess;
+	attach_test_frontend(sess);
+	sess.thread = &worker;
+	sess.connections_handler = true;
+	sess.polardb_config.is_polardb_enabled = true;
+	sess.polardb_route_state.client_rfq_lsn_requested = true;
+	const PolarDB_WriterScope scope{
+		writer_cfg->writer_hostgroup,
+		writer_cfg->writer_epoch->load(std::memory_order_relaxed)};
+	sess.polardb_query.request_writer_scope = scope;
+	sess.polardb_session_consistency.writer_scope = scope;
+	sess.polardb_session_consistency.write_lsn = 0x100;
+
+	PgSQL_Data_Stream backend_myds;
+	backend_myds.sess = &sess;
+	PgSQL_Connection* backend_conn = make_cached_reader_connection(writer);
+	backend_conn->pgsql_conn = unit_connected_pgconn();
+	backend_conn->myds = &backend_myds;
+	backend_myds.myconn = backend_conn;
+
+	unit_set_current_query(sess, "BEGIN", PGSQL_QUERY_BEGIN);
+	unit_parse_xact_rfq(backend_conn->pgsql_conn, 'x', "", 0x900);
+	uint64_t client_lsn = 0;
+	bool include_client_lsn = sess.polardb_client_ready_lsn(
+		backend_conn, true, 0x900, &client_lsn);
+	ok(include_client_lsn && client_lsn == 0x100 &&
+			sess.polardb_query.keep_session_lsn,
+		"PolarDB read-only transaction RFQ: BEGIN keeps the frontend LSN");
+	sess.polardb_process_result(&backend_myds, "BEGIN", PGSQL_QUERY_BEGIN);
+	ok(sess.polardb_txn_has_no_writes &&
+			sess.polardb_session_consistency.target() == 0x100 &&
+			sess.polardb_transaction_split.primary_lsn == 0,
+		"PolarDB read-only transaction RFQ: BEGIN hint does not advance the session LSN");
+	ok(writer->polardb_current_lsn.load(std::memory_order_relaxed) == 0x900,
+		"PolarDB read-only transaction RFQ: BEGIN hint still advances the server cache");
+
+	unit_set_current_query(sess, "SELECT 1", PGSQL_QUERY_SELECT);
+	unit_parse_xact_rfq(backend_conn->pgsql_conn, 'x', "", 0xA00);
+	client_lsn = 0;
+	include_client_lsn = sess.polardb_client_ready_lsn(
+		backend_conn, true, 0xA00, &client_lsn);
+	ok(include_client_lsn && client_lsn == 0x100,
+		"PolarDB read-only transaction RFQ: read hint keeps the client LSN");
+	sess.polardb_process_result(&backend_myds, "SELECT ?", PGSQL_QUERY_SELECT);
+	ok(sess.polardb_txn_has_no_writes &&
+			sess.polardb_session_consistency.target() == 0x100 &&
+			sess.polardb_transaction_split.primary_lsn == 0 &&
+			writer->polardb_current_lsn.load(std::memory_order_relaxed) == 0xA00,
+		"PolarDB read-only transaction RFQ: read hint updates only the server cache");
+
+	unit_set_current_query(sess, "COMMIT", PGSQL_QUERY_COMMIT);
+	unit_parse_xact_rfq(backend_conn->pgsql_conn, 0, nullptr, 0xB00, 'I');
+	client_lsn = 0;
+	include_client_lsn = sess.polardb_client_ready_lsn(
+		backend_conn, true, 0xB00, &client_lsn);
+	ok(include_client_lsn && client_lsn == 0x100 &&
+			sess.polardb_query.keep_session_lsn,
+		"PolarDB read-only transaction RFQ: client keeps its session LSN at COMMIT");
+
+	sess.polardb_process_result(&backend_myds, "COMMIT", PGSQL_QUERY_COMMIT);
+	ok(sess.polardb_session_consistency.target() == 0x100 &&
+			!sess.polardb_txn_has_no_writes,
+		"PolarDB read-only transaction RFQ: COMMIT ignores the unrelated LSN and ends transaction state");
+	ok(writer->polardb_current_lsn.load(std::memory_order_relaxed) == 0xB00,
+		"PolarDB read-only transaction RFQ: server cache still records the backend LSN");
+
+	unit_set_current_query(sess, "BEGIN", PGSQL_QUERY_BEGIN);
+	unit_parse_xact_rfq(backend_conn->pgsql_conn, 'x', "", 0xB00);
+	client_lsn = 0;
+	(void)sess.polardb_client_ready_lsn(
+		backend_conn, true, 0xB00, &client_lsn);
+	sess.polardb_process_result(&backend_myds, "BEGIN", PGSQL_QUERY_BEGIN);
+	unit_set_current_query(sess, "INSERT INTO t VALUES (1)", PGSQL_QUERY_INSERT);
+	unit_parse_xact_rfq(backend_conn->pgsql_conn, 'x', "7,100", 0xC00);
+	sess.polardb_process_result(
+		&backend_myds, "INSERT INTO t VALUES (?)", PGSQL_QUERY_INSERT);
+	ok(!sess.polardb_txn_has_no_writes &&
+			sess.polardb_session_consistency.write_lsn == 0xC00 &&
+			sess.polardb_transaction_split.primary_lsn == 0xC00,
+		"PolarDB read-only transaction RFQ: a write marks the transaction as not read-only");
+
+	backend_myds.myconn = nullptr;
+	delete backend_conn;
+}
+
 static void test_reader_lsn_lag_range_predicate() {
 	ok(polardb_reader_lsn_in_best_behind_range(0xC000, 0xC000, 0),
 		"PolarDB best-behind range: exact mode includes the best reader LSN");
@@ -5480,6 +5669,101 @@ static void test_two_reader_less_loaded_weight_scale_invariance() {
 	pgsql_thread___polardb_reader_prefer_freshest_below_target = saved_exact;
 	pgsql_thread___throttle_connections_per_sec_to_hostgroup = saved_throttle;
 }
+
+#if POLARDB_PROFILE
+static void test_wait_profile_target_and_counter_contract() {
+	PgSQL_Session sess;
+	PolarDB_Query_RouteCtx route_ctx;
+	route_ctx.session.write_lsn = 0x1000;
+	route_ctx.session.observed_lsn = 0x2000;
+	route_ctx.session.observed_lsn_source_server_token = 0xA1;
+	PolarDB_Query_RoutePlan plan;
+	plan.wait_spec = PolarDB_WaitSpec::lsn(
+		0x2000, POLARDB_DEFAULT_WAIT_TIMEOUT_MS,
+		PolarDB_WaitMode::BEST_EFFORT);
+	plan.reader.consistency_mode = PolarDB_ConsistencyMode::SESSION_LSN;
+
+	sess.polardb_profile_prepare_wait(
+		plan, route_ctx, PolarDB_WaitProfileContext::TXN_PREWRITE);
+	ok(sess.polardb_query.wait_profile.active &&
+			sess.polardb_query.wait_profile.target_source ==
+				PolarDB_WaitProfileTargetSource::OBSERVED &&
+			sess.polardb_query.wait_profile.observed_source_server_token == 0xA1,
+		"PolarDB wait profile: pre-write wait attributes an observed-session target");
+
+	plan.reader.consistency_mode = PolarDB_ConsistencyMode::GLOBAL_LSN;
+	plan.wait_spec.target = 0x3000;
+	sess.polardb_profile_prepare_wait(
+		plan, route_ctx, PolarDB_WaitProfileContext::ORDINARY);
+	ok(sess.polardb_query.wait_profile.target_source ==
+			PolarDB_WaitProfileTargetSource::GLOBAL &&
+			!sess.polardb_query.wait_profile.target_mismatch,
+		"PolarDB wait profile: global LSN raise is attributed separately");
+
+	route_ctx.transaction_split.primary_lsn = 0x4000;
+	plan.wait_spec.target = 0x4000;
+	sess.polardb_profile_prepare_wait(
+		plan, route_ctx, PolarDB_WaitProfileContext::TXN_SPLIT);
+	ok(sess.polardb_query.wait_profile.target_source ==
+			PolarDB_WaitProfileTargetSource::TXN_PRIMARY &&
+			!sess.polardb_query.wait_profile.target_mismatch,
+		"PolarDB wait profile: transaction split attributes its primary LSN target");
+
+	plan.reader.consistency_mode = PolarDB_ConsistencyMode::SESSION_LSN;
+	plan.wait_spec.target = 0x4001;
+	sess.polardb_profile_prepare_wait(
+		plan, route_ctx, PolarDB_WaitProfileContext::TXN_SPLIT);
+	ok(sess.polardb_query.wait_profile.target_mismatch &&
+			sess.polardb_query.wait_profile.target_source ==
+				PolarDB_WaitProfileTargetSource::UNKNOWN,
+		"PolarDB wait profile: inconsistent captured target is counted as a mismatch");
+
+	std::unique_ptr<PgSQL_Thread> worker(new PgSQL_Thread());
+	PolarDB_WaitProfileState state;
+	state.active = true;
+	state.context = PolarDB_WaitProfileContext::TXN_PREWRITE;
+	state.target_source = PolarDB_WaitProfileTargetSource::OBSERVED;
+	state.selection_recorded = true;
+	state.selected_lsn_known = true;
+	state.selected_lsn_fresh = true;
+	state.selection_compared = true;
+	state.selected_behind_best = true;
+	state.selected_gap_bytes = 4096;
+	state.selection_loss_bytes = 512;
+	state.selected_lsn_age_known = true;
+	state.selected_lsn_age_us = 750;
+	state.observed_source_server_token = 0xA1;
+	state.selected_server_token = 0xB2;
+	polardb_count_wait_profile_completion(worker.get(), state, 3000);
+
+	ok(worker->polardb_status_variables.stvar[
+			polardb_st_var_txn_wait_lsn_count] == 1 &&
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_txn_wait_lsn_sum_us] == 3000 &&
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_txn_wait_lsn_elapsed_le_5ms] == 1,
+		"PolarDB wait profile: pre-write count, sum, and histogram share one sample");
+	ok(worker->polardb_status_variables.stvar[
+			polardb_st_var_wait_profile_target_observed_count] == 1 &&
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_wait_profile_target_observed_sum_us] == 3000 &&
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_wait_profile_observed_cross_reader_count] == 1,
+		"PolarDB wait profile: observed target correlates cross-reader elapsed time");
+	ok(worker->polardb_status_variables.stvar[
+			polardb_st_var_wait_profile_selected_behind_best_count] == 1 &&
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_wait_profile_selection_loss_sum_bytes] == 512,
+		"PolarDB wait profile: selected-behind-best count keeps its LSN loss");
+	ok(worker->polardb_status_variables.stvar[
+			polardb_st_var_wait_profile_gap_le_4kb_count] == 1 &&
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_wait_profile_selected_gap_sum_bytes] == 4096 &&
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_wait_profile_lsn_age_le_1ms_count] == 1,
+		"PolarDB wait profile: target-gap and LSN-age buckets correlate the sample");
+}
+#endif // POLARDB_PROFILE
 
 static void test_lag_range_best_behind_reader_can_acquire_lower_lsn_candidate() {
 	const int writer_hg = 962;
@@ -6512,6 +6796,44 @@ static void test_collect_is_const_stable_snapshot() {
 				before_local_state,
 		"PolarDB collect snapshot: collect does not mutate session state");
 
+	PolarDB_Query_RouteCtx txn_ctx;
+	txn_ctx.is_polar_hg = true;
+	txn_ctx.replica_eligible = true;
+	txn_ctx.in_transaction = true;
+	txn_ctx.txn_split_enabled = true;
+	txn_ctx.is_txn_split_safe_read = true;
+	txn_ctx.txn_reader_wait_isolation_read_committed = true;
+	txn_ctx.txn_reader_wait_local_state_clean = true;
+	txn_ctx.writer_scope = PolarDB_WriterScope{
+		writer_cfg->writer_hostgroup,
+		writer_cfg->writer_epoch->load(std::memory_order_relaxed)};
+	txn_ctx.session.writer_scope = txn_ctx.writer_scope;
+	txn_ctx.session.write_lsn = 0x2110;
+	txn_ctx.reader_hg = reader_hg;
+	txn_ctx.effective_consistency_mode =
+		static_cast<int>(PolarDB_ConsistencyMode::SESSION_LSN);
+	txn_ctx.transaction_split.stage =
+		PolarDB_TransactionSplitStage::TXN_ON_PRIMARY;
+	txn_ctx.transaction_split.primary_lsn = 0x2110;
+	txn_ctx.transaction_split.splittable = true;
+	PolarDB_Query_RoutePlan txn_plan = sess.polardb_plan(txn_ctx);
+	ok(txn_plan.txn_wait_read && txn_plan.target_hg == reader_hg,
+		"PolarDB transaction wait safety: explicit empty-XID split marker permits a pre-write reader");
+
+	txn_ctx.transaction_split.splittable = false;
+	txn_plan = sess.polardb_plan(txn_ctx);
+	ok(txn_plan.action == PolarDB_Query_RoutePlan::RouteAction::FORCE_PRIMARY &&
+			txn_plan.target_hg == writer_cfg->writer_hostgroup,
+		"PolarDB transaction wait safety: empty XIDs without a split marker stay primary");
+
+	txn_ctx.transaction_split.stage =
+		PolarDB_TransactionSplitStage::TXN_SPLITTABLE;
+	txn_ctx.transaction_split.xids = "10,11";
+	txn_ctx.transaction_split.splittable = true;
+	txn_plan = sess.polardb_plan(txn_ctx);
+	ok(txn_plan.action == PolarDB_Query_RoutePlan::RouteAction::REPLICA_TXN_SPLIT,
+		"PolarDB transaction wait safety: complete backend split metadata permits later replica reads");
+
 	sess.polardb_observe_route_inputs(writer_hg);
 	ok(sess.polardb_query.backend_isolation_status_needed,
 		"PolarDB observe: LSN transaction split checks backend isolation status");
@@ -6584,6 +6906,9 @@ int main() {
 	test_reader_target_selection_counter_contract();
 	test_two_reader_fresher_less_loaded_policy();
 	test_two_reader_less_loaded_weight_scale_invariance();
+#if POLARDB_PROFILE
+	test_wait_profile_target_and_counter_contract();
+#endif // POLARDB_PROFILE
 	test_v2_target_reader_keeps_wait_until_lsn_is_reached();
 	test_server_selection_snapshot_refresh_and_immutability();
 	test_reader_selection_reload_concurrency();
@@ -6631,6 +6956,8 @@ int main() {
 	test_no_wait_pooled_reader_requires_startup_identity();
 	test_no_wait_pooled_reader_requires_exact_session_state();
 	test_successful_wait_cache_advance_requires_active_wait();
+	test_libpq_empty_xact_markers();
+	test_read_only_txn_end_keeps_session_lsn();
 	test_reader_lsn_lag_range_predicate();
 	test_txn_reader_state_clear_contract();
 	test_tied_freshest_behind_reader_can_acquire_second_candidate();
