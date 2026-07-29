@@ -1298,6 +1298,10 @@ void PgSQL_Logger::log_audit_entry(PGSQL_LOG_EVENT_TYPE _et, PgSQL_Session *sess
 }
 
 void PgSQL_Logger::flush(bool force) {
+	if (!force && !is_events_logfile_open() && !is_audit_logfile_open()) {
+		return;
+	}
+
 	const uint64_t current_time = monotonic_time();
 
 	if (force) {
