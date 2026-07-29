@@ -20,7 +20,7 @@ source "$BENCH_DIR/../lib/bench_harness.sh"
 
 CASE_NUM="bench1"
 CASE_NAME="LSN Stress"
-CONSISTENCY_MODE=1
+CONSISTENCY_MODE=session_lsn
 SPLIT_ENABLED=0
 XACT_SPLIT=0
 TEST_ID=101
@@ -31,7 +31,7 @@ BENCH1_ADHOC_CLIENTS="${BENCH1_ADHOC_CLIENTS:-1}"
 BENCH1_TXN_CLIENTS="${BENCH1_TXN_CLIENTS:-1}"
 BENCH1_DURATION_SEC="${BENCH1_DURATION_SEC:-10}"
 BENCH1_WAIT_TIMEOUT_MS="${BENCH1_WAIT_TIMEOUT_MS:-10000}"
-BENCH1_WAIT_MODE="${BENCH1_WAIT_MODE:-strict}"
+BENCH1_LSN_WAIT_TIMEOUT_ACTION="${BENCH1_LSN_WAIT_TIMEOUT_ACTION:-primary}"
 BENCH1_EXPECT_REPLICA="${BENCH1_EXPECT_REPLICA:-1}"
 BENCH1_REPLICA_SERVER_PORT="${BENCH1_REPLICA_SERVER_PORT:-}"
 
@@ -197,7 +197,7 @@ run_bench1_lsn_stress() {
     echo "[$(ts)] BENCH 1: $CASE_NAME"
     echo "================================================================"
     echo "[$(ts)] clients: ryw=$BENCH1_RYW_CLIENTS iters=$BENCH1_RYW_ITERS adhoc=$BENCH1_ADHOC_CLIENTS txn=$BENCH1_TXN_CLIENTS duration=${BENCH1_DURATION_SEC}s"
-    echo "[$(ts)] mode=lsn wait_mode=$BENCH1_WAIT_MODE timeout=${BENCH1_WAIT_TIMEOUT_MS}ms expect_replica=$BENCH1_EXPECT_REPLICA"
+    echo "[$(ts)] mode=session_lsn lsn_wait_timeout_action=$BENCH1_LSN_WAIT_TIMEOUT_ACTION timeout=${BENCH1_WAIT_TIMEOUT_MS}ms expect_replica=$BENCH1_EXPECT_REPLICA"
 
     export PROXYSQL_DEBUG=1
     if ! start_proxysql; then
@@ -206,7 +206,8 @@ run_bench1_lsn_stress() {
     fi
 
     echo "[$(ts)] Configuring LSN consistency policy"
-    polardb_bench_configure_mode lsn lsn "$BENCH1_WAIT_MODE" "$BENCH1_WAIT_TIMEOUT_MS" -1 0 || return 1
+    polardb_bench_configure_mode session_lsn session_lsn replica \
+        "$BENCH1_LSN_WAIT_TIMEOUT_ACTION" "$BENCH1_WAIT_TIMEOUT_MS" -1 0 || return 1
     setup_reader_routing "$POLARDB_BENCH_READER_HG" 5 || polardb_bench_mark_fail "reader routing warmup failed"
 
     if [ -z "$BENCH1_REPLICA_SERVER_PORT" ]; then

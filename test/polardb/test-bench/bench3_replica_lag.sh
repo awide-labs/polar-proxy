@@ -8,7 +8,7 @@
 #   session_smart  - LSN mode with a positive max_lag_bytes cap; unsafe reader
 #                    lag/freshness forces writer instead of waiting
 #   session        - LSN mode without lag cap; reader + LSN wait
-#   primary_only   - primary mode; writer only
+#   primary   - primary mode; writer only
 
 set -uo pipefail
 
@@ -20,7 +20,7 @@ source "$BENCH_DIR/../lib/bench_harness.sh"
 
 CASE_NUM="bench3"
 CASE_NAME="Replica Lag Benchmark"
-CONSISTENCY_MODE=1
+CONSISTENCY_MODE=session_lsn
 SPLIT_ENABLED=0
 XACT_SPLIT=0
 TEST_ID=103
@@ -30,7 +30,7 @@ BENCH3_ITERS="${BENCH3_ITERS:-10}"
 BENCH3_REPLAY_LAG_BYTES="${BENCH3_REPLAY_LAG_BYTES:-50000}"
 BENCH3_SMART_MAX_LAG_BYTES="${BENCH3_SMART_MAX_LAG_BYTES:-10000}"
 BENCH3_WAIT_TIMEOUT_MS="${BENCH3_WAIT_TIMEOUT_MS:-5000}"
-BENCH3_WAIT_MODE="${BENCH3_WAIT_MODE:-strict}"
+BENCH3_LSN_WAIT_TIMEOUT_ACTION="${BENCH3_LSN_WAIT_TIMEOUT_ACTION:-primary}"
 BENCH3_WAL_SLEEP_SEC="${BENCH3_WAL_SLEEP_SEC:-0.02}"
 BENCH3_WAL_BYTES="${BENCH3_WAL_BYTES:-200}"
 BENCH3_TABLE="${BENCH3_TABLE:-polardb_bench3_replica_lag}"
@@ -45,9 +45,11 @@ declare -A B3_WRITER_Q B3_READER_Q B3_WAITS B3_WAIT_US
 bench3_configure_mode() {
     local mode="$1"
     local consistency="$2"
-    local max_lag_bytes="$3"
+    local read_target="$3"
+    local max_lag_bytes="$4"
 
-    polardb_bench_configure_mode "$mode" "$consistency" "$BENCH3_WAIT_MODE" "$BENCH3_WAIT_TIMEOUT_MS" "$max_lag_bytes" 1
+    polardb_bench_configure_mode "$mode" "$consistency" "$read_target" \
+        "$BENCH3_LSN_WAIT_TIMEOUT_ACTION" "$BENCH3_WAIT_TIMEOUT_MS" "$max_lag_bytes" 1
 }
 
 bench3_worker_script() {
@@ -63,7 +65,8 @@ bench3_worker_script() {
 bench3_run_mode() {
     local mode="$1"
     local consistency="$2"
-    local max_lag_bytes="$3"
+    local read_target="$3"
+    local max_lag_bytes="$4"
     local expected=$((BENCH3_CLIENTS * BENCH3_ITERS))
     local t0 t1 elapsed
     local wait_before wait_after wait_us_before wait_us_after writer_before writer_after reader_before reader_after
@@ -74,7 +77,7 @@ bench3_run_mode() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     bench3_modes+=("$mode")
-    bench3_configure_mode "$mode" "$consistency" "$max_lag_bytes" || return 1
+    bench3_configure_mode "$mode" "$consistency" "$read_target" "$max_lag_bytes" || return 1
 
     polardb_bench_truncate "$BENCH3_TABLE" || return 1
     polardb_bench_truncate "$BENCH3_RESULT_TABLE" || return 1
@@ -153,7 +156,7 @@ run_bench3_replica_lag_bench() {
     echo "================================================================"
     echo "[$(ts)] BENCH 3: Replica lag benchmark"
     echo "================================================================"
-    echo "[$(ts)] clients=$BENCH3_CLIENTS iters=$BENCH3_ITERS replay_lag_bytes=$BENCH3_REPLAY_LAG_BYTES smart_max_lag_bytes=$BENCH3_SMART_MAX_LAG_BYTES wait_mode=$BENCH3_WAIT_MODE timeout=${BENCH3_WAIT_TIMEOUT_MS}ms"
+    echo "[$(ts)] clients=$BENCH3_CLIENTS iters=$BENCH3_ITERS replay_lag_bytes=$BENCH3_REPLAY_LAG_BYTES smart_max_lag_bytes=$BENCH3_SMART_MAX_LAG_BYTES lsn_wait_timeout_action=$BENCH3_LSN_WAIT_TIMEOUT_ACTION timeout=${BENCH3_WAIT_TIMEOUT_MS}ms"
 
     unset PROXYSQL_DEBUG
     if ! start_proxysql; then
@@ -170,18 +173,18 @@ run_bench3_replica_lag_bench() {
     snapshot_pool "B"
 
     bench3_enable_lag_window
-    bench3_run_mode eventual off -1 || return 1
+    bench3_run_mode eventual eventual replica -1 || return 1
     bench3_disable_lag_window
 
     bench3_enable_lag_window
-    bench3_run_mode session_smart lsn "$BENCH3_SMART_MAX_LAG_BYTES" || return 1
+    bench3_run_mode session_smart session_lsn replica "$BENCH3_SMART_MAX_LAG_BYTES" || return 1
     bench3_disable_lag_window
 
     bench3_enable_lag_window
-    bench3_run_mode session lsn -1 || return 1
+    bench3_run_mode session session_lsn replica -1 || return 1
     bench3_disable_lag_window
 
-    bench3_run_mode primary_only primary -1 || return 1
+    bench3_run_mode primary eventual primary -1 || return 1
 
     snapshot "A"
     snapshot_pool "A"
@@ -202,10 +205,10 @@ run_bench3_replica_lag_bench() {
     else
         polardb_bench_mark_fail "session stale=${B3_STALE[session]:-?} errors=${B3_ERRORS[session]:-?}"
     fi
-    if [ "${B3_STALE[primary_only]:-999}" -eq 0 ] && [ "${B3_ERRORS[primary_only]:-999}" -eq 0 ]; then
-        echo "[$(ts)]   PASS: primary_only has zero stale reads/errors"
+    if [ "${B3_STALE[primary]:-999}" -eq 0 ] && [ "${B3_ERRORS[primary]:-999}" -eq 0 ]; then
+        echo "[$(ts)]   PASS: primary has zero stale reads/errors"
     else
-        polardb_bench_mark_fail "primary_only stale=${B3_STALE[primary_only]:-?} errors=${B3_ERRORS[primary_only]:-?}"
+        polardb_bench_mark_fail "primary stale=${B3_STALE[primary]:-?} errors=${B3_ERRORS[primary]:-?}"
     fi
     if [ "${B3_READER_Q[eventual]:-0}" -gt 0 ]; then
         echo "[$(ts)]   PASS: eventual routes to reader"

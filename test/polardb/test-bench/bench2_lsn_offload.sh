@@ -24,7 +24,7 @@ source "$BENCH_DIR/../lib/bench_harness.sh"
 
 CASE_NUM="bench2"
 CASE_NAME="LSN Offload Benchmark"
-CONSISTENCY_MODE=1
+CONSISTENCY_MODE=session_lsn
 SPLIT_ENABLED=0
 XACT_SPLIT=0
 TEST_ID=102
@@ -34,7 +34,7 @@ BENCH2_ITERS="${BENCH2_ITERS:-10}"
 BENCH2_PRIMARY_DELAY_US="${BENCH2_PRIMARY_DELAY_US:-200000}"
 BENCH2_REPLAY_LAG_BYTES="${BENCH2_REPLAY_LAG_BYTES:-2000}"
 BENCH2_WAIT_TIMEOUT_MS="${BENCH2_WAIT_TIMEOUT_MS:-5000}"
-BENCH2_WAIT_MODE="${BENCH2_WAIT_MODE:-strict}"
+BENCH2_LSN_WAIT_TIMEOUT_ACTION="${BENCH2_LSN_WAIT_TIMEOUT_ACTION:-primary}"
 BENCH2_WAL_SLEEP_SEC="${BENCH2_WAL_SLEEP_SEC:-0.01}"
 BENCH2_TABLE="${BENCH2_TABLE:-polardb_bench2_lsn_offload}"
 BENCH2_LOAD_TABLE="${BENCH2_LOAD_TABLE:-polardb_bench2_load}"
@@ -47,8 +47,11 @@ declare -A B2_WRITER_Q B2_READER_Q B2_WAIT_PREPARED B2_WAIT_SENT
 
 bench2_configure_mode() {
     local mode="$1"
+    local consistency="$2"
+    local read_target="$3"
 
-    polardb_bench_configure_mode "$mode" "$mode" "$BENCH2_WAIT_MODE" "$BENCH2_WAIT_TIMEOUT_MS" -1 0
+    polardb_bench_configure_mode "$mode" "$consistency" "$read_target" \
+        "$BENCH2_LSN_WAIT_TIMEOUT_ACTION" "$BENCH2_WAIT_TIMEOUT_MS" -1 0
 }
 
 bench2_write_worker_script() {
@@ -69,6 +72,8 @@ bench2_write_worker_script() {
 
 bench2_run_mode() {
     local mode="$1"
+    local consistency="$2"
+    local read_target="$3"
     local expected=$((BENCH2_CLIENTS * BENCH2_ITERS))
     local t0 t1 elapsed wait_prepared_before wait_prepared_after wait_sent_before wait_sent_after
     local writer_before writer_after reader_before reader_after
@@ -79,7 +84,7 @@ bench2_run_mode() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     bench2_modes+=("$mode")
-    bench2_configure_mode "$mode" || return 1
+    bench2_configure_mode "$mode" "$consistency" "$read_target" || return 1
 
     polardb_bench_truncate "$BENCH2_TABLE" || return 1
     polardb_bench_truncate "$BENCH2_RESULT_TABLE" || return 1
@@ -191,7 +196,7 @@ run_bench2_lsn_offload() {
     echo "================================================================"
     echo "[$(ts)] BENCH 2: $CASE_NAME"
     echo "================================================================"
-    echo "[$(ts)] clients=$BENCH2_CLIENTS iters=$BENCH2_ITERS primary_session_delay_us=$BENCH2_PRIMARY_DELAY_US replay_lag_bytes=$BENCH2_REPLAY_LAG_BYTES wait_mode=$BENCH2_WAIT_MODE timeout=${BENCH2_WAIT_TIMEOUT_MS}ms"
+    echo "[$(ts)] clients=$BENCH2_CLIENTS iters=$BENCH2_ITERS primary_session_delay_us=$BENCH2_PRIMARY_DELAY_US replay_lag_bytes=$BENCH2_REPLAY_LAG_BYTES lsn_wait_timeout_action=$BENCH2_LSN_WAIT_TIMEOUT_ACTION timeout=${BENCH2_WAIT_TIMEOUT_MS}ms"
 
     primary_delay=$(get_polar_query_delay_us primary)
     replica_delay=$(get_polar_query_delay_us replica)
@@ -220,9 +225,9 @@ run_bench2_lsn_offload() {
     snapshot "B"
     snapshot_pool "B"
 
-    bench2_run_mode off || return 1
-    bench2_run_mode lsn || return 1
-    bench2_run_mode primary || return 1
+    bench2_run_mode off off replica || return 1
+    bench2_run_mode lsn session_lsn replica || return 1
+    bench2_run_mode primary eventual primary || return 1
 
     snapshot "A"
     snapshot_pool "A"

@@ -21,7 +21,7 @@ source "$SCRIPT_DIR/../lib/scenario_harness.sh"
 
 CASE_NUM=1
 CASE_NAME="Eventual Consistency"
-CONSISTENCY_MODE=0
+CONSISTENCY_MODE=eventual
 SPLIT_ENABLED=0
 XACT_SPLIT=0
 EXPECT_OUTCOME=success

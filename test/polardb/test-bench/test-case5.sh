@@ -9,7 +9,8 @@
 #   the writer-side control scenario for LSN offload comparisons.
 #
 # Configuration:
-#   - consistency mode: primary
+#   - consistency mode: eventual
+#   - read target: primary
 #   - transaction split: disabled
 #   - expected outcome: success
 #
@@ -21,7 +22,8 @@ source "$SCRIPT_DIR/../lib/scenario_harness.sh"
 
 CASE_NUM=5
 CASE_NAME="Primary-only"
-CONSISTENCY_MODE=3
+CONSISTENCY_MODE=eventual
+READ_TARGET=primary
 SPLIT_ENABLED=0
 XACT_SPLIT=0
 EXPECT_OUTCOME=success

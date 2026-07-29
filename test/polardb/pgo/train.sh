@@ -45,14 +45,14 @@ run_hotpath() {
 
 train_smoke() {
 	run_target test-case1
-	run_target test-case2-strict-success
+	run_target test-case2-use-writer-success
 	run_target test-case5
 	run_hotpath smoke
 }
 
 train_core() {
 	train_smoke
-	run_target test-case2-best-effort-success
+	run_target test-case2-stale-with-warning-success
 	run_target tap-split
 	run_target tap-split-failure-policy
 	run_hotpath core
@@ -60,9 +60,9 @@ train_core() {
 
 train_full() {
 	train_smoke
-	run_target test-case2-best-effort-success
-	run_target test-case2-best-effort-failure
-	run_target test-case2-strict-failure
+	run_target test-case2-stale-with-warning-success
+	run_target test-case2-stale-with-warning-failure
+	run_target test-case2-use-writer-failure
 	run_target tap-split
 	run_target tap-split-failure-policy
 	run_hotpath full

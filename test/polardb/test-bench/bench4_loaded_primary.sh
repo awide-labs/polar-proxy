@@ -25,7 +25,7 @@ source "$BENCH_DIR/../lib/bench_harness.sh"
 
 CASE_NUM="bench4"
 CASE_NAME="Loaded Primary Benchmark"
-CONSISTENCY_MODE=1
+CONSISTENCY_MODE=session_lsn
 SPLIT_ENABLED=0
 XACT_SPLIT=0
 TEST_ID=104
@@ -35,7 +35,7 @@ BENCH4_ITERS="${BENCH4_ITERS:-10}"
 BENCH4_PRIMARY_DELAY_US="${BENCH4_PRIMARY_DELAY_US:-50000}"
 BENCH4_REPLAY_LAG_BYTES="${BENCH4_REPLAY_LAG_BYTES:-2000}"
 BENCH4_WAIT_TIMEOUT_MS="${BENCH4_WAIT_TIMEOUT_MS:-5000}"
-BENCH4_WAIT_MODE="${BENCH4_WAIT_MODE:-strict}"
+BENCH4_LSN_WAIT_TIMEOUT_ACTION="${BENCH4_LSN_WAIT_TIMEOUT_ACTION:-primary}"
 BENCH4_WAL_SLEEP_SEC="${BENCH4_WAL_SLEEP_SEC:-0.01}"
 BENCH4_WAL_BYTES="${BENCH4_WAL_BYTES:-1000}"
 BENCH4_TABLE="${BENCH4_TABLE:-polardb_bench4_loaded_primary}"
@@ -50,8 +50,10 @@ declare -A B4_WRITER_Q B4_READER_Q B4_WAITS B4_WAIT_US
 bench4_configure_mode() {
     local mode="$1"
     local consistency="$2"
+    local read_target="$3"
 
-    polardb_bench_configure_mode "$mode" "$consistency" "$BENCH4_WAIT_MODE" "$BENCH4_WAIT_TIMEOUT_MS" -1 0
+    polardb_bench_configure_mode "$mode" "$consistency" "$read_target" \
+        "$BENCH4_LSN_WAIT_TIMEOUT_ACTION" "$BENCH4_WAIT_TIMEOUT_MS" -1 0
 }
 
 bench4_worker_script() {
@@ -67,6 +69,7 @@ bench4_worker_script() {
 bench4_run_mode() {
     local mode="$1"
     local consistency="$2"
+    local read_target="$3"
     local expected=$((BENCH4_CLIENTS * BENCH4_ITERS))
     local t0 t1 elapsed
     local wait_before wait_after wait_us_before wait_us_after writer_before writer_after reader_before reader_after
@@ -77,7 +80,7 @@ bench4_run_mode() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     bench4_modes+=("$mode")
-    bench4_configure_mode "$mode" "$consistency" || return 1
+    bench4_configure_mode "$mode" "$consistency" "$read_target" || return 1
 
     polardb_bench_truncate "$BENCH4_TABLE" || return 1
     polardb_bench_truncate "$BENCH4_RESULT_TABLE" || return 1
@@ -146,7 +149,7 @@ run_bench4_loaded_primary_bench() {
     echo "================================================================"
     echo "[$(ts)] BENCH 4: Loaded primary benchmark"
     echo "================================================================"
-    echo "[$(ts)] clients=$BENCH4_CLIENTS iters=$BENCH4_ITERS primary_delay_us=$BENCH4_PRIMARY_DELAY_US replay_lag_bytes=$BENCH4_REPLAY_LAG_BYTES wait_mode=$BENCH4_WAIT_MODE timeout=${BENCH4_WAIT_TIMEOUT_MS}ms"
+    echo "[$(ts)] clients=$BENCH4_CLIENTS iters=$BENCH4_ITERS primary_delay_us=$BENCH4_PRIMARY_DELAY_US replay_lag_bytes=$BENCH4_REPLAY_LAG_BYTES lsn_wait_timeout_action=$BENCH4_LSN_WAIT_TIMEOUT_ACTION timeout=${BENCH4_WAIT_TIMEOUT_MS}ms"
 
     unset PROXYSQL_DEBUG
     if ! start_proxysql; then
@@ -177,9 +180,9 @@ run_bench4_loaded_primary_bench() {
     snapshot "B"
     snapshot_pool "B"
 
-    bench4_run_mode loaded_primary primary || return 1
-    bench4_run_mode loaded_session lsn || return 1
-    bench4_run_mode loaded_eventual off || return 1
+    bench4_run_mode loaded_primary eventual primary || return 1
+    bench4_run_mode loaded_session session_lsn replica || return 1
+    bench4_run_mode loaded_eventual eventual replica || return 1
 
     snapshot "A"
     snapshot_pool "A"

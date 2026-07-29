@@ -7,22 +7,22 @@
 #   Validate session-LSN consistency. A write advances the session LSN and the
 #   following read is protected by the LSN wait path unless policy or topology
 #   forces the writer. Success variants run without induced lag; failure variants
-#   hold replica replay behind the target. best_effort surfaces the timeout as a
-#   WARNING and may return stale reader data. strict retries the read on the
-#   writer when no user result has reached the client.
+#   hold replica replay behind the target. warning returns a WARNING
+#   and may return stale reader data. primary retries the read on the primary
+#   when no user result has reached the client.
 #
 # Configuration:
 #   - consistency mode: session LSN
 #   - transaction split: disabled
-#   - wait mode and expected outcome: selected by command-line arguments
+#   - LSN wait timeout action and expected outcome: selected by arguments
 #
 # Usage:
-#   ./test-case2.sh -a -success   # best_effort, no lag
-#   ./test-case2.sh -a -failure   # best_effort, with lag -> WARNING
-#   ./test-case2.sh -b -success   # strict, no lag
-#   ./test-case2.sh -b -failure   # strict, with lag -> writer retry
-#   ./test-case2.sh -a -s         # best_effort, no lag (shortcut)
-#   ./test-case2.sh -b -f         # strict, with lag -> writer retry (shortcut)
+#   ./test-case2.sh -a -success   # warning, no lag
+#   ./test-case2.sh -a -failure   # warning, lag -> WARNING
+#   ./test-case2.sh -b -success   # primary, no lag
+#   ./test-case2.sh -b -failure   # primary, lag -> primary retry
+#   ./test-case2.sh -a -s         # warning, no lag (shortcut)
+#   ./test-case2.sh -b -f         # primary, lag -> primary retry (shortcut)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../lib/scenario_harness.sh"
@@ -30,9 +30,9 @@ parse_common_args "$@"
 
 CASE_NUM=2
 CASE_NAME="Session LSN"
-CONSISTENCY_MODE=1
+CONSISTENCY_MODE=session_lsn
 SPLIT_ENABLED=0
 XACT_SPLIT=0
 TEST_ID=2
 
-run_test "Case 2: Session LSN ($POLAR_MODE, $EXPECT_OUTCOME)" run_consistency_test
+run_test "Case 2: Session LSN ($LSN_WAIT_TIMEOUT_ACTION, $EXPECT_OUTCOME)" run_consistency_test

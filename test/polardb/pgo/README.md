@@ -26,7 +26,7 @@ The reference workload shape was:
 - high-concurrency OLTP plus concurrent OLAP
 - session LSN consistency enabled
 - transaction split enabled
-- heavy RFQ LSN/XID publication
+- heavy RFQ LSN/XID processing
 - reader offload present but much smaller than writer traffic
 - no wait-timeout path during the measured profile
 
@@ -41,7 +41,7 @@ single cost, with PolarDB-specific cost concentrated in:
 - `PgSQL_Session::polardb_execute`
 - `PgSQL_Session::polardb_prepare_txn_wait_read`
 - `PgSQL_Session::polardb_prepare_txn_split_read`
-- `PgSQL_HostGroups_Manager::get_MyConn_polardb_reader`
+- `PgSQL_HostGroups_Manager::polardb_acquire_reader_connection`
 - `polardb_try_weighted_rfq_candidates`
 - `polardb_get_rfq_profile_compatible_conn`
 - `PgSQL_Connection::has_same_connection_options`
@@ -78,7 +78,7 @@ Use these shapes as the main profile source:
 
 Use these only as low-weight edge coverage:
 
-- finite best-effort and strict timeout cases
+- finite `warning` and `primary` timeout cases
 - reader failure or no-backend fallback cases
 - explicit eventual-consistency/off baseline
 - long transaction split variants
@@ -138,7 +138,7 @@ Shape overrides:
 
 Policy overrides:
 
-- `POLARDB_HOTPATH_WAIT_MODE`
+- `POLARDB_HOTPATH_LSN_WAIT_TIMEOUT_ACTION`
 - `POLARDB_HOTPATH_WAIT_TIMEOUT_MS`
 - `POLARDB_HOTPATH_MAX_LAG_BYTES`
 - `POLARDB_HOTPATH_LAZY_WARMUP_SPLIT`

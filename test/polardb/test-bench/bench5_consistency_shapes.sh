@@ -28,7 +28,7 @@ source "$BENCH_DIR/../lib/bench_harness.sh"
 
 CASE_NUM="bench5"
 CASE_NAME="Consistency Shape Matrix"
-CONSISTENCY_MODE=1
+CONSISTENCY_MODE=session_lsn
 SPLIT_ENABLED=1
 XACT_SPLIT=1
 TEST_ID=105
@@ -38,7 +38,7 @@ BENCH5_ITERS="${BENCH5_ITERS:-4}"
 BENCH5_PRIMARY_DELAY_US="${BENCH5_PRIMARY_DELAY_US:-50000}"
 BENCH5_REPLAY_LAG_BYTES="${BENCH5_REPLAY_LAG_BYTES:-0}"
 BENCH5_WAIT_TIMEOUT_MS="${BENCH5_WAIT_TIMEOUT_MS:-5000}"
-BENCH5_WAIT_MODE="${BENCH5_WAIT_MODE:-strict}"
+BENCH5_LSN_WAIT_TIMEOUT_ACTION="${BENCH5_LSN_WAIT_TIMEOUT_ACTION:-primary}"
 BENCH5_WAL_SLEEP_SEC="${BENCH5_WAL_SLEEP_SEC:-0.01}"
 BENCH5_WAL_BYTES="${BENCH5_WAL_BYTES:-1000}"
 BENCH5_WAL_GENERATOR="${BENCH5_WAL_GENERATOR:-0}"
@@ -113,26 +113,30 @@ bench5_shape_is_supported() {
 bench5_configure_case() {
     local shape="$1"
     local mode="$2"
-    local consistency txn_split max_lag
+    local consistency read_target txn_split max_lag
 
     case "$mode" in
     primary)
-        consistency="primary"
+        consistency="eventual"
+        read_target="primary"
         txn_split=0
         max_lag=-1
         ;;
     lsn)
-        consistency="lsn"
+        consistency="session_lsn"
+        read_target="replica"
         txn_split=0
         max_lag="$BENCH5_MAX_LAG_BYTES"
         ;;
     split)
-        consistency="lsn"
+        consistency="session_lsn"
+        read_target="replica"
         txn_split=1
         max_lag="$BENCH5_MAX_LAG_BYTES"
         ;;
     off)
         consistency="off"
+        read_target="replica"
         txn_split=0
         max_lag=-1
         ;;
@@ -151,7 +155,8 @@ bench5_configure_case() {
         echo "[$(ts)]   NOTE: shape=$shape is not a transaction; split mode acts like session LSN with txn_split_enabled=1"
     fi
 
-    polardb_bench_configure_mode "$mode" "$consistency" "$BENCH5_WAIT_MODE" "$BENCH5_WAIT_TIMEOUT_MS" "$max_lag" 1 || return 1
+    polardb_bench_configure_mode "$mode" "$consistency" "$read_target" \
+        "$BENCH5_LSN_WAIT_TIMEOUT_ACTION" "$BENCH5_WAIT_TIMEOUT_MS" "$max_lag" 1 || return 1
     polardb_bench_admin "UPDATE pgsql_replication_hostgroups SET txn_split_enabled=$txn_split, proxy_protocol='v15' WHERE writer_hostgroup=${POLARDB_BENCH_WRITER_HG}" || return 1
     polardb_bench_admin "UPDATE global_variables SET variable_value='$BENCH5_LAZY_WARMUP_SPLIT' WHERE variable_name='pgsql-polardb_lazy_warmup_split'" || return 1
     polardb_bench_admin "UPDATE global_variables SET variable_value='$BENCH5_PROXY_IDENTITY_MODE' WHERE variable_name='pgsql-polardb_proxy_identity_mode'" || return 1
@@ -443,7 +448,7 @@ run_bench5_consistency_shapes() {
     echo "================================================================"
     echo "[$(ts)] BENCH 5: $CASE_NAME"
     echo "================================================================"
-    echo "[$(ts)] clients=$BENCH5_CLIENTS iters=$BENCH5_ITERS primary_delay_us=$BENCH5_PRIMARY_DELAY_US replay_lag_bytes=$BENCH5_REPLAY_LAG_BYTES wait_mode=$BENCH5_WAIT_MODE timeout=${BENCH5_WAIT_TIMEOUT_MS}ms wal_generator=$BENCH5_WAL_GENERATOR lazy_warmup_split=$BENCH5_LAZY_WARMUP_SPLIT proxy_identity_mode=$BENCH5_PROXY_IDENTITY_MODE txn_split_warmup_mode=$BENCH5_TXN_SPLIT_WARMUP_MODE txn_long_work_ms=$BENCH5_TXN_LONG_WORK_MS split_select_wait_ms=$BENCH5_TXN_SPLIT_SELECT_WAIT_MS split_warmup_wait_sec=$BENCH5_SPLIT_WARMUP_WAIT_SEC"
+    echo "[$(ts)] clients=$BENCH5_CLIENTS iters=$BENCH5_ITERS primary_delay_us=$BENCH5_PRIMARY_DELAY_US replay_lag_bytes=$BENCH5_REPLAY_LAG_BYTES lsn_wait_timeout_action=$BENCH5_LSN_WAIT_TIMEOUT_ACTION timeout=${BENCH5_WAIT_TIMEOUT_MS}ms wal_generator=$BENCH5_WAL_GENERATOR lazy_warmup_split=$BENCH5_LAZY_WARMUP_SPLIT proxy_identity_mode=$BENCH5_PROXY_IDENTITY_MODE txn_split_warmup_mode=$BENCH5_TXN_SPLIT_WARMUP_MODE txn_long_work_ms=$BENCH5_TXN_LONG_WORK_MS split_select_wait_ms=$BENCH5_TXN_SPLIT_SELECT_WAIT_MS split_warmup_wait_sec=$BENCH5_SPLIT_WARMUP_WAIT_SEC"
     echo "[$(ts)] cases=$BENCH5_CASES"
 
     bench5_validate_warmup_mode "$BENCH5_TXN_SPLIT_WARMUP_MODE" || return 1

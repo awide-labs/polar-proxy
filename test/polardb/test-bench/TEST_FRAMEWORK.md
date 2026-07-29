@@ -19,9 +19,9 @@ Run the whole short scenario matrix with:
 make -C test/polardb test-cases
 ```
 
-That target runs `test-case2.sh` in all supported wait-mode/outcome variants:
-best_effort success, best_effort timeout with a client WARNING, strict success,
-and strict timeout with writer retry.
+That target runs `test-case2.sh` in all supported short-scenario outcomes:
+`warning` success and timeout with a client WARNING, plus
+`primary` success and timeout with primary retry.
 `make -C test/polardb bench` is kept as a compatibility alias for this short
 scenario set.
 
@@ -49,9 +49,8 @@ There must be no benchmark-local copies of `lib.sh`, `test_common.sh`, or
 ProxySQL lifecycle code. If a benchmark needs shared behavior, add it to
 `lib/bench_harness.sh` or `lib/scenario_harness.sh`.
 
-CSN helpers in `lib/scenario_harness.sh` remain postponed scaffold. LSN
-transaction split is active and may be used by benchmark scripts when the script
-also verifies split routing and counters.
+LSN transaction split is active and may be used by benchmark scripts when the
+script also verifies split routing and counters.
 
 ## Output
 
@@ -125,7 +124,7 @@ Useful knobs:
 - `BENCH1_ADHOC_CLIENTS`
 - `BENCH1_TXN_CLIENTS`
 - `BENCH1_DURATION_SEC`
-- `BENCH1_WAIT_MODE`
+- `BENCH1_LSN_WAIT_TIMEOUT_ACTION`
 - `BENCH1_WAIT_TIMEOUT_MS`
 
 ### `bench2_lsn_offload.sh`
@@ -146,7 +145,7 @@ Useful knobs:
 - `BENCH2_ITERS`
 - `BENCH2_PRIMARY_DELAY_US`
 - `BENCH2_REPLAY_LAG_BYTES`
-- `BENCH2_WAIT_MODE`
+- `BENCH2_LSN_WAIT_TIMEOUT_ACTION`
 - `BENCH2_WAIT_TIMEOUT_MS`
 
 ### `bench3_replica_lag.sh`
@@ -157,7 +156,7 @@ Replica-lag correctness benchmark. It compares:
 - `session_smart`: LSN mode with a byte-lag cap, forcing writer when the reader
   is outside policy;
 - `session`: LSN mode without lag cap, using reader waits;
-- `primary_only`: writer-only reads.
+- `primary`: writer-only reads.
 
 Useful knobs:
 
@@ -165,7 +164,7 @@ Useful knobs:
 - `BENCH3_ITERS`
 - `BENCH3_REPLAY_LAG_BYTES`
 - `BENCH3_SMART_MAX_LAG_BYTES`
-- `BENCH3_WAIT_MODE`
+- `BENCH3_LSN_WAIT_TIMEOUT_ACTION`
 - `BENCH3_WAIT_TIMEOUT_MS`
 
 ### `bench4_loaded_primary.sh`
@@ -181,7 +180,7 @@ Useful knobs:
 - `BENCH4_ITERS`
 - `BENCH4_PRIMARY_DELAY_US`
 - `BENCH4_REPLAY_LAG_BYTES`
-- `BENCH4_WAIT_MODE`
+- `BENCH4_LSN_WAIT_TIMEOUT_ACTION`
 - `BENCH4_WAIT_TIMEOUT_MS`
 
 ### `bench5_consistency_shapes.sh`
@@ -232,7 +231,7 @@ Useful knobs:
 - `BENCH5_REPLAY_LAG_BYTES`
 - `BENCH5_WAL_GENERATOR`
 - `BENCH5_MAX_LAG_BYTES`
-- `BENCH5_WAIT_MODE`
+- `BENCH5_LSN_WAIT_TIMEOUT_ACTION`
 - `BENCH5_WAIT_TIMEOUT_MS`
 - `BENCH5_LAZY_WARMUP_SPLIT`
 - `BENCH5_PROXY_IDENTITY_MODE`
