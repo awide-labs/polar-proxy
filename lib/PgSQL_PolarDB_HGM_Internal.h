@@ -28,8 +28,4 @@ unsigned int pgsql_srv_latency_limit_us(unsigned int configured_max_latency_us);
 bool pgsql_srv_latency_allowed(const PgSQL_SrvC* mysrvc);
 bool pgsql_srv_latency_allowed(
 	unsigned int current_latency_us, unsigned int configured_max_latency_us);
-#if POLARDB_PROXY
-int current_global_polardb_proxy_protocol();
-#endif // POLARDB_PROXY
-
 #endif // PROXYSQL_PGSQL_POLARDB_HGM_INTERNAL_H

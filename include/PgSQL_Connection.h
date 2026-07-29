@@ -863,7 +863,9 @@ public:
 	 */
 	PolarDB_StartupProfile polardb_startup_profile;
 	uint32_t polardb_startup_profile_generation;
+	uint64_t polardb_startup_config_generation;
 	int polardb_startup_identity_mode;
+	bool polardb_startup_contract_installed;
 
 	/**
 	 * @brief Explicit endpoint to advertise in PolarDB startup params.
@@ -925,6 +927,19 @@ public:
 	 * startup profile. No-op when there is no live connection.
 	 */
 	void polardb_init_connection_tracking();
+
+	/**
+	 * @brief Install the startup contract chosen by ReaderPool creation.
+	 *
+	 * Demand creation resolves this state before asynchronous connect begins.
+	 * connect_start() must then emit this exact contract rather than rereading
+	 * thread-local configuration that may have changed after server selection.
+	 */
+	void install_polardb_startup_contract(
+		const PolarDB_StartupProfile& profile,
+		int identity_mode,
+		uint64_t startup_config_generation,
+		const PolarDB_StartupClientContext& startup_client);
 
 	/**
 	 * @brief Read the PolarDB WAL LSN carried by the last ReadyForQuery (RFQ-only).

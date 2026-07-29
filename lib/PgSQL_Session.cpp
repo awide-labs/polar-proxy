@@ -1786,6 +1786,46 @@ bool PgSQL_Session::handler_again___status_CONNECTING_SERVER(int* _rc) {
 #endif // POLARDB_PROXY
 		switch (rc) {
 		case 0:
+#if POLARDB_PROXY
+			if (myconn->polardb_startup_contract_installed &&
+					!PgHGM->polardb_connected_reader_accepts_current_startup(
+						myconn, mybe->hostgroup_id)) {
+				const int writer_hg =
+					polardb_query.reader_plan.fallback_writer_hg;
+				POLARDB_THREAD_COUNT_ONE(
+					thread, reader_pool_current_state_retry);
+				POLARDB_TRACE(
+					"PolarDB startup contract changed while connecting "
+					"reader_hg=%d writer_hg=%d; rejecting backend\n",
+					mybe->hostgroup_id, writer_hg);
+				myds->destroy_MySQL_Connection_From_Pool(false);
+				if (polardb_redirect_to_writer(
+						writer_hg, "reader startup contract changed")) {
+					set_status(CONNECTING_SERVER);
+					*_rc = 1;
+					return false;
+				}
+
+				const char* errmsg =
+					"PolarDB reader configuration changed while connecting "
+					"and no writer fallback is available";
+				if (client_myds) {
+					client_myds->myprot.generate_error_packet(
+						true, true, errmsg,
+						PGSQL_ERROR_CODES::
+							ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
+						false, true);
+				}
+				RequestEnd(myds, true);
+				while (previous_status.size()) {
+					previous_status.pop();
+				}
+				myds->max_connect_time = 0;
+				set_status(WAITING_CLIENT_DATA);
+				*_rc = 1;
+				return false;
+			}
+#endif // POLARDB_PROXY
 			myds->myds_type = MYDS_BACKEND;
 			myds->DSS = STATE_MARIADB_GENERIC;
 			status = WAITING_CLIENT_DATA;
@@ -6276,7 +6316,8 @@ void PgSQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 					polardb_reader_acquisition_handled = true;
 				}
 			} else {
-				// READER_UNAVAILABLE / READER_BUSY are ordinary pool outcomes.
+				// Availability, capacity, and cold-state retries are ordinary
+				// pool outcomes.
 				// Keep mc==NULL and let ProxySQL's existing retry/wait logic run.
 				polardb_reader_acquisition_handled = true;
 			}

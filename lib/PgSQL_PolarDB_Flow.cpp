@@ -504,15 +504,8 @@ void PgSQL_Session::polardb_collect(PolarDB_Query_RouteCtx& route_ctx,
 	// Session LSN positions. SESSION_LSN waits on max(write_lsn, observed_lsn).
 	// The caller already reconciled this state with the current writer scope.
 	route_ctx.session = polardb_session_consistency;
-	route_ctx.transaction_split.stage = polardb_transaction_split.stage;
-	route_ctx.transaction_split.primary_lsn = polardb_transaction_split.primary_lsn;
-	route_ctx.transaction_split.splittable = polardb_transaction_split.splittable;
-	route_ctx.transaction_split.wal_pending = polardb_transaction_split.wal_pending;
-	route_ctx.transaction_split.blocked = polardb_transaction_split.blocked;
-	route_ctx.transaction_split.was_splittable =
-		polardb_transaction_split.was_splittable;
-	route_ctx.transaction_split.did_split = polardb_transaction_split.did_split;
-	route_ctx.transaction_split_xids = polardb_transaction_split.xids;
+	route_ctx.transaction_split =
+		polardb_transaction_split_snapshot(polardb_transaction_split);
 	route_ctx.txn_split_enabled = policy.txn_split_enabled;
 	route_ctx.txn_force_writer_after_reader_failure =
 		polardb_txn_reader_failure.force_writer(&route_ctx.txn_writer_hg);
@@ -602,7 +595,7 @@ void PgSQL_Session::polardb_collect(PolarDB_Query_RouteCtx& route_ctx,
 			route_ctx.is_txn_split_locking_read ? 1 : 0,
 			(int)route_ctx.transaction_split.stage,
 			(unsigned long)route_ctx.transaction_split.primary_lsn,
-			route_ctx.transaction_split_xids.size(),
+			route_ctx.transaction_split.xids.size(),
 			route_ctx.transaction_split.wal_pending ? 1 : 0,
 			route_ctx.txn_reader_wait_isolation_read_committed ? 1 : 0,
 			route_ctx.txn_reader_wait_local_state_clean ? 1 : 0,
@@ -783,7 +776,6 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(const PolarDB_Query_RouteCtx
 			polardb_txn_split_rejection_reason(
 				route_ctx.txn_split_enabled,
 				route_ctx.transaction_split,
-				route_ctx.transaction_split_xids,
 				route_ctx.session.write_unknown,
 				route_ctx.session.observed_unknown,
 				route_ctx.is_multi_statement,
@@ -794,7 +786,7 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(const PolarDB_Query_RouteCtx
 				route_ctx.txn_split_enabled &&
 				route_ctx.transaction_split.stage ==
 					PolarDB_TransactionSplitStage::TXN_ON_PRIMARY &&
-				route_ctx.transaction_split_xids.empty() &&
+				route_ctx.transaction_split.xids.empty() &&
 				route_ctx.is_txn_split_safe_read) {
 			if (route_ctx.txn_reader_wait_isolation_read_committed &&
 					route_ctx.txn_reader_wait_local_state_clean) {
@@ -847,7 +839,7 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(const PolarDB_Query_RouteCtx
 					"reader_hg=%d primary_hg=%d\n",
 					static_cast<int>(route_ctx.transaction_split.stage),
 					(unsigned long)route_ctx.transaction_split.primary_lsn,
-					route_ctx.transaction_split_xids.size(),
+					route_ctx.transaction_split.xids.size(),
 					route_ctx.is_txn_split_safe_read ? 1 : 0,
 					route_ctx.is_txn_split_locking_read ? 1 : 0,
 					route_ctx.reader_hg,
@@ -904,7 +896,7 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(const PolarDB_Query_RouteCtx
 				route_ctx.reader_hg,
 				route_ctx.writer_scope.hg,
 				split_wait,
-				route_ctx.transaction_split_xids);
+				route_ctx.transaction_split.xids);
 			plan.reader.consistency_mode = mode;
 			plan.reader.route_rfq_policy = route_ctx.route_rfq_policy;
 			plan.reader.allow_best_effort_degrade = false;

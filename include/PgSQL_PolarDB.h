@@ -407,6 +407,7 @@ enum class PolarDB_ReaderStatus : uint8_t {
     ACQUIRED = 0,           // Got a usable reader connection
     READER_UNAVAILABLE,     // No reader online/usable (plain availability)
     READER_BUSY,            // Readers exist but none is immediately usable
+    RETRY_CURRENT_STATE,    // Cold creation state changed; retry next worker pass
     RFQ_UNAVAILABLE,        // No free reader with an RFQ-LSN startup profile
     PRIMARY_LSN_UNKNOWN,    // Lag cap on, but the primary LSN sample is missing
     READER_LSN_UNKNOWN,     // Lag cap on, but the reader LSN sample is missing
@@ -431,6 +432,8 @@ static inline int polardb_reader_status_priority(
         return 40;
     case PolarDB_ReaderStatus::READER_BUSY:
         return 30;
+    case PolarDB_ReaderStatus::RETRY_CURRENT_STATE:
+        return 20;
     case PolarDB_ReaderStatus::READER_UNAVAILABLE:
         return 10;
     case PolarDB_ReaderStatus::ACQUIRED:
@@ -456,6 +459,8 @@ static inline const char* polardb_reader_status_name(
         return "reader_unavailable";
     case PolarDB_ReaderStatus::READER_BUSY:
         return "reader_busy";
+    case PolarDB_ReaderStatus::RETRY_CURRENT_STATE:
+        return "retry_current_state";
     case PolarDB_ReaderStatus::RFQ_UNAVAILABLE:
         return "rfq_unavailable";
     case PolarDB_ReaderStatus::PRIMARY_LSN_UNKNOWN:
@@ -666,19 +671,6 @@ enum class PolarDB_PoolProfile : uint8_t {
     RFQ = 1
 };
 
-struct PolarDB_PoolScope {
-    unsigned int hostgroup_id{0};
-    PgSQL_SrvC* server{nullptr};
-
-    bool operator==(const PolarDB_PoolScope& other) const {
-        return hostgroup_id == other.hostgroup_id && server == other.server;
-    }
-
-    bool operator!=(const PolarDB_PoolScope& other) const {
-        return !(*this == other);
-    }
-};
-
 struct PolarDB_PoolKey {
     uint64_t auth_hash{0};
     uint64_t startup_identity_hash{0};
@@ -763,25 +755,11 @@ static inline bool polardb_pool_profile_matches_startup_profile(
 }
 
 struct PolarDB_PoolRequest {
-    PolarDB_PoolScope scope;
     PolarDB_PoolKey key;
-    PolarDB_PoolProfile expected_profile{PolarDB_PoolProfile::BASE};
     PolarDB_StartupProfile startup_profile;
     int startup_identity_mode{1};  // PolarDB_ProxyIdentityMode::PROXY
+    PolarDB_PoolProfile expected_profile{PolarDB_PoolProfile::BASE};
     bool only_pooled{false};
-    bool allow_create{true};
-    bool allow_wait_bypass{false};
-    uint64_t consistency_target_lsn{0};
-    int max_lag_bytes{0};
-
-    bool has_consistency_target_lsn() const {
-        return consistency_target_lsn != 0;
-    }
-
-    bool requires_rfq_lsn() const {
-        return has_consistency_target_lsn();
-    }
-
 };
 
 enum class PolarDB_PoolReuseState : uint8_t {
@@ -826,20 +804,14 @@ struct PolarDB_PoolReuseClassification {
 static inline PolarDB_PoolRequest polardb_make_read_pool_request(
         const PolarDB_StartupProfile& startup_profile,
         bool only_pooled,
-        uint64_t consistency_target_lsn,
-        int max_lag_bytes,
-        bool allow_wait_bypass = false) {
+        bool require_rfq_profile) {
     PolarDB_PoolRequest request;
     request.startup_profile = startup_profile;
     request.expected_profile =
-        consistency_target_lsn != 0
+        require_rfq_profile
             ? PolarDB_PoolProfile::RFQ
             : polardb_pool_profile_from_startup_profile(startup_profile);
     request.only_pooled = only_pooled;
-    request.allow_create = !only_pooled;
-    request.allow_wait_bypass = allow_wait_bypass;
-    request.consistency_target_lsn = consistency_target_lsn;
-    request.max_lag_bytes = max_lag_bytes;
     return request;
 }
 
@@ -1255,6 +1227,33 @@ enum class PolarDB_ProxyIdentityMode : uint8_t {
     CLIENT = 0,
     PROXY = 1
 };
+
+/**
+ * @brief Coherent parsed values that affect PolarDB backend startup packets.
+ *
+ * The thread handler owns the canonical value. Workers copy it while holding
+ * the existing thread-variable lock and then use their thread-local fields.
+ */
+struct PolarDB_StartupConfigValue {
+    uint64_t generation{1};
+    PolarDB_ProxyProtocol proxy_protocol{PolarDB_ProxyProtocol::V15};
+    PolarDB_ProxyIdentityMode identity_mode{PolarDB_ProxyIdentityMode::PROXY};
+    PolarDB_StartupIdentity configured_identity;
+};
+
+struct PolarDB_ParsedGlobalConfigValue {
+    int consistency_mode{0};
+    PolarDB_StartupConfigValue startup;
+};
+
+static inline bool polardb_same_startup_config_inputs(
+        const PolarDB_StartupConfigValue& lhs,
+        const PolarDB_StartupConfigValue& rhs) {
+    return lhs.proxy_protocol == rhs.proxy_protocol &&
+        lhs.identity_mode == rhs.identity_mode &&
+        lhs.configured_identity.host == rhs.configured_identity.host &&
+        lhs.configured_identity.port == rhs.configured_identity.port;
+}
 
 static inline int polardb_proxy_identity_mode_from_string(
         const char* value,
@@ -1725,6 +1724,39 @@ struct PolarDB_TransactionSplitState {
         did_split = false;
     }
 };
+
+/**
+ * @brief Immutable transaction-split inputs captured for one routing decision.
+ *
+ * The session state above owns the RFQ XID string and is mutable across queries.
+ * Routing needs only a synchronous view of that string plus the scalar evidence;
+ * keeping this separate avoids constructing an unused std::string in every
+ * PolarDB_Query_RouteCtx.
+ */
+struct PolarDB_TransactionSplitSnapshot {
+    std::string_view xids;
+    uint64_t primary_lsn = 0;
+    PolarDB_TransactionSplitStage stage = PolarDB_TransactionSplitStage::NONE;
+    bool splittable = false;
+    bool wal_pending = false;
+    bool blocked = false;
+    bool was_splittable = false;
+    bool did_split = false;
+};
+
+static inline PolarDB_TransactionSplitSnapshot
+polardb_transaction_split_snapshot(const PolarDB_TransactionSplitState& state) {
+    PolarDB_TransactionSplitSnapshot snapshot;
+    snapshot.xids = state.xids;
+    snapshot.primary_lsn = state.primary_lsn;
+    snapshot.stage = state.stage;
+    snapshot.splittable = state.splittable;
+    snapshot.wal_pending = state.wal_pending;
+    snapshot.blocked = state.blocked;
+    snapshot.was_splittable = state.was_splittable;
+    snapshot.did_split = state.did_split;
+    return snapshot;
+}
 
 /**
  * @brief Immutable wait payload for one routed query (Spec: payload only).
@@ -2362,10 +2394,9 @@ bool parse_polardb_full_health_check(const char* node_type_str, const char* is_a
 struct PolarDB_Query_RouteCtx {
     PolarDB_WriterScope writer_scope;         // replication-group writer identity
     PolarDB_SessionConsistency session;       // session LSN/sticky-flag snapshot
-    // Observed primary RFQ split state. XIDs are carried separately as a view so
-    // collect->plan does not copy the transaction XID string on every query.
-    PolarDB_TransactionSplitState transaction_split;
-    std::string_view transaction_split_xids;
+    // Observed primary RFQ split state. The snapshot views the session-owned XID
+    // string; collect->plan is synchronous and never crosses an async boundary.
+    PolarDB_TransactionSplitSnapshot transaction_split;
 
     // --- 32-bit fields ---
     uint32_t wait_timeout_ms = POLARDB_DEFAULT_WAIT_TIMEOUT_MS; // resolved wait timeout (HG or global)
@@ -2626,8 +2657,7 @@ struct PolarDB_Query_RoutePlan {
  */
 static inline PolarDB_Query_RoutePlan::RouteActionReason polardb_txn_split_rejection_reason(
     bool txn_split_enabled,
-    const PolarDB_TransactionSplitState& transaction_split,
-    std::string_view transaction_split_xids,
+    const PolarDB_TransactionSplitSnapshot& transaction_split,
     bool write_lsn_unknown,
     bool observed_lsn_unknown,
     bool is_multi_statement,
@@ -2648,7 +2678,7 @@ static inline PolarDB_Query_RoutePlan::RouteActionReason polardb_txn_split_rejec
     if (transaction_split.stage != PolarDB_TransactionSplitStage::TXN_SPLITTABLE) {
         return RAR::IN_TRANSACTION;
     }
-    if (transaction_split_xids.empty()) return RAR::INVARIANT_VIOLATION;
+    if (transaction_split.xids.empty()) return RAR::INVARIANT_VIOLATION;
     if (transaction_split.primary_lsn == 0) return RAR::NO_TXN_LSN;
 
     return RAR::NONE;

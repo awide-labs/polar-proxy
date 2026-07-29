@@ -700,9 +700,11 @@ polardb-opt-report:
 polardb-check:
 	@echo "=== polardb-check [1/2]: POLARDB_PROXY=0 (stubs) ==="
 	+$(MAKE) clean
+	+$(MAKE) -C deps postgresql-reset
 	+$(MAKE) POLARDB_PROXY=0 build_src
 	@echo "=== polardb-check [2/2]: POLARDB_PROXY=1 ==="
 	+$(MAKE) clean
+	+$(MAKE) -C deps postgresql-reset
 	+$(MAKE) POLARDB_PROXY=1 build_src
 	@echo "=== polardb-check OK: both tiers build; tree left at POLARDB_PROXY=1 ==="
 

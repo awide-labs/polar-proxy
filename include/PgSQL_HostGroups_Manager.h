@@ -217,6 +217,7 @@ struct PgSQL_PoolGetResult {
 	PgSQL_Connection* conn{nullptr};
 	PgSQL_PoolGetSource source{PgSQL_PoolGetSource::NONE};
 	bool server_saturated{false};
+	bool retry_current_state{false};
 };
 
 class PgSQL_SrvConnList {
@@ -957,6 +958,7 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 		std::atomic<unsigned long long> polardb_reader_pool_drop_unusable{0}; // reader-pool readers dropped because no longer reusable
 		std::atomic<unsigned long long> polardb_reader_pool_drop_client_identity{0}; // reader-pool readers closed because CLIENT startup identity cannot be shared
 		std::atomic<unsigned long long> polardb_reader_pool_lookup{0};       // reader-pool lookup attempts
+		std::atomic<unsigned long long> polardb_reader_pool_current_state_retry{0}; // cold reader creations retried after topology or startup configuration changed
 		std::atomic<unsigned long long> polardb_reader_pool_server_considered{0}; // reader servers considered by reader pool
 		std::atomic<unsigned long long> polardb_reader_pool_server_skip_unusable{0}; // reader-pool server skipped by status, weight, or latency
 		std::atomic<unsigned long long> polardb_reader_pool_match_attempt{0}; // exact connection attempts on an eligible reader
@@ -1481,7 +1483,9 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 		PgSQL_SrvC* srv, unsigned int expected_hostgroup_id,
 		const PgSQL_PoolMatchKey& match_key,
 		PgSQL_Session* sess, PgSQL_PoolGetMode mode,
-		unsigned int selected_max_connections = 0);
+		unsigned int selected_max_connections = 0,
+		uint64_t expected_server_list_generation = 0,
+		uint64_t expected_startup_config_generation = 0);
 #endif // POLARDB_PROXY
 
 	void drop_all_idle_connections();
@@ -1617,6 +1621,10 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 	PolarDB_HG_Policy get_polardb_hg_policy(unsigned int hostgroup_id);
 	std::shared_ptr<const PolarDB_ServerListSnapshot>
 		get_polardb_server_list_snapshot() const;
+	uint64_t polardb_server_list_snapshot_generation(
+		const std::shared_ptr<const void>& snapshot) const;
+	bool polardb_connected_reader_accepts_current_startup(
+		const PgSQL_Connection* conn, unsigned int expected_hostgroup_id);
 	PgSQL_HGC* polardb_find_hostgroup(unsigned int hostgroup_id);
 
 	/**
@@ -1624,13 +1632,14 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 	 *        PolarDB proxy-protocol policy.
 	 */
 	PolarDB_StartupProfile polardb_startup_profile_for_hostgroup(
-		unsigned int hostgroup_id);
+		unsigned int hostgroup_id, int fallback_proxy_protocol);
 
 	/**
 	 * @brief Whether the hostgroup's current effective proxy protocol requests
 	 *        RFQ LSN feedback.
 	 */
-	bool polardb_hostgroup_requests_rfq_lsn(unsigned int hostgroup_id);
+	bool polardb_hostgroup_requests_rfq_lsn(
+		unsigned int hostgroup_id, int fallback_proxy_protocol);
 
 	/**
 	 * @brief Warn about loaded PolarDB policy combinations whose effective
@@ -1740,6 +1749,7 @@ private:
 	void polardb_update_server_list_snapshot_locked();
 	void polardb_retire_server_locked(PgSQL_SrvC* srv);
 	void polardb_cleanup_retired_servers_locked();
+	void polardb_quiesce_snapshots_for_shutdown();
 
 	// PolarDB HG topology cache populated from pgsql_replication_hostgroups;
 	// empty until then, so accessors fail safe.
@@ -1758,6 +1768,7 @@ private:
 	};
 	std::vector<PolarDB_RetiredServer> polardb_retired_servers_;
 	std::unique_ptr<PgSQL_PolarDB_ReaderPool> polardb_reader_pool_;
+	bool polardb_snapshots_quiesced_{false};
 #endif // POLARDB_PROXY
 };
 

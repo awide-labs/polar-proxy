@@ -174,6 +174,10 @@ static void test_reader_status_names() {
 			"reader_busy") == 0,
 		"reader busy status has stable lowercase name");
 	ok(strcmp(polardb_reader_status_name(
+			PolarDB_ReaderStatus::RETRY_CURRENT_STATE),
+			"retry_current_state") == 0,
+		"current-state retry status has stable lowercase name");
+	ok(strcmp(polardb_reader_status_name(
 			PolarDB_ReaderStatus::RFQ_UNAVAILABLE),
 			"rfq_unavailable") == 0,
 		"RFQ unavailable status has stable lowercase name");
@@ -199,6 +203,9 @@ static void test_reader_status_names() {
 	ok(!polardb_reader_status_redirects_to_writer(
 			PolarDB_ReaderStatus::READER_BUSY),
 		"reader busy uses normal no-connection handling");
+	ok(!polardb_reader_status_redirects_to_writer(
+			PolarDB_ReaderStatus::RETRY_CURRENT_STATE),
+		"current-state retry returns through normal no-connection handling");
 	ok(polardb_reader_status_redirects_to_writer(
 			PolarDB_ReaderStatus::PRIMARY_LSN_UNKNOWN),
 		"unknown primary LSN redirects this consistency read to writer");
@@ -223,6 +230,9 @@ static void test_reader_status_names() {
 	ok(polardb_reader_status_split_warmup_can_help(
 			PolarDB_ReaderStatus::RFQ_UNAVAILABLE),
 		"split warmup can help when no RFQ-LSN-capable reader backend is available");
+	ok(!polardb_reader_status_split_warmup_can_help(
+			PolarDB_ReaderStatus::RETRY_CURRENT_STATE),
+		"split warmup is not requested for configuration churn");
 	ok(!polardb_reader_status_split_warmup_can_help(
 			PolarDB_ReaderStatus::PRIMARY_LSN_UNKNOWN),
 		"split warmup cannot fix a missing primary LSN sample");

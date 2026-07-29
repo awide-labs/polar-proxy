@@ -438,8 +438,10 @@ PgSQL_Connection::PgSQL_Connection(bool is_client_conn) {
 	polardb_parent_queries_sent_pending = 0;
 	polardb_parent_query_batch_count = 0;
 	polardb_startup_profile_generation = 0;
+	polardb_startup_config_generation = 0;
 	polardb_startup_identity_mode =
 		static_cast<int>(PolarDB_ProxyIdentityMode::PROXY);
+	polardb_startup_contract_installed = false;
 	polardb_forced_startup_identity = PolarDB_StartupIdentity{};
 	polardb_forced_startup_parameters = false;
 	polardb_startup_client = PolarDB_StartupClientContext{};
@@ -1494,10 +1496,16 @@ void PgSQL_Connection::connect_start() {
 	const bool is_polardb_hg =
 		parent && parent->myhgc && PgHGM->is_polardb_hostgroup(polardb_hid);
 	const bool client_backed = myds && myds->sess && myds->sess->client_myds;
-	polardb_startup_profile = build_polardb_startup_profile(polardb_hid);
-	polardb_startup_profile_generation =
-		polardb_startup_profile.generation(
-			pgsql_thread___polardb_proxy_identity_mode);
+	if (!polardb_startup_contract_installed) {
+		polardb_startup_profile = build_polardb_startup_profile(polardb_hid);
+		polardb_startup_identity_mode =
+			pgsql_thread___polardb_proxy_identity_mode;
+		polardb_startup_profile_generation =
+			polardb_startup_profile.generation(
+				polardb_startup_identity_mode);
+	}
+	const bool use_polardb_startup_contract =
+		is_polardb_hg || polardb_startup_contract_installed;
 	POLARDB_TRACE("PolarDB CONNINFO: hg=%u is_polardb=%d protocol=%s request_bits=0x%x\n",
 		polardb_hid, is_polardb_hg ? 1 : 0,
 		polardb_proxy_protocol_name(polardb_startup_profile.protocol),
@@ -1584,7 +1592,7 @@ void PgSQL_Connection::connect_start() {
 		// Append the PolarDB startup parameters now that the options block above
 		// is closed: they must be top-level conninfo keys, not options entries.
 		// The profile decides whether v15, legacy, or no parameters are emitted.
-		if (is_polardb_hg) {
+		if (use_polardb_startup_contract) {
 			POLARDB_TRACE("PolarDB CONNINFO: client-backed sess=%p is_polardb_enabled=%d session_consistency_mode=%d\n",
 				myds->sess,
 				myds->sess ? (myds->sess->polardb_config.is_polardb_enabled ? 1 : 0) : -1,
@@ -1633,7 +1641,7 @@ void PgSQL_Connection::connect_start() {
 	// Non-client (monitor / internal) connections use the same profile builder.
 	// If RFQ LSN is requested here, configured fallback identity is normally
 	// required because there is no real client address.
-	if (!client_backed && is_polardb_hg) {
+	if (!client_backed && use_polardb_startup_contract) {
 		if (!append_polardb_startup_params(conninfo, polardb_startup_profile, polardb_hid)) {
 			return;
 		}
@@ -1691,6 +1699,20 @@ PolarDB_StartupProfile PgSQL_Connection::build_polardb_startup_profile(unsigned 
 		polardb_proxy_protocol_from_int(protocol));
 }
 
+void PgSQL_Connection::install_polardb_startup_contract(
+		const PolarDB_StartupProfile& profile,
+		int identity_mode,
+		uint64_t startup_config_generation,
+		const PolarDB_StartupClientContext& startup_client) {
+	polardb_startup_profile = profile;
+	polardb_startup_identity_mode = identity_mode;
+	polardb_startup_profile_generation = profile.generation(identity_mode);
+	polardb_startup_config_generation = startup_config_generation;
+	polardb_startup_client = startup_client;
+	polardb_forced_startup_identity = startup_client.identity;
+	polardb_startup_contract_installed = true;
+}
+
 /// @brief Pick the client identity to advertise in PolarDB startup parameters.
 ///
 /// PolarDB uses this host/port to identify the request source behind the proxy.
@@ -1717,12 +1739,17 @@ PolarDB_StartupIdentity PgSQL_Connection::resolve_polardb_startup_identity(
 	const bool debug_use_listener_proxy = false;
 	const bool debug_use_configured_fallback = false;
 #endif
-	const int identity_mode = pgsql_thread___polardb_proxy_identity_mode;
+	const int identity_mode = polardb_startup_identity_mode;
 	const bool use_client_identity =
 		polardb_proxy_identity_mode_uses_client_identity(identity_mode);
 	const bool use_proxy_identity =
 		!use_client_identity || debug_use_listener_proxy ||
 		debug_use_configured_fallback;
+	if (polardb_startup_contract_installed &&
+			!debug_use_listener_proxy &&
+			!debug_use_configured_fallback) {
+		return polardb_startup_client.identity;
+	}
 	if (polardb_forced_startup_identity.source !=
 			PolarDB_StartupIdentitySource::NONE) {
 		const bool forced_client_identity =
@@ -1811,8 +1838,11 @@ PolarDB_StartupIdentity PgSQL_Connection::resolve_polardb_startup_identity(
 // declaration in PgSQL_Connection.h for the full contract.
 bool PgSQL_Connection::append_polardb_startup_params(std::ostringstream& conninfo,
 	const PolarDB_StartupProfile& profile, unsigned int hid) {
-	polardb_startup_client = PolarDB_StartupClientContext{};
-	polardb_startup_identity_mode = pgsql_thread___polardb_proxy_identity_mode;
+	if (!polardb_startup_contract_installed) {
+		polardb_startup_client = PolarDB_StartupClientContext{};
+		polardb_startup_identity_mode =
+			pgsql_thread___polardb_proxy_identity_mode;
+	}
 	// Profiles that do not ask for RFQ payloads need no startup parameters at all.
 	if (!profile.emits_startup_params()) {
 		POLARDB_TRACE("PolarDB CONNINFO: no RFQ startup request for HG %u protocol=%s\n",
@@ -1830,7 +1860,7 @@ bool PgSQL_Connection::append_polardb_startup_params(std::ostringstream& conninf
 		msg += " requests RFQ payloads but no startup identity is available ";
 		msg += "(identity_mode=";
 		msg += polardb_proxy_identity_mode_name(
-			pgsql_thread___polardb_proxy_identity_mode);
+			polardb_startup_identity_mode);
 		msg += "); ";
 		msg += "use a client-backed connection, listener/proxy address, or configure ";
 		msg += "pgsql-polardb_proxy_identity_host and pgsql-polardb_proxy_identity_port";

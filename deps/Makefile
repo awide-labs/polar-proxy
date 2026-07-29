@@ -438,6 +438,10 @@ postgresql/postgresql/src/bin/pgbench/pgbench: postgresql/postgresql/src/interfa
 
 postgresql: postgresql/postgresql/src/interfaces/libpq/libpq.a postgresql/postgresql/src/bin/pgbench/pgbench
 
+.PHONY: postgresql-reset
+postgresql-reset:
+	cd postgresql && rm -rf postgres-*/ || true
+
 .PHONY: libpq-rebuild
 libpq-rebuild:
 	+cd postgresql/postgresql/src/interfaces/libpq && CC=${CC} CXX=${CXX} ${MAKE} MAKELEVEL=0

@@ -14,6 +14,7 @@
 
 #include <cstring>
 #include <string_view>
+#include <type_traits>
 
 // ---- SESSION_LSN monotonic target & wait-plan construction ----
 
@@ -330,69 +331,81 @@ static void test_zero_lsn_safe_statement_classifier() {
 
 static void test_txn_split_rejection_reason() {
 	PolarDB_TransactionSplitState state;
+	auto snapshot = [&]() {
+		return polardb_transaction_split_snapshot(state);
+	};
 
-	ok(polardb_txn_split_rejection_reason(false, state, state.xids, false, false, false, false, true, false) ==
+	ok(sizeof(PolarDB_TransactionSplitSnapshot) <= 32,
+		"transaction split route snapshot stays within 32 bytes");
+	ok(std::is_trivially_destructible<PolarDB_TransactionSplitSnapshot>::value,
+		"transaction split route snapshot owns no request-lifetime state");
+	ok(snapshot().xids.data() == state.xids.data(),
+		"transaction split route snapshot views the session-owned XID string");
+
+	ok(polardb_txn_split_rejection_reason(false, snapshot(), false, false, false, false, true, false) ==
 			PolarDB_Query_RoutePlan::RouteActionReason::HG_SPLIT_DISABLED,
 		"transaction split planning rejects disabled hostgroup policy");
-	ok(polardb_txn_split_rejection_reason(true, state, state.xids, false, false, true, false, true, false) ==
+	ok(polardb_txn_split_rejection_reason(true, snapshot(), false, false, true, false, true, false) ==
 			PolarDB_Query_RoutePlan::RouteActionReason::MULTI_STATEMENT,
 		"transaction split planning rejects multi-statement query");
-	ok(polardb_txn_split_rejection_reason(true, state, state.xids, false, false, false, true, true, false) ==
+	ok(polardb_txn_split_rejection_reason(true, snapshot(), false, false, false, true, true, false) ==
 			PolarDB_Query_RoutePlan::RouteActionReason::EXTENDED_PROTOCOL,
 		"transaction split planning rejects extended protocol");
-	ok(polardb_txn_split_rejection_reason(true, state, state.xids, false, false, false, false, false, false) ==
+	ok(polardb_txn_split_rejection_reason(true, snapshot(), false, false, false, false, false, false) ==
 			PolarDB_Query_RoutePlan::RouteActionReason::SPLIT_NOT_SELECT,
 		"transaction split planning rejects non-SELECT statement shape");
-	ok(polardb_txn_split_rejection_reason(true, state, state.xids, false, false, false, false, false, true) ==
+	ok(polardb_txn_split_rejection_reason(true, snapshot(), false, false, false, false, false, true) ==
 			PolarDB_Query_RoutePlan::RouteActionReason::SPLIT_LOCKING_READ,
 		"transaction split planning rejects locking SELECT statement shape");
-	ok(polardb_txn_split_rejection_reason(true, state, state.xids, true, false, false, false, true, false) ==
+	ok(polardb_txn_split_rejection_reason(true, snapshot(), true, false, false, false, true, false) ==
 			PolarDB_Query_RoutePlan::RouteActionReason::SPLIT_WRITE_LSN_UNKNOWN,
 		"transaction split planning rejects prior write with unknown LSN");
-	ok(polardb_txn_split_rejection_reason(true, state, state.xids, false, true, false, false, true, false) ==
+	ok(polardb_txn_split_rejection_reason(true, snapshot(), false, true, false, false, true, false) ==
 			PolarDB_Query_RoutePlan::RouteActionReason::SPLIT_OBSERVED_LSN_UNKNOWN,
 		"transaction split planning rejects prior observed read with unknown LSN");
 
 	state.stage = PolarDB_TransactionSplitStage::TXN_ON_PRIMARY;
 	state.blocked = true;
-	ok(polardb_txn_split_rejection_reason(true, state, state.xids, false, false, false, false, true, false) ==
+	ok(polardb_txn_split_rejection_reason(true, snapshot(), false, false, false, false, true, false) ==
 			PolarDB_Query_RoutePlan::RouteActionReason::SPLIT_BLOCKED,
 		"transaction split planning rejects blocked transaction");
 
 	state.blocked = false;
 	state.wal_pending = true;
-	ok(polardb_txn_split_rejection_reason(true, state, state.xids, false, false, false, false, true, false) ==
+	ok(polardb_txn_split_rejection_reason(true, snapshot(), false, false, false, false, true, false) ==
 			PolarDB_Query_RoutePlan::RouteActionReason::WAL_PENDING,
 		"transaction split planning rejects WAL-pending transaction");
 
 	state.xids = "10,11";
 	state.primary_lsn = 900;
-	ok(polardb_txn_split_rejection_reason(true, state, state.xids, false, false, false, false, true, false) ==
+	ok(polardb_txn_split_rejection_reason(true, snapshot(), false, false, false, false, true, false) ==
 			PolarDB_Query_RoutePlan::RouteActionReason::WAL_PENDING,
 		"transaction split planning rejects WAL-pending transaction with XIDs and LSN");
 
 	state.wal_pending = false;
-	ok(polardb_txn_split_rejection_reason(true, state, state.xids, false, false, false, false, true, false) ==
+	ok(polardb_txn_split_rejection_reason(true, snapshot(), false, false, false, false, true, false) ==
 			PolarDB_Query_RoutePlan::RouteActionReason::IN_TRANSACTION,
 		"transaction split planning keeps non-splittable transaction on primary");
 
 	state.stage = PolarDB_TransactionSplitStage::TXN_SPLITTABLE;
 	state.xids.clear();
 	state.primary_lsn = 0;
-	ok(polardb_txn_split_rejection_reason(true, state, state.xids, false, false, false, false, true, false) ==
+	ok(polardb_txn_split_rejection_reason(true, snapshot(), false, false, false, false, true, false) ==
 			PolarDB_Query_RoutePlan::RouteActionReason::INVARIANT_VIOLATION,
 		"transaction split planning rejects splittable state without XIDs");
 
 	state.xids = "10,11";
-	ok(polardb_txn_split_rejection_reason(true, state, std::string_view(), false, false, false, false, true, false) ==
+	PolarDB_TransactionSplitSnapshot missing_xids = snapshot();
+	missing_xids.xids = std::string_view();
+	ok(polardb_txn_split_rejection_reason(true, missing_xids, false, false, false, false, true, false) ==
 			PolarDB_Query_RoutePlan::RouteActionReason::INVARIANT_VIOLATION,
 		"transaction split planning reads XIDs from the route-context view");
-	ok(polardb_txn_split_rejection_reason(true, state, state.xids, false, false, false, false, true, false) ==
+	ok(polardb_txn_split_rejection_reason(true, snapshot(), false, false, false, false, true, false) ==
 			PolarDB_Query_RoutePlan::RouteActionReason::NO_TXN_LSN,
 		"transaction split planning rejects splittable state without primary LSN");
 
 	state.primary_lsn = 900;
-	ok(polardb_txn_split_rejection_reason(true, state, state.xids, false, false, false, false, true, false) ==
+	ok(polardb_txn_split_rejection_reason(true, snapshot(), false, false, false, false, true, false) ==
 			PolarDB_Query_RoutePlan::RouteActionReason::NONE,
 		"transaction split planning accepts complete RFQ evidence");
 }
@@ -452,7 +465,7 @@ static void test_session_lsn_scope_check() {
 }
 
 int main() {
-	plan(138);
+	plan(141);
 	test_route_action_values_are_append_only();
 	test_session_lsn_target_uses_max_position();
 	test_wait_plan_uses_monotonic_session_lsn();

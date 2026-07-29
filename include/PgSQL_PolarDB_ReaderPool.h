@@ -41,6 +41,7 @@ struct PgSQL_SplitWarmupRequest {
 	bool has_startup_parameters = false;
 	int startup_identity_mode =
 		static_cast<int>(PolarDB_ProxyIdentityMode::PROXY);
+	uint64_t startup_config_generation = 0;
 	unsigned int max_connections_per_request = 1;
 	unsigned long long requested_at_us = 0;
 	std::string target_address;

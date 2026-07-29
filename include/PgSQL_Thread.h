@@ -1017,6 +1017,12 @@ private:
 	//   variable address
 	//   special variable : if true, further input validation is required
 	std::unordered_map<std::string, std::tuple<bool*, bool>> VariablesPointers_bool;
+#if POLARDB_PROXY
+	PolarDB_ParsedGlobalConfigValue polardb_global_config_;
+	std::atomic<uint64_t> polardb_startup_config_generation_{1};
+	PolarDB_ParsedGlobalConfigValue build_polardb_global_config_locked(
+		uint64_t startup_generation) const;
+#endif // POLARDB_PROXY
 	/**
 	 * @brief Holds the clients host cache. It keeps track of the number of
 	 *   errors associated to a specific client:
@@ -1424,6 +1430,16 @@ public:
 	 *
 	 */
 	void commit();
+
+#if POLARDB_PROXY
+	/** Copy the canonical parsed PolarDB values while the caller holds rwlock. */
+	PolarDB_ParsedGlobalConfigValue polardb_global_config_locked() const;
+
+	/** Copy parsed PolarDB values for cold callers. */
+	PolarDB_ParsedGlobalConfigValue get_polardb_global_config();
+
+	uint64_t get_polardb_startup_config_generation() const;
+#endif // POLARDB_PROXY
 
 	/**
 	 * @brief Retrieves the value of a thread variable as a string.

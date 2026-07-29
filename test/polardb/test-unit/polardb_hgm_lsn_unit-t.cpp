@@ -1356,13 +1356,15 @@ static void test_reader_pool_request_limits() {
 
 	PolarDB_StartupProfile startup_profile;
 	PolarDB_PoolRequest pooled_request =
-		polardb_make_read_pool_request(startup_profile, true, 0, 0);
-	ok(!pooled_request.allow_create,
+		polardb_make_read_pool_request(startup_profile, true, false);
+	ok(pooled_request.only_pooled,
 		"PolarDB reader request policy: pooled-only requests cannot create");
 	PolarDB_PoolRequest ordinary_request =
-		polardb_make_read_pool_request(startup_profile, false, 0, 0);
-	ok(ordinary_request.allow_create,
+		polardb_make_read_pool_request(startup_profile, false, false);
+	ok(!ordinary_request.only_pooled,
 		"PolarDB reader request policy: ordinary requests can create");
+	ok(sizeof(PolarDB_PoolRequest) <= 40,
+		"PolarDB reader request policy: hot pool request stays within 40 bytes");
 }
 
 static void test_core_match_pool_index_and_transfer() {
@@ -1430,13 +1432,42 @@ static void test_core_match_pool_index_and_transfer() {
 	ok(denied.conn == nullptr && denied.source == PgSQL_PoolGetSource::NONE,
 		"PostgreSQL core match pool: NONE performs no pool action");
 
+	PgSQL_PoolMatchKey missing_key;
+	missing_key.words[0] = 3;
+	missing_key.words[1] = 33;
+	const auto current_server_snapshot =
+		PgHGM->get_polardb_server_list_snapshot();
+	const uint64_t current_server_generation = current_server_snapshot
+		? current_server_snapshot->generation : 0;
+	const uint64_t current_startup_generation =
+		GloPTH->get_polardb_startup_config_generation();
+	PgSQL_PoolGetResult stale_startup =
+		PgHGM->get_connection_from_selected_server(
+			reader, reader_hg, missing_key, nullptr,
+			PgSQL_PoolGetMode::ALLOW_EXACT_MATCH |
+				PgSQL_PoolGetMode::ALLOW_CREATE,
+			/*selected_max_connections=*/0,
+			current_server_generation,
+			current_startup_generation + 1);
+	ok(!stale_startup.conn && stale_startup.retry_current_state &&
+			!stale_startup.server_saturated,
+		"PostgreSQL core match pool: stale startup state requests a cold-path retry without reporting saturation");
+	PgSQL_PoolGetResult stale_server_list =
+		PgHGM->get_connection_from_selected_server(
+			reader, reader_hg, missing_key, nullptr,
+			PgSQL_PoolGetMode::ALLOW_EXACT_MATCH |
+				PgSQL_PoolGetMode::ALLOW_CREATE,
+			/*selected_max_connections=*/0,
+			current_server_generation + 1,
+			current_startup_generation);
+	ok(!stale_server_list.conn && stale_server_list.retry_current_state &&
+			!stale_server_list.server_saturated,
+		"PostgreSQL core match pool: stale selected-server state requests a cold-path retry without reporting saturation");
+
 	PgSQL_Connection* used_a = reader->take_matching_connection(key_a);
 	PgSQL_Connection* used_b = reader->take_matching_connection(key_b);
 	ok(used_a == conn_a && used_b == conn_b,
 		"PostgreSQL core match pool: saturation fixture moves all free connections to USED");
-	PgSQL_PoolMatchKey missing_key;
-	missing_key.words[0] = 3;
-	missing_key.words[1] = 33;
 	const int saved_max_connections = reader->max_connections;
 	reader->max_connections = 3;
 	PgSQL_PoolGetResult snapshot_full =
@@ -3877,6 +3908,8 @@ static void test_split_warmup_request_dedup() {
 	const bool saved_lazy_warmup = pgsql_thread___polardb_lazy_warmup_split;
 	const bool saved_runtime_lazy_warmup =
 		GloPTH ? GloPTH->variables.polardb_lazy_warmup_split : false;
+	const uint64_t saved_startup_generation =
+		pgsql_thread___polardb_startup_config_generation;
 	auto set_lazy_warmup = [](bool value) {
 		pgsql_thread___polardb_lazy_warmup_split = value;
 		if (GloPTH) {
@@ -3890,7 +3923,6 @@ static void test_split_warmup_request_dedup() {
 	PgHGM->warm_split_pools();
 
 	set_lazy_warmup(true);
-	pgsql_thread___polardb_lazy_warmup_split = false;
 
 	const unsigned long long requested_before =
 		PgHGM->status.polardb_split_warmup_requested.load(std::memory_order_relaxed);
@@ -3902,7 +3934,7 @@ static void test_split_warmup_request_dedup() {
 		"polardb_unit_db", startup_client, nullptr);
 	ok(PgHGM->status.polardb_split_warmup_requested.load(std::memory_order_relaxed) ==
 			requested_before + 1,
-		"PolarDB warmup request: runtime setting owns request acceptance");
+		"PolarDB warmup request: refreshed thread-local setting owns request acceptance");
 	ok(PgHGM->status.polardb_warmup_pending.load(std::memory_order_relaxed) == 1,
 		"PolarDB warmup request: pending gauge stores the deduplicated queue depth");
 
@@ -3910,6 +3942,32 @@ static void test_split_warmup_request_dedup() {
 	PgHGM->warm_split_pools();
 	ok(PgHGM->status.polardb_warmup_pending.load(std::memory_order_relaxed) == 0,
 		"PolarDB warmup request: disabled lazy warmup drains queued work");
+
+	set_lazy_warmup(true);
+	const unsigned long long current_state_retry_before =
+		PgHGM->status.polardb_reader_pool_current_state_retry.load(
+			std::memory_order_relaxed);
+	const unsigned long long stale_failed_before =
+		PgHGM->status.polardb_split_warmup_failed.load(
+			std::memory_order_relaxed);
+	const uint64_t queued_startup_generation =
+		saved_startup_generation != 0 ? saved_startup_generation : 1;
+	pgsql_thread___polardb_startup_config_generation =
+		queued_startup_generation;
+	PgHGM->request_split_warmup(
+		reader_hg, "polardb_unit_user", "polardb_unit_pass",
+		"polardb_unit_db", startup_client, nullptr);
+	pgsql_thread___polardb_startup_config_generation =
+		queued_startup_generation + 1;
+	PgHGM->warm_split_pools();
+	ok(PgHGM->status.polardb_reader_pool_current_state_retry.load(
+			std::memory_order_relaxed) == current_state_retry_before + 1,
+		"PolarDB warmup request: stale startup generation is discarded before connect");
+	ok(PgHGM->status.polardb_split_warmup_failed.load(
+			std::memory_order_relaxed) == stale_failed_before,
+		"PolarDB warmup request: configuration churn is not counted as a backend failure");
+	pgsql_thread___polardb_startup_config_generation =
+		saved_startup_generation;
 
 	set_lazy_warmup(true);
 	const unsigned long long hg0_requested_before =
@@ -3963,6 +4021,8 @@ static void test_split_warmup_runtime_variable_refresh() {
 		GloPTH->variables.connect_timeout_server_max;
 	const int saved_runtime_max_connections =
 		GloPTH->variables.polardb_split_warmup_max_connections_per_request;
+	const bool saved_runtime_lazy_warmup =
+		GloPTH->variables.polardb_lazy_warmup_split;
 	char* saved_runtime_proxy_protocol =
 		GloPTH->variables.polardb_proxy_protocol ?
 			strdup(GloPTH->variables.polardb_proxy_protocol) : NULL;
@@ -3985,6 +4045,8 @@ static void test_split_warmup_runtime_variable_refresh() {
 	const int saved_tls_timeout_max = pgsql_thread___connect_timeout_server_max;
 	const int saved_tls_max_connections =
 		pgsql_thread___polardb_split_warmup_max_connections_per_request;
+	const bool saved_tls_lazy_warmup =
+		pgsql_thread___polardb_lazy_warmup_split;
 	const int saved_tls_proxy_protocol =
 		pgsql_thread___polardb_proxy_protocol;
 	const int saved_tls_identity_mode =
@@ -3994,7 +4056,7 @@ static void test_split_warmup_runtime_variable_refresh() {
 			strdup(pgsql_thread___polardb_proxy_identity_host) : NULL;
 	const int saved_tls_identity_port =
 		pgsql_thread___polardb_proxy_identity_port;
-
+	GloPTH->wrlock();
 	GloPTH->variables.throttle_connections_per_sec_to_hostgroup = 0;
 	GloPTH->variables.default_max_latency_ms = 17;
 	GloPTH->variables.connect_retries_on_failure = 2;
@@ -4003,6 +4065,7 @@ static void test_split_warmup_runtime_variable_refresh() {
 	GloPTH->variables.connect_timeout_server = 1234;
 	GloPTH->variables.connect_timeout_server_max = 4321;
 	GloPTH->variables.polardb_split_warmup_max_connections_per_request = 7;
+	GloPTH->variables.polardb_lazy_warmup_split = !saved_tls_lazy_warmup;
 	free(GloPTH->variables.polardb_proxy_protocol);
 	GloPTH->variables.polardb_proxy_protocol = strdup((char*)"legacy");
 	free(GloPTH->variables.polardb_proxy_identity_mode);
@@ -4010,6 +4073,8 @@ static void test_split_warmup_runtime_variable_refresh() {
 	free(GloPTH->variables.polardb_proxy_identity_host);
 	GloPTH->variables.polardb_proxy_identity_host = strdup((char*)"127.0.0.99");
 	GloPTH->variables.polardb_proxy_identity_port = 6603;
+	GloPTH->commit();
+	GloPTH->wrunlock();
 
 	pgsql_thread___throttle_connections_per_sec_to_hostgroup = 99;
 	pgsql_thread___default_max_latency_ms = 99;
@@ -4019,6 +4084,7 @@ static void test_split_warmup_runtime_variable_refresh() {
 	pgsql_thread___connect_timeout_server = 99;
 	pgsql_thread___connect_timeout_server_max = 99;
 	pgsql_thread___polardb_split_warmup_max_connections_per_request = 99;
+	pgsql_thread___polardb_lazy_warmup_split = saved_tls_lazy_warmup;
 	pgsql_thread___polardb_proxy_protocol = POLARDB_PROXY_PROTOCOL_OFF;
 	pgsql_thread___polardb_proxy_identity_mode =
 		static_cast<int>(PolarDB_ProxyIdentityMode::CLIENT);
@@ -4041,6 +4107,8 @@ static void test_split_warmup_runtime_variable_refresh() {
 		"PolarDB warmup variables: connect timeout policy refresh");
 	ok(pgsql_thread___polardb_split_warmup_max_connections_per_request == 7,
 		"PolarDB warmup variables: max connections per request refresh");
+	ok(pgsql_thread___polardb_lazy_warmup_split == !saved_tls_lazy_warmup,
+		"PolarDB warmup variables: lazy-warmup enablement refreshes safely");
 	ok(pgsql_thread___polardb_proxy_protocol == POLARDB_PROXY_PROTOCOL_LEGACY,
 		"PolarDB warmup variables: proxy protocol refresh");
 	ok(pgsql_thread___polardb_proxy_identity_mode ==
@@ -4050,7 +4118,11 @@ static void test_split_warmup_runtime_variable_refresh() {
 				"127.0.0.99") == 0 &&
 			pgsql_thread___polardb_proxy_identity_port == 6603,
 		"PolarDB warmup variables: proxy identity policy refresh");
+	ok(pgsql_thread___polardb_startup_config_generation ==
+			GloPTH->get_polardb_startup_config_generation(),
+		"PolarDB warmup variables: startup generation refreshes with parsed fields");
 
+	GloPTH->wrlock();
 	GloPTH->variables.throttle_connections_per_sec_to_hostgroup =
 		saved_runtime_throttle;
 	GloPTH->variables.default_max_latency_ms = saved_runtime_latency;
@@ -4061,6 +4133,8 @@ static void test_split_warmup_runtime_variable_refresh() {
 	GloPTH->variables.connect_timeout_server_max = saved_runtime_timeout_max;
 	GloPTH->variables.polardb_split_warmup_max_connections_per_request =
 		saved_runtime_max_connections;
+	GloPTH->variables.polardb_lazy_warmup_split =
+		saved_runtime_lazy_warmup;
 	free(GloPTH->variables.polardb_proxy_protocol);
 	GloPTH->variables.polardb_proxy_protocol =
 		saved_runtime_proxy_protocol ? saved_runtime_proxy_protocol : strdup((char*)"");
@@ -4072,6 +4146,8 @@ static void test_split_warmup_runtime_variable_refresh() {
 		saved_runtime_identity_host ? saved_runtime_identity_host : strdup((char*)"");
 	GloPTH->variables.polardb_proxy_identity_port =
 		saved_runtime_identity_port;
+	GloPTH->commit();
+	GloPTH->wrunlock();
 
 	pgsql_thread___throttle_connections_per_sec_to_hostgroup =
 		saved_tls_throttle;
@@ -4083,6 +4159,7 @@ static void test_split_warmup_runtime_variable_refresh() {
 	pgsql_thread___connect_timeout_server_max = saved_tls_timeout_max;
 	pgsql_thread___polardb_split_warmup_max_connections_per_request =
 		saved_tls_max_connections;
+	pgsql_thread___polardb_lazy_warmup_split = saved_tls_lazy_warmup;
 	pgsql_thread___polardb_proxy_protocol = saved_tls_proxy_protocol;
 	pgsql_thread___polardb_proxy_identity_mode = saved_tls_identity_mode;
 	if (pgsql_thread___polardb_proxy_identity_host) {
@@ -4090,6 +4167,125 @@ static void test_split_warmup_runtime_variable_refresh() {
 	}
 	pgsql_thread___polardb_proxy_identity_host = saved_tls_identity_host;
 	pgsql_thread___polardb_proxy_identity_port = saved_tls_identity_port;
+	pgsql_thread___polardb_startup_config_generation =
+		GloPTH->get_polardb_startup_config_generation();
+}
+
+static void test_startup_config_commit_contract() {
+	if (!GloPTH) {
+		ok(1, "PolarDB startup config: skipped without PgSQL thread handler");
+		ok(1, "PolarDB startup config: consistency-only generation skipped");
+		return;
+	}
+
+	GloPTH->wrlock();
+	char* saved_protocol = strdup(GloPTH->variables.polardb_proxy_protocol);
+	char* saved_consistency = strdup(GloPTH->variables.polardb_consistency_mode);
+	const PolarDB_ParsedGlobalConfigValue before =
+		GloPTH->polardb_global_config_locked();
+	const char* alternate_protocol =
+		before.startup.proxy_protocol == PolarDB_ProxyProtocol::LEGACY ?
+			"v15" : "legacy";
+	const bool protocol_set = GloPTH->set_variable(
+		(char*)"polardb_proxy_protocol", alternate_protocol);
+	GloPTH->commit();
+	const PolarDB_ParsedGlobalConfigValue after_startup =
+		GloPTH->polardb_global_config_locked();
+	GloPTH->wrunlock();
+
+	ok(protocol_set &&
+			after_startup.startup.generation ==
+				before.startup.generation + 1 &&
+			after_startup.startup.proxy_protocol !=
+				before.startup.proxy_protocol,
+		"PolarDB startup config: one committed startup change advances one generation");
+
+	GloPTH->wrlock();
+	const char* alternate_consistency =
+		after_startup.consistency_mode == POLARDB_CONSISTENCY_LSN ?
+			"off" : "lsn";
+	const bool consistency_set = GloPTH->set_variable(
+		(char*)"polardb_consistency_mode", alternate_consistency);
+	GloPTH->commit();
+	const PolarDB_ParsedGlobalConfigValue after_consistency =
+		GloPTH->polardb_global_config_locked();
+	GloPTH->wrunlock();
+
+	ok(consistency_set &&
+			after_consistency.consistency_mode !=
+				after_startup.consistency_mode &&
+			after_consistency.startup.generation ==
+				after_startup.startup.generation,
+		"PolarDB startup config: consistency-only commit preserves startup generation");
+
+	GloPTH->wrlock();
+	GloPTH->set_variable((char*)"polardb_proxy_protocol", saved_protocol);
+	GloPTH->set_variable((char*)"polardb_consistency_mode", saved_consistency);
+	GloPTH->commit();
+	GloPTH->wrunlock();
+	free(saved_protocol);
+	free(saved_consistency);
+}
+
+static void test_demand_startup_contract_acceptance() {
+	const int writer_hg = 988;
+	const int reader_hg = 989;
+	stage_polardb_topology(PgHGM, "PolarDB demand startup contract",
+		writer_hg, "polardb-contract-writer", 22982,
+		reader_hg, "polardb-contract-reader", 22983);
+	PgSQL_SrvC* reader = find_pgsql_server(
+		PgHGM->MyHGC_lookup(reader_hg),
+		"polardb-contract-reader", 22983);
+	ok(reader != nullptr,
+		"PolarDB demand startup contract: reader fixture is available");
+	if (!reader || !GloPTH) {
+		return;
+	}
+
+	const PolarDB_ParsedGlobalConfigValue global_config =
+		GloPTH->get_polardb_global_config();
+	const int identity_mode =
+		static_cast<int>(global_config.startup.identity_mode);
+	const PolarDB_StartupProfile profile =
+		PgHGM->polardb_startup_profile_for_hostgroup(
+			reader_hg,
+			static_cast<int>(global_config.startup.proxy_protocol));
+	PolarDB_StartupClientContext startup_client;
+	startup_client.identity = PolarDB_StartupIdentity{
+		"127.0.0.41", 6041,
+		polardb_proxy_identity_mode_uses_client_identity(identity_mode)
+			? PolarDB_StartupIdentitySource::CLIENT
+			: PolarDB_StartupIdentitySource::LISTENER_PROXY};
+
+	PgSQL_Connection conn(false);
+	conn.parent = reader;
+	conn.polardb_selected_server_snapshot =
+		PgHGM->get_polardb_server_list_snapshot();
+	conn.install_polardb_startup_contract(
+		profile, identity_mode, global_config.startup.generation,
+		startup_client);
+	ok(conn.polardb_startup_contract_installed &&
+			conn.polardb_startup_config_generation ==
+				global_config.startup.generation &&
+			conn.polardb_startup_profile_generation ==
+				profile.generation(identity_mode) &&
+			conn.polardb_startup_client.identity.host == "127.0.0.41",
+		"PolarDB demand startup contract: installation preserves the selected startup state");
+	ok(PgHGM->polardb_connected_reader_accepts_current_startup(
+			&conn, reader_hg),
+		"PolarDB demand startup contract: unchanged current state accepts the connected reader");
+
+	conn.polardb_startup_config_generation++;
+	ok(!PgHGM->polardb_connected_reader_accepts_current_startup(
+			&conn, reader_hg),
+		"PolarDB demand startup contract: stale startup generation rejects the connected reader");
+	conn.polardb_startup_config_generation =
+		global_config.startup.generation;
+	reader->set_status(MYSQL_SERVER_STATUS_OFFLINE_HARD);
+	ok(!PgHGM->polardb_connected_reader_accepts_current_startup(
+			&conn, reader_hg),
+		"PolarDB demand startup contract: offline selected server rejects dispatch");
+	reader->set_status(MYSQL_SERVER_STATUS_ONLINE);
 }
 
 static void test_split_warmup_failure_accounting_policy() {
@@ -4269,6 +4465,27 @@ static void test_reader_selection_uses_all_configured_servers() {
 
 	target->remove_free_connection(conn);
 	delete conn;
+}
+
+static void test_hgm_shutdown_releases_server_snapshots() {
+	auto current_snapshot = PgHGM->get_polardb_server_list_snapshot();
+	std::weak_ptr<const PgSQL_HostGroups_Manager::PolarDB_ServerListSnapshot>
+		current_snapshot_reference = current_snapshot;
+	ok(current_snapshot != nullptr,
+		"PolarDB shutdown: current server snapshot exists before quiesce");
+	current_snapshot.reset();
+
+	PgHGM->shutdown();
+	ok(PgHGM->get_polardb_server_list_snapshot() == nullptr,
+		"PolarDB shutdown: server snapshot publication is empty after quiesce");
+	ok(current_snapshot_reference.expired(),
+		"PolarDB shutdown: calling-thread snapshot cache releases the final generation");
+	ok(!PgHGM->is_polardb_hostgroup(1115),
+		"PolarDB shutdown: topology access fails closed after quiesce");
+
+	PgHGM->shutdown();
+	ok(PgHGM->get_polardb_server_list_snapshot() == nullptr,
+		"PolarDB shutdown: repeated quiesce is idempotent");
 }
 
 static PgSQL_SplitWarmupRequest make_unit_warmup_request(
@@ -4735,6 +4952,8 @@ int main() {
 	test_tied_freshest_behind_reader_can_acquire_second_candidate();
 	test_lag_range_best_behind_reader_can_acquire_lower_lsn_candidate();
 	test_split_warmup_request_dedup();
+	test_startup_config_commit_contract();
+	test_demand_startup_contract_acceptance();
 	test_split_warmup_runtime_variable_refresh();
 	test_split_warmup_failure_accounting_policy();
 	test_split_warmup_max_connections_per_request_policy();
@@ -4746,6 +4965,7 @@ int main() {
 	test_collect_is_const_stable_snapshot();
 	test_split_warmup_thread_refreshes_idle_server_list();
 	test_reader_selection_uses_all_configured_servers();
+	test_hgm_shutdown_releases_server_snapshots();
 
 	test_cleanup_hostgroups();
 	test_cleanup_query_processor();

@@ -1288,6 +1288,8 @@ PgSQL_Threads_Handler::PgSQL_Threads_Handler() {
 	variables.polardb_proxy_identity_mode = strdup((char*)"proxy");
 	variables.polardb_proxy_identity_host = strdup((char*)"");
 	variables.polardb_proxy_identity_port = 0;
+	polardb_global_config_ = build_polardb_global_config_locked(1);
+	polardb_startup_config_generation_.store(1, std::memory_order_relaxed);
 #endif // POLARDB_PROXY
 	variables.automatic_detect_sqli = false;
 	variables.firewall_whitelist_enabled = false;
@@ -1497,7 +1499,61 @@ void PgSQL_Threads_Handler::wrunlock() {
 	pthread_rwlock_unlock(&rwlock);
 }
 
+#if POLARDB_PROXY
+PolarDB_ParsedGlobalConfigValue
+PgSQL_Threads_Handler::build_polardb_global_config_locked(
+		uint64_t startup_generation) const {
+	PolarDB_ParsedGlobalConfigValue config;
+	config.consistency_mode = polardb_consistency_mode_from_string(
+		variables.polardb_consistency_mode, POLARDB_CONSISTENCY_OFF);
+	config.startup.generation = startup_generation;
+	config.startup.proxy_protocol = polardb_proxy_protocol_from_int(
+		polardb_proxy_protocol_from_string(
+			variables.polardb_proxy_protocol, POLARDB_PROXY_PROTOCOL_V15));
+	config.startup.identity_mode = static_cast<PolarDB_ProxyIdentityMode>(
+		polardb_proxy_identity_mode_from_string(
+			variables.polardb_proxy_identity_mode,
+			static_cast<int>(PolarDB_ProxyIdentityMode::PROXY)));
+	config.startup.configured_identity = PolarDB_StartupIdentity{
+		variables.polardb_proxy_identity_host,
+		variables.polardb_proxy_identity_port,
+		PolarDB_StartupIdentitySource::CONFIGURED_FALLBACK};
+	return config;
+}
+
+PolarDB_ParsedGlobalConfigValue
+PgSQL_Threads_Handler::polardb_global_config_locked() const {
+	return polardb_global_config_;
+}
+
+PolarDB_ParsedGlobalConfigValue
+PgSQL_Threads_Handler::get_polardb_global_config() {
+	wrlock();
+	PolarDB_ParsedGlobalConfigValue config = polardb_global_config_;
+	wrunlock();
+	return config;
+}
+
+uint64_t PgSQL_Threads_Handler::get_polardb_startup_config_generation() const {
+	return polardb_startup_config_generation_.load(std::memory_order_acquire);
+}
+#endif // POLARDB_PROXY
+
 void PgSQL_Threads_Handler::commit() {
+#if POLARDB_PROXY
+	uint64_t startup_generation =
+		polardb_startup_config_generation_.load(std::memory_order_relaxed);
+	PolarDB_ParsedGlobalConfigValue next =
+		build_polardb_global_config_locked(startup_generation);
+	if (!polardb_same_startup_config_inputs(
+			next.startup, polardb_global_config_.startup)) {
+		startup_generation++;
+		next.startup.generation = startup_generation;
+	}
+	polardb_global_config_ = std::move(next);
+	polardb_startup_config_generation_.store(
+		startup_generation, std::memory_order_release);
+#endif // POLARDB_PROXY
 	__sync_add_and_fetch(&__global_PgSQL_Thread_Variables_version, 1);
 	proxy_debug(PROXY_DEBUG_MYSQL_SERVER, 1, "Increasing version number to %d - all threads will notice this and refresh their variables\n", __global_PgSQL_Thread_Variables_version);
 }
@@ -3697,6 +3753,11 @@ void PgSQL_Thread::run() {
 		else {
 			maintenance_loop = false;
 		}
+#if POLARDB_PROXY
+		if (maintenance_loop && PgHGM) {
+			PgHGM->refresh_polardb_thread_snapshots();
+		}
+#endif // POLARDB_PROXY
 
 		handle_kill_queues();
 
@@ -4411,7 +4472,9 @@ void PgSQL_Thread::refresh_variables() {
 	pgsql_thread___max_allowed_packet = GloPTH->get_variable_int((char*)"max_allowed_packet");
 #if POLARDB_PROXY
 	// PolarDB session-consistency knobs. The integer/bool knobs refresh directly;
-	// the two word-valued *mode* knobs are mapped into the globals consumed by routing.
+	// parsed startup values are copied as one coherent committed value.
+	const PolarDB_ParsedGlobalConfigValue polardb_global_config =
+		GloPTH->polardb_global_config_locked();
 	pgsql_thread___polardb_lag_bytes = GloPTH->get_variable_int((char*)"polardb_lag_bytes");
 	pgsql_thread___polardb_lag_ms = GloPTH->get_variable_int((char*)"polardb_lag_ms");
 	pgsql_thread___polardb_lag_wait_ms = GloPTH->get_variable_int((char*)"polardb_lag_wait_ms");
@@ -4432,12 +4495,8 @@ void PgSQL_Thread::refresh_variables() {
 	pgsql_thread___polardb_result_fast_forward = (bool)GloPTH->get_variable_int((char*)"polardb_result_fast_forward");
 	pgsql_thread___polardb_split_warmup_max_connections_per_request =
 		GloPTH->get_variable_int((char*)"polardb_split_warmup_max_connections_per_request");
-	{
-		char* cm = GloPTH->get_variable_string((char*)"polardb_consistency_mode");
-		pgsql_thread___polardb_consistency_mode =
-			polardb_consistency_mode_from_string(cm, POLARDB_CONSISTENCY_OFF);
-		if (cm) free(cm);
-	}
+	pgsql_thread___polardb_consistency_mode =
+		polardb_global_config.consistency_mode;
 	{
 		char* wm = GloPTH->get_variable_string((char*)"polardb_wait_timeout_mode");
 		pgsql_thread___polardb_wait_timeout_mode =
@@ -4445,12 +4504,8 @@ void PgSQL_Thread::refresh_variables() {
 				wm, static_cast<int>(PolarDB_WaitMode::BEST_EFFORT));
 		if (wm) free(wm);
 	}
-	{
-		char* protocol = GloPTH->get_variable_string((char*)"polardb_proxy_protocol");
-		pgsql_thread___polardb_proxy_protocol =
-			polardb_proxy_protocol_from_string(protocol, POLARDB_PROXY_PROTOCOL_V15);
-		if (protocol) free(protocol);
-	}
+	pgsql_thread___polardb_proxy_protocol = static_cast<int>(
+		polardb_global_config.startup.proxy_protocol);
 	{
 		char* policy = GloPTH->get_variable_string((char*)"polardb_route_rfq_policy");
 		pgsql_thread___polardb_route_rfq_policy = polardb_route_rfq_policy_from_string(policy);
@@ -4474,17 +4529,15 @@ void PgSQL_Thread::refresh_variables() {
 			action, static_cast<int>(PolarDB_ReaderAction::FORWARD));
 		if (action) free(action);
 	}
-	{
-		char* identity_mode = GloPTH->get_variable_string((char*)"polardb_proxy_identity_mode");
-		pgsql_thread___polardb_proxy_identity_mode =
-			polardb_proxy_identity_mode_from_string(
-				identity_mode, static_cast<int>(PolarDB_ProxyIdentityMode::PROXY));
-		if (identity_mode) free(identity_mode);
-	}
+	pgsql_thread___polardb_proxy_identity_mode = static_cast<int>(
+		polardb_global_config.startup.identity_mode);
 	if (pgsql_thread___polardb_proxy_identity_host) free(pgsql_thread___polardb_proxy_identity_host);
-	pgsql_thread___polardb_proxy_identity_host = GloPTH->get_variable_string((char*)"polardb_proxy_identity_host");
+	pgsql_thread___polardb_proxy_identity_host = strdup(
+		polardb_global_config.startup.configured_identity.host.c_str());
 	pgsql_thread___polardb_proxy_identity_port =
-		GloPTH->get_variable_int((char*)"polardb_proxy_identity_port");
+		polardb_global_config.startup.configured_identity.port;
+	pgsql_thread___polardb_startup_config_generation =
+		polardb_global_config.startup.generation;
 #endif // POLARDB_PROXY
 	pgsql_thread___set_query_lock_on_hostgroup = GloPTH->get_variable_int((char*)"set_query_lock_on_hostgroup");
 	pgsql_thread___verbose_query_error = (bool)GloPTH->get_variable_int((char*)"verbose_query_error");

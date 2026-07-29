@@ -1172,6 +1172,7 @@ __thread int pgsql_thread___polardb_reader_error_action;     // retry=0, forward
 __thread int pgsql_thread___polardb_proxy_identity_mode;     // client=0, proxy=1
 __thread char* pgsql_thread___polardb_proxy_identity_host;   // empty or IP literal
 __thread int pgsql_thread___polardb_proxy_identity_port;     // 0..65535
+__thread unsigned long long pgsql_thread___polardb_startup_config_generation;
 #endif // POLARDB_PROXY
 
 /* variables used for SSL , from proxy to server (p2s) */
@@ -1543,6 +1544,7 @@ extern __thread bool pgsql_thread___polardb_writev_direct;
 extern __thread bool pgsql_thread___polardb_result_fast_forward;
 extern __thread char* pgsql_thread___polardb_proxy_identity_host;
 extern __thread int pgsql_thread___polardb_proxy_identity_port;
+extern __thread unsigned long long pgsql_thread___polardb_startup_config_generation;
 #endif // POLARDB_PROXY
 
 extern __thread char* pgsql_thread___ssl_p2s_ca;

@@ -529,6 +529,9 @@
 	T(reader_pool_lookup, "PolarDB_Reader_Pool_Lookup", \
 		"proxysql_polardb_reader_pool_lookup_total", \
 		"PolarDB reader-pool lookup attempts") \
+	T(reader_pool_current_state_retry, "PolarDB_Reader_Pool_Current_State_Retry", \
+		"proxysql_polardb_reader_pool_current_state_retry_total", \
+		"Cold reader creations retried after topology or startup configuration changed") \
 	T(reader_pool_server_considered, "PolarDB_Reader_Pool_Server_Considered", \
 		"proxysql_polardb_reader_pool_server_considered_total", \
 		"Reader servers examined by PolarDB policy selection") \

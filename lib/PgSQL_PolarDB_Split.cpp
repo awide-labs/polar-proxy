@@ -136,6 +136,8 @@ static void polardb_count_split_fallback_status(
 	case PolarDB_ReaderStatus::READER_BUSY:
 		POLARDB_THREAD_COUNT_ONE(thread, split_fallback_reader_busy);
 		break;
+	case PolarDB_ReaderStatus::RETRY_CURRENT_STATE:
+		break;
 	case PolarDB_ReaderStatus::RFQ_UNAVAILABLE:
 		POLARDB_THREAD_COUNT_ONE(thread, split_fallback_rfq_unavailable);
 		break;
@@ -166,6 +168,8 @@ static void polardb_count_split_pool_acquire_failure(
 		POLARDB_THREAD_COUNT_ONE(thread, split_pool_empty);
 		POLARDB_THREAD_COUNT_ONE(thread, split_pool_contention);
 		POLARDB_THREAD_COUNT_ONE(thread, split_no_backend);
+		break;
+	case PolarDB_ReaderStatus::RETRY_CURRENT_STATE:
 		break;
 	case PolarDB_ReaderStatus::RFQ_UNAVAILABLE:
 		// The selected server has no connection for this exact RFQ key.
