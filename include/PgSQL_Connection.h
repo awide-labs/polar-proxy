@@ -889,6 +889,10 @@ public:
 	PolarDB_PoolKey polardb_pool_key;
 	uint32_t polardb_core_pool_position{UINT32_MAX};
 	uint64_t polardb_worker_cache_epoch{0};
+	std::atomic<bool> polardb_idle_ping_inflight{false};
+	std::atomic<bool> polardb_reader_pool_connect_pending{false};
+	bool polardb_reader_pool_created{false};
+	bool polardb_idle_trim_pending{false};
 
 	/**
 	 * Keeps the selected server alive while this backend is in use. Server-list

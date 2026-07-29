@@ -1838,11 +1838,13 @@ void PgSQL_Session::polardb_process_result(
 	PgSQL_SrvC* backend_srv = myds->myconn->parent;
 	uint64_t lsn = myds->myconn->get_polardb_lsn();
 	bool rfq_lsn_payload_present = myds->myconn->has_polardb_lsn_payload();
-	bool has_lsn = rfq_lsn_payload_present && lsn > 0;
+	const PolarDB_RfqLsnPayloadState rfq_lsn_state =
+		polardb_rfq_lsn_payload_state(rfq_lsn_payload_present, lsn);
+	bool has_lsn = rfq_lsn_state == PolarDB_RfqLsnPayloadState::POSITIONED;
 	if (myds->myconn->polardb_startup_profile.has_rfq_lsn()) {
-		if (!rfq_lsn_payload_present) {
+		if (rfq_lsn_state == PolarDB_RfqLsnPayloadState::MISSING) {
 			POLARDB_PROFILE_THREAD_COUNT_ONE(thread, rfq_requested_missing_payload);
-		} else if (lsn == 0) {
+		} else if (rfq_lsn_state == PolarDB_RfqLsnPayloadState::ZERO) {
 			POLARDB_PROFILE_THREAD_COUNT_ONE(thread, rfq_requested_zero_payload);
 		}
 	}
@@ -1918,7 +1920,7 @@ void PgSQL_Session::polardb_process_result(
 
 	if (has_lsn) {
 		(void)polardb_process_positioned_rfq_lsn(result_ctx);
-	} else if (rfq_lsn_payload_present) {
+	} else if (rfq_lsn_state == PolarDB_RfqLsnPayloadState::ZERO) {
 		polardb_process_zero_rfq_lsn(result_ctx);
 	} else {
 		polardb_process_missing_rfq_lsn(result_ctx);

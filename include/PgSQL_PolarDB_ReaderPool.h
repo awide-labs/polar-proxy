@@ -127,6 +127,16 @@ public:
 	void refresh_split_warmup_variables();
 	bool connection_match_key_for_return(PgSQL_Connection* conn,
 		PgSQL_PoolMatchKey* match_key);
+	bool reader_claim_server_eligible(
+		unsigned int hostgroup_id, PgSQL_SrvC* server,
+		const PolarDB_Query_ReaderPlan& reader_plan,
+		const PolarDB_WaitSpec& wait_spec,
+		const char* exclude_address = nullptr, int exclude_port = -1,
+		std::shared_ptr<const void>* selected_server_snapshot = nullptr) const;
+	bool reader_claim_match_key(
+		unsigned int hostgroup_id, PgSQL_Session* sess,
+		const PolarDB_WaitSpec& wait_spec,
+		PgSQL_PoolMatchKey* match_key) const;
 	PolarDB_ReaderLocalReturn local_return_decision(
 		PgSQL_Connection* conn);
 	PolarDB_ReaderResult get_MyConn_polardb_reader(unsigned int hid,
@@ -134,7 +144,8 @@ public:
 		const PolarDB_Query_ReaderPlan& reader_plan,
 		const PolarDB_WaitSpec& wait_spec,
 		bool only_pooled,
-		const char* exclude_address = nullptr, int exclude_port = -1);
+		const char* exclude_address = nullptr, int exclude_port = -1,
+		bool confirm_reader_group_capacity = false);
 
 private:
 #ifdef POLARDB_UNIT_FULL_HARNESS

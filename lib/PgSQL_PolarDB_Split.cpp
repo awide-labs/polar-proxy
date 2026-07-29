@@ -134,6 +134,7 @@ static void polardb_count_split_fallback_status(
 		POLARDB_THREAD_COUNT_ONE(thread, split_fallback_reader_unavailable);
 		break;
 	case PolarDB_ReaderStatus::READER_BUSY:
+	case PolarDB_ReaderStatus::READER_GROUP_BUSY:
 		POLARDB_THREAD_COUNT_ONE(thread, split_fallback_reader_busy);
 		break;
 	case PolarDB_ReaderStatus::RETRY_CURRENT_STATE:
@@ -165,6 +166,7 @@ static void polardb_count_split_pool_acquire_failure(
 		POLARDB_THREAD_COUNT_ONE(thread, split_no_backend);
 		break;
 	case PolarDB_ReaderStatus::READER_BUSY:
+	case PolarDB_ReaderStatus::READER_GROUP_BUSY:
 		POLARDB_THREAD_COUNT_ONE(thread, split_pool_empty);
 		POLARDB_THREAD_COUNT_ONE(thread, split_pool_contention);
 		POLARDB_THREAD_COUNT_ONE(thread, split_no_backend);
@@ -539,6 +541,12 @@ bool PgSQL_Session::polardb_prepare_txn_split_read(
 		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, split_reader_acquire_count);
 #endif // POLARDB_PROFILE
 		if (!reader_result.acquired()) {
+#if POLARDB_PROFILE
+			if (reader_result.exact_match_claimed) {
+				POLARDB_PROFILE_THREAD_COUNT_ONE(
+					thread, split_pool_miss_claimed_exact);
+			}
+#endif // POLARDB_PROFILE
 			polardb_count_split_fallback_status(thread, reader_result.status);
 			polardb_count_split_pool_acquire_failure(thread, reader_result.status);
 			const bool warmup_can_help =

@@ -532,6 +532,189 @@
 	T(reader_pool_current_state_retry, "PolarDB_Reader_Pool_Current_State_Retry", \
 		"proxysql_polardb_reader_pool_current_state_retry_total", \
 		"Cold reader creations retried after topology or startup configuration changed") \
+	T(reader_pool_create_decision, "PolarDB_Reader_Pool_Create_Decision", \
+		"proxysql_polardb_reader_pool_create_decision_total", \
+		"ReaderPool cold-path decisions that reached exact-compatible backend creation admission") \
+	T(reader_pool_create_issued, "PolarDB_Reader_Pool_Create_Issued", \
+		"proxysql_polardb_reader_pool_create_issued_total", \
+		"ReaderPool backend connection objects issued by cold creation") \
+	T(reader_pool_create_connected, "PolarDB_Reader_Pool_Create_Connected", \
+		"proxysql_polardb_reader_pool_create_connected_total", \
+		"ReaderPool-created backend connections that completed connection establishment") \
+	T(reader_pool_create_failed, "PolarDB_Reader_Pool_Create_Failed", \
+		"proxysql_polardb_reader_pool_create_failed_total", \
+		"ReaderPool-created backend connections that failed before establishment") \
+	T(reader_pool_create_timeout, "PolarDB_Reader_Pool_Create_Timeout", \
+		"proxysql_polardb_reader_pool_create_timeout_total", \
+		"ReaderPool-created backend connections that exceeded the backend connect timeout") \
+	T(reader_pool_idle_ping_take, "PolarDB_Reader_Pool_Idle_Ping_Take", \
+		"proxysql_polardb_reader_pool_idle_ping_take_total", \
+		"Exact pool connections removed from shared FREE for idle-ping maintenance") \
+	T(reader_pool_idle_ping_return, "PolarDB_Reader_Pool_Idle_Ping_Return", \
+		"proxysql_polardb_reader_pool_idle_ping_return_total", \
+		"Idle-ping maintenance connections returned to normal ReaderPool ownership") \
+	T(reader_pool_idle_ping_destroy, "PolarDB_Reader_Pool_Idle_Ping_Destroy", \
+		"proxysql_polardb_reader_pool_idle_ping_destroy_total", \
+		"Idle-ping maintenance connections destroyed before normal ReaderPool return") \
+	T(reader_pool_idle_trim_deferred, "PolarDB_Reader_Pool_Idle_Trim_Deferred", \
+		"proxysql_polardb_reader_pool_idle_trim_deferred_total", \
+		"Excess shared FREE connections deferred for one maintenance pass before percentage trimming") \
+	T(reader_pool_idle_trim_cancelled, "PolarDB_Reader_Pool_Idle_Trim_Cancelled", \
+		"proxysql_polardb_reader_pool_idle_trim_cancelled_total", \
+		"Pending percentage trims cancelled because the connection was taken, retained, or removed for another reason") \
+	T(reader_pool_idle_trim_cancelled_taken, "PolarDB_Reader_Pool_Idle_Trim_Cancelled_Taken", \
+		"proxysql_polardb_reader_pool_idle_trim_cancelled_taken_total", \
+		"Pending percentage trims cancelled because the connection left shared FREE for use") \
+	T(reader_pool_idle_trim_cancelled_retained, "PolarDB_Reader_Pool_Idle_Trim_Cancelled_Retained", \
+		"proxysql_polardb_reader_pool_idle_trim_cancelled_retained_total", \
+		"Pending percentage trims cancelled because shared FREE no longer exceeded its configured target") \
+	T(reader_pool_idle_trim_cancelled_other, "PolarDB_Reader_Pool_Idle_Trim_Cancelled_Other", \
+		"proxysql_polardb_reader_pool_idle_trim_cancelled_other_total", \
+		"Pending percentage trims cancelled because another removal policy handled the connection") \
+	T(reader_pool_idle_trim_destroyed, "PolarDB_Reader_Pool_Idle_Trim_Destroyed", \
+		"proxysql_polardb_reader_pool_idle_trim_destroyed_total", \
+		"Excess shared FREE connections destroyed after remaining idle across a maintenance pass") \
+	T(reader_capacity_wait_enter, "PolarDB_Reader_Capacity_Wait_Enter", \
+		"proxysql_polardb_reader_capacity_wait_enter_total", \
+		"Sessions entering worker-local ReaderPool capacity waiting") \
+	T(reader_capacity_wait_exit, "PolarDB_Reader_Capacity_Wait_Exit", \
+		"proxysql_polardb_reader_capacity_wait_exit_total", \
+		"Sessions leaving worker-local ReaderPool capacity waiting") \
+	T(reader_capacity_wait_sum_us, "PolarDB_Reader_Capacity_Wait_Sum_Us", \
+		"proxysql_polardb_reader_capacity_wait_microseconds_total", \
+		"Total completed ReaderPool capacity wait time, in microseconds") \
+	T(reader_capacity_wait_max_us, "PolarDB_Reader_Capacity_Wait_Max_Us", \
+		"proxysql_polardb_reader_capacity_wait_max_microseconds_total", \
+		"Largest completed ReaderPool capacity wait observed, in microseconds") \
+	T(reader_capacity_retry_pass, "PolarDB_Reader_Capacity_Retry_Pass", \
+		"proxysql_polardb_reader_capacity_retry_pass_total", \
+		"Worker passes admitted to retry ReaderPool capacity waiters") \
+	T(reader_capacity_retry_pass_deadline, "PolarDB_Reader_Capacity_Retry_Pass_Deadline", \
+		"proxysql_polardb_reader_capacity_retry_pass_deadline_total", \
+		"ReaderPool capacity retry passes started by the worker deadline") \
+	T(reader_capacity_retry_pass_local, "PolarDB_Reader_Capacity_Retry_Pass_Local", \
+		"proxysql_polardb_reader_capacity_retry_pass_local_total", \
+		"ReaderPool capacity retry passes started by a same-pass local return") \
+	T(reader_capacity_retry_attempt, "PolarDB_Reader_Capacity_Retry_Attempt", \
+		"proxysql_polardb_reader_capacity_retry_attempt_total", \
+		"Worker-admitted ReaderPool capacity retry attempts") \
+	T(reader_capacity_retry_acquired, "PolarDB_Reader_Capacity_Retry_Acquired", \
+		"proxysql_polardb_reader_capacity_retry_acquired_total", \
+		"Worker-admitted capacity retries that acquired a reader") \
+	T(reader_capacity_retry_selected_busy, "PolarDB_Reader_Capacity_Retry_Selected_Busy", \
+		"proxysql_polardb_reader_capacity_retry_selected_busy_total", \
+		"Worker-admitted retries that could not establish complete reader-group saturation") \
+	T(reader_capacity_retry_group_busy, "PolarDB_Reader_Capacity_Retry_Group_Busy", \
+		"proxysql_polardb_reader_capacity_retry_group_busy_total", \
+		"Worker-admitted retries that found every currently eligible reader full") \
+	T(reader_capacity_retry_scope_skipped, "PolarDB_Reader_Capacity_Retry_Scope_Skipped", \
+		"proxysql_polardb_reader_capacity_retry_scope_skipped_total", \
+		"Capacity waiters deferred after the same scope was confirmed full in a worker pass") \
+	T(reader_capacity_wait_le_1ms, "PolarDB_Reader_Capacity_Wait_Le_1ms", \
+		"proxysql_polardb_reader_capacity_wait_le_1ms_total", \
+		"Completed ReaderPool capacity waits no longer than one millisecond") \
+	T(reader_capacity_wait_le_5ms, "PolarDB_Reader_Capacity_Wait_Le_5ms", \
+		"proxysql_polardb_reader_capacity_wait_le_5ms_total", \
+		"Completed ReaderPool capacity waits over one and no longer than five milliseconds") \
+	T(reader_capacity_wait_le_20ms, "PolarDB_Reader_Capacity_Wait_Le_20ms", \
+		"proxysql_polardb_reader_capacity_wait_le_20ms_total", \
+		"Completed ReaderPool capacity waits over five and no longer than twenty milliseconds") \
+	T(reader_capacity_wait_le_100ms, "PolarDB_Reader_Capacity_Wait_Le_100ms", \
+		"proxysql_polardb_reader_capacity_wait_le_100ms_total", \
+		"Completed ReaderPool capacity waits over twenty and no longer than one hundred milliseconds") \
+	T(reader_capacity_wait_le_1s, "PolarDB_Reader_Capacity_Wait_Le_1s", \
+		"proxysql_polardb_reader_capacity_wait_le_1s_total", \
+		"Completed ReaderPool capacity waits over one hundred milliseconds and no longer than one second") \
+	T(reader_capacity_wait_gt_1s, "PolarDB_Reader_Capacity_Wait_Gt_1s", \
+		"proxysql_polardb_reader_capacity_wait_gt_1s_total", \
+		"Completed ReaderPool capacity waits longer than one second") \
+	T(reader_claim_ownership_local, "PolarDB_Reader_Claim_Ownership_Local", \
+		"proxysql_polardb_reader_claim_ownership_local_total", \
+		"Claim registrations avoided because the worker held compatible local capacity") \
+	T(reader_claim_ownership_active, "PolarDB_Reader_Claim_Ownership_Active", \
+		"proxysql_polardb_reader_claim_ownership_active_total", \
+		"Claim registrations avoided because the worker had compatible reusable active capacity") \
+	T(reader_claim_ownership_claim, "PolarDB_Reader_Claim_Ownership_Claim", \
+		"proxysql_polardb_reader_claim_ownership_claim_total", \
+		"Claim registrations avoided because the worker already had a compatible pending or published claim") \
+	T(reader_claim_ownership_zero, "PolarDB_Reader_Claim_Ownership_Zero", \
+		"proxysql_polardb_reader_claim_ownership_zero_total", \
+		"Complete reader-group busy results for workers with no compatible owned capacity") \
+	T(reader_ownership_lease_started, "PolarDB_Reader_Ownership_Lease_Started", \
+		"proxysql_polardb_reader_ownership_lease_started_total", \
+		"Concrete claims converted into demand-driven worker-local ownership leases") \
+	T(reader_ownership_lease_released, "PolarDB_Reader_Ownership_Lease_Released", \
+		"proxysql_polardb_reader_ownership_lease_released_total", \
+		"Worker-local ownership leases released after compatible demand disappeared") \
+	T(reader_ownership_lease_yielded, "PolarDB_Reader_Ownership_Lease_Yielded", \
+		"proxysql_polardb_reader_ownership_lease_yielded_total", \
+		"Leased reader connections yielded at a worker-pass boundary to an exact compatible zero-owner demand") \
+	T(reader_yield_debt_demand_observed, "PolarDB_Reader_Yield_Debt_Demand_Observed", \
+		"proxysql_polardb_reader_yield_debt_demand_observed_total", \
+		"Worker passes that observed compatible remote demand while owning matching capacity") \
+	T(reader_yield_debt_set, "PolarDB_Reader_Yield_Debt_Set", \
+		"proxysql_polardb_reader_yield_debt_set_total", \
+		"Persistent worker yield debts set for the next matching connection completion") \
+	T(reader_yield_debt_fulfilled, "PolarDB_Reader_Yield_Debt_Fulfilled", \
+		"proxysql_polardb_reader_yield_debt_fulfilled_total", \
+		"Yield debts completed by atomically publishing a matching connection to another worker") \
+	T(reader_yield_debt_cancelled, "PolarDB_Reader_Yield_Debt_Cancelled", \
+		"proxysql_polardb_reader_yield_debt_cancelled_total", \
+		"Yield debts cleared after demand or compatible owned capacity disappeared") \
+	T(reader_claim_demand_registered, "PolarDB_Reader_Claim_Demand_Registered", \
+		"proxysql_polardb_reader_claim_demand_registered_total", \
+		"Cold-worker ReaderPool claim demands registered") \
+	T(reader_claim_demand_cancelled, "PolarDB_Reader_Claim_Demand_Cancelled", \
+		"proxysql_polardb_reader_claim_demand_cancelled_total", \
+		"Pending ReaderPool claim demands cancelled before publication") \
+	T(reader_claim_published, "PolarDB_Reader_Claim_Published", \
+		"proxysql_polardb_reader_claim_published_total", \
+		"Returned FREE reader connections temporarily assigned to a worker") \
+	T(reader_claim_acquired, "PolarDB_Reader_Claim_Acquired", \
+		"proxysql_polardb_reader_claim_acquired_total", \
+		"Worker-assigned FREE reader connections acquired") \
+	T(reader_claim_released, "PolarDB_Reader_Claim_Released", \
+		"proxysql_polardb_reader_claim_released_total", \
+		"Unconsumed reader claims restored to ordinary FREE availability") \
+	T(reader_claim_wake, "PolarDB_Reader_Claim_Wake", \
+		"proxysql_polardb_reader_claim_wake_total", \
+		"Worker pipe wakes issued for published reader claims") \
+	T(reader_claim_wake_coalesced, "PolarDB_Reader_Claim_Wake_Coalesced", \
+		"proxysql_polardb_reader_claim_wake_coalesced_total", \
+		"Reader claim wakes coalesced with an already pending worker wake") \
+	T(reader_claim_missing, "PolarDB_Reader_Claim_Missing", \
+		"proxysql_polardb_reader_claim_missing_total", \
+		"Worker claim states that found no active server-side claim") \
+	T(reader_claim_missing_retired, "PolarDB_Reader_Claim_Missing_Retired", \
+		"proxysql_polardb_reader_claim_missing_retired_total", \
+		"Worker claim states resolved to a classified server-side retirement") \
+	T(reader_claim_missing_unknown, "PolarDB_Reader_Claim_Missing_Unknown", \
+		"proxysql_polardb_reader_claim_missing_unknown_total", \
+		"Worker claim states with no active, pending, or retired server-side token") \
+	G(reader_claim_retired_create_evict, "PolarDB_Reader_Claim_Retired_Create_Evict", \
+		"proxysql_polardb_reader_claim_retired_create_evict_total", \
+		"Reader claim tokens retired when FREE capacity was evicted for creation") \
+	G(reader_claim_retired_idle_trim, "PolarDB_Reader_Claim_Retired_Idle_Trim", \
+		"proxysql_polardb_reader_claim_retired_idle_trim_total", \
+		"Reader claim tokens retired by idle FREE connection trimming") \
+	G(reader_claim_retired_max_age, "PolarDB_Reader_Claim_Retired_Max_Age", \
+		"proxysql_polardb_reader_claim_retired_max_age_total", \
+		"Reader claim tokens retired by connection maximum-age cleanup") \
+	G(reader_claim_retired_offline, "PolarDB_Reader_Claim_Retired_Offline", \
+		"proxysql_polardb_reader_claim_retired_offline_total", \
+		"Reader claim tokens retired when their server became offline") \
+	G(reader_claim_retired_pool_drop, "PolarDB_Reader_Claim_Retired_Pool_Drop", \
+		"proxysql_polardb_reader_claim_retired_pool_drop_total", \
+		"Reader claim tokens retired while dropping a FREE pool") \
+	G(reader_claim_retired_explicit, "PolarDB_Reader_Claim_Retired_Explicit", \
+		"proxysql_polardb_reader_claim_retired_explicit_total", \
+		"Reader claim tokens retired by an explicit FREE connection removal") \
+	G(reader_claim_retired_invalid, "PolarDB_Reader_Claim_Retired_Invalid", \
+		"proxysql_polardb_reader_claim_retired_invalid_total", \
+		"Reader claim tokens retired after inconsistent FREE-list state was detected") \
+	G(reader_claim_demand_retired, "PolarDB_Reader_Claim_Demand_Retired", \
+		"proxysql_polardb_reader_claim_demand_retired_total", \
+		"Pending ReaderPool claim demands retired by server lifecycle cleanup") \
 	T(reader_pool_server_considered, "PolarDB_Reader_Pool_Server_Considered", \
 		"proxysql_polardb_reader_pool_server_considered_total", \
 		"Reader servers examined by PolarDB policy selection") \
@@ -925,6 +1108,9 @@
 	T(split_pool_contention, "PolarDB_Split_Pool_Contention", \
 		"proxysql_polardb_split_pool_contention_total", \
 		"Transaction-split reads that could not use a pooled replica connection because the pool had no available match") \
+	T(split_pool_miss_claimed_exact, "PolarDB_Split_Pool_Miss_Claimed_Exact", \
+		"proxysql_polardb_split_pool_miss_claimed_exact_total", \
+		"Profile-only transaction-split pooled misses where exact-compatible FREE capacity was reserved by a ReaderPool claim") \
 	T(split_conn_reused, "PolarDB_Split_Conn_Reused", \
 		"proxysql_polardb_split_conn_reused_total", \
 		"Transaction-split reads that reused an already attached split backend connection") \
@@ -1023,6 +1209,9 @@
 	G(split_warmup_created, "PolarDB_Split_Warmup_Created", \
 		"proxysql_polardb_split_warmup_created_total", \
 		"Lazy split pool warmup connections added to replica pools") \
+	G(split_warmup_claimed_on_publish, "PolarDB_Split_Warmup_Claimed_On_Publish", \
+		"proxysql_polardb_split_warmup_claimed_on_publish_total", \
+		"Warmup-created split connections immediately assigned to pending ReaderPool claims instead of indexed exact FREE availability") \
 	G(split_warmup_failed, "PolarDB_Split_Warmup_Failed", \
 		"proxysql_polardb_split_warmup_failed_total", \
 		"Lazy split pool warmup base requests rejected or completed without a target") \

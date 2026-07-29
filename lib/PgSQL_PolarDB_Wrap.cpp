@@ -521,6 +521,9 @@ bool PgSQL_Session::polardb_account_wait_timeout(const char* source) {
  *                       named override after this helper clears transient state.
  */
 void PgSQL_Session::polardb_clear_staged_wait_state_for_reset(bool reset_override) {
+	polardb_leave_reader_capacity_wait(
+		PolarDB_ReaderStatus::READER_UNAVAILABLE);
+	polardb_reader_capacity_wait.reset();
 	polardb_query.reset_for_new_query();
 	clear_pending_notices(/*free_buffers=*/true);  // FREE the queue, not just null it
 	polardb_route_state.clear_resettable();
@@ -531,6 +534,9 @@ void PgSQL_Session::polardb_clear_staged_wait_state_for_reset(bool reset_overrid
 }
 
 void PgSQL_Session::polardb_clear_session_state_for_reset() {
+	polardb_leave_reader_capacity_wait(
+		PolarDB_ReaderStatus::READER_UNAVAILABLE);
+	polardb_reader_capacity_wait.reset();
 	polardb_query.reset_for_new_query();
 	polardb_route_state.clear_session();
 	polardb_clear_transaction_split_state("session_reset", /*want_reuse=*/false);
@@ -539,6 +545,13 @@ void PgSQL_Session::polardb_clear_session_state_for_reset() {
 
 void PgSQL_Session::polardb_clear_request_state_for_query_end(
 		PgSQL_Data_Stream* myds, bool called_on_failure) {
+	if (polardb_reader_capacity_wait.active) {
+		polardb_leave_reader_capacity_wait(
+			PolarDB_ReaderStatus::READER_UNAVAILABLE);
+	}
+	if (polardb_reader_capacity_wait.result_valid) {
+		polardb_reader_capacity_wait.reset();
+	}
 	const bool current_txn_wait_reader =
 		polardb_txn_reader.wait_read_active &&
 		polardb_txn_reader.backend &&

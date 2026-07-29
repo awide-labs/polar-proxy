@@ -64,6 +64,7 @@ static bool polardb_debug_startup_identity_fault(char* out, size_t out_size) {
 	}
 
 	if (found) {
+		POLARDB_TRACE("PolarDB CONNINFO: consumed startup identity fault='%s'\n", out);
 		polardb_debug_clear_fault_file("POLARDB_DEBUG_STARTUP_IDENTITY_FILE");
 	}
 	return found;
@@ -239,7 +240,7 @@ static void polardb_account_wrapper_set_error(PgSQL_Connection* conn, const PGre
 		is_lsn_timeout ? 1 : 0);
 
 	// In strict mode the timeout can arrive after every wrapper SET result has
-	// already been consumed: the wait is armed by SET polar_xact_split_wait_lsn,
+	// already been consumed: the wait starts with SET polar_xact_split_wait_lsn,
 	// then the backend raises ERROR before running the user SELECT. Count it only
 	// when the structured marker is present AND the wait is still active, so an
 	// ordinary user-query error that happens to resemble a timeout is not counted.
@@ -455,6 +456,15 @@ PgSQL_Connection::PgSQL_Connection(bool is_client_conn) {
 PgSQL_Connection::~PgSQL_Connection() {
 	proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 4, "Destroying PgSQL_Connection %p\n", this);
 #if POLARDB_PROXY
+	if (parent) {
+		parent->polardb_finish_idle_ping(this, true);
+	}
+	if (polardb_reader_pool_created &&
+			polardb_reader_pool_connect_pending.exchange(
+				false, std::memory_order_acq_rel) && PgHGM) {
+		POLARDB_HGM_STATUS_COUNT_ONE(
+			PgHGM->status, reader_pool_create_failed);
+	}
 	polardb_flush_parent_bytes(PolarDB_ParentBytesFlushReason::Destructor);
 #endif
 	if (userinfo) {
@@ -652,6 +662,14 @@ handler_again:
 		}
 		__sync_fetch_and_add(&PgHGM->status.server_connections_connected, 1);
 		__sync_fetch_and_add(&parent->connect_OK, 1);
+#if POLARDB_PROXY
+		if (polardb_reader_pool_created &&
+				polardb_reader_pool_connect_pending.exchange(
+					false, std::memory_order_acq_rel)) {
+			POLARDB_HGM_STATUS_COUNT_ONE(
+				PgHGM->status, reader_pool_create_connected);
+		}
+#endif // POLARDB_PROXY
 		// Seed the PgSQL DNS cache from the just-established connection so
 		// the next connect for this hostname can skip getaddrinfo even if
 		// the background resolver loop hasn't visited it yet.
@@ -666,12 +684,28 @@ handler_again:
 #endif
 		break;
 	case ASYNC_CONNECT_FAILED:
+#if POLARDB_PROXY
+		if (polardb_reader_pool_created &&
+				polardb_reader_pool_connect_pending.exchange(
+					false, std::memory_order_acq_rel)) {
+			POLARDB_HGM_STATUS_COUNT_ONE(
+				PgHGM->status, reader_pool_create_failed);
+		}
+#endif // POLARDB_PROXY
 		//PQfinish(pgsql_conn);//release connection even on error
 		//pgsql_conn = NULL;
 		PgHGM->p_update_pgsql_error_counter(p_pgsql_error_type::pgsql, parent->myhgc->hid, parent->address, parent->port, 9999 /* TODO: fix this mysql_errno(pgsql) */);
 		parent->connect_error(9999 /* TODO: fix this mysql_errno(pgsql)*/);
 		break;
 	case ASYNC_CONNECT_TIMEOUT:
+#if POLARDB_PROXY
+		if (polardb_reader_pool_created &&
+				polardb_reader_pool_connect_pending.exchange(
+					false, std::memory_order_acq_rel)) {
+			POLARDB_HGM_STATUS_COUNT_ONE(
+				PgHGM->status, reader_pool_create_timeout);
+		}
+#endif // POLARDB_PROXY
 		// to fix
 		//PQfinish(pgsql_conn);//release connection
 		//pgsql_conn = NULL;
@@ -1750,7 +1784,8 @@ PolarDB_StartupIdentity PgSQL_Connection::resolve_polardb_startup_identity(
 			!debug_use_configured_fallback) {
 		return polardb_startup_client.identity;
 	}
-	if (polardb_forced_startup_identity.source !=
+	if (!debug_use_listener_proxy && !debug_use_configured_fallback &&
+			polardb_forced_startup_identity.source !=
 			PolarDB_StartupIdentitySource::NONE) {
 		const bool forced_client_identity =
 			polardb_forced_startup_identity.source ==

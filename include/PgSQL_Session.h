@@ -669,6 +669,34 @@ public:
 	// before each query and at query end, so nothing leaks into the next query.
 	PolarDB_QueryState polardb_query;
 
+	struct PolarDB_ReaderCapacityWaitState {
+		uint64_t started_at_us = 0;
+		uint64_t scope_hash = 0;
+		PgSQL_SrvC* claim_server = nullptr;
+		std::shared_ptr<const void> claim_server_snapshot;
+		uint32_t claim_profile_generation = 0;
+		PolarDB_PoolKey claim_pool_key;
+		PolarDB_ReaderStatus last_status =
+			PolarDB_ReaderStatus::READER_UNAVAILABLE;
+		bool active = false;
+		bool retry_admitted = false;
+		bool result_valid = false;
+
+		void reset() {
+			started_at_us = 0;
+			scope_hash = 0;
+			claim_server = nullptr;
+			claim_server_snapshot.reset();
+			claim_profile_generation = 0;
+			claim_pool_key = PolarDB_PoolKey{};
+			last_status = PolarDB_ReaderStatus::READER_UNAVAILABLE;
+			active = false;
+			retry_admitted = false;
+			result_valid = false;
+		}
+	};
+	PolarDB_ReaderCapacityWaitState polardb_reader_capacity_wait;
+
 	struct PolarDB_SessionRouteState {
 		// When set, this session forces the writer instead of sending an
 		// unwrapped read to a replica. It is set when a wait wrapper cannot be
@@ -1201,6 +1229,13 @@ public:
 	 * clears per-session PolarDB overrides.
 	 */
 	void polardb_clear_staged_wait_state_for_reset(bool reset_override);
+	void polardb_enter_reader_capacity_wait(
+		uint64_t scope_hash, PolarDB_ReaderStatus status,
+		PgSQL_SrvC* claim_server = nullptr,
+		std::shared_ptr<const void> claim_server_snapshot = nullptr,
+		uint32_t claim_profile_generation = 0,
+		const PolarDB_PoolKey* claim_pool_key = nullptr);
+	void polardb_leave_reader_capacity_wait(PolarDB_ReaderStatus status);
 #endif // POLARDB_PROXY
 
 private:

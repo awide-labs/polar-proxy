@@ -224,7 +224,9 @@ static SQLite3_result *make_pgsql_servers_result_two_readers(
 		int reader_hg,
 		const char *reader_addr1, int reader_port1,
 		const char *reader_addr2, int reader_port2,
-		int reader_weight1 = 1, int reader_weight2 = 1) {
+		int reader_weight1 = 1, int reader_weight2 = 1,
+		int reader_max_connections1 = 50,
+		int reader_max_connections2 = 50) {
 	SQLite3_result *result = new SQLite3_result(11);
 	char writer_hg_buf[16];
 	char writer_port_buf[16];
@@ -233,6 +235,8 @@ static SQLite3_result *make_pgsql_servers_result_two_readers(
 	char reader_port2_buf[16];
 	char reader_weight1_buf[16];
 	char reader_weight2_buf[16];
+	char reader_max_connections1_buf[16];
+	char reader_max_connections2_buf[16];
 	snprintf(writer_hg_buf, sizeof(writer_hg_buf), "%d", writer_hg);
 	snprintf(writer_port_buf, sizeof(writer_port_buf), "%d", writer_port);
 	snprintf(reader_hg_buf, sizeof(reader_hg_buf), "%d", reader_hg);
@@ -240,6 +244,10 @@ static SQLite3_result *make_pgsql_servers_result_two_readers(
 	snprintf(reader_port2_buf, sizeof(reader_port2_buf), "%d", reader_port2);
 	snprintf(reader_weight1_buf, sizeof(reader_weight1_buf), "%d", reader_weight1);
 	snprintf(reader_weight2_buf, sizeof(reader_weight2_buf), "%d", reader_weight2);
+	snprintf(reader_max_connections1_buf,
+		sizeof(reader_max_connections1_buf), "%d", reader_max_connections1);
+	snprintf(reader_max_connections2_buf,
+		sizeof(reader_max_connections2_buf), "%d", reader_max_connections2);
 
 	char *writer_row[] = {
 		writer_hg_buf,
@@ -263,7 +271,7 @@ static SQLite3_result *make_pgsql_servers_result_two_readers(
 		(char*)"ONLINE",
 		reader_weight1_buf,
 		(char*)"0",
-		(char*)"50",
+		reader_max_connections1_buf,
 		(char*)"0",
 		(char*)"0",
 		(char*)"1000",
@@ -278,7 +286,7 @@ static SQLite3_result *make_pgsql_servers_result_two_readers(
 		(char*)"ONLINE",
 		reader_weight2_buf,
 		(char*)"0",
-		(char*)"50",
+		reader_max_connections2_buf,
 		(char*)"0",
 		(char*)"0",
 		(char*)"1000",

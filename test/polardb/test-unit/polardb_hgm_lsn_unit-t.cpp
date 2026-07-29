@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -183,11 +184,9 @@ static PgSQL_PoolMatchKey unit_reader_pool_match_key(
 		return core_key;
 	}
 	unit_reader_pool_refresh_key(conn);
-	core_key.words[0] = conn->polardb_startup_profile_generation;
-	core_key.words[1] = conn->polardb_pool_key.auth_hash;
-	core_key.words[2] = conn->polardb_pool_key.startup_identity_hash;
-	core_key.words[3] = conn->polardb_pool_key.startup_options_hash;
-	return core_key;
+	return pgsql_pool_match_key(
+		conn->polardb_startup_profile_generation,
+		conn->polardb_pool_key);
 }
 
 static void unit_reader_pool_add_matching(
@@ -484,8 +483,8 @@ static void test_polardb_writev_direct_send() {
 				"PolarDB writev: small buffered result leaves no queued output");
 			ok(small_worker->polardb_status_variables.stvar[
 					polardb_st_var_writev_small_batch_fallback] ==
-					small_before + 1,
-				"PolarDB writev: small-batch fallback is counted once per writeout");
+					small_before,
+				"PolarDB writev: canonical buffered writeout skips the direct-write fallback probe");
 			ok(small_worker->polardb_status_variables.stvar[
 					polardb_st_var_writev_attempts] == attempts_before &&
 				small_worker->polardb_status_variables.stvar[
@@ -645,21 +644,29 @@ static void test_polardb_thread_counter_aggregation_and_fold() {
 	const uint64_t GLOBAL_TARGET_LSN_PREFERRED = 10;
 	const uint64_t GLOBAL_WAIT_LSN_SUM_US = 100;
 	const uint64_t GLOBAL_WAIT_WRAP_BYPASSED = 5;
+	const uint64_t GLOBAL_CAPACITY_WAIT_MAX_US = 100;
 	const uint64_t EXPECTED_TARGET_LSN_PREFERRED = 15;   // 10 + 2 + 3
 	const uint64_t EXPECTED_WAIT_LSN_SUM_US = 118;       // 100 + 7 + 11
 	const uint64_t EXPECTED_WAIT_WRAP_BYPASSED = 35;     // 5 + 13 + 17
+	const uint64_t EXPECTED_CAPACITY_WAIT_MAX_US = 250;
 	PgHGM->status.polardb_target_lsn_preferred.store(
 		GLOBAL_TARGET_LSN_PREFERRED, std::memory_order_relaxed);
 	PgHGM->status.polardb_wait_lsn_sum_us.store(
 		GLOBAL_WAIT_LSN_SUM_US, std::memory_order_relaxed);
 	PgHGM->status.polardb_wait_wrap_bypassed.store(
 		GLOBAL_WAIT_WRAP_BYPASSED, std::memory_order_relaxed);
+	PgHGM->status.polardb_reader_capacity_wait_max_us.store(
+		GLOBAL_CAPACITY_WAIT_MAX_US, std::memory_order_relaxed);
 	worker1->polardb_status_variables.stvar[polardb_st_var_target_lsn_preferred] = 2;
 	worker2->polardb_status_variables.stvar[polardb_st_var_target_lsn_preferred] = 3;
 	worker1->polardb_status_variables.stvar[polardb_st_var_wait_lsn_sum_us] = 7;
 	worker2->polardb_status_variables.stvar[polardb_st_var_wait_lsn_sum_us] = 11;
 	worker1->polardb_status_variables.stvar[polardb_st_var_wait_wrap_bypassed] = 13;
 	worker2->polardb_status_variables.stvar[polardb_st_var_wait_wrap_bypassed] = 17;
+	worker1->polardb_status_variables.stvar[
+		polardb_st_var_reader_capacity_wait_max_us] = 250;
+	worker2->polardb_status_variables.stvar[
+		polardb_st_var_reader_capacity_wait_max_us] = 180;
 
 	// The enum and metadata list must stay tied together. Do not use a fixed
 	// number here because POLARDB_PROFILE intentionally adds more counters.
@@ -681,6 +688,11 @@ static void test_polardb_thread_counter_aggregation_and_fold() {
 			polardb_st_var_wait_wrap_bypassed,
 			PgHGM->status.polardb_wait_wrap_bypassed) == EXPECTED_WAIT_WRAP_BYPASSED,
 		"PolarDB counters: aggregation includes wait-wrapper bypasses");
+	ok(GloPTH->get_polardb_counter(
+			polardb_st_var_reader_capacity_wait_max_us,
+			PgHGM->status.polardb_reader_capacity_wait_max_us) ==
+			EXPECTED_CAPACITY_WAIT_MAX_US,
+		"PolarDB counters: maximum aggregation selects the largest worker wait");
 
 	const uint64_t GLOBAL_LSN_UPDATES_FROM_MONITOR = 6;
 	PgHGM->status.polardb_lsn_updates_from_monitor.store(
@@ -1025,6 +1037,30 @@ static void test_v2_target_reader_keeps_wait_until_lsn_is_reached() {
 		PgHGM->push_MyConn_to_pool(hit);
 		reader->remove_free_connection(hit);
 		delete hit;
+	}
+
+	const uint64_t fallback_before =
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_target_lsn_fallback_wait];
+	const int saved_creation_throttle =
+		pgsql_thread___throttle_connections_per_sec_to_hostgroup;
+	pgsql_thread___throttle_connections_per_sec_to_hostgroup =
+		std::numeric_limits<int>::max();
+	PolarDB_ReaderResult created_result =
+		PgHGM->get_MyConn_polardb_reader(
+			reader_hg, &sess, plan, wait, /*only_pooled=*/false);
+	pgsql_thread___throttle_connections_per_sec_to_hostgroup =
+		saved_creation_throttle;
+	ok(created_result.acquired(),
+		"PolarDB v2 reader: cold target read creates a reader backend");
+	ok(created_result.acquired() && !created_result.wait_bypass_allowed &&
+			worker->polardb_status_variables.stvar[
+				polardb_st_var_target_lsn_fallback_wait] ==
+				fallback_before + 1,
+		"PolarDB v2 reader: cold backend keeps wait and counts fallback selection");
+	if (created_result.conn) {
+		reader->remove_used_connection(created_result.conn);
+		delete created_result.conn;
 	}
 }
 
@@ -1494,7 +1530,7 @@ static void test_core_match_pool_index_and_transfer() {
 			PgSQL_PoolGetMode::ALLOW_EXACT_MATCH,
 			/*selected_max_connections=*/2);
 	ok(!free_available.conn && !free_available.server_saturated,
-		"PostgreSQL core match pool: any free connection prevents confirmed saturation");
+		"PostgreSQL core match pool: an unclaimed free connection preserves the creation path");
 	ok(reader->return_matching_connection(used_b, key_b),
 		"PostgreSQL core match pool: second used connection returns after saturation check");
 
@@ -1513,6 +1549,467 @@ static void test_core_match_pool_index_and_transfer() {
 			reader->pool_used_count_value() == 0,
 		"PostgreSQL core match pool: offline return removes USED without adding FREE");
 	delete offline_conn;
+	reader->set_status(MYSQL_SERVER_STATUS_ONLINE);
+}
+
+static void test_reader_claim_lifecycle() {
+	const int writer_hg = 902;
+	const int reader_hg = 903;
+	stage_polardb_topology_two_readers(PgHGM, "PostgreSQL reader claim",
+		writer_hg, "polardb-claim-writer", 22332,
+		reader_hg,
+		"polardb-claim-reader-a", 22333,
+		"polardb-claim-reader-b", 22334);
+	PgSQL_SrvC* reader = find_pgsql_server(
+		PgHGM->MyHGC_lookup(reader_hg), "polardb-claim-reader-a", 22333);
+	PgSQL_SrvC* peer = find_pgsql_server(
+		PgHGM->MyHGC_lookup(reader_hg), "polardb-claim-reader-b", 22334);
+	ok(reader != nullptr && peer != nullptr,
+		"PostgreSQL reader claim: both reader fixtures are available");
+	if (!reader || !peer) {
+		return;
+	}
+
+	PgSQL_PoolMatchKey key_a;
+	key_a.words[0] = 1;
+	key_a.words[1] = 101;
+	PgSQL_PoolMatchKey key_b;
+	key_b.words[0] = 2;
+	key_b.words[1] = 202;
+	PgSQL_Connection* conn = make_cached_reader_connection(reader);
+	conn->polardb_selected_server_snapshot =
+		PgHGM->get_polardb_server_list_snapshot();
+	ok(reader->add_matching_connection(conn, key_a) &&
+			!conn->polardb_selected_server_snapshot,
+		"PostgreSQL reader claim: ordinary FREE publication releases its selection snapshot");
+	ok(reader->take_matching_connection(key_a) == conn,
+		"PostgreSQL reader claim: fixture connection starts in USED without a retained snapshot");
+
+	ok(reader->register_reader_claim_demand(1, 101, key_a) &&
+			reader->register_reader_claim_demand(2, 102, key_a) &&
+			reader->register_reader_claim_demand(3, 103, key_b) &&
+			reader->reader_claim_demand_count() == 3,
+		"PostgreSQL reader claim: worker demands are bounded value records with exact keys");
+	ok(reader->has_matching_reader_claim_demand(key_a) &&
+			reader->has_matching_reader_claim_demand(key_b),
+		"PostgreSQL reader claim: local returns can detect matching cold-worker demand");
+	PolarDB_ReaderClaimWake first_wake;
+	ok(reader->return_matching_connection(
+			conn, key_a, nullptr, nullptr, &first_wake) &&
+			first_wake.worker_index == 1 && first_wake.token == 101 &&
+			first_wake.server_snapshot != nullptr &&
+			reader->reader_claim_count() == 1 &&
+			reader->reader_claim_demand_count() == 2,
+		"PostgreSQL reader claim: first matching demand receives the returned FREE connection");
+	ok(reader->pool_free_count_value() == 1 &&
+			reader->pool_used_count_value() == 0 &&
+			reader->take_matching_connection(key_a) == nullptr,
+		"PostgreSQL reader claim: claimed connection stays FREE but ordinary exact lookup skips it");
+#if POLARDB_PROFILE
+	PgSQL_PoolGetResult claimed_exact =
+		PgHGM->get_connection_from_selected_server(
+			reader, reader_hg, key_a, nullptr,
+			PgSQL_PoolGetMode::ALLOW_EXACT_MATCH,
+			/*selected_max_connections=*/0);
+	ok(!claimed_exact.conn && claimed_exact.exact_match_claimed,
+		"PostgreSQL reader claim: pooled-only exact miss identifies compatible capacity hidden by a claim");
+#endif // POLARDB_PROFILE
+	PgSQL_PoolGetResult claimed_capacity =
+		PgHGM->get_connection_from_selected_server(
+			reader, reader_hg, key_a, nullptr,
+			PgSQL_PoolGetMode::ALLOW_EXACT_MATCH,
+			/*selected_max_connections=*/1);
+	ok(!claimed_capacity.conn && claimed_capacity.server_saturated,
+		"PostgreSQL reader claim: non-evictable claimed FREE capacity reports saturation without entering creation");
+	PolarDB_ReaderClaimTakeResult wrong_worker =
+		reader->take_reader_claim(9, 101);
+	ok(wrong_worker.status == PolarDB_ReaderClaimTakeStatus::MISSING &&
+			reader->reader_claim_count() == 1,
+		"PostgreSQL reader claim: another worker cannot consume the claim token");
+	PolarDB_ReaderClaimTakeResult first_take =
+		reader->take_reader_claim(1, 101);
+	ok(first_take.status == PolarDB_ReaderClaimTakeStatus::ACQUIRED &&
+			first_take.conn == conn &&
+			reader->pool_free_count_value() == 0 &&
+			reader->pool_used_count_value() == 1,
+		"PostgreSQL reader claim: target worker transfers the claimed connection FREE to USED");
+
+	PolarDB_ReaderClaimWake second_wake;
+	ok(reader->return_matching_connection(
+			conn, key_a, nullptr, nullptr, &second_wake) &&
+			second_wake.worker_index == 2 && second_wake.token == 102,
+		"PostgreSQL reader claim: the next compatible worker receives the next return");
+	ok(reader->register_reader_claim_demand(4, 104, key_a),
+		"PostgreSQL reader claim: a later compatible demand can wait behind an active claim");
+	PolarDB_ReaderClaimWake reassigned_wake;
+	ok(reader->cancel_reader_claim(2, 102, &reassigned_wake) &&
+			reassigned_wake.worker_index == 4 && reassigned_wake.token == 104 &&
+			reader->reader_claim_count() == 1,
+		"PostgreSQL reader claim: cancellation reassigns the same FREE connection without a race");
+	PolarDB_ReaderClaimTakeResult reassigned_take =
+		reader->take_reader_claim(4, 104);
+	ok(reassigned_take.status == PolarDB_ReaderClaimTakeStatus::ACQUIRED &&
+			reassigned_take.conn == conn,
+		"PostgreSQL reader claim: reassigned worker consumes before normal selection");
+	PolarDB_ReaderClaimWake ordinary_wake;
+	ok(reader->return_matching_connection(
+			conn, key_a, nullptr, nullptr, &ordinary_wake) &&
+			!ordinary_wake.valid() &&
+			reader->take_matching_connection(key_a) == conn,
+		"PostgreSQL reader claim: unmatched return restores ordinary exact availability");
+	ok(reader->cancel_reader_claim(3, 103) &&
+			reader->reader_claim_demand_count() == 0 &&
+			!reader->has_matching_reader_claim_demand(key_b),
+		"PostgreSQL reader claim: pending demand cancels without connection ownership");
+
+	PgSQL_Connection* self_donor = make_cached_reader_connection(reader);
+	ok(reader->add_used_matching_connection(self_donor, key_a) &&
+			reader->register_reader_claim_demand(20, 120, key_a),
+		"PostgreSQL reader yield debt: self-demand fixture starts in USED");
+	PolarDB_ReaderClaimWake self_wake;
+	const PolarDB_ReaderYieldResult self_result =
+		reader->yield_matching_connection_to_claim(
+			self_donor, key_a, 20, &self_wake);
+	PgSQL_PoolMatchKey self_used_key;
+	ok(self_result == PolarDB_ReaderYieldResult::NO_REMOTE_DEMAND &&
+			!self_wake.valid() &&
+			reader->used_connection_match_key(self_donor, &self_used_key) &&
+			self_used_key == key_a &&
+			reader->reader_claim_demand_count() == 1,
+		"PostgreSQL reader yield debt: donor cannot satisfy its own demand and retains USED ownership");
+	ok(reader->cancel_reader_claim(20, 120) &&
+			reader->remove_used_connection(self_donor),
+		"PostgreSQL reader yield debt: self-demand cancellation leaves the donor removable from USED");
+	delete self_donor;
+
+	PgSQL_Connection* competing_donor_a =
+		make_cached_reader_connection(reader);
+	PgSQL_Connection* competing_donor_b =
+		make_cached_reader_connection(peer);
+	ok(reader->add_used_matching_connection(competing_donor_a, key_a) &&
+			peer->add_used_matching_connection(competing_donor_b, key_a) &&
+			reader->register_reader_claim_demand(21, 121, key_a),
+		"PostgreSQL reader yield debt: two donors observe one remote demand");
+	PolarDB_ReaderClaimWake competing_wake_a;
+	PolarDB_ReaderClaimWake competing_wake_b;
+	PolarDB_ReaderYieldResult competing_result_a =
+		PolarDB_ReaderYieldResult::CONNECTION_INVALID;
+	PolarDB_ReaderYieldResult competing_result_b =
+		PolarDB_ReaderYieldResult::CONNECTION_INVALID;
+	std::thread competing_yield_a([&]() {
+		competing_result_a = reader->yield_matching_connection_to_claim(
+			competing_donor_a, key_a, 30, &competing_wake_a);
+	});
+	std::thread competing_yield_b([&]() {
+		competing_result_b = peer->yield_matching_connection_to_claim(
+			competing_donor_b, key_a, 31, &competing_wake_b);
+	});
+	competing_yield_a.join();
+	competing_yield_b.join();
+	const bool donor_a_published = competing_result_a ==
+		PolarDB_ReaderYieldResult::CLAIM_PUBLISHED;
+	const bool donor_b_published = competing_result_b ==
+		PolarDB_ReaderYieldResult::CLAIM_PUBLISHED;
+	const bool donor_a_retained = competing_result_a ==
+		PolarDB_ReaderYieldResult::NO_REMOTE_DEMAND;
+	const bool donor_b_retained = competing_result_b ==
+		PolarDB_ReaderYieldResult::NO_REMOTE_DEMAND;
+	PolarDB_ReaderClaimWake& competing_wake = competing_wake_a.valid()
+		? competing_wake_a : competing_wake_b;
+	PgSQL_Connection* retained_donor = donor_a_retained
+		? competing_donor_a : competing_donor_b;
+	PgSQL_SrvC* retained_server = donor_a_retained ? reader : peer;
+	PgSQL_PoolMatchKey retained_key;
+	ok(donor_a_published != donor_b_published &&
+			donor_a_retained != donor_b_retained &&
+			competing_wake.valid() && competing_wake.worker_index == 21 &&
+			competing_wake.token == 121 &&
+			reader->reader_claim_demand_count() == 0 &&
+			retained_server->used_connection_match_key(
+				retained_donor, &retained_key) && retained_key == key_a,
+		"PostgreSQL reader yield debt: final atomic selection lets one donor publish and the other retain USED ownership");
+	const PolarDB_ReaderClaimTakeResult competing_take =
+		competing_wake.server->take_reader_claim(21, 121);
+	ok(competing_take.status == PolarDB_ReaderClaimTakeStatus::ACQUIRED &&
+			competing_take.conn != nullptr,
+		"PostgreSQL reader yield debt: the sole published concrete claim is consumable");
+	reader->remove_used_connection(competing_donor_a);
+	peer->remove_used_connection(competing_donor_b);
+	delete competing_donor_a;
+	delete competing_donor_b;
+
+	PgSQL_Connection* cancelled_donor = make_cached_reader_connection(reader);
+	ok(reader->add_used_matching_connection(cancelled_donor, key_a) &&
+			reader->register_reader_claim_demand(22, 122, key_a) &&
+			reader->cancel_reader_claim(22, 122),
+		"PostgreSQL reader yield debt: remote demand can cancel before donor completion");
+	PolarDB_ReaderClaimWake cancelled_wake;
+	const PolarDB_ReaderYieldResult cancelled_result =
+		reader->yield_matching_connection_to_claim(
+			cancelled_donor, key_a, 30, &cancelled_wake);
+	PgSQL_PoolMatchKey cancelled_used_key;
+	ok(cancelled_result == PolarDB_ReaderYieldResult::NO_REMOTE_DEMAND &&
+			!cancelled_wake.valid() &&
+			reader->used_connection_match_key(
+				cancelled_donor, &cancelled_used_key) &&
+			cancelled_used_key == key_a,
+		"PostgreSQL reader yield debt: cancelled demand causes atomic retain rather than ordinary FREE spill");
+	reader->remove_used_connection(cancelled_donor);
+	delete cancelled_donor;
+
+	PgSQL_Connection* invalid_donor = make_cached_reader_connection(reader);
+	const PgSQL_PoolMatchKey invalid_key =
+		unit_reader_pool_match_key(invalid_donor);
+	ok(reader->add_used_matching_connection(invalid_donor, invalid_key) &&
+			reader->register_reader_claim_demand(23, 123, invalid_key),
+		"PostgreSQL reader yield debt: invalid donor fixture starts in USED with remote demand");
+	invalid_donor->reusable = false;
+	const PolarDB_ReaderYieldResult invalid_result =
+		PgHGM->yield_connection_to_reader_claim(invalid_donor, invalid_key, 30);
+	PgSQL_PoolMatchKey invalid_used_key;
+	ok(invalid_result == PolarDB_ReaderYieldResult::CONNECTION_INVALID &&
+			reader->used_connection_match_key(
+				invalid_donor, &invalid_used_key) &&
+			reader->reader_claim_demand_count() == 1,
+		"PostgreSQL reader yield debt: non-reusable completion is invalid and cannot consume demand");
+	invalid_donor->reusable = true;
+	reader->polardb_fast_status.store(
+		MYSQL_SERVER_STATUS_OFFLINE_HARD, std::memory_order_relaxed);
+	const PolarDB_ReaderYieldResult offline_result =
+		PgHGM->yield_connection_to_reader_claim(invalid_donor, invalid_key, 30);
+	reader->polardb_fast_status.store(
+		MYSQL_SERVER_STATUS_ONLINE, std::memory_order_relaxed);
+	ok(offline_result == PolarDB_ReaderYieldResult::CONNECTION_INVALID &&
+			reader->used_connection_match_key(
+				invalid_donor, &invalid_used_key) &&
+			reader->cancel_reader_claim(23, 123),
+		"PostgreSQL reader yield debt: offline donor is invalid without moving USED ownership or consuming demand");
+	reader->remove_used_connection(invalid_donor);
+	delete invalid_donor;
+
+	PolarDB_Query_ReaderPlan lag_plan;
+	lag_plan.primary_lsn = 1000;
+	lag_plan.max_lag_bytes = 10;
+	PolarDB_WaitSpec no_wait;
+	reader->polardb_current_lsn.store(1000, std::memory_order_relaxed);
+	reader->lsn_updated_at.store(monotonic_time(), std::memory_order_relaxed);
+	peer->polardb_current_lsn.store(900, std::memory_order_relaxed);
+	peer->lsn_updated_at.store(monotonic_time(), std::memory_order_relaxed);
+	PgSQL_Connection* lagged_peer_conn = make_cached_reader_connection(peer);
+	ok(peer->add_used_matching_connection(lagged_peer_conn, key_b) &&
+			reader->myhgc->register_reader_claim_demand(
+				11, 111, 111, key_b, lag_plan, no_wait),
+		"PostgreSQL reader claim: lag-qualified hostgroup demand is registered independently of its original reader");
+	PolarDB_ReaderClaimWake lagged_wake;
+	ok(peer->return_matching_connection(
+			lagged_peer_conn, key_b, nullptr, nullptr, &lagged_wake) &&
+			!lagged_wake.valid() &&
+			peer->take_matching_connection(key_b) == lagged_peer_conn &&
+			reader->reader_claim_demand_count() == 1,
+		"PostgreSQL reader claim: a lag-ineligible peer cannot consume hostgroup demand");
+	peer->remove_used_connection(lagged_peer_conn);
+	delete lagged_peer_conn;
+	PgSQL_Connection* eligible_conn = make_cached_reader_connection(reader);
+	ok(reader->add_used_matching_connection(eligible_conn, key_b),
+		"PostgreSQL reader claim: eligible donor fixture starts in USED");
+	PolarDB_ReaderClaimWake eligible_wake;
+	ok(reader->return_matching_connection(
+			eligible_conn, key_b, nullptr, nullptr, &eligible_wake) &&
+			eligible_wake.worker_index == 11 && eligible_wake.token == 111 &&
+			eligible_wake.server == reader,
+		"PostgreSQL reader claim: current lag eligibility selects a concrete donor");
+	const PolarDB_ReaderClaimTakeResult eligible_take =
+		reader->take_reader_claim(11, 111);
+	ok(eligible_take.status == PolarDB_ReaderClaimTakeStatus::ACQUIRED &&
+			eligible_take.conn == eligible_conn,
+		"PostgreSQL reader claim: lag-qualified concrete claim is consumed directly");
+	reader->remove_used_connection(eligible_conn);
+	delete eligible_conn;
+	reader->polardb_current_lsn.store(0, std::memory_order_relaxed);
+	peer->polardb_current_lsn.store(0, std::memory_order_relaxed);
+
+	PgSQL_Connection* concurrent_a = make_cached_reader_connection(reader);
+	PgSQL_Connection* concurrent_b = make_cached_reader_connection(peer);
+	ok(reader->add_used_matching_connection(concurrent_a, key_a) &&
+			peer->add_used_matching_connection(concurrent_b, key_a) &&
+			reader->register_reader_claim_demand(12, 112, key_a) &&
+			peer->register_reader_claim_demand(13, 113, key_a),
+		"PostgreSQL reader claim: two servers and two hostgroup demands are ready for concurrent publication");
+	PolarDB_ReaderClaimWake concurrent_wake_a;
+	PolarDB_ReaderClaimWake concurrent_wake_b;
+	bool concurrent_return_a = false;
+	bool concurrent_return_b = false;
+	std::thread return_a([&]() {
+		concurrent_return_a = reader->return_matching_connection(
+			concurrent_a, key_a, nullptr, nullptr, &concurrent_wake_a);
+	});
+	std::thread return_b([&]() {
+		concurrent_return_b = peer->return_matching_connection(
+			concurrent_b, key_a, nullptr, nullptr, &concurrent_wake_b);
+	});
+	return_a.join();
+	return_b.join();
+	const bool concurrent_tokens_match =
+		(concurrent_wake_a.token == 112 && concurrent_wake_b.token == 113) ||
+		(concurrent_wake_a.token == 113 && concurrent_wake_b.token == 112);
+	ok(concurrent_return_a && concurrent_return_b &&
+			concurrent_wake_a.valid() && concurrent_wake_b.valid() &&
+			concurrent_tokens_match &&
+			reader->reader_claim_demand_count() == 0,
+		"PostgreSQL reader claim: server-to-hostgroup lock order publishes concurrent cross-server claims without loss");
+	const PolarDB_ReaderClaimTakeResult concurrent_take_a =
+		concurrent_wake_a.server->take_reader_claim(
+			concurrent_wake_a.worker_index, concurrent_wake_a.token);
+	const PolarDB_ReaderClaimTakeResult concurrent_take_b =
+		concurrent_wake_b.server->take_reader_claim(
+			concurrent_wake_b.worker_index, concurrent_wake_b.token);
+	ok(concurrent_take_a.status == PolarDB_ReaderClaimTakeStatus::ACQUIRED &&
+			concurrent_take_b.status == PolarDB_ReaderClaimTakeStatus::ACQUIRED,
+		"PostgreSQL reader claim: both concurrent concrete claims are consumable");
+	reader->remove_used_connection(concurrent_a);
+	peer->remove_used_connection(concurrent_b);
+	delete concurrent_a;
+	delete concurrent_b;
+
+	const unsigned long long explicit_before =
+		PgHGM->status.polardb_reader_claim_retired_explicit.load(
+			std::memory_order_relaxed);
+	ok(reader->return_matching_connection(conn, key_a) &&
+			reader->take_matching_connection(key_a) == conn &&
+			reader->register_reader_claim_demand(7, 107, key_a),
+		"PostgreSQL reader claim: explicit retirement fixture starts with a matching demand");
+	PolarDB_ReaderClaimWake explicit_wake;
+	ok(reader->return_matching_connection(
+			conn, key_a, nullptr, nullptr, &explicit_wake) &&
+			explicit_wake.worker_index == 7 && explicit_wake.token == 107 &&
+			reader->remove_free_connection(conn),
+		"PostgreSQL reader claim: explicit FREE removal retires the concrete claim");
+	const PolarDB_ReaderClaimTakeResult explicit_retired =
+		reader->take_reader_claim(7, 107);
+	ok(explicit_retired.status == PolarDB_ReaderClaimTakeStatus::RETIRED &&
+			explicit_retired.retire_reason ==
+				PolarDB_ReaderClaimRetireReason::EXPLICIT_REMOVE &&
+			PgHGM->status.polardb_reader_claim_retired_explicit.load(
+				std::memory_order_relaxed) == explicit_before + 1,
+		"PostgreSQL reader claim: worker observes a classified explicit retirement");
+	delete conn;
+
+	PgSQL_Connection* claimed_for_create =
+		make_cached_reader_connection(reader);
+	PgSQL_Connection* ordinary_for_create =
+		make_cached_reader_connection(reader);
+	const int saved_max_connections = reader->max_connections;
+	const unsigned long long create_evict_before =
+		PgHGM->status.polardb_reader_claim_retired_create_evict.load(
+			std::memory_order_relaxed);
+	ok(reader->add_matching_connection(claimed_for_create, key_a) &&
+			reader->take_matching_connection(key_a) == claimed_for_create &&
+			reader->register_reader_claim_demand(10, 110, key_a),
+		"PostgreSQL reader claim: creation-eviction fixture registers one concrete claim");
+	PolarDB_ReaderClaimWake create_wake;
+	ok(reader->return_matching_connection(
+			claimed_for_create, key_a, nullptr, nullptr, &create_wake) &&
+			create_wake.worker_index == 10 && create_wake.token == 110 &&
+			reader->add_matching_connection(ordinary_for_create, key_b),
+		"PostgreSQL reader claim: claimed and ordinary FREE connections share the capacity limit");
+	reader->max_connections = 2;
+	PgSQL_PoolMatchKey create_key;
+	create_key.words[0] = 3;
+	create_key.words[1] = 303;
+	const int saved_creation_throttle =
+		pgsql_thread___throttle_connections_per_sec_to_hostgroup;
+	pgsql_thread___throttle_connections_per_sec_to_hostgroup =
+		std::numeric_limits<int>::max();
+	PgSQL_PoolGetResult created = PgHGM->get_connection_from_selected_server(
+		reader, reader_hg, create_key, nullptr,
+		PgSQL_PoolGetMode::ALLOW_EXACT_MATCH |
+			PgSQL_PoolGetMode::ALLOW_CREATE);
+	pgsql_thread___throttle_connections_per_sec_to_hostgroup =
+		saved_creation_throttle;
+	ok(created.conn && created.source == PgSQL_PoolGetSource::CREATED &&
+			reader->reader_claim_count() == 1 &&
+			PgHGM->status.polardb_reader_claim_retired_create_evict.load(
+				std::memory_order_relaxed) == create_evict_before,
+		"PostgreSQL reader claim: creation evicts only ordinary FREE capacity");
+	const PolarDB_ReaderClaimTakeResult claim_after_create =
+		reader->take_reader_claim(10, 110);
+	ok(claim_after_create.status == PolarDB_ReaderClaimTakeStatus::ACQUIRED &&
+			claim_after_create.conn == claimed_for_create,
+		"PostgreSQL reader claim: creation preserves the promised connection for its worker");
+	reader->max_connections = saved_max_connections;
+	if (created.conn) {
+		reader->remove_used_connection(created.conn);
+		delete created.conn;
+	}
+	if (claim_after_create.conn) {
+		reader->remove_used_connection(claim_after_create.conn);
+		delete claim_after_create.conn;
+	}
+
+	const unsigned long long offline_before =
+		PgHGM->status.polardb_reader_claim_retired_offline.load(
+			std::memory_order_relaxed);
+	const unsigned long long demand_retired_before =
+		PgHGM->status.polardb_reader_claim_demand_retired.load(
+			std::memory_order_relaxed);
+	PgSQL_Connection* offline_conn = make_cached_reader_connection(reader);
+	ok(reader->add_matching_connection(offline_conn, key_a) &&
+			reader->take_matching_connection(key_a) == offline_conn &&
+			reader->register_reader_claim_demand(5, 105, key_a) &&
+			reader->register_reader_claim_demand(6, 106, key_b) &&
+			reader->register_reader_claim_demand(8, 108, key_b),
+		"PostgreSQL reader claim: offline cleanup fixture has one claim and two pending demands");
+	PolarDB_ReaderClaimWake offline_wake;
+	ok(reader->return_matching_connection(
+			offline_conn, key_a, nullptr, nullptr, &offline_wake) &&
+			reader->reader_claim_count() == 1 &&
+			reader->reader_claim_demand_count() == 2,
+		"PostgreSQL reader claim: offline cleanup fixture publishes the active claim");
+	reader->set_status(MYSQL_SERVER_STATUS_OFFLINE_HARD);
+	ok(reader->pool_free_count_value() == 0 &&
+			reader->reader_claim_count() == 0 &&
+			reader->reader_claim_demand_count() == 2 &&
+			peer->has_matching_reader_claim_demand(key_b) &&
+			PgHGM->status.polardb_reader_claim_retired_offline.load(
+				std::memory_order_relaxed) == offline_before + 1 &&
+			PgHGM->status.polardb_reader_claim_demand_retired.load(
+				std::memory_order_relaxed) == demand_retired_before,
+		"PostgreSQL reader claim: OFFLINE_HARD retires only the concrete server claim");
+	const PolarDB_ReaderClaimTakeResult offline_claim =
+		reader->take_reader_claim(5, 105);
+	const PolarDB_ReaderClaimTakeResult offline_demand =
+		reader->take_reader_claim(6, 106);
+	ok(offline_claim.status == PolarDB_ReaderClaimTakeStatus::RETIRED &&
+			offline_claim.retire_reason ==
+				PolarDB_ReaderClaimRetireReason::SERVER_OFFLINE &&
+			offline_demand.status == PolarDB_ReaderClaimTakeStatus::PENDING,
+		"PostgreSQL reader claim: pending hostgroup demand survives one reader going offline");
+
+	PgSQL_Connection* peer_conn = make_cached_reader_connection(peer);
+	ok(peer->add_used_matching_connection(peer_conn, key_b),
+		"PostgreSQL reader claim: peer fixture starts in USED after the original reader is offline");
+	PolarDB_ReaderClaimWake peer_wake;
+	ok(peer->return_matching_connection(
+			peer_conn, key_b, nullptr, nullptr, &peer_wake) &&
+			peer_wake.worker_index == 6 && peer_wake.token == 106 &&
+			peer_wake.server == peer &&
+			peer->reader_claim_count() == 1 &&
+			peer->reader_claim_demand_count() == 1,
+		"PostgreSQL reader claim: another eligible reader satisfies hostgroup demand with a concrete claim");
+	const PolarDB_ReaderClaimTakeResult peer_take =
+		peer->take_reader_claim(6, 106);
+	ok(peer_take.status == PolarDB_ReaderClaimTakeStatus::ACQUIRED &&
+			peer_take.conn == peer_conn,
+		"PostgreSQL reader claim: target worker consumes the cross-reader claim without reselection");
+	peer->remove_used_connection(peer_conn);
+	delete peer_conn;
+	ok(reader->cancel_reader_claim(8, 108) &&
+			reader->take_reader_claim(8, 108).status ==
+				PolarDB_ReaderClaimTakeStatus::MISSING,
+		"PostgreSQL reader claim: remaining hostgroup demand cancels through either reader");
+	ok(reader->take_reader_claim(9, 999).status ==
+			PolarDB_ReaderClaimTakeStatus::MISSING,
+		"PostgreSQL reader claim: an unknown token remains distinguishable from retirement");
 	reader->set_status(MYSQL_SERVER_STATUS_ONLINE);
 }
 
@@ -1857,6 +2354,207 @@ static void test_idle_ping_connection_survives_topology_purge() {
 	delete conn;
 }
 
+static void test_idle_ping_reader_pool_accounting() {
+	const int writer_hg = 996;
+	const int reader_hg = 997;
+	stage_polardb_topology(PgHGM, "PolarDB idle-ping accounting",
+		writer_hg, "polardb-ping-accounting-writer", 22372,
+		reader_hg, "polardb-ping-accounting-reader", 22373);
+	PgSQL_SrvC* reader = find_pgsql_server(
+		PgHGM->MyHGC_lookup(reader_hg),
+		"polardb-ping-accounting-reader", 22373);
+	ok(reader != nullptr,
+		"PolarDB idle-ping accounting: reader server fixture is available");
+	if (!reader) {
+		return;
+	}
+
+	const unsigned long long take_before =
+		PgHGM->status.polardb_reader_pool_idle_ping_take.load(
+			std::memory_order_relaxed);
+	const unsigned long long return_before =
+		PgHGM->status.polardb_reader_pool_idle_ping_return.load(
+			std::memory_order_relaxed);
+	const unsigned long long destroy_before =
+		PgHGM->status.polardb_reader_pool_idle_ping_destroy.load(
+			std::memory_order_relaxed);
+
+	PgSQL_Connection* returned = make_cached_reader_connection(reader);
+	returned->last_time_used = 1;
+	unit_reader_pool_add_matching(reader, returned);
+	ok(reader->take_free_connection_for_ping(returned, 2) == returned &&
+			returned->polardb_idle_ping_inflight.load(
+				std::memory_order_acquire) &&
+			reader->polardb_idle_ping_count.load(
+				std::memory_order_relaxed) == 1,
+		"PolarDB idle-ping accounting: FREE extraction publishes in-flight ownership");
+	ok(reader->polardb_finish_idle_ping(returned, false) &&
+			!returned->polardb_idle_ping_inflight.load(
+				std::memory_order_acquire) &&
+			reader->polardb_idle_ping_count.load(
+				std::memory_order_relaxed) == 0,
+		"PolarDB idle-ping accounting: successful completion clears ownership");
+	ok(PgHGM->status.polardb_reader_pool_idle_ping_take.load(
+			std::memory_order_relaxed) == take_before + 1 &&
+		PgHGM->status.polardb_reader_pool_idle_ping_return.load(
+			std::memory_order_relaxed) == return_before + 1,
+		"PolarDB idle-ping accounting: extraction and return counters advance once");
+	reader->remove_used_connection(returned);
+	delete returned;
+
+	PgSQL_Connection* destroyed = make_cached_reader_connection(reader);
+	destroyed->last_time_used = 1;
+	unit_reader_pool_add_matching(reader, destroyed);
+	ok(reader->take_free_connection_for_ping(destroyed, 2) == destroyed,
+		"PolarDB idle-ping accounting: destruction fixture enters maintenance ownership");
+	PgHGM->destroy_MyConn_from_pool(destroyed);
+	ok(reader->polardb_idle_ping_count.load(
+			std::memory_order_relaxed) == 0 &&
+		PgHGM->status.polardb_reader_pool_idle_ping_destroy.load(
+			std::memory_order_relaxed) == destroy_before + 1,
+		"PolarDB idle-ping accounting: destruction clears ownership and advances its counter");
+}
+
+static void test_reader_pool_idle_trim_grace() {
+	const int writer_hg = 974;
+	const int reader_hg = 975;
+	stage_polardb_topology(PgHGM, "PolarDB idle-trim grace",
+		writer_hg, "polardb-trim-writer", 22374,
+		reader_hg, "polardb-trim-reader", 22375);
+	PgSQL_SrvC* reader = find_pgsql_server(
+		PgHGM->MyHGC_lookup(reader_hg),
+		"polardb-trim-reader", 22375);
+	ok(reader != nullptr,
+		"PolarDB idle-trim grace: reader server fixture is available");
+	if (!reader) {
+		return;
+	}
+
+	PgSQL_PoolMatchKey key;
+	for (unsigned int index = 0; index < 5; index++) {
+		PgSQL_Connection* connection = make_cached_reader_connection(reader);
+		const PgSQL_PoolMatchKey connection_key =
+			unit_reader_pool_match_key(connection);
+		if (key.empty()) {
+			key = connection_key;
+		}
+		assert(connection_key == key);
+		assert(reader->add_matching_connection(connection, key));
+	}
+
+	const unsigned long long deferred_before =
+		PgHGM->status.polardb_reader_pool_idle_trim_deferred.load(
+			std::memory_order_relaxed);
+	const unsigned long long destroyed_before =
+		PgHGM->status.polardb_reader_pool_idle_trim_destroyed.load(
+			std::memory_order_relaxed);
+	const unsigned long long cancelled_before =
+		PgHGM->status.polardb_reader_pool_idle_trim_cancelled.load(
+			std::memory_order_relaxed);
+	const unsigned long long cancelled_taken_before =
+		PgHGM->status.polardb_reader_pool_idle_trim_cancelled_taken.load(
+			std::memory_order_relaxed);
+	const unsigned long long cancelled_retained_before =
+		PgHGM->status.polardb_reader_pool_idle_trim_cancelled_retained.load(
+			std::memory_order_relaxed);
+	const unsigned long long cancelled_other_before =
+		PgHGM->status.polardb_reader_pool_idle_trim_cancelled_other.load(
+			std::memory_order_relaxed);
+	std::vector<PgSQL_Connection*> connections_to_delete;
+	PolarDB_IdleTrimResult first;
+	{
+		std::lock_guard<std::recursive_mutex> pool_lock(reader->pool_mutex);
+		first = reader->polardb_trim_free_connections_pct_unlocked(
+			2, connections_to_delete);
+	}
+	ok(first.deferred == 3 && first.cancelled == 0 && first.destroyed == 0 &&
+			connections_to_delete.empty() &&
+			reader->pool_free_count_value() == 5,
+		"PolarDB idle-trim grace: first over-limit observation defers exactly the excess inventory");
+
+	PgSQL_Connection* reused = nullptr;
+	for (unsigned int index = 0;
+			index < reader->ConnectionsFree->conns_length(); index++) {
+		PgSQL_Connection* connection = reader->ConnectionsFree->index(index);
+		if (connection && connection->polardb_idle_trim_pending) {
+			reused = connection;
+			break;
+		}
+	}
+	assert(reused != nullptr);
+	reused->last_time_used = 1;
+	PgSQL_Connection* taken = reader->take_free_connection_for_ping(reused, 2);
+	ok(taken == reused &&
+			reader->polardb_finish_idle_ping(reused, false) &&
+			!reused->polardb_idle_trim_pending &&
+			reader->remove_used_connection(reused) &&
+			reader->add_matching_connection(reused, key),
+		"PolarDB idle-trim grace: reuse cancels stale trim eligibility before republishing FREE");
+
+	PolarDB_IdleTrimResult second;
+	{
+		std::lock_guard<std::recursive_mutex> pool_lock(reader->pool_mutex);
+		second = reader->polardb_trim_free_connections_pct_unlocked(
+			2, connections_to_delete);
+	}
+	ok(second.deferred == 1 && second.cancelled == 0 &&
+			second.destroyed == 2 &&
+			connections_to_delete.size() == 2 &&
+			reader->pool_free_count_value() == 3,
+		"PolarDB idle-trim grace: second observation removes only continuously idle excess inventory");
+	for (PgSQL_Connection* connection : connections_to_delete) {
+		delete connection;
+	}
+	connections_to_delete.clear();
+
+	PgSQL_Connection* retained = reader->take_matching_connection(key);
+	assert(retained != nullptr);
+	ok(reader->remove_used_connection(retained),
+		"PolarDB idle-trim grace: target-reduction fixture removes one unmarked connection");
+
+	PolarDB_IdleTrimResult third;
+	{
+		std::lock_guard<std::recursive_mutex> pool_lock(reader->pool_mutex);
+		third = reader->polardb_trim_free_connections_pct_unlocked(
+			2, connections_to_delete);
+	}
+	ok(third.deferred == 0 && third.cancelled == 1 &&
+			third.destroyed == 0 && connections_to_delete.empty() &&
+			reader->pool_free_count_value() == 2,
+		"PolarDB idle-trim grace: falling to the target retains and clears pending inventory");
+	delete retained;
+	bool retained_trim_marker = false;
+	for (unsigned int index = 0;
+			index < reader->ConnectionsFree->conns_length(); index++) {
+		PgSQL_Connection* connection = reader->ConnectionsFree->index(index);
+		retained_trim_marker = retained_trim_marker ||
+			(connection && connection->polardb_idle_trim_pending);
+	}
+	ok(!retained_trim_marker,
+		"PolarDB idle-trim grace: retained target inventory has no stale trim eligibility");
+	ok(PgHGM->status.polardb_reader_pool_idle_trim_deferred.load(
+			std::memory_order_relaxed) == deferred_before + 4 &&
+		PgHGM->status.polardb_reader_pool_idle_trim_destroyed.load(
+			std::memory_order_relaxed) == destroyed_before + 2 &&
+		PgHGM->status.polardb_reader_pool_idle_trim_cancelled.load(
+			std::memory_order_relaxed) == cancelled_before + 2 &&
+		PgHGM->status.polardb_reader_pool_idle_trim_cancelled_taken.load(
+			std::memory_order_relaxed) == cancelled_taken_before + 1 &&
+		PgHGM->status.polardb_reader_pool_idle_trim_cancelled_retained.load(
+			std::memory_order_relaxed) == cancelled_retained_before + 1 &&
+		PgHGM->status.polardb_reader_pool_idle_trim_cancelled_other.load(
+			std::memory_order_relaxed) == cancelled_other_before,
+		"PolarDB idle-trim grace: deferred outcomes and cancellation reasons reconcile exactly");
+
+	while (PgSQL_Connection* connection = reader->take_matching_connection(key)) {
+		assert(reader->remove_used_connection(connection));
+		delete connection;
+	}
+	ok(reader->pool_free_count_value() == 0 &&
+			reader->pool_used_count_value() == 0,
+		"PolarDB idle-trim grace: fixture cleanup leaves no pooled connection ownership");
+}
+
 static void test_worker_local_reader_selection_sequence() {
 	std::atomic<uint64_t> selection_start{0};
 	std::unique_ptr<PgSQL_Thread> first_worker(new PgSQL_Thread());
@@ -2051,6 +2749,263 @@ static void test_two_reader_selection_ignores_inventory_and_alternates() {
 		srv->remove_free_connection(conn);
 		delete conn;
 	}
+}
+
+static void test_reader_capacity_group_confirmation() {
+	const int writer_hg = 1110;
+	const int reader_hg = 1111;
+	ok(PgHGM->servers_add(make_pgsql_servers_result_two_readers(
+			writer_hg, "polardb-capacity-scope-writer", 25110,
+			reader_hg,
+			"polardb-capacity-scope-reader-a", 25111,
+			"polardb-capacity-scope-reader-b", 25112,
+			/*reader_weight1=*/1, /*reader_weight2=*/1,
+			/*reader_max_connections1=*/1,
+			/*reader_max_connections2=*/1)) == 0,
+		"PolarDB capacity scope: writer and bounded readers are staged");
+	PgHGM->save_incoming_pgsql_table(
+		make_polardb_replication_row(writer_hg, reader_hg),
+		"pgsql_replication_hostgroups");
+	ok(PgHGM->commit({}, {}, false, false),
+		"PolarDB capacity scope: bounded reader topology commits");
+
+	auto snapshot = PgHGM->get_polardb_server_list_snapshot();
+	const PgSQL_HostGroups_Manager::PolarDB_ServerListEntry* entry = nullptr;
+	if (snapshot) {
+		auto found = snapshot->by_hostgroup.find(reader_hg);
+		if (found != snapshot->by_hostgroup.end()) {
+			entry = &found->second;
+		}
+	}
+	const bool fixture_ok = entry && entry->servers.size() == 2 &&
+		entry->selection_start;
+	ok(fixture_ok,
+		"PolarDB capacity scope: two-reader snapshot is available");
+	if (!fixture_ok) {
+		return;
+	}
+	PgSQL_SrvC* selected = entry->servers[0].srv;
+	PgSQL_SrvC* peer = entry->servers[1].srv;
+
+	PgSQL_Connection* selected_conn = make_cached_reader_connection(selected);
+	selected_conn->pgsql_conn = unit_connected_pgconn();
+	unit_reader_pool_add_matching(selected, selected_conn);
+	const PgSQL_PoolMatchKey selected_key =
+		unit_reader_pool_match_key(selected_conn);
+	PgSQL_Connection* selected_used =
+		selected->take_matching_connection(selected_key);
+
+	PgSQL_Connection* peer_conn = make_cached_reader_connection(peer);
+	peer_conn->pgsql_conn = unit_connected_pgconn();
+	unit_reader_pool_add_matching(peer, peer_conn);
+	const PgSQL_PoolMatchKey peer_key = unit_reader_pool_match_key(peer_conn);
+	ok(selected_used == selected_conn &&
+			selected->pool_used_count_value() == 1 &&
+			peer->pool_free_count_value() == 1,
+		"PolarDB capacity scope: selected reader is full while its peer is FREE");
+
+	PolarDB_Query_ReaderPlan plan;
+	plan.fallback_writer_hg = writer_hg;
+	PolarDB_WaitSpec no_wait;
+	entry->selection_start->store(0, std::memory_order_relaxed);
+	std::unique_ptr<PgSQL_Thread> ordinary_worker(new PgSQL_Thread());
+	PgSQL_Session ordinary_sess;
+	ordinary_sess.thread = ordinary_worker.get();
+	attach_test_frontend(ordinary_sess);
+	PolarDB_ReaderResult ordinary = PgHGM->get_MyConn_polardb_reader(
+		reader_hg, &ordinary_sess, plan, no_wait, /*only_pooled=*/false);
+	ok(!ordinary.acquired() &&
+			ordinary.status == PolarDB_ReaderStatus::READER_BUSY &&
+			peer->pool_free_count_value() == 1,
+		"PolarDB capacity scope: ordinary selection preserves its full reader choice");
+
+	entry->selection_start->store(0, std::memory_order_relaxed);
+	std::unique_ptr<PgSQL_Thread> admitted_worker(new PgSQL_Thread());
+	PgSQL_Session admitted_sess;
+	admitted_sess.thread = admitted_worker.get();
+	attach_test_frontend(admitted_sess);
+	PolarDB_ReaderResult admitted = PgHGM->get_MyConn_polardb_reader(
+		reader_hg, &admitted_sess, plan, no_wait, /*only_pooled=*/false,
+		nullptr, -1, /*confirm_reader_group_capacity=*/true);
+	ok(admitted.acquired() && admitted.srv == peer,
+		"PolarDB capacity scope: admitted retry acquires from a FREE peer");
+	if (admitted.conn) {
+		ok(peer->return_matching_connection(admitted.conn, peer_key),
+			"PolarDB capacity scope: acquired peer returns to core FREE accounting");
+	} else {
+		ok(false,
+			"PolarDB capacity scope: acquired peer returns to core FREE accounting");
+	}
+
+	PgSQL_Connection* peer_used = peer->take_matching_connection(peer_key);
+	entry->selection_start->store(0, std::memory_order_relaxed);
+	std::unique_ptr<PgSQL_Thread> full_worker(new PgSQL_Thread());
+	PgSQL_Session full_sess;
+	full_sess.thread = full_worker.get();
+	attach_test_frontend(full_sess);
+	PolarDB_ReaderResult full = PgHGM->get_MyConn_polardb_reader(
+		reader_hg, &full_sess, plan, no_wait, /*only_pooled=*/false,
+		nullptr, -1, /*confirm_reader_group_capacity=*/true);
+	ok(!full.acquired() &&
+			full.status == PolarDB_ReaderStatus::READER_GROUP_BUSY &&
+			full.retry_scope_hash != 0,
+		"PolarDB capacity scope: only a complete eligible-reader check reports group busy");
+	full_sess.current_hostgroup = reader_hg;
+	full_sess.polardb_query.reader_plan = plan;
+	full_sess.polardb_enter_reader_capacity_wait(
+		full.retry_scope_hash, full.status, full.srv,
+		std::move(full.selected_server_snapshot),
+		full.claim_profile_generation, &full.claim_pool_key);
+	full_worker->polardb_reader_adopt_ownership_lease(&full_sess);
+	PgSQL_Connection* owned_connection =
+		full.srv == selected ? selected_used : peer_used;
+	const bool clean_wait_match =
+		full_worker->polardb_reader_connection_matches_wait(
+			owned_connection, &full_sess, true);
+	const bool clean_lease_match =
+		full_worker->polardb_reader_connection_matches_lease_contract(
+			owned_connection, true);
+	owned_connection->polardb_txn_split_xids_dirty = true;
+	ok(clean_wait_match && clean_lease_match &&
+			!full_worker->polardb_reader_connection_matches_wait(
+				owned_connection, &full_sess, true) &&
+			!full_worker->polardb_reader_connection_matches_lease_contract(
+				owned_connection, true),
+		"PolarDB capacity ownership: dirty transaction-split state cannot satisfy ownership or a lease");
+	owned_connection->polardb_txn_split_xids_dirty = false;
+	full_sess.polardb_leave_reader_capacity_wait(
+		PolarDB_ReaderStatus::ACQUIRED);
+
+	entry->selection_start->store(0, std::memory_order_relaxed);
+	std::unique_ptr<PgSQL_Thread> other_worker(new PgSQL_Thread());
+	PgSQL_Session other_sess;
+	other_sess.thread = other_worker.get();
+	attach_test_frontend(other_sess);
+	other_sess.client_myds->myconn->userinfo->set(
+		(char*)"polardb_capacity_other",
+		(char*)"polardb_unit_pass",
+		(char*)"polardb_unit_db",
+		nullptr);
+	PolarDB_ReaderResult other = PgHGM->get_MyConn_polardb_reader(
+		reader_hg, &other_sess, plan, no_wait, /*only_pooled=*/false,
+		nullptr, -1, /*confirm_reader_group_capacity=*/true);
+	ok(other.status == PolarDB_ReaderStatus::READER_GROUP_BUSY &&
+			other.retry_scope_hash != full.retry_scope_hash,
+		"PolarDB capacity scope: different compatibility keys do not block each other");
+
+	ok(peer_used == peer_conn &&
+			peer->return_matching_connection(peer_used, peer_key) &&
+			selected->return_matching_connection(selected_used, selected_key),
+		"PolarDB capacity scope: saturated fixtures return to FREE accounting");
+	selected->remove_free_connection(selected_conn);
+	peer->remove_free_connection(peer_conn);
+	delete selected_conn;
+	delete peer_conn;
+}
+
+static void test_reader_capacity_pass_admission_shape() {
+	const uint64_t first_scope = 0x1111;
+	const uint64_t second_scope = 0x2222;
+	PgSQL_Thread worker;
+	worker.polardb_reader_capacity_wait_started(first_scope);
+	worker.polardb_reader_capacity_wait_started(first_scope);
+	ok(worker.polardb_reader_wait_scope_active(first_scope) &&
+			!worker.polardb_reader_wait_scope_active(second_scope),
+		"PolarDB capacity ownership: repeated waiters share one active scope");
+	worker.polardb_reader_capacity_wait_scope_changed(
+		first_scope, second_scope);
+	ok(worker.polardb_reader_wait_scope_active(first_scope) &&
+			worker.polardb_reader_wait_scope_active(second_scope),
+		"PolarDB capacity ownership: rerouting moves only one waiter between scopes");
+	worker.polardb_reader_capacity_wait_finished(first_scope);
+	worker.polardb_reader_capacity_wait_finished(second_scope);
+	ok(!worker.polardb_reader_wait_scope_active(first_scope) &&
+			!worker.polardb_reader_wait_scope_active(second_scope),
+		"PolarDB capacity ownership: the last waiter releases each scope");
+
+	PgSQL_Session wait_sess;
+	wait_sess.thread = &worker;
+	worker.curtime = 1000000;
+	wait_sess.polardb_enter_reader_capacity_wait(
+		first_scope, PolarDB_ReaderStatus::READER_BUSY);
+	worker.curtime += 4200;
+	wait_sess.polardb_leave_reader_capacity_wait(
+		PolarDB_ReaderStatus::ACQUIRED);
+	ok(worker.polardb_status_variables.stvar[
+			polardb_st_var_reader_capacity_wait_sum_us] == 4200 &&
+			worker.polardb_status_variables.stvar[
+				polardb_st_var_reader_capacity_wait_max_us] == 4200,
+		"PolarDB capacity accounting: completed wait records total and maximum latency");
+	ok(worker.polardb_status_variables.stvar[
+			polardb_st_var_reader_capacity_wait_le_5ms] == 1,
+		"PolarDB capacity accounting: completed wait records its latency bucket");
+
+	std::vector<uint64_t> blocked;
+	unsigned int attempts = 0;
+	for (unsigned int n = 0; n < 1100; n++) {
+		if (polardb_reader_capacity_scope_blocked(blocked, first_scope)) {
+			continue;
+		}
+		attempts++;
+		polardb_reader_capacity_note_result(
+			blocked, first_scope, PolarDB_ReaderStatus::READER_GROUP_BUSY);
+	}
+	ok(attempts == 1 && blocked.size() == 1,
+		"PolarDB capacity admission: mass expiry permits one failed group probe per scope");
+
+	blocked.clear();
+	attempts = 0;
+	for (unsigned int n = 0; n < 1100; n++) {
+		if (polardb_reader_capacity_scope_blocked(blocked, first_scope)) {
+			continue;
+		}
+		attempts++;
+		const PolarDB_ReaderStatus status = n < 10
+			? PolarDB_ReaderStatus::ACQUIRED
+			: PolarDB_ReaderStatus::READER_GROUP_BUSY;
+		polardb_reader_capacity_note_result(blocked, first_scope, status);
+	}
+	ok(attempts == 11,
+		"PolarDB capacity admission: successful acquisitions continue until the first group-full result");
+	ok(polardb_reader_capacity_scope_blocked(blocked, first_scope) &&
+			!polardb_reader_capacity_scope_blocked(blocked, second_scope),
+		"PolarDB capacity admission: a full scope does not block an unrelated scope");
+	polardb_reader_capacity_note_result(
+		blocked, second_scope, PolarDB_ReaderStatus::READER_BUSY);
+	ok(!polardb_reader_capacity_scope_blocked(blocked, second_scope),
+		"PolarDB capacity admission: selected-server busy does not claim group saturation");
+	ok(polardb_reader_capacity_retry_delay_us(0) == 1000,
+		"PolarDB capacity admission: zero retry delay advances on a one-millisecond worker tick");
+	ok(polardb_reader_capacity_retry_delay_us(10) == 10000,
+		"PolarDB capacity admission: positive retry delay keeps its configured pacing");
+	ok(polardb_reader_capacity_retry_poll_timeout(1000, 1000, 0) == 1000 &&
+			polardb_reader_capacity_retry_poll_timeout(1500, 1000, 0) == 1000,
+		"PolarDB capacity admission: due and sub-millisecond retries preserve the one-millisecond poll floor");
+	ok(polardb_reader_capacity_retry_poll_timeout(6000, 1000, 2000) == 2000,
+		"PolarDB capacity admission: an earlier dynamic timeout remains authoritative");
+	ok(polardb_reader_claim_should_register(
+			PolarDB_ReaderStatus::READER_GROUP_BUSY,
+			PolarDB_ReaderOwnership::NONE) &&
+			!polardb_reader_claim_should_register(
+				PolarDB_ReaderStatus::READER_GROUP_BUSY,
+				PolarDB_ReaderOwnership::LOCAL) &&
+			!polardb_reader_claim_should_register(
+				PolarDB_ReaderStatus::READER_GROUP_BUSY,
+				PolarDB_ReaderOwnership::ACTIVE) &&
+			!polardb_reader_claim_should_register(
+				PolarDB_ReaderStatus::READER_GROUP_BUSY,
+				PolarDB_ReaderOwnership::CLAIM) &&
+			!polardb_reader_claim_should_register(
+				PolarDB_ReaderStatus::READER_BUSY,
+				PolarDB_ReaderOwnership::NONE),
+		"PolarDB reader claim: only a group-busy zero-owner worker enters the handoff path");
+	ok(polardb_reader_ownership_lease_retains(
+			PolarDB_ReaderLocalReturn::KEEP_WITH_WORKER, true) &&
+		!polardb_reader_ownership_lease_retains(
+			PolarDB_ReaderLocalReturn::USE_SHARED_POOL, true) &&
+		!polardb_reader_ownership_lease_retains(
+			PolarDB_ReaderLocalReturn::REMOVE_CONNECTION, true),
+		"PolarDB reader ownership: compatible external demand overrides a local lease");
 }
 
 static void test_two_reader_unequal_weights_keep_global_sequence() {
@@ -2796,6 +3751,45 @@ static void test_reader_pool_worker_local_reuse() {
 	ok(reader->pool_used_count_value() == 1 &&
 			reader->pool_free_count_value() == 0,
 		"PolarDB worker-local reuse: connection remains in the core USED list");
+
+	std::unique_ptr<PgSQL_Thread> waiting_worker(new PgSQL_Thread());
+	PgSQL_Session waiting_sess;
+	waiting_sess.thread = waiting_worker.get();
+	attach_test_frontend(waiting_sess);
+	const int original_max_connections = reader->max_connections;
+	const int original_creation_throttle =
+		pgsql_thread___throttle_connections_per_sec_to_hostgroup;
+	pgsql_thread___throttle_connections_per_sec_to_hostgroup =
+		std::numeric_limits<int>::max();
+	reader->max_connections = 2;
+	PgSQL_PoolMatchKey different_match_key = unit_reader_pool_match_key(conn);
+	different_match_key.words[1] ^= 1;
+	PgSQL_PoolGetResult different_created =
+		PgHGM->get_connection_from_selected_server(
+			reader, reader_hg, different_match_key, nullptr,
+			PgSQL_PoolGetMode::ALLOW_EXACT_MATCH |
+				PgSQL_PoolGetMode::ALLOW_CREATE);
+	ok(different_created.conn &&
+			different_created.source == PgSQL_PoolGetSource::CREATED,
+		"PolarDB worker-local reuse: incompatible local capacity does not block required creation");
+	if (different_created.conn) {
+		reader->remove_used_connection(different_created.conn);
+		delete different_created.conn;
+	}
+	PolarDB_ReaderResult peer_created = PgHGM->get_MyConn_polardb_reader(
+		reader_hg, &waiting_sess, plan, no_wait,
+		/*only_pooled=*/false);
+	ok(peer_created.acquired() && peer_created.conn != conn &&
+			reader->pool_used_count_value() == 2 &&
+			reader->pool_free_count_value() == 0,
+		"PolarDB worker-local reuse: a cold peer creates below the server limit because another worker's local connection is unavailable");
+	if (peer_created.conn) {
+		reader->remove_used_connection(peer_created.conn);
+		delete peer_created.conn;
+	}
+	reader->max_connections = original_max_connections;
+	pgsql_thread___throttle_connections_per_sec_to_hostgroup =
+		original_creation_throttle;
 	ok(worker->get_MyConn_local(
 			reader_hg, &sess, nullptr, 0, -1) == nullptr,
 		"PolarDB worker-local reuse: normal local lookup does not take an exact-key reader connection");
@@ -4912,14 +5906,19 @@ int main() {
 	test_server_list_snapshot_survives_topology_purge();
 	test_reader_pool_request_limits();
 	test_core_match_pool_index_and_transfer();
+	test_reader_claim_lifecycle();
 	test_core_match_pool_concurrent_transfer();
 	test_core_match_pool_concurrent_boundaries();
 	test_keyless_core_use_restores_exact_match();
 	test_selected_server_survives_concurrent_purge();
 	test_idle_ping_connection_survives_topology_purge();
+	test_idle_ping_reader_pool_accounting();
+	test_reader_pool_idle_trim_grace();
 	test_worker_local_reader_selection_sequence();
 	test_two_reader_degraded_uses_healthy_peer();
 	test_two_reader_selection_ignores_inventory_and_alternates();
+	test_reader_capacity_group_confirmation();
+	test_reader_capacity_pass_admission_shape();
 	test_two_reader_unequal_weights_keep_global_sequence();
 	test_multi_reader_selection_samples_two_servers();
 	test_reader_pool_status_and_pooled_only_contract();

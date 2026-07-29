@@ -26,6 +26,8 @@
 #ifndef __CLASS_PGSQL_POLARDB_H
 #define __CLASS_PGSQL_POLARDB_H
 
+#include <limits>
+
 class PgSQL_Connection;
 class PgSQL_Backend;
 class PgSQL_Data_Stream;
@@ -111,8 +113,10 @@ class PgSQL_Session;
 #include <cstring>  // strcasecmp in parse_node_type / parse_is_available
 #include <memory>
 #include <netinet/in.h>
+#include <algorithm>
 #include <string>
 #include <string_view>
+#include <vector>
 #include <sys/socket.h>
 #include <utility>
 
@@ -157,6 +161,21 @@ static inline bool polardb_starts_with_sql_keyword(
     }
     const unsigned char next = (unsigned char)query[len];
     return next == '\0' || std::isspace(next) || next == ';';
+}
+
+enum class PolarDB_RfqLsnPayloadState : uint8_t {
+    MISSING = 0,
+    ZERO = 1,
+    POSITIONED = 2
+};
+
+static inline PolarDB_RfqLsnPayloadState polardb_rfq_lsn_payload_state(
+        bool payload_present, uint64_t lsn) {
+    if (!payload_present) {
+        return PolarDB_RfqLsnPayloadState::MISSING;
+    }
+    return lsn == 0 ? PolarDB_RfqLsnPayloadState::ZERO
+                    : PolarDB_RfqLsnPayloadState::POSITIONED;
 }
 
 static inline bool polardb_zero_lsn_payload_can_skip_wait_target(
@@ -406,7 +425,8 @@ enum class PolarDB_RfqRoutePolicy : uint8_t {
 enum class PolarDB_ReaderStatus : uint8_t {
     ACQUIRED = 0,           // Got a usable reader connection
     READER_UNAVAILABLE,     // No reader online/usable (plain availability)
-    READER_BUSY,            // Readers exist but none is immediately usable
+    READER_BUSY,            // The policy-selected reader is at capacity
+    READER_GROUP_BUSY,      // A retry checked every eligible reader and found no capacity
     RETRY_CURRENT_STATE,    // Cold creation state changed; retry next worker pass
     RFQ_UNAVAILABLE,        // No free reader with an RFQ-LSN startup profile
     PRIMARY_LSN_UNKNOWN,    // Lag cap on, but the primary LSN sample is missing
@@ -431,6 +451,8 @@ static inline int polardb_reader_status_priority(
     case PolarDB_ReaderStatus::READER_LAG_EXCEEDED:
         return 40;
     case PolarDB_ReaderStatus::READER_BUSY:
+        return 30;
+    case PolarDB_ReaderStatus::READER_GROUP_BUSY:
         return 30;
     case PolarDB_ReaderStatus::RETRY_CURRENT_STATE:
         return 20;
@@ -459,6 +481,8 @@ static inline const char* polardb_reader_status_name(
         return "reader_unavailable";
     case PolarDB_ReaderStatus::READER_BUSY:
         return "reader_busy";
+    case PolarDB_ReaderStatus::READER_GROUP_BUSY:
+        return "reader_group_busy";
     case PolarDB_ReaderStatus::RETRY_CURRENT_STATE:
         return "retry_current_state";
     case PolarDB_ReaderStatus::RFQ_UNAVAILABLE:
@@ -473,6 +497,59 @@ static inline const char* polardb_reader_status_name(
         return "reader_lag_exceeded";
     }
     return "unknown";
+}
+
+static inline bool polardb_reader_capacity_scope_blocked(
+		const std::vector<uint64_t>& blocked_scopes, uint64_t scope_hash) {
+	return std::find(blocked_scopes.begin(), blocked_scopes.end(), scope_hash) !=
+		blocked_scopes.end();
+}
+
+static inline void polardb_reader_capacity_note_result(
+		std::vector<uint64_t>& blocked_scopes, uint64_t scope_hash,
+		PolarDB_ReaderStatus status) {
+	if (status == PolarDB_ReaderStatus::READER_GROUP_BUSY &&
+			!polardb_reader_capacity_scope_blocked(blocked_scopes, scope_hash)) {
+		blocked_scopes.push_back(scope_hash);
+	}
+}
+
+static inline uint64_t polardb_reader_capacity_retry_delay_us(int delay_ms) {
+	// poll() has millisecond resolution. Zero means the next worker tick, not a
+	// nonblocking loop.
+	return static_cast<uint64_t>(delay_ms > 0 ? delay_ms : 1) * 1000;
+}
+
+static inline unsigned int polardb_reader_capacity_retry_poll_timeout(
+		uint64_t retry_at_us, uint64_t now_us,
+		unsigned int current_timeout_us) {
+	uint64_t remaining = retry_at_us > now_us
+		? retry_at_us - now_us : 1000;
+	remaining = std::max<uint64_t>(remaining, 1000);
+	const unsigned int candidate = static_cast<unsigned int>(
+		std::min<uint64_t>(remaining,
+			std::numeric_limits<unsigned int>::max()));
+	return current_timeout_us == 0 || candidate < current_timeout_us
+		? candidate : current_timeout_us;
+}
+
+enum class PolarDB_ReaderOwnership : uint8_t {
+	NONE = 0,
+	LOCAL,
+	ACTIVE,
+	CLAIM
+};
+
+enum class PolarDB_ReaderYieldResult : uint8_t {
+	CLAIM_PUBLISHED = 0,
+	NO_REMOTE_DEMAND,
+	CONNECTION_INVALID
+};
+
+static inline bool polardb_reader_claim_should_register(
+		PolarDB_ReaderStatus status, PolarDB_ReaderOwnership ownership) {
+	return status == PolarDB_ReaderStatus::READER_GROUP_BUSY &&
+		ownership == PolarDB_ReaderOwnership::NONE;
 }
 
 /**
@@ -508,6 +585,7 @@ static inline bool polardb_reader_status_split_warmup_can_help(
 	switch (status) {
 	case PolarDB_ReaderStatus::READER_UNAVAILABLE:
 	case PolarDB_ReaderStatus::READER_BUSY:
+	case PolarDB_ReaderStatus::READER_GROUP_BUSY:
 	case PolarDB_ReaderStatus::RFQ_UNAVAILABLE:
 		return true;
 	default:
@@ -697,6 +775,12 @@ enum class PolarDB_ReaderLocalReturn : uint8_t {
     KEEP_WITH_WORKER,
     REMOVE_CONNECTION
 };
+
+static inline bool polardb_reader_ownership_lease_retains(
+        PolarDB_ReaderLocalReturn pool_decision, bool lease_matches) {
+    return lease_matches &&
+        pool_decision == PolarDB_ReaderLocalReturn::KEEP_WITH_WORKER;
+}
 
 static inline uint64_t polardb_pool_hash_bytes(
         uint64_t hash, const void* data, size_t len) {
@@ -2532,6 +2616,13 @@ struct PolarDB_ReaderResult {
         PolarDB_ReaderStatus::READER_UNAVAILABLE;
     bool wait_bypass_allowed = false;  // selected reader already reached consistency target
     bool server_saturated = false;     // selected snapshot had no free or open capacity
+    bool exact_match_claimed = false;  // an eligible exact FREE match was reserved by a claim
+    // A compact worker-local pacing scope. Hash equality is used only to defer
+    // another retry until the next worker pass; pool identity still uses the
+    // complete collision-safe match key.
+    uint64_t retry_scope_hash = 0;
+    uint32_t claim_profile_generation = 0;
+    PolarDB_PoolKey claim_pool_key;
 
     /// @brief True only when a usable reader connection was obtained.
     bool acquired() const {

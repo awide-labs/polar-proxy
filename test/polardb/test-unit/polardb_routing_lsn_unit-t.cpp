@@ -308,6 +308,15 @@ static void test_txn_split_query_shape_classifier() {
 }
 
 static void test_zero_lsn_safe_statement_classifier() {
+	ok(polardb_rfq_lsn_payload_state(false, 0) ==
+			PolarDB_RfqLsnPayloadState::MISSING,
+		"RFQ payload classifier distinguishes an absent payload");
+	ok(polardb_rfq_lsn_payload_state(true, 0) ==
+			PolarDB_RfqLsnPayloadState::ZERO,
+		"RFQ payload classifier preserves a present zero value");
+	ok(polardb_rfq_lsn_payload_state(true, 42) ==
+			PolarDB_RfqLsnPayloadState::POSITIONED,
+		"RFQ payload classifier recognizes a positioned LSN");
 	ok(polardb_zero_lsn_payload_can_skip_wait_target(
 			"SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED"),
 		"zero RFQ-LSN classifier allows session SET statements");
@@ -465,7 +474,7 @@ static void test_session_lsn_scope_check() {
 }
 
 int main() {
-	plan(141);
+	plan(144);
 	test_route_action_values_are_append_only();
 	test_session_lsn_target_uses_max_position();
 	test_wait_plan_uses_monotonic_session_lsn();

@@ -18,6 +18,7 @@
 #include <sys/epoll.h>
 #endif // IDLE_THREADS
 #include <atomic>
+#include <mutex>
 
 #include "prometheus_helpers.h"
 
@@ -46,6 +47,7 @@ constexpr const char* AUTHENTICATION_METHOD_STR[] = {
 */
 
 #if POLARDB_PROXY
+class PgSQL_HGC;
 struct PolarDB_Query_ReaderPlan;
 struct PolarDB_WaitSpec;
 
@@ -229,6 +231,87 @@ private:
 	std::vector<PolarDB_ReaderSelectionState>
 		polardb_reader_selection_sequences;
 	uint64_t polardb_reader_cache_epoch{1};
+	unsigned int polardb_reader_capacity_waiter_count{0};
+	uint64_t polardb_reader_capacity_retry_at_us{0};
+	unsigned int polardb_reader_local_connection_count{0};
+	bool polardb_reader_local_added_this_pass{false};
+	struct PolarDB_ReaderWaitScopeCount {
+		uint64_t scope_hash{0};
+		unsigned int count{0};
+	};
+	std::vector<PolarDB_ReaderWaitScopeCount>
+		polardb_reader_capacity_wait_scopes;
+	std::vector<uint64_t> polardb_reader_capacity_blocked_scopes;
+	std::vector<PgSQL_Session*> polardb_reader_capacity_retry_sessions;
+	struct PolarDB_ReaderWorkerClaimState {
+		uint64_t token{0};
+		uint32_t session_id{0};
+		uint64_t scope_hash{0};
+		// HGCs are manager-owned and outlive all PostgreSQL workers.
+		PgSQL_HGC* hostgroup{nullptr};
+		PgSQL_SrvC* server{nullptr};
+		std::shared_ptr<const void> server_snapshot;
+		uint32_t profile_generation{0};
+		PolarDB_PoolKey pool_key;
+
+		bool active() const {
+			return token != 0 && hostgroup != nullptr;
+		}
+		bool published() const {
+			return active() && server != nullptr;
+		}
+		void reset() {
+			token = 0;
+			session_id = 0;
+			scope_hash = 0;
+			hostgroup = nullptr;
+			server = nullptr;
+			server_snapshot.reset();
+			profile_generation = 0;
+			pool_key = PolarDB_PoolKey{};
+		}
+	};
+	PolarDB_ReaderWorkerClaimState polardb_reader_claim;
+	struct PolarDB_ReaderOwnershipLeaseState {
+		// scope_hash tracks local wait-set lifetime only. Handoff correctness uses
+		// the exact hostgroup, pool key, reader plan and wait specification below.
+		uint64_t scope_hash{0};
+		// HGCs are manager-owned and outlive all PostgreSQL workers.
+		PgSQL_HGC* hostgroup{nullptr};
+		unsigned int hostgroup_id{0};
+		uint32_t profile_generation{0};
+		PolarDB_PoolKey pool_key;
+		PolarDB_Query_ReaderPlan reader_plan;
+		PolarDB_WaitSpec wait_spec;
+		bool yield_pending{false};
+
+		bool active() const {
+			return scope_hash != 0 && hostgroup != nullptr &&
+				profile_generation != 0 &&
+				!pool_key.empty();
+		}
+		void reset() {
+			scope_hash = 0;
+			hostgroup = nullptr;
+			hostgroup_id = 0;
+			profile_generation = 0;
+			pool_key = PolarDB_PoolKey{};
+			reader_plan.reset();
+			wait_spec.reset();
+			yield_pending = false;
+		}
+	};
+	PolarDB_ReaderOwnershipLeaseState polardb_reader_ownership_lease;
+	struct PolarDB_ReaderClaimWakeNotification {
+		uint64_t token{0};
+		PgSQL_SrvC* server{nullptr};
+		std::shared_ptr<const void> server_snapshot;
+	};
+	std::mutex polardb_reader_claim_wake_mutex;
+	std::vector<PolarDB_ReaderClaimWakeNotification>
+		polardb_reader_claim_wakes;
+	std::atomic<bool> polardb_reader_claim_wake_pending{false};
+	unsigned int polardb_worker_index{UINT_MAX};
 #endif // POLARDB_PROXY
 
 #ifdef IDLE_THREADS
@@ -592,6 +675,33 @@ public:
 	 *
 	 */
 	void process_all_sessions();
+#if POLARDB_PROXY
+	void process_polardb_reader_capacity_waiters(
+		bool deadline_due, bool claim_ready = false);
+	void tune_polardb_reader_capacity_retry_timeout();
+	bool register_polardb_reader_claim(PgSQL_Session* sess);
+	PolarDB_ReaderOwnership polardb_reader_ownership(
+		PgSQL_Session* waiting_session);
+	bool polardb_reader_connection_matches_wait(
+		PgSQL_Connection* conn, PgSQL_Session* waiting_session,
+		bool active_connection) const;
+	bool polardb_reader_connection_matches_lease(
+		PgSQL_Connection* conn) const;
+	bool polardb_reader_connection_matches_lease_contract(
+		PgSQL_Connection* conn, bool active_connection) const;
+	void polardb_reader_adopt_ownership_lease(PgSQL_Session* sess);
+	bool polardb_reader_set_yield_debt(PgSQL_Connection* conn);
+	PolarDB_ReaderYieldResult polardb_reader_fulfill_yield_debt(
+		PgSQL_Connection* conn);
+	void polardb_reader_cancel_yield_debt();
+	bool polardb_reader_wait_scope_active(uint64_t scope_hash) const;
+	PgSQL_Connection* take_polardb_reader_claim(PgSQL_Session* sess);
+	void cancel_polardb_reader_claim(uint32_t session_id = 0);
+	bool notify_polardb_reader_claim(
+		uint64_t token, PgSQL_SrvC* server,
+		std::shared_ptr<const void> server_snapshot);
+	bool consume_polardb_reader_claim_wakes();
+#endif // POLARDB_PROXY
 
 	/**
 	 * @brief Refreshes the thread's variables from the global variables handler.
@@ -708,6 +818,10 @@ public:
 	PgSQL_Connection* get_local_polardb_reader_connection(
 		PgSQL_SrvC* server, uint32_t profile_generation,
 		const PolarDB_PoolKey& pool_key);
+	void polardb_reader_capacity_wait_started(uint64_t scope_hash);
+	void polardb_reader_capacity_wait_scope_changed(
+		uint64_t old_scope_hash, uint64_t new_scope_hash);
+	void polardb_reader_capacity_wait_finished(uint64_t scope_hash);
 #endif // POLARDB_PROXY
 
 	/**
@@ -838,6 +952,27 @@ static inline void polardb_thread_count(
 	}
 }
 
+static inline void polardb_thread_max(
+	PgSQL_Thread* thread,
+	PolarDB_ThreadStatusVariable idx,
+	std::atomic<unsigned long long>& global_counter,
+	unsigned long long value)
+{
+	if (thread) {
+		unsigned long long& current =
+			thread->polardb_status_variables.stvar[idx];
+		if (value > current) {
+			current = value;
+		}
+		return;
+	}
+	unsigned long long current = global_counter.load(std::memory_order_relaxed);
+	while (current < value && !global_counter.compare_exchange_weak(
+			current, value, std::memory_order_relaxed,
+			std::memory_order_relaxed)) {
+	}
+}
+
 #if POLARDB_THREAD_COUNTERS
 #define POLARDB_THREAD_COUNT(thread, name, value) \
 	polardb_thread_count((thread), polardb_st_var_##name, \
@@ -845,9 +980,14 @@ static inline void polardb_thread_count(
 
 #define POLARDB_THREAD_COUNT_ONE(thread, name) \
 	POLARDB_THREAD_COUNT((thread), name, 1)
+
+#define POLARDB_THREAD_MAX(thread, name, value) \
+	polardb_thread_max((thread), polardb_st_var_##name, \
+		PgHGM->status.polardb_##name, (value))
 #else
 #define POLARDB_THREAD_COUNT(thread, name, value) do { } while (0)
 #define POLARDB_THREAD_COUNT_ONE(thread, name) do { } while (0)
+#define POLARDB_THREAD_MAX(thread, name, value) do { } while (0)
 #endif // POLARDB_THREAD_COUNTERS
 
 void polardb_count_lsn_wait_elapsed_bucket(
@@ -1633,6 +1773,11 @@ public:
 	 *
 	 */
 	void shutdown_threads();
+#if POLARDB_PROXY
+	bool signal_polardb_reader_claim(
+		unsigned int worker_index, uint64_t token, PgSQL_SrvC* server,
+		std::shared_ptr<const void> server_snapshot);
+#endif // POLARDB_PROXY
 
 	/**
 	 * @brief Adds a new listener to the thread pool, based on an interface string.

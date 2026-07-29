@@ -2,10 +2,10 @@
 # Focused RFQ-LSN lifecycle diagnostic.
 #
 # The CH-benCHmark connection shape runs SET SESSION CHARACTERISTICS, SET
-# search_path, then analytical SELECTs. On a PolarDB15 proxy connection that
-# requested RFQ LSNs, setup statements may expose an RFQ payload with value 0.
-# That must not be collapsed into "payload absent", because doing so poisons the
-# session as missing-LSN and forces later OLAP reads back to the writer.
+# search_path, then analytical SELECTs. A PolarDB15 proxy connection that
+# requested RFQ LSNs may return either zero or a positioned value for setup
+# statements. In both cases payload presence must survive, so setup does not
+# poison the session as missing-LSN and force later OLAP reads to the writer.
 
 set -uo pipefail
 
@@ -230,7 +230,7 @@ fi
 
 trace_file="$PROXYSQL_DATA_DIR/proxysql.log"
 if tap_trace_checks_enabled "$trace_file"; then
-    if tap_trace_must_count_ge "$trace_file" "PolarDB PROCESS_RESULT: RFQ LSN payload present with zero value" 1 &&
+    if tap_trace_must_count_ge "$trace_file" "PolarDB PROCESS_RESULT: rfq probe requested_lsn=1 payload_present=1" 2 &&
         tap_trace_must_count_ge "$trace_file" "PolarDB PROCESS_RESULT: accepted read RFQ LSN" 1; then
         ok 0 "debug trace records RFQ probe for backend-dispatched setup/read statements"
     else

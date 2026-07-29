@@ -8,6 +8,7 @@
 #include "PgSQL_Connection.h"
 #include "PgSQL_Data_Stream.h"
 #include "ProxySQL_Poll.h"
+#include "Base_Thread.h"
 
 #include <functional>
 #include <poll.h>
@@ -80,10 +81,24 @@ static void test_pgsql_poll_remove_data_stream_with_stale_index() {
 	ok(poll.len == 0, "remaining data stream unregisters from poll during destruction");
 }
 
+static void test_session_pause_poll_timeout() {
+	ok(Base_Thread::session_pause_poll_timeout(1000, 1400, 0) == 400,
+		"future session pause supplies the poll timeout when none is set");
+	ok(Base_Thread::session_pause_poll_timeout(1000, 1400, 200) == 200,
+		"future session pause does not lengthen an existing poll timeout");
+	ok(Base_Thread::session_pause_poll_timeout(1000, 1400, 800) == 400,
+		"future session pause shortens a longer poll timeout");
+	ok(Base_Thread::session_pause_poll_timeout(1000, 1000, 0) == 1,
+		"due session pause becomes runnable without unsigned underflow");
+	ok(Base_Thread::session_pause_poll_timeout(1000, 900, 500) == 1,
+		"expired session pause becomes runnable without unsigned underflow");
+}
+
 int main() {
-	plan(15);
+	plan(20);
 	test_update_expired_conns_after_reset();
 	test_backend_only_handler_without_backend();
 	test_pgsql_poll_remove_data_stream_with_stale_index();
+	test_session_pause_poll_timeout();
 	return exit_status();
 }

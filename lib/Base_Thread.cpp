@@ -424,8 +424,10 @@ void Base_Thread::tune_timeout_for_myds_needs_pause(DS * myds) {
 template<typename T, typename DS>
 void Base_Thread::tune_timeout_for_session_needs_pause(DS * myds) {
 	T* thr = static_cast<T*>(this);
-	if (thr->mypolls.poll_timeout==0 || (myds->sess->pause_until - curtime < thr->mypolls.poll_timeout) ) {
-		thr->mypolls.poll_timeout= myds->sess->pause_until - curtime;
+	const unsigned int timeout = session_pause_poll_timeout(
+		curtime, myds->sess->pause_until, thr->mypolls.poll_timeout);
+	if (timeout != thr->mypolls.poll_timeout) {
+		thr->mypolls.poll_timeout = timeout;
 		proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 7, "Session=%p , poll_timeout=%u , pause_until=%llu , curtime=%llu\n", myds->sess, thr->mypolls.poll_timeout, myds->sess->pause_until, curtime);
 	}
 }

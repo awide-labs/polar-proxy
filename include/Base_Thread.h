@@ -3,6 +3,8 @@
 
 #include "proxysql.h"
 
+#include <limits>
+
 typedef struct _thr_id_username_t {
 	uint32_t id;
 	char *username;
@@ -80,6 +82,23 @@ public:
 	// outer iteration of process_all_sessions (even when the partition path
 	// is otherwise skipped) so the counters don't accumulate stale.
 	bool update_partition_gate();
+
+	static unsigned int session_pause_poll_timeout(
+			unsigned long long now_us,
+			unsigned long long pause_until_us,
+			unsigned int current_timeout_us) {
+		if (pause_until_us <= now_us) {
+			return 1;
+		}
+		const unsigned long long remaining_us = pause_until_us - now_us;
+		if (current_timeout_us != 0 && remaining_us >= current_timeout_us) {
+			return current_timeout_us;
+		}
+		return static_cast<unsigned int>(std::min(
+			remaining_us,
+			static_cast<unsigned long long>(
+				std::numeric_limits<unsigned int>::max())));
+	}
 
 	unsigned long long curtime;
 	unsigned long long last_move_to_idle_thread_time;

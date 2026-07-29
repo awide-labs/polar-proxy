@@ -358,6 +358,85 @@ void PgSQL_Session::set_status(enum session_status e) {
 	status = e;
 }
 
+#if POLARDB_PROXY
+void PgSQL_Session::polardb_enter_reader_capacity_wait(
+		uint64_t scope_hash, PolarDB_ReaderStatus reader_status,
+		PgSQL_SrvC* claim_server,
+		std::shared_ptr<const void> claim_server_snapshot,
+		uint32_t claim_profile_generation,
+		const PolarDB_PoolKey* claim_pool_key) {
+	PolarDB_ReaderCapacityWaitState& wait = polardb_reader_capacity_wait;
+	if (!wait.active) {
+		wait.active = true;
+		wait.started_at_us = thread && thread->curtime
+			? thread->curtime : monotonic_time();
+		wait.scope_hash = scope_hash;
+		POLARDB_THREAD_COUNT_ONE(thread, reader_capacity_wait_enter);
+		if (thread) {
+			thread->polardb_reader_capacity_wait_started(scope_hash);
+		}
+	} else if (wait.scope_hash != scope_hash && thread) {
+		thread->polardb_reader_capacity_wait_scope_changed(
+			wait.scope_hash, scope_hash);
+	}
+	wait.scope_hash = scope_hash;
+	if (reader_status == PolarDB_ReaderStatus::READER_GROUP_BUSY &&
+			claim_server && claim_server_snapshot && claim_pool_key &&
+			claim_profile_generation != 0 && !claim_pool_key->empty()) {
+		wait.claim_server = claim_server;
+		wait.claim_server_snapshot = std::move(claim_server_snapshot);
+		wait.claim_profile_generation = claim_profile_generation;
+		wait.claim_pool_key = *claim_pool_key;
+	}
+	wait.last_status = reader_status;
+	wait.result_valid = true;
+	wait.retry_admitted = false;
+}
+
+void PgSQL_Session::polardb_leave_reader_capacity_wait(
+		PolarDB_ReaderStatus reader_status) {
+	PolarDB_ReaderCapacityWaitState& wait = polardb_reader_capacity_wait;
+	if (thread) {
+		thread->cancel_polardb_reader_claim(thread_session_id);
+	}
+	if (wait.active) {
+		const uint64_t now = thread && thread->curtime
+			? thread->curtime : monotonic_time();
+		const uint64_t elapsed = now >= wait.started_at_us
+			? now - wait.started_at_us : 0;
+		POLARDB_THREAD_COUNT_ONE(thread, reader_capacity_wait_exit);
+		POLARDB_THREAD_COUNT(thread, reader_capacity_wait_sum_us, elapsed);
+		POLARDB_THREAD_MAX(thread, reader_capacity_wait_max_us, elapsed);
+		if (elapsed <= 1000) {
+			POLARDB_THREAD_COUNT_ONE(thread, reader_capacity_wait_le_1ms);
+		} else if (elapsed <= 5000) {
+			POLARDB_THREAD_COUNT_ONE(thread, reader_capacity_wait_le_5ms);
+		} else if (elapsed <= 20000) {
+			POLARDB_THREAD_COUNT_ONE(thread, reader_capacity_wait_le_20ms);
+		} else if (elapsed <= 100000) {
+			POLARDB_THREAD_COUNT_ONE(thread, reader_capacity_wait_le_100ms);
+		} else if (elapsed <= 1000000) {
+			POLARDB_THREAD_COUNT_ONE(thread, reader_capacity_wait_le_1s);
+		} else {
+			POLARDB_THREAD_COUNT_ONE(thread, reader_capacity_wait_gt_1s);
+		}
+		if (thread) {
+			thread->polardb_reader_capacity_wait_finished(wait.scope_hash);
+		}
+	}
+	wait.started_at_us = 0;
+	wait.scope_hash = 0;
+	wait.claim_server = nullptr;
+	wait.claim_server_snapshot.reset();
+	wait.claim_profile_generation = 0;
+	wait.claim_pool_key = PolarDB_PoolKey{};
+	wait.last_status = reader_status;
+	wait.active = false;
+	wait.retry_admitted = false;
+	wait.result_valid = true;
+}
+#endif // POLARDB_PROXY
+
 
 PgSQL_Session::PgSQL_Session() {
 	thread = nullptr;
@@ -1718,6 +1797,14 @@ bool PgSQL_Session::handler_again___status_CONNECTING_SERVER(int* _rc) {
 			NEXT_IMMEDIATE_NEW(WAITING_CLIENT_DATA);
 		}
 	}
+#if POLARDB_PROXY
+	if (polardb_reader_capacity_wait.active &&
+			!polardb_reader_capacity_wait.retry_admitted) {
+		pause_until = 0;
+		*_rc = 1;
+		return false;
+	}
+#endif // POLARDB_PROXY
 	if (mybe->server_myds->myconn == NULL) {
 		handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED__get_connection();
 	}
@@ -1732,7 +1819,15 @@ bool PgSQL_Session::handler_again___status_CONNECTING_SERVER(int* _rc) {
 	// 'pgsql_thread___connect_retries_delay'. In case of 'async_connect' failing, 'pause_until' should also
 	// be set to 'pgsql_thread___connect_retries_delay'. Complementary NOTE below.
 	if (mybe->server_myds->myconn == NULL) {
-		pause_until = thread->curtime + pgsql_thread___connect_retries_delay * 1000;
+#if POLARDB_PROXY
+		if (polardb_reader_capacity_wait.active) {
+			pause_until = 0;
+		} else
+#endif // POLARDB_PROXY
+		{
+			pause_until = thread->curtime +
+				pgsql_thread___connect_retries_delay * 1000;
+		}
 		*_rc = 1;
 		return false;
 	}
@@ -6203,6 +6298,11 @@ void PgSQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 		session_fast_forward == SESSION_FORWARD_TYPE_NONE &&
 		!qpo->create_new_conn && trxid == 0 &&
 		(qpo->max_lag_ms < 0 || polardb_query.wait.spec.has_wait());
+	if (polardb_reader_capacity_wait.active &&
+			!polardb_reader_pool_eligible) {
+		polardb_leave_reader_capacity_wait(
+			PolarDB_ReaderStatus::READER_UNAVAILABLE);
+	}
 #endif // POLARDB_PROXY
 	if (session_fast_forward == SESSION_FORWARD_TYPE_NONE && qpo->create_new_conn == false) {
 #ifndef STRESSTEST_POOL
@@ -6247,9 +6347,41 @@ void PgSQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 		bool polardb_reader_acquisition_handled = false;
 		const PolarDB_WaitSpec& polardb_wait_spec = polardb_query.wait.spec;
 		if (polardb_reader_pool_eligible) {
-			PolarDB_ReaderResult reader_result =
-				PgHGM->get_MyConn_polardb_reader(mybe->hostgroup_id, this,
-					polardb_query.reader_plan, polardb_wait_spec, false);
+			const bool confirm_reader_group_capacity =
+				polardb_reader_capacity_wait.active &&
+				polardb_reader_capacity_wait.retry_admitted;
+			PolarDB_ReaderResult reader_result;
+			if (thread) {
+				reader_result.conn = thread->take_polardb_reader_claim(this);
+				if (reader_result.conn) {
+					reader_result.srv = static_cast<PgSQL_SrvC*>(
+						reader_result.conn->parent);
+					reader_result.status = PolarDB_ReaderStatus::ACQUIRED;
+				}
+			}
+			if (!reader_result.acquired()) {
+				reader_result = PgHGM->get_MyConn_polardb_reader(
+					mybe->hostgroup_id, this,
+					polardb_query.reader_plan, polardb_wait_spec, false,
+					nullptr, -1, confirm_reader_group_capacity);
+			}
+			if (reader_result.acquired() &&
+					polardb_reader_capacity_wait.active) {
+				polardb_leave_reader_capacity_wait(
+					PolarDB_ReaderStatus::ACQUIRED);
+			} else if (reader_result.status ==
+					PolarDB_ReaderStatus::READER_BUSY ||
+				reader_result.status ==
+					PolarDB_ReaderStatus::READER_GROUP_BUSY) {
+				polardb_enter_reader_capacity_wait(
+					reader_result.retry_scope_hash, reader_result.status,
+					reader_result.srv,
+					std::move(reader_result.selected_server_snapshot),
+					reader_result.claim_profile_generation,
+					&reader_result.claim_pool_key);
+			} else if (polardb_reader_capacity_wait.active) {
+				polardb_leave_reader_capacity_wait(reader_result.status);
+			}
 			POLARDB_TRACE(
 				"PolarDB consistency: get_MyConn_polardb_reader status=%s conn=%p "
 				"target_lsn=%lu reader_hg=%d writer_hg=%d\n",
@@ -6295,7 +6427,23 @@ void PgSQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 				PolarDB_ReaderResult degraded_result =
 					PgHGM->get_MyConn_polardb_reader(
 						mybe->hostgroup_id, this,
-						polardb_query.reader_plan, no_wait, false);
+						polardb_query.reader_plan, no_wait, false,
+						nullptr, -1, confirm_reader_group_capacity);
+				if (degraded_result.acquired() &&
+						polardb_reader_capacity_wait.active) {
+					polardb_leave_reader_capacity_wait(
+						PolarDB_ReaderStatus::ACQUIRED);
+				} else if (degraded_result.status ==
+						PolarDB_ReaderStatus::READER_BUSY ||
+					degraded_result.status ==
+						PolarDB_ReaderStatus::READER_GROUP_BUSY) {
+					polardb_enter_reader_capacity_wait(
+						degraded_result.retry_scope_hash,
+						degraded_result.status, degraded_result.srv,
+						std::move(degraded_result.selected_server_snapshot),
+						degraded_result.claim_profile_generation,
+						&degraded_result.claim_pool_key);
+				}
 				if (degraded_result.acquired()) {
 					mc = degraded_result.conn;
 					polardb_query.reset_reader_target();
