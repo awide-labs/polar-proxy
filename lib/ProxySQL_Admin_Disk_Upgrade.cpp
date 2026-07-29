@@ -703,7 +703,15 @@ void ProxySQL_Admin::disk_upgrade_pgsql_replication_hostgroups() {
 		);
 		configdb->execute(
 			"INSERT INTO pgsql_replication_hostgroups(writer_hostgroup, reader_hostgroup, check_type, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment)"
-				" SELECT writer_hostgroup, reader_hostgroup, check_type, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, 'default', comment FROM pgsql_replication_hostgroups_v303"
+				" SELECT writer_hostgroup, reader_hostgroup, check_type,"
+				" CASE LOWER(consistency_mode)"
+				" WHEN 'lsn' THEN 'session_lsn'"
+				" WHEN 'global' THEN 'global_lsn'"
+				" WHEN 'lsn_global' THEN 'global_lsn'"
+				" WHEN 'primary' THEN 'off'"
+				" ELSE LOWER(consistency_mode) END,"
+				" max_lag_bytes, lsn_wait_timeout_ms, 'default', comment"
+				" FROM pgsql_replication_hostgroups_v303"
 		);
 	}
 
@@ -726,7 +734,47 @@ void ProxySQL_Admin::disk_upgrade_pgsql_replication_hostgroups() {
 		);
 		configdb->execute(
 			"INSERT INTO pgsql_replication_hostgroups(writer_hostgroup, reader_hostgroup, check_type, txn_split_enabled, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment)"
-				" SELECT writer_hostgroup, reader_hostgroup, check_type, 0, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment FROM pgsql_replication_hostgroups_v304"
+				" SELECT writer_hostgroup, reader_hostgroup, check_type, 0,"
+				" CASE LOWER(consistency_mode)"
+				" WHEN 'lsn' THEN 'session_lsn'"
+				" WHEN 'global' THEN 'global_lsn'"
+				" WHEN 'lsn_global' THEN 'global_lsn'"
+				" WHEN 'primary' THEN 'off'"
+				" ELSE LOWER(consistency_mode) END,"
+				" max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment"
+				" FROM pgsql_replication_hostgroups_v304"
+		);
+	}
+
+	// PolarDB policy upgrade: V3_0_5 -> V3_0_9. Keep the historical V3_0_5
+	// definition unchanged so an existing database is detected and copied
+	// instead of being dropped by the generic schema check.
+	rci = configdb->check_table_structure(
+		const_cast<char*>("pgsql_replication_hostgroups"),
+		const_cast<char*>(ADMIN_SQLITE_TABLE_PGSQL_REPLICATION_HOSTGROUPS_V3_0_5)
+	);
+
+	if (rci) {
+		proxy_warning("Detected version 3.0.5 of table 'pgsql_replication_hostgroups'\n");
+		proxy_warning("ONLINE UPGRADE of table 'pgsql_replication_hostgroups' in progress\n");
+		configdb->execute("DROP TABLE IF EXISTS pgsql_replication_hostgroups_v305");
+		configdb->execute("ALTER TABLE pgsql_replication_hostgroups RENAME TO pgsql_replication_hostgroups_v305");
+		configdb->build_table(
+			const_cast<char*>("pgsql_replication_hostgroups"),
+			const_cast<char*>(ADMIN_SQLITE_TABLE_PGSQL_REPLICATION_HOSTGROUPS),
+			false
+		);
+		configdb->execute(
+			"INSERT INTO pgsql_replication_hostgroups(writer_hostgroup, reader_hostgroup, check_type, txn_split_enabled, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment)"
+				" SELECT writer_hostgroup, reader_hostgroup, check_type, txn_split_enabled,"
+				" CASE LOWER(consistency_mode)"
+				" WHEN 'lsn' THEN 'session_lsn'"
+				" WHEN 'global' THEN 'global_lsn'"
+				" WHEN 'lsn_global' THEN 'global_lsn'"
+				" WHEN 'primary' THEN 'off'"
+				" ELSE LOWER(consistency_mode) END,"
+				" max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment"
+				" FROM pgsql_replication_hostgroups_v305"
 		);
 	}
 #endif // POLARDB_PROXY

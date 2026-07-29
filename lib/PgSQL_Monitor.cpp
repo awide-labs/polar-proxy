@@ -49,7 +49,7 @@ const char READ_ONLY_QUERY[] { "SELECT pg_is_in_recovery()" };
  * - Col 2: current WAL LSN (pg_current_wal_lsn on primary, pg_last_wal_replay_lsn on replica)
  *
  * The 3-column result is detected by col_count >= 3 in the monitor and parsed by
- * parse_polardb_full_health_check(). Standard PG backends use READ_ONLY_QUERY
+ * PolarDB_Protocol::parse_health_check(). Standard PG backends use READ_ONLY_QUERY
  * (1-column) and fall through to the pg_is_in_recovery() path.
  *
  * polar_is_available() returns 'f' while PolarDB has the node in maintenance
@@ -356,7 +356,7 @@ static bool polardb_debug_monitor_health_override(
 		const mon_srv_t& srv, PolarDB_DebugMonitorHealth& out) {
 	char buf[256] = {0};
 	bool matched = false;
-	if (polardb_debug_consume_fault_file(
+	if (polardb_debug_read_fault_file(
 			"POLARDB_DEBUG_MONITOR_HEALTH_FILE", buf, sizeof(buf))) {
 		char* node_type = strchr(buf, '|');
 		char* is_available = node_type ? strchr(node_type + 1, '|') : NULL;
@@ -801,39 +801,21 @@ short handle_async_check_cont(state_t& st, short _) {
 						}
 #endif
 
-						PolarDB_HealthCheck health;
-						parse_polardb_full_health_check(col0, col1, col2, health);
-						uint32_t lsn_logid = 0;
-						uint32_t lsn_offset = 0;
+						PolarDB_HealthCheck health =
+							PolarDB_Protocol::parse_health_check(
+								col0, col1, col2);
 						const bool availability_valid =
-							col1 && (col1[0] == 't' || col1[0] == 'T' ||
-								col1[0] == 'f' || col1[0] == 'F') &&
-							col1[1] == '\0';
-						int parsed_lsn_len = 0;
-						const bool invalid_lsn_text =
-							!col2 ||
-							sscanf(col2, "%X/%X%n", &lsn_logid, &lsn_offset, &parsed_lsn_len) != 2 ||
-							col2[parsed_lsn_len] != '\0';
+							health.availability_valid;
+						const bool invalid_lsn_text = !health.lsn_valid;
 						// ProxySQL routes only primary/master, replica, and standby
 						// roles. PolarDB can return the literal role "unknown" for
 						// POLAR_UNKNOWN while a node has no established role yet, or
 						// for POLAR_STANDALONE_DATAMAX. Both parse as UNKNOWN here.
 						// Treat that as an invalid routing role, not corrupt data. A
-						// valid zero LSN is allowed; the LSN update gate ignores it.
-						const bool invalid_role =
-							health.node_type == PolarDB_NodeType::UNKNOWN;
+						// valid zero LSN is allowed; the LSN update check ignores it.
+						const bool invalid_role = !health.role_valid;
 						const bool invalid_values =
 							!availability_valid || invalid_lsn_text;
-						// Use only the strictly parsed LSN. A partial parse such as
-						// "FFFFFFFF/FFFFFFFFjunk" must not seed the per-server cache
-						// or the primary LSN mirror with a value that never came from
-						// a valid monitor row.
-						if (!invalid_lsn_text) {
-							health.current_lsn =
-								(static_cast<uint64_t>(lsn_logid) << 32) | lsn_offset;
-						} else {
-							health.current_lsn = 0;
-						}
 						if (invalid_role) {
 							PgHGM->status.polardb_monitor_health_invalid_role.fetch_add(
 								1, std::memory_order_relaxed);
@@ -2082,13 +2064,15 @@ void perf_readonly_actions(SQLite3DB* db, state_t& state) {
 
 #if POLARDB_PROXY
 			// PolarDB: feed the per-server LSN cache for consistency routing.
-			// Gated by pgsql-polardb_monitor_lsn_updates (default on). polardb_update_server_lsn()
+			// Controlled by pgsql-polardb_monitor_lsn_updates (default on).
+			// polardb_update_server_lsn_from_monitor()
 			// itself no-ops unless a PolarDB hostgroup is configured. The monitor worker
 			// refreshes thread-locals (refresh_variables()), so this per-thread copy is valid.
 			if (op_result->is_available &&
 					polardb_should_update_monitor_lsn(
 						pgsql_thread___polardb_monitor_lsn_updates, op_result->lsn)) {
-				if (PgHGM->polardb_update_server_lsn(srv.addr.c_str(), srv.port, op_result->lsn)) {
+				if (PgHGM->polardb_update_server_lsn_from_monitor(
+						srv.addr.c_str(), srv.port, op_result->lsn)) {
 					PgHGM->status.polardb_lsn_updates_from_monitor.fetch_add(1, std::memory_order_relaxed);
 				}
 			}

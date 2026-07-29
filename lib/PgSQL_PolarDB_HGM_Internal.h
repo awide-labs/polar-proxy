@@ -10,8 +10,8 @@ class PgSQL_Connection;
 class PgSQL_SrvC;
 class PgSQL_Thread;
 
-bool pgsql_connection_creation_throttled_locked(PgSQL_SrvC* mysrvc);
-PgSQL_Connection* pgsql_create_backend_connection_locked(PgSQL_SrvC* mysrvc);
+bool pgsql_connection_creation_throttled_unlocked(PgSQL_SrvC* mysrvc);
+PgSQL_Connection* pgsql_create_backend_connection_unlocked(PgSQL_SrvC* mysrvc);
 void pgsql_pool_status_count(unsigned long* counter, unsigned long value = 1);
 void pgsql_pool_status_count_get(
 	PgSQL_Thread* thread, unsigned long* fallback_counter,

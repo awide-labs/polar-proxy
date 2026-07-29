@@ -26,6 +26,7 @@ using json = nlohmann::json;
 #include "PgSQL_Query_Processor.h"
 #if POLARDB_PROXY
 #include "PgSQL_PolarDB.h"
+#include "PgSQL_PolarDB_ReaderPool_Internal.h"
 #endif
 #include "StatCounters.h"
 #include "PgSQL_PreparedStatement.h"
@@ -61,6 +62,21 @@ extern PgSQL_Monitor* GloPgMon;
 extern PgSQL_Logger* GloPgSQL_Logger;
 
 #if POLARDB_PROXY
+/**
+ * @brief Fold one worker's PolarDB counter array into the PgHGM global atomics.
+ *
+ * Counters registered in POLARDB_THREAD_MAX_COUNTER_LIST are folded with
+ * polardb_thread_raise_max(nullptr, ...) so the global keeps a running maximum; all
+ * others are folded with a relaxed fetch_add.
+ *
+ * The fold is purely additive and does not clear the source array, so a second
+ * call double-counts every counter. Call it exactly once per worker, at
+ * teardown: after that worker's last counter update, and after its slot has been
+ * detached so a live scrape can no longer read the same values through
+ * PgSQL_Threads_Handler::get_polardb_counter().
+ *
+ * @param counters The exiting worker's counter array.
+ */
 static void polardb_fold_thread_counters_to_global(
 	const PolarDB_ThreadStatusVariables& counters)
 {
@@ -70,8 +86,8 @@ static void polardb_fold_thread_counters_to_global(
 	#define X(name, display_name, prom_name, help) do { \
 		const unsigned long long value = \
 			counters.stvar[polardb_st_var_##name]; \
-		if (polardb_st_var_##name == polardb_st_var_reader_capacity_wait_max_us) { \
-			polardb_thread_max(nullptr, polardb_st_var_##name, \
+		if (polardb_thread_counter_aggregates_max(polardb_st_var_##name)) { \
+			polardb_thread_raise_max(nullptr, polardb_st_var_##name, \
 				PgHGM->status.polardb_##name, value); \
 		} else { \
 			PgHGM->status.polardb_##name.fetch_add( \
@@ -82,6 +98,47 @@ static void polardb_fold_thread_counters_to_global(
 #undef X
 }
 
+// These bucket macros expand to direct comparison chains. Keeping the
+// boundaries in one place prevents release and profile counters drifting.
+#define POLARDB_WAIT_ELAPSED_BUCKET(elapsed_us, count_bucket) do { \
+	const auto polardb_wait_elapsed_bucket_value__ = (elapsed_us); \
+	if (polardb_wait_elapsed_bucket_value__ <= 1000) { \
+		count_bucket(le_1ms); \
+	} else if (polardb_wait_elapsed_bucket_value__ <= 5000) { \
+		count_bucket(le_5ms); \
+	} else if (polardb_wait_elapsed_bucket_value__ <= 10000) { \
+		count_bucket(le_10ms); \
+	} else if (polardb_wait_elapsed_bucket_value__ <= 50000) { \
+		count_bucket(le_50ms); \
+	} else if (polardb_wait_elapsed_bucket_value__ <= 100000) { \
+		count_bucket(le_100ms); \
+	} else if (polardb_wait_elapsed_bucket_value__ <= 500000) { \
+		count_bucket(le_500ms); \
+	} else if (polardb_wait_elapsed_bucket_value__ <= 1000000) { \
+		count_bucket(le_1s); \
+	} else { \
+		count_bucket(gt_1s); \
+	} \
+} while (0)
+
+#define POLARDB_LSN_GAP_BUCKET(gap_bytes, count_bucket) do { \
+	const auto polardb_lsn_gap_bucket_value__ = (gap_bytes); \
+	if (polardb_lsn_gap_bucket_value__ == 0) { \
+		count_bucket(zero); \
+	} else if (polardb_lsn_gap_bucket_value__ <= 4ULL * 1024ULL) { \
+		count_bucket(le_4kb); \
+	} else if (polardb_lsn_gap_bucket_value__ <= 64ULL * 1024ULL) { \
+		count_bucket(le_64kb); \
+	} else if (polardb_lsn_gap_bucket_value__ <= 1024ULL * 1024ULL) { \
+		count_bucket(le_1mb); \
+	} else if (polardb_lsn_gap_bucket_value__ <= \
+			16ULL * 1024ULL * 1024ULL) { \
+		count_bucket(le_16mb); \
+	} else { \
+		count_bucket(gt_16mb); \
+	} \
+} while (0)
+
 void polardb_count_lsn_wait_elapsed_bucket(
 	PgSQL_Thread* thread,
 	unsigned long long elapsed_us,
@@ -89,55 +146,16 @@ void polardb_count_lsn_wait_elapsed_bucket(
 {
 	// Coarse buckets show whether waits are immediate, visible, or timeout-scale
 	// without adding detailed per-query tracing to the hot path.
-	if (elapsed_us <= 1000) {
-		if (transaction_split) {
-			POLARDB_THREAD_COUNT_ONE(thread, split_lsn_wait_elapsed_le_1ms);
-		} else {
-			POLARDB_THREAD_COUNT_ONE(thread, wait_lsn_elapsed_le_1ms);
-		}
-	} else if (elapsed_us <= 5000) {
-		if (transaction_split) {
-			POLARDB_THREAD_COUNT_ONE(thread, split_lsn_wait_elapsed_le_5ms);
-		} else {
-			POLARDB_THREAD_COUNT_ONE(thread, wait_lsn_elapsed_le_5ms);
-		}
-	} else if (elapsed_us <= 10000) {
-		if (transaction_split) {
-			POLARDB_THREAD_COUNT_ONE(thread, split_lsn_wait_elapsed_le_10ms);
-		} else {
-			POLARDB_THREAD_COUNT_ONE(thread, wait_lsn_elapsed_le_10ms);
-		}
-	} else if (elapsed_us <= 50000) {
-		if (transaction_split) {
-			POLARDB_THREAD_COUNT_ONE(thread, split_lsn_wait_elapsed_le_50ms);
-		} else {
-			POLARDB_THREAD_COUNT_ONE(thread, wait_lsn_elapsed_le_50ms);
-		}
-	} else if (elapsed_us <= 100000) {
-		if (transaction_split) {
-			POLARDB_THREAD_COUNT_ONE(thread, split_lsn_wait_elapsed_le_100ms);
-		} else {
-			POLARDB_THREAD_COUNT_ONE(thread, wait_lsn_elapsed_le_100ms);
-		}
-	} else if (elapsed_us <= 500000) {
-		if (transaction_split) {
-			POLARDB_THREAD_COUNT_ONE(thread, split_lsn_wait_elapsed_le_500ms);
-		} else {
-			POLARDB_THREAD_COUNT_ONE(thread, wait_lsn_elapsed_le_500ms);
-		}
-	} else if (elapsed_us <= 1000000) {
-		if (transaction_split) {
-			POLARDB_THREAD_COUNT_ONE(thread, split_lsn_wait_elapsed_le_1s);
-		} else {
-			POLARDB_THREAD_COUNT_ONE(thread, wait_lsn_elapsed_le_1s);
-		}
-	} else {
-		if (transaction_split) {
-			POLARDB_THREAD_COUNT_ONE(thread, split_lsn_wait_elapsed_gt_1s);
-		} else {
-			POLARDB_THREAD_COUNT_ONE(thread, wait_lsn_elapsed_gt_1s);
-		}
-	}
+#define POLARDB_COUNT_LSN_WAIT_BUCKET(suffix) do { \
+	if (transaction_split) { \
+		POLARDB_THREAD_COUNT_ONE( \
+			thread, split_lsn_wait_elapsed_##suffix); \
+	} else { \
+		POLARDB_THREAD_COUNT_ONE(thread, wait_lsn_elapsed_##suffix); \
+	} \
+} while (0)
+	POLARDB_WAIT_ELAPSED_BUCKET(elapsed_us, POLARDB_COUNT_LSN_WAIT_BUCKET);
+#undef POLARDB_COUNT_LSN_WAIT_BUCKET
 }
 
 void polardb_count_reader_target_lsn_gap_bucket(
@@ -154,22 +172,12 @@ void polardb_count_reader_target_lsn_gap_bucket(
 		POLARDB_THREAD_COUNT_ONE(thread, reader_target_selected_lsn_stale);
 		return;
 	}
-	if (reader_lsn >= target_lsn) {
-		POLARDB_THREAD_COUNT_ONE(thread, reader_target_gap_zero);
-		return;
-	}
-	const uint64_t gap = target_lsn - reader_lsn;
-	if (gap <= 4ULL * 1024ULL) {
-		POLARDB_THREAD_COUNT_ONE(thread, reader_target_gap_le_4kb);
-	} else if (gap <= 64ULL * 1024ULL) {
-		POLARDB_THREAD_COUNT_ONE(thread, reader_target_gap_le_64kb);
-	} else if (gap <= 1024ULL * 1024ULL) {
-		POLARDB_THREAD_COUNT_ONE(thread, reader_target_gap_le_1mb);
-	} else if (gap <= 16ULL * 1024ULL * 1024ULL) {
-		POLARDB_THREAD_COUNT_ONE(thread, reader_target_gap_le_16mb);
-	} else {
-		POLARDB_THREAD_COUNT_ONE(thread, reader_target_gap_gt_16mb);
-	}
+	const uint64_t gap = reader_lsn < target_lsn
+		? target_lsn - reader_lsn : 0;
+#define POLARDB_COUNT_READER_TARGET_GAP_BUCKET(suffix) \
+	POLARDB_THREAD_COUNT_ONE(thread, reader_target_gap_##suffix)
+	POLARDB_LSN_GAP_BUCKET(gap, POLARDB_COUNT_READER_TARGET_GAP_BUCKET);
+#undef POLARDB_COUNT_READER_TARGET_GAP_BUCKET
 }
 
 void polardb_count_reader_target_selection(
@@ -209,23 +217,11 @@ void polardb_count_reader_target_selection(
 #if POLARDB_PROFILE
 static void polardb_count_txn_wait_elapsed_bucket(
 		PgSQL_Thread* thread, unsigned long long elapsed_us) {
-	if (elapsed_us <= 1000) {
-		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, txn_wait_lsn_elapsed_le_1ms);
-	} else if (elapsed_us <= 5000) {
-		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, txn_wait_lsn_elapsed_le_5ms);
-	} else if (elapsed_us <= 10000) {
-		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, txn_wait_lsn_elapsed_le_10ms);
-	} else if (elapsed_us <= 50000) {
-		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, txn_wait_lsn_elapsed_le_50ms);
-	} else if (elapsed_us <= 100000) {
-		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, txn_wait_lsn_elapsed_le_100ms);
-	} else if (elapsed_us <= 500000) {
-		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, txn_wait_lsn_elapsed_le_500ms);
-	} else if (elapsed_us <= 1000000) {
-		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, txn_wait_lsn_elapsed_le_1s);
-	} else {
-		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, txn_wait_lsn_elapsed_gt_1s);
-	}
+#define POLARDB_COUNT_TXN_WAIT_BUCKET(suffix) \
+	POLARDB_PROFILE_THREAD_COUNT_ONE( \
+		thread, txn_wait_lsn_elapsed_##suffix)
+	POLARDB_WAIT_ELAPSED_BUCKET(elapsed_us, POLARDB_COUNT_TXN_WAIT_BUCKET);
+#undef POLARDB_COUNT_TXN_WAIT_BUCKET
 }
 
 void polardb_count_wait_profile_completion(
@@ -305,18 +301,13 @@ void polardb_count_wait_profile_completion(
 		POLARDB_COUNT_WAIT_PROFILE_PAIR(gap_unknown);
 	} else if (!state.selected_lsn_fresh) {
 		POLARDB_COUNT_WAIT_PROFILE_PAIR(gap_stale);
-	} else if (state.selected_gap_bytes == 0) {
-		POLARDB_COUNT_WAIT_PROFILE_PAIR(gap_zero);
-	} else if (state.selected_gap_bytes <= 4ULL * 1024ULL) {
-		POLARDB_COUNT_WAIT_PROFILE_PAIR(gap_le_4kb);
-	} else if (state.selected_gap_bytes <= 64ULL * 1024ULL) {
-		POLARDB_COUNT_WAIT_PROFILE_PAIR(gap_le_64kb);
-	} else if (state.selected_gap_bytes <= 1024ULL * 1024ULL) {
-		POLARDB_COUNT_WAIT_PROFILE_PAIR(gap_le_1mb);
-	} else if (state.selected_gap_bytes <= 16ULL * 1024ULL * 1024ULL) {
-		POLARDB_COUNT_WAIT_PROFILE_PAIR(gap_le_16mb);
 	} else {
-		POLARDB_COUNT_WAIT_PROFILE_PAIR(gap_gt_16mb);
+#define POLARDB_COUNT_WAIT_PROFILE_GAP_BUCKET(suffix) \
+	POLARDB_COUNT_WAIT_PROFILE_PAIR(gap_##suffix)
+		POLARDB_LSN_GAP_BUCKET(
+			state.selected_gap_bytes,
+			POLARDB_COUNT_WAIT_PROFILE_GAP_BUCKET);
+#undef POLARDB_COUNT_WAIT_PROFILE_GAP_BUCKET
 	}
 
 	if (!state.selected_lsn_age_known) {
@@ -345,6 +336,9 @@ void polardb_count_wait_profile_completion(
 #undef POLARDB_COUNT_WAIT_PROFILE_PAIR
 }
 #endif // POLARDB_PROFILE
+
+#undef POLARDB_LSN_GAP_BUCKET
+#undef POLARDB_WAIT_ELAPSED_BUCKET
 
 static bool polardb_parse_proxy_identity_port(const char* value, int* port) {
 	if (!value || !*value || !port) return false;
@@ -680,12 +674,15 @@ static char* pgsql_thread_variables_names[] = {
 	(char*)"monitor_writer_is_also_reader",
 	(char*)"max_allowed_packet",
 #if POLARDB_PROXY
-	// PolarDB session-consistency knobs.
+	// PolarDB policy and supporting settings.
+	(char*)"polardb_profile",
 	(char*)"polardb_consistency_mode",
-	(char*)"polardb_lag_bytes",
-	(char*)"polardb_lag_ms",
-	(char*)"polardb_lag_wait_ms",
-	(char*)"polardb_lsn_freshness_ms",
+	(char*)"polardb_read_target",
+	(char*)"polardb_action_read_fallback",
+	(char*)"polardb_max_reader_lsn_gap_bytes",
+	(char*)"polardb_max_reader_lag_ms",
+	(char*)"polardb_lsn_wait_timeout_ms",
+	(char*)"polardb_reader_lsn_max_age_ms",
 	(char*)"polardb_lag_cap_freshness_ms",
 	(char*)"polardb_reader_lsn_lag_range_bytes",
 	(char*)"polardb_reader_prefer_freshest_below_target",
@@ -698,12 +695,11 @@ static char* pgsql_thread_variables_names[] = {
 	(char*)"polardb_writev_direct",
 	(char*)"polardb_result_fast_forward",
 	(char*)"polardb_split_warmup_max_connections_per_request",
-	(char*)"polardb_wait_timeout_mode",
+	(char*)"polardb_action_lsn_timeout",
 	(char*)"polardb_proxy_protocol",
-	(char*)"polardb_route_rfq_policy",
-	(char*)"polardb_reader_death_action",
-	(char*)"polardb_reader_timeout_action",
-	(char*)"polardb_reader_error_action",
+	(char*)"polardb_action_missing_lsn",
+	(char*)"polardb_action_replica_loss",
+	(char*)"polardb_action_replica_error",
 	(char*)"polardb_proxy_identity_mode",
 	(char*)"polardb_proxy_identity_host",
 	(char*)"polardb_proxy_identity_port",
@@ -1447,12 +1443,22 @@ PgSQL_Threads_Handler::PgSQL_Threads_Handler() {
 	variables.monitor_writer_is_also_reader = true;
 	variables.max_allowed_packet = 64 * 1024 * 1024;
 #if POLARDB_PROXY
-	// PolarDB session-consistency knob defaults.
-	variables.polardb_consistency_mode = strdup((char*)"off");   // consistency disabled by default
-	variables.polardb_lag_bytes = 0;                             // 0 = lag-cap (bytes) disabled
-	variables.polardb_lag_ms = 0;                                // reserved: T13 accepts only 0; no PgSQL ms-lag producer yet
-	variables.polardb_lag_wait_ms = 1000;                        // default finite wait timeout
-	variables.polardb_lsn_freshness_ms = 5000;                   // 5s max age for a trusted cached LSN
+	// The session-consistency profile with primary fallback is the complete
+	// factory default.
+	const PolarDB_ProfileDefinition& default_profile =
+		POLARDB_DEFAULT_PROFILE_DEFINITION;
+	variables.polardb_profile = strdup(default_profile.name);
+	variables.polardb_consistency_mode =
+		strdup(polardb_consistency_mode_name(default_profile.consistency));
+	variables.polardb_read_target =
+		strdup(polardb_read_target_name(default_profile.read_target));
+	variables.polardb_action_read_fallback =
+		strdup(polardb_read_fallback_action_name(
+			default_profile.read_fallback));
+	variables.polardb_max_reader_lsn_gap_bytes = 0;             // byte lag cap disabled
+	variables.polardb_max_reader_lag_ms = 0;                    // reserved until a real lag-time producer exists
+	variables.polardb_lsn_wait_timeout_ms = 1000;                // finite one-second wait
+	variables.polardb_reader_lsn_max_age_ms = 5000;              // trust cached LSNs for five seconds
 	variables.polardb_lag_cap_freshness_ms = 250;                // cap trusted LSN age under byte-lag + finite wait
 	variables.polardb_reader_lsn_lag_range_bytes = 0;            // 0 = exact best-behind reader only
 	variables.polardb_reader_prefer_freshest_below_target = false; // preserve balanced selection unless testing best-behind preference
@@ -1460,21 +1466,32 @@ PgSQL_Threads_Handler::PgSQL_Threads_Handler() {
 	variables.polardb_reader_connection_retention = 0;           // return readers to shared storage after every worker pass
 	variables.polardb_output_coalesce_bytes = 0;                 // 0 = disabled; hold incomplete streaming output up to this byte budget
 	variables.polardb_output_coalesce_packets = 0;               // 0 = disabled; hold incomplete streaming output up to this packet budget
-	variables.polardb_monitor_lsn_updates = true;                // monitor LSN cache updates enabled
-	variables.polardb_lazy_warmup_split = true;                  // demand warm split-reader pool entries
+	variables.polardb_monitor_lsn_updates =
+		default_profile.monitor_lsn_updates;
+	variables.polardb_lazy_warmup_split =
+		default_profile.split_warmup;
 	variables.polardb_writev_direct = true;                      // direct plaintext frontend write path enabled
 	variables.polardb_result_fast_forward = false;               // backend DataRow row-run batching is opt-in for benchmark validation
 	variables.polardb_split_warmup_max_connections_per_request = 1;           // one warmup request opens one backend by default
-	variables.polardb_wait_timeout_mode = strdup((char*)"best_effort");
-	variables.polardb_proxy_protocol = strdup((char*)"v15");
-	variables.polardb_route_rfq_policy = strdup((char*)"strict");
-	variables.polardb_reader_death_action = strdup((char*)"retry");
-	variables.polardb_reader_timeout_action = strdup((char*)"retry");
-	variables.polardb_reader_error_action = strdup((char*)"forward");
+	variables.polardb_action_lsn_timeout =
+		strdup(polardb_lsn_wait_timeout_action_name(
+			default_profile.lsn_timeout));
+	variables.polardb_proxy_protocol =
+		strdup(polardb_proxy_protocol_config_name(
+			default_profile.rfq_protocol));
+	variables.polardb_action_missing_lsn =
+		strdup(polardb_missing_lsn_action_name(
+			default_profile.missing_lsn));
+	variables.polardb_action_replica_loss =
+		strdup(polardb_replica_loss_action_name(
+			default_profile.replica_loss));
+	variables.polardb_action_replica_error =
+		strdup(polardb_replica_error_action_name(
+			default_profile.replica_error));
 	variables.polardb_proxy_identity_mode = strdup((char*)"proxy");
 	variables.polardb_proxy_identity_host = strdup((char*)"");
 	variables.polardb_proxy_identity_port = 0;
-	polardb_global_config_ = build_polardb_global_config_locked(1);
+	polardb_global_config_ = polardb_build_global_config_unlocked(1);
 	polardb_startup_config_generation_.store(1, std::memory_order_relaxed);
 #endif // POLARDB_PROXY
 	variables.automatic_detect_sqli = false;
@@ -1681,21 +1698,56 @@ void PgSQL_Threads_Handler::wrlock() {
 	pthread_rwlock_wrlock(&rwlock);
 }
 
+void PgSQL_Threads_Handler::rdlock() {
+	pthread_rwlock_rdlock(&rwlock);
+}
+
 void PgSQL_Threads_Handler::wrunlock() {
+	pthread_rwlock_unlock(&rwlock);
+}
+
+void PgSQL_Threads_Handler::rdunlock() {
 	pthread_rwlock_unlock(&rwlock);
 }
 
 #if POLARDB_PROXY
 PolarDB_ParsedGlobalConfigValue
-PgSQL_Threads_Handler::build_polardb_global_config_locked(
+PgSQL_Threads_Handler::polardb_build_global_config_unlocked(
 		uint64_t startup_generation) const {
 	PolarDB_ParsedGlobalConfigValue config;
+	config.profile = polardb_profile_from_string(
+		variables.polardb_profile, config.profile);
 	config.consistency_mode = polardb_consistency_mode_from_string(
-		variables.polardb_consistency_mode, POLARDB_CONSISTENCY_OFF);
+		variables.polardb_consistency_mode, config.consistency_mode);
+	config.read_target = polardb_read_target_from_string(
+		variables.polardb_read_target, config.read_target);
+	config.read_fallback_action = polardb_read_fallback_action_from_string(
+		variables.polardb_action_read_fallback,
+		config.read_fallback_action);
+	config.missing_lsn_action = polardb_missing_lsn_action_from_string(
+		variables.polardb_action_missing_lsn,
+		config.missing_lsn_action);
+	config.lsn_wait_timeout_action =
+		polardb_lsn_wait_timeout_action_from_string(
+			variables.polardb_action_lsn_timeout,
+			config.lsn_wait_timeout_action);
+	config.replica_loss_action =
+		polardb_replica_loss_action_from_string(
+			variables.polardb_action_replica_loss,
+			config.replica_loss_action);
+	config.replica_error_action = polardb_replica_error_action_from_string(
+		variables.polardb_action_replica_error,
+		config.replica_error_action);
+	config.lsn_wait_timeout_ms = variables.polardb_lsn_wait_timeout_ms;
+	config.split_warmup_max_connections_per_request =
+		variables.polardb_split_warmup_max_connections_per_request;
+	config.monitor_lsn_updates = variables.polardb_monitor_lsn_updates;
+	config.split_warmup = variables.polardb_lazy_warmup_split;
 	config.startup.generation = startup_generation;
 	config.startup.proxy_protocol = polardb_proxy_protocol_from_int(
 		polardb_proxy_protocol_from_string(
-			variables.polardb_proxy_protocol, POLARDB_PROXY_PROTOCOL_V15));
+			variables.polardb_proxy_protocol,
+			static_cast<int>(config.startup.proxy_protocol)));
 	config.startup.identity_mode = static_cast<PolarDB_ProxyIdentityMode>(
 		polardb_proxy_identity_mode_from_string(
 			variables.polardb_proxy_identity_mode,
@@ -1707,16 +1759,59 @@ PgSQL_Threads_Handler::build_polardb_global_config_locked(
 	return config;
 }
 
+void PgSQL_Threads_Handler::apply_polardb_global_config_unlocked(
+		const PolarDB_ParsedGlobalConfigValue& config) {
+	const auto replace_word = [](char*& target, const char* value) {
+		free(target);
+		target = strdup(value);
+	};
+	replace_word(variables.polardb_profile,
+		polardb_profile_name(polardb_profile_from_int(config.profile)));
+	replace_word(variables.polardb_consistency_mode,
+		polardb_consistency_mode_name(
+			polardb_consistency_from_int(config.consistency_mode)));
+	replace_word(variables.polardb_read_target,
+		polardb_read_target_name(
+			polardb_read_target_from_int(config.read_target)));
+	replace_word(variables.polardb_action_read_fallback,
+		polardb_read_fallback_action_name(
+			polardb_read_fallback_action_from_int(
+				config.read_fallback_action)));
+	replace_word(variables.polardb_action_missing_lsn,
+		polardb_missing_lsn_action_name(
+			polardb_missing_lsn_action_from_int(
+				config.missing_lsn_action)));
+	replace_word(variables.polardb_action_lsn_timeout,
+		polardb_lsn_wait_timeout_action_name(
+			polardb_lsn_wait_timeout_action_from_int(
+				config.lsn_wait_timeout_action)));
+	replace_word(variables.polardb_action_replica_error,
+		polardb_replica_error_action_name(
+			polardb_replica_error_action_from_int(
+				config.replica_error_action)));
+	replace_word(variables.polardb_action_replica_loss,
+		polardb_replica_loss_action_name(
+			polardb_replica_loss_action_from_int(
+				config.replica_loss_action)));
+	replace_word(variables.polardb_proxy_protocol,
+		polardb_proxy_protocol_config_name(config.startup.proxy_protocol));
+	variables.polardb_lsn_wait_timeout_ms = config.lsn_wait_timeout_ms;
+	variables.polardb_monitor_lsn_updates = config.monitor_lsn_updates;
+	variables.polardb_lazy_warmup_split = config.split_warmup;
+	variables.polardb_split_warmup_max_connections_per_request =
+		config.split_warmup_max_connections_per_request;
+}
+
 PolarDB_ParsedGlobalConfigValue
-PgSQL_Threads_Handler::polardb_global_config_locked() const {
+PgSQL_Threads_Handler::get_polardb_global_config_unlocked() const {
 	return polardb_global_config_;
 }
 
 PolarDB_ParsedGlobalConfigValue
 PgSQL_Threads_Handler::get_polardb_global_config() {
-	wrlock();
+	rdlock();
 	PolarDB_ParsedGlobalConfigValue config = polardb_global_config_;
-	wrunlock();
+	rdunlock();
 	return config;
 }
 
@@ -1730,7 +1825,7 @@ void PgSQL_Threads_Handler::commit() {
 	uint64_t startup_generation =
 		polardb_startup_config_generation_.load(std::memory_order_relaxed);
 	PolarDB_ParsedGlobalConfigValue next =
-		build_polardb_global_config_locked(startup_generation);
+		polardb_build_global_config_unlocked(startup_generation);
 	if (!polardb_same_startup_config_inputs(
 			next.startup, polardb_global_config_.startup)) {
 		startup_generation++;
@@ -1754,13 +1849,15 @@ char* PgSQL_Threads_Handler::get_variable_string(char* name) {
 	}
 #if POLARDB_PROXY
 	// PolarDB word-valued knobs.
+	if (!strcmp(name, "polardb_profile")) return strdup(variables.polardb_profile);
 	if (!strcmp(name, "polardb_consistency_mode")) return strdup(variables.polardb_consistency_mode);
-	if (!strcmp(name, "polardb_wait_timeout_mode")) return strdup(variables.polardb_wait_timeout_mode);
+	if (!strcmp(name, "polardb_read_target")) return strdup(variables.polardb_read_target);
+	if (!strcmp(name, "polardb_action_read_fallback")) return strdup(variables.polardb_action_read_fallback);
+	if (!strcmp(name, "polardb_action_lsn_timeout")) return strdup(variables.polardb_action_lsn_timeout);
 	if (!strcmp(name, "polardb_proxy_protocol")) return strdup(variables.polardb_proxy_protocol);
-	if (!strcmp(name, "polardb_route_rfq_policy")) return strdup(variables.polardb_route_rfq_policy);
-	if (!strcmp(name, "polardb_reader_death_action")) return strdup(variables.polardb_reader_death_action);
-	if (!strcmp(name, "polardb_reader_timeout_action")) return strdup(variables.polardb_reader_timeout_action);
-	if (!strcmp(name, "polardb_reader_error_action")) return strdup(variables.polardb_reader_error_action);
+	if (!strcmp(name, "polardb_action_missing_lsn")) return strdup(variables.polardb_action_missing_lsn);
+	if (!strcmp(name, "polardb_action_replica_loss")) return strdup(variables.polardb_action_replica_loss);
+	if (!strcmp(name, "polardb_action_replica_error")) return strdup(variables.polardb_action_replica_error);
 	if (!strcmp(name, "polardb_proxy_identity_mode")) return strdup(variables.polardb_proxy_identity_mode);
 	if (!strcmp(name, "polardb_proxy_identity_host")) return strdup(variables.polardb_proxy_identity_host);
 #endif // POLARDB_PROXY
@@ -2061,13 +2158,15 @@ char* PgSQL_Threads_Handler::get_variable(char* name) {	// this is the public fu
 	}
 #if POLARDB_PROXY
 	// PolarDB word-valued knobs.
+	if (!strcasecmp(name, "polardb_profile")) return strdup(variables.polardb_profile);
 	if (!strcasecmp(name, "polardb_consistency_mode")) return strdup(variables.polardb_consistency_mode);
-	if (!strcasecmp(name, "polardb_wait_timeout_mode")) return strdup(variables.polardb_wait_timeout_mode);
+	if (!strcasecmp(name, "polardb_read_target")) return strdup(variables.polardb_read_target);
+	if (!strcasecmp(name, "polardb_action_read_fallback")) return strdup(variables.polardb_action_read_fallback);
+	if (!strcasecmp(name, "polardb_action_lsn_timeout")) return strdup(variables.polardb_action_lsn_timeout);
 	if (!strcasecmp(name, "polardb_proxy_protocol")) return strdup(variables.polardb_proxy_protocol);
-	if (!strcasecmp(name, "polardb_route_rfq_policy")) return strdup(variables.polardb_route_rfq_policy);
-	if (!strcasecmp(name, "polardb_reader_death_action")) return strdup(variables.polardb_reader_death_action);
-	if (!strcasecmp(name, "polardb_reader_timeout_action")) return strdup(variables.polardb_reader_timeout_action);
-	if (!strcasecmp(name, "polardb_reader_error_action")) return strdup(variables.polardb_reader_error_action);
+	if (!strcasecmp(name, "polardb_action_missing_lsn")) return strdup(variables.polardb_action_missing_lsn);
+	if (!strcasecmp(name, "polardb_action_replica_loss")) return strdup(variables.polardb_action_replica_loss);
+	if (!strcasecmp(name, "polardb_action_replica_error")) return strdup(variables.polardb_action_replica_error);
 	if (!strcasecmp(name, "polardb_proxy_identity_mode")) return strdup(variables.polardb_proxy_identity_mode);
 	if (!strcasecmp(name, "polardb_proxy_identity_host")) return strdup(variables.polardb_proxy_identity_host);
 #endif // POLARDB_PROXY
@@ -2103,6 +2202,35 @@ bool PgSQL_Threads_Handler::set_variable(char* name, const char* value) {	// thi
 	std::string nameS = string(name);
 	std::transform(nameS.begin(), nameS.end(), nameS.begin(), [](unsigned char c) { return std::tolower(c); });
 #if POLARDB_PROXY
+	if (polardb_profile_owns_setting(nameS.c_str())) {
+		const PolarDB_ParsedGlobalConfigValue current =
+			polardb_build_global_config_unlocked(
+				polardb_startup_config_generation_.load(
+					std::memory_order_relaxed));
+		PolarDB_ParsedGlobalConfigValue candidate = current;
+		const PolarDB_ProfileSettingResult result =
+			polardb_update_profile_setting(
+				&candidate, nameS.c_str(), value);
+		if (result != PolarDB_ProfileSettingResult::UPDATED) {
+			proxy_error(
+				"Invalid value '%s' for pgsql-%s (allowed: %s)\n",
+				value, nameS.c_str(),
+				polardb_profile_setting_allowed_values(nameS.c_str()));
+			return false;
+		}
+		if (nameS != "polardb_profile" &&
+				!polardb_same_profile_owned_settings(current, candidate)) {
+			candidate.profile = static_cast<int>(PolarDB_Profile::CUSTOM);
+		}
+		if (const char* error = polardb_global_policy_error(candidate)) {
+			proxy_error(
+				"Invalid PolarDB policy after setting pgsql-%s='%s': %s\n",
+				nameS.c_str(), value, error);
+			return false;
+		}
+		apply_polardb_global_config_unlocked(candidate);
+		return true;
+	}
 	if (nameS == "polardb_proxy_identity_port") {
 		int port = 0;
 		if (polardb_parse_proxy_identity_port(value, &port)) {
@@ -2181,79 +2309,23 @@ bool PgSQL_Threads_Handler::set_variable(char* name, const char* value) {	// thi
 	}
 
 #if POLARDB_PROXY
-	// PolarDB word-valued knobs are stored as strings and mapped into the
-	// pgsql_thread___ globals during commit_get_global_variables_refresh().
-	if (!strcasecmp(name, "polardb_consistency_mode")) {
-		if (polardb_consistency_mode_from_string(value, -1) >= 0) {
-			free(variables.polardb_consistency_mode);
-			variables.polardb_consistency_mode = strdup(value);
-			return true;
+	// Startup identity settings are independent from the policy profile.
+	const auto set_polardb_word = [&](char*& target, int parsed, const char* allowed) {
+		if (parsed < 0) {
+			proxy_error(
+				"Invalid value '%s' for pgsql-%s (allowed: %s)\n",
+				value, name, allowed);
+			return false;
 		}
-		proxy_error("Invalid value '%s' for pgsql-polardb_consistency_mode (allowed: off, lsn, global_lsn, primary)\n", value);
-		return false;
-	}
-	if (!strcasecmp(name, "polardb_wait_timeout_mode")) {
-		if (polardb_wait_mode_from_string(value, -1) >= 0) {
-			free(variables.polardb_wait_timeout_mode);
-			variables.polardb_wait_timeout_mode = strdup(value);
-			return true;
-		}
-		proxy_error("Invalid value '%s' for pgsql-polardb_wait_timeout_mode (allowed: best_effort, strict)\n", value);
-		return false;
-	}
-	if (!strcasecmp(name, "polardb_proxy_protocol")) {
-		if (polardb_proxy_protocol_from_string(value, -1) >= 0) {
-			free(variables.polardb_proxy_protocol);
-			variables.polardb_proxy_protocol = strdup(value);
-			return true;
-		}
-		proxy_error("Invalid value '%s' for pgsql-polardb_proxy_protocol (allowed: v15, legacy, off)\n", value);
-		return false;
-	}
-	if (!strcasecmp(name, "polardb_route_rfq_policy")) {
-		if (polardb_route_rfq_policy_from_string(value, -1) >= 0) {
-			free(variables.polardb_route_rfq_policy);
-			variables.polardb_route_rfq_policy = strdup(value);
-			return true;
-		}
-		proxy_error("Invalid value '%s' for pgsql-polardb_route_rfq_policy (allowed: strict, best_effort)\n", value);
-		return false;
-	}
-	if (!strcasecmp(name, "polardb_reader_death_action")) {
-		if (polardb_reader_action_from_string(value, -1) >= 0) {
-			free(variables.polardb_reader_death_action);
-			variables.polardb_reader_death_action = strdup(value);
-			return true;
-		}
-		proxy_error("Invalid value '%s' for pgsql-polardb_reader_death_action (allowed: retry, forward, terminate)\n", value);
-		return false;
-	}
-	if (!strcasecmp(name, "polardb_reader_timeout_action")) {
-		if (polardb_reader_action_from_string(value, -1) >= 0) {
-			free(variables.polardb_reader_timeout_action);
-			variables.polardb_reader_timeout_action = strdup(value);
-			return true;
-		}
-		proxy_error("Invalid value '%s' for pgsql-polardb_reader_timeout_action (allowed: retry, forward, terminate)\n", value);
-		return false;
-	}
-	if (!strcasecmp(name, "polardb_reader_error_action")) {
-		if (polardb_reader_action_from_string(value, -1) >= 0) {
-			free(variables.polardb_reader_error_action);
-			variables.polardb_reader_error_action = strdup(value);
-			return true;
-		}
-		proxy_error("Invalid value '%s' for pgsql-polardb_reader_error_action (allowed: retry, forward, terminate)\n", value);
-		return false;
-	}
+		free(target);
+		target = strdup(value);
+		return true;
+	};
 	if (!strcasecmp(name, "polardb_proxy_identity_mode")) {
-		if (polardb_proxy_identity_mode_from_string(value, -1) >= 0) {
-			free(variables.polardb_proxy_identity_mode);
-			variables.polardb_proxy_identity_mode = strdup(value);
-			return true;
-		}
-		proxy_error("Invalid value '%s' for pgsql-polardb_proxy_identity_mode (allowed: client, proxy)\n", value);
-		return false;
+		return set_polardb_word(
+			variables.polardb_proxy_identity_mode,
+			polardb_proxy_identity_mode_from_string(value, -1),
+			"client, proxy");
 	}
 	if (!strcasecmp(name, "polardb_proxy_identity_host")) {
 		if (polardb_identity_config_valid(
@@ -2922,12 +2994,13 @@ char** PgSQL_Threads_Handler::get_variables_list() {
 		VariablesPointers_int["long_query_time"] = make_tuple(&variables.long_query_time, 0, 20 * 24 * 3600 * 1000, false);
 		VariablesPointers_int["max_allowed_packet"] = make_tuple(&variables.max_allowed_packet, 8192, 1024 * 1024 * 1024, false);
 #if POLARDB_PROXY
-		// PolarDB numeric session-consistency knobs. The two word-valued *mode*
-		// knobs are handled by dedicated get/set handlers, not VariablesPointers.
-		VariablesPointers_int["polardb_lag_bytes"] = make_tuple(&variables.polardb_lag_bytes, 0, INT_MAX, false);    // 0 = off
-		VariablesPointers_int["polardb_lag_ms"] = make_tuple(&variables.polardb_lag_ms, 0, 0, false);                // reserved for future PgSQL ms-lag producer; T13 accepts only 0
-		VariablesPointers_int["polardb_lag_wait_ms"] = make_tuple(&variables.polardb_lag_wait_ms, 0, 60000, false);  // 0 = wait indefinitely, max 60s
-		VariablesPointers_int["polardb_lsn_freshness_ms"] = make_tuple(&variables.polardb_lsn_freshness_ms, 100, 60000, false); // 100ms-60s
+		// PolarDB numeric session-consistency knobs. The word-valued knobs are
+		// read and written by dedicated branches in get_variable_string() and
+		// set_variable(), not through VariablesPointers.
+		VariablesPointers_int["polardb_max_reader_lsn_gap_bytes"] = make_tuple(&variables.polardb_max_reader_lsn_gap_bytes, 0, INT_MAX, false);    // 0 = off
+		VariablesPointers_int["polardb_max_reader_lag_ms"] = make_tuple(&variables.polardb_max_reader_lag_ms, 0, 0, false);                // reserved for a future PgSQL ms-lag producer; only 0 is accepted
+		VariablesPointers_int["polardb_lsn_wait_timeout_ms"] = make_tuple(&variables.polardb_lsn_wait_timeout_ms, 0, 60000, false);  // 0 = wait indefinitely, max 60s
+		VariablesPointers_int["polardb_reader_lsn_max_age_ms"] = make_tuple(&variables.polardb_reader_lsn_max_age_ms, 100, 60000, false); // 100ms-60s
 		VariablesPointers_int["polardb_lag_cap_freshness_ms"] = make_tuple(&variables.polardb_lag_cap_freshness_ms, 0, 60000, false); // 0 = wait-fraction only
 		VariablesPointers_int["polardb_reader_lsn_lag_range_bytes"] = make_tuple(&variables.polardb_reader_lsn_lag_range_bytes, 0, INT_MAX, false); // 0 = exact
 		VariablesPointers_int["polardb_reader_connection_retention"] = make_tuple(&variables.polardb_reader_connection_retention, 0, 1, false);
@@ -3057,8 +3130,12 @@ proxysql_pgsql_thread_t* PgSQL_Threads_Handler::create_thread(unsigned int tn, v
 			assert(0);
 			// LCOV_EXCL_STOP
 		}
+		else {
+			pgsql_threads[tn].thread_created = true;
+		}
 #if defined(__linux__) || defined(__FreeBSD__)
-		if (GloVars.set_thread_name == true) {
+		if (pgsql_threads[tn].thread_created &&
+				GloVars.set_thread_name == true) {
 			char thr_name[16];
 			snprintf(thr_name, sizeof(thr_name), "PgSQLWorker%d", tn);
 			pthread_setname_np(pgsql_threads[tn].thread_id, thr_name);
@@ -3074,8 +3151,12 @@ proxysql_pgsql_thread_t* PgSQL_Threads_Handler::create_thread(unsigned int tn, v
 				assert(0);
 				// LCOV_EXCL_STOP
 			}
+			else {
+				pgsql_threads_idles[tn].thread_created = true;
+			}
 #if defined(__linux__) || defined(__FreeBSD__)
-			if (GloVars.set_thread_name == true) {
+			if (pgsql_threads_idles[tn].thread_created &&
+					GloVars.set_thread_name == true) {
 				char thr_name[16];
 				snprintf(thr_name, sizeof(thr_name), "PgSQLIdle%d", tn);
 				pthread_setname_np(pgsql_threads_idles[tn].thread_id, thr_name);
@@ -3088,48 +3169,93 @@ proxysql_pgsql_thread_t* PgSQL_Threads_Handler::create_thread(unsigned int tn, v
 }
 
 #if POLARDB_PROXY
-bool PgSQL_Threads_Handler::signal_polardb_reader_claim(
+PolarDB_WorkerAttachResult PgSQL_Threads_Handler::polardb_attach_worker(
+		unsigned int worker_index, PgSQL_Thread* worker) {
+	std::lock_guard<std::mutex> lifecycle_lock(
+		polardb_worker_lifecycle_mutex_);
+	if (!worker || !pgsql_threads || worker_index >= num_threads ||
+			pgsql_threads[worker_index].worker) {
+		return PolarDB_WorkerAttachResult::INVALID_SLOT;
+	}
+	if (shutdown_) {
+		return PolarDB_WorkerAttachResult::SHUTDOWN_STARTED;
+	}
+	pgsql_threads[worker_index].worker = worker;
+	worker->polardb_worker_index = worker_index;
+	return PolarDB_WorkerAttachResult::ATTACHED;
+}
+
+bool PgSQL_Threads_Handler::polardb_detach_worker(
+		unsigned int worker_index, PgSQL_Thread* worker) {
+	std::lock_guard<std::mutex> lifecycle_lock(
+		polardb_worker_lifecycle_mutex_);
+	if (!worker || !pgsql_threads || worker_index >= num_threads ||
+			pgsql_threads[worker_index].worker != worker) {
+		return false;
+	}
+	pgsql_threads[worker_index].worker = nullptr;
+	return true;
+}
+
+bool PgSQL_Threads_Handler::polardb_queue_reader_reservation_wake(
 		unsigned int worker_index, uint64_t token, PgSQL_SrvC* server,
 		std::shared_ptr<const void> server_snapshot) {
+	std::lock_guard<std::mutex> lifecycle_lock(
+		polardb_worker_lifecycle_mutex_);
 	if (shutdown_ || !pgsql_threads || worker_index >= num_threads) {
 		return false;
 	}
 	PgSQL_Thread* worker = pgsql_threads[worker_index].worker;
-	return worker && worker->notify_polardb_reader_claim(
+	return worker && worker->polardb_queue_reader_reservation_wake(
 		token, server, std::move(server_snapshot));
 }
 #endif // POLARDB_PROXY
 
 void PgSQL_Threads_Handler::shutdown_threads() {
 	unsigned int i;
+
+#if POLARDB_PROXY
+	std::unique_lock<std::mutex> lifecycle_lock(
+		polardb_worker_lifecycle_mutex_);
+#endif // POLARDB_PROXY
 	shutdown_ = 1;
 	if (pgsql_threads) {
-		for (i = 0; i < num_threads; i++) {
-			if (pgsql_threads[i].worker) {
-				pthread_mutex_lock(&pgsql_threads[i].worker->thread_mutex);
-				pgsql_threads[i].worker->shutdown = 1;
-				pthread_mutex_unlock(&pgsql_threads[i].worker->thread_mutex);
+		auto stop_worker = [](PgSQL_Thread* worker) {
+			if (!worker) {
+				return;
 			}
+			pthread_mutex_lock(&worker->thread_mutex);
+			worker->shutdown = 1;
+			const unsigned char byte = 1;
+			if (write(worker->pipefd[1], &byte, 1) == -1 && errno != EAGAIN) {
+				proxy_error("Error while waking a PostgreSQL worker for shutdown\n");
+			}
+			pthread_mutex_unlock(&worker->thread_mutex);
+		};
+		for (i = 0; i < num_threads; i++) {
+			stop_worker(pgsql_threads[i].worker);
 		}
 #ifdef IDLE_THREADS
 		if (GloVars.global.idle_threads) {
 			for (i = 0; i < num_threads; i++) {
-				if (pgsql_threads_idles[i].worker) {
-					pthread_mutex_lock(&pgsql_threads[i].worker->thread_mutex);
-					pgsql_threads_idles[i].worker->shutdown = 1;
-					pthread_mutex_unlock(&pgsql_threads[i].worker->thread_mutex);
-				}
+				stop_worker(pgsql_threads_idles[i].worker);
 			}
 		}
 #endif /* IDLE_THREADS */
-		signal_all_threads(1);
+#if POLARDB_PROXY
+		lifecycle_lock.unlock();
+#endif // POLARDB_PROXY
 		for (i = 0; i < num_threads; i++) {
-			if (pgsql_threads[i].worker)
+			if (pgsql_threads[i].thread_created) {
 				pthread_join(pgsql_threads[i].thread_id, NULL);
+				pgsql_threads[i].thread_created = false;
+			}
 #ifdef IDLE_THREADS
 			if (GloVars.global.idle_threads) {
-				if (pgsql_threads_idles[i].worker)
+				if (pgsql_threads_idles[i].thread_created) {
 					pthread_join(pgsql_threads_idles[i].thread_id, NULL);
+					pgsql_threads_idles[i].thread_created = false;
+				}
 			}
 #endif /* IDLE_THREADS */
 		}
@@ -3344,13 +3470,15 @@ PgSQL_Threads_Handler::~PgSQL_Threads_Handler() {
 	if (variables.monitor_dbname) { free(variables.monitor_dbname); variables.monitor_dbname = NULL; }
 #if POLARDB_PROXY
 	// PolarDB word-valued knobs.
+	if (variables.polardb_profile) { free(variables.polardb_profile); variables.polardb_profile = NULL; }
 	if (variables.polardb_consistency_mode) { free(variables.polardb_consistency_mode); variables.polardb_consistency_mode = NULL; }
-	if (variables.polardb_wait_timeout_mode) { free(variables.polardb_wait_timeout_mode); variables.polardb_wait_timeout_mode = NULL; }
+	if (variables.polardb_read_target) { free(variables.polardb_read_target); variables.polardb_read_target = NULL; }
+	if (variables.polardb_action_read_fallback) { free(variables.polardb_action_read_fallback); variables.polardb_action_read_fallback = NULL; }
+	if (variables.polardb_action_lsn_timeout) { free(variables.polardb_action_lsn_timeout); variables.polardb_action_lsn_timeout = NULL; }
 	if (variables.polardb_proxy_protocol) { free(variables.polardb_proxy_protocol); variables.polardb_proxy_protocol = NULL; }
-	if (variables.polardb_route_rfq_policy) { free(variables.polardb_route_rfq_policy); variables.polardb_route_rfq_policy = NULL; }
-	if (variables.polardb_reader_death_action) { free(variables.polardb_reader_death_action); variables.polardb_reader_death_action = NULL; }
-	if (variables.polardb_reader_timeout_action) { free(variables.polardb_reader_timeout_action); variables.polardb_reader_timeout_action = NULL; }
-	if (variables.polardb_reader_error_action) { free(variables.polardb_reader_error_action); variables.polardb_reader_error_action = NULL; }
+	if (variables.polardb_action_missing_lsn) { free(variables.polardb_action_missing_lsn); variables.polardb_action_missing_lsn = NULL; }
+	if (variables.polardb_action_replica_loss) { free(variables.polardb_action_replica_loss); variables.polardb_action_replica_loss = NULL; }
+	if (variables.polardb_action_replica_error) { free(variables.polardb_action_replica_error); variables.polardb_action_replica_error = NULL; }
 	if (variables.polardb_proxy_identity_mode) { free(variables.polardb_proxy_identity_mode); variables.polardb_proxy_identity_mode = NULL; }
 	if (variables.polardb_proxy_identity_host) { free(variables.polardb_proxy_identity_host); variables.polardb_proxy_identity_host = NULL; }
 #endif // POLARDB_PROXY
@@ -3397,42 +3525,18 @@ PgSQL_Threads_Handler::~PgSQL_Threads_Handler() {
 
 PgSQL_Thread::~PgSQL_Thread() {
 
-	if (PgHGM) {
-		if (status_variables.pgconnpoll_get) {
-			__sync_fetch_and_add(
-				&PgHGM->status.pgconnpoll_get,
-				static_cast<unsigned long>(status_variables.pgconnpoll_get));
-		}
-		if (status_variables.pgconnpoll_get_ok) {
-			__sync_fetch_and_add(
-				&PgHGM->status.pgconnpoll_get_ok,
-				static_cast<unsigned long>(status_variables.pgconnpoll_get_ok));
-		}
-		if (status_variables.pgconnpoll_push) {
-			__sync_fetch_and_add(
-				&PgHGM->status.pgconnpoll_push,
-				static_cast<unsigned long>(status_variables.pgconnpoll_push));
-		}
-	}
-
 #if POLARDB_PROXY
 	if (PgHGM) {
-		// A return can publish a concrete claim just before shutdown while the
+		// A return can reserve a concrete connection just before shutdown while the
 		// worker still records hostgroup-pending state. Resolve queued wakes first
 		// so cancellation addresses the actual server and releases its snapshot.
-		(void)consume_polardb_reader_claim_wakes();
-		cancel_polardb_reader_claim();
-		polardb_reader_cancel_yield_debt();
-		if (polardb_reader_ownership_lease.active()) {
-			polardb_reader_ownership_lease.reset();
-			POLARDB_THREAD_COUNT_ONE(this, reader_ownership_lease_released);
+		(void)polardb_process_reader_reservation_wakes();
+		polardb_cancel_reader_reservation();
+		if (polardb_reader_retention.active()) {
+			polardb_reader_retention.reset();
+			POLARDB_THREAD_COUNT_ONE(this, reader_pool_retention_cleared);
 		}
 	}
-	// shutdown_threads() sets shutdown_ before workers exit, so live scrapes stop
-	// reading per-thread slots before this destructor folds them into the global
-	// counters. This preserves final shutdown totals without promising safety for
-	// arbitrary runtime thread deletion. The PgHGM guard keeps helper threads safe.
-	polardb_fold_thread_counters_to_global(polardb_status_variables);
 #endif // POLARDB_PROXY
 
 	if (mysql_sessions) {
@@ -3505,9 +3609,34 @@ PgSQL_Thread::~PgSQL_Thread() {
 #endif // IDLE_THREADS
 
 	if (cached_connections) {
-		return_local_connections(true);
+		return_local_connections_for_shutdown();
 		delete cached_connections;
 	}
+
+	if (PgHGM) {
+		if (status_variables.pgconnpoll_get) {
+			__sync_fetch_and_add(
+				&PgHGM->status.pgconnpoll_get,
+				static_cast<unsigned long>(status_variables.pgconnpoll_get));
+		}
+		if (status_variables.pgconnpoll_get_ok) {
+			__sync_fetch_and_add(
+				&PgHGM->status.pgconnpoll_get_ok,
+				static_cast<unsigned long>(status_variables.pgconnpoll_get_ok));
+		}
+		if (status_variables.pgconnpoll_push) {
+			__sync_fetch_and_add(
+				&PgHGM->status.pgconnpoll_push,
+				static_cast<unsigned long>(status_variables.pgconnpoll_push));
+		}
+	}
+
+#if POLARDB_PROXY
+	// Session destruction and cached connection returns above can still update
+	// worker-local counters. Fold only after those final cleanup operations.
+	// shutdown_threads() has already stopped live scrapes from reading this slot.
+	polardb_fold_thread_counters_to_global(polardb_status_variables);
+#endif // POLARDB_PROXY
 
 	unsigned int i;
 	for (i = 0; i < mypolls.len; i++) {
@@ -3624,17 +3753,6 @@ bool PgSQL_Thread::init() {
 	memset(my_idle_conns, 0, sizeof(PgSQL_Connection*) * SESSIONS_FOR_CONNECTIONS_HANDLER);
 	GloPgQPro->init_thread();
 	refresh_variables();
-#if POLARDB_PROXY
-	if (GloPTH && GloPTH->pgsql_threads) {
-		for (unsigned int worker_index = 0;
-				worker_index < GloPTH->num_threads; worker_index++) {
-			if (GloPTH->pgsql_threads[worker_index].worker == this) {
-				polardb_worker_index = worker_index;
-				break;
-			}
-		}
-	}
-#endif // POLARDB_PROXY
 	i = pipe(pipefd);
 	ioctl_FIONBIO(pipefd[0], 1);
 	ioctl_FIONBIO(pipefd[1], 1);
@@ -3982,7 +4100,7 @@ void PgSQL_Thread::run() {
 		}
 #if POLARDB_PROXY
 		if (maintenance_loop && PgHGM) {
-			PgHGM->refresh_polardb_thread_snapshots();
+			PgHGM->polardb_refresh_thread_snapshots();
 		}
 #endif // POLARDB_PROXY
 
@@ -4073,9 +4191,15 @@ void PgSQL_Thread::run() {
 		else {
 #endif // IDLE_THREADS
 			// iterate through all sessions and process the session logic
+#if POLARDB_PROXY
+			polardb_begin_worker_pass();
+#endif
 			process_all_sessions();
 
 			return_local_connections();
+#if POLARDB_PROXY
+			polardb_finish_worker_pass();
+#endif
 #ifdef IDLE_THREADS
 		}
 #endif // IDLE_THREADS
@@ -4089,6 +4213,178 @@ void PgSQL_Thread::run() {
 	}
 }
 // end of ::run()
+
+#if POLARDB_PROXY
+#if POLARDB_PROFILE
+/**
+ * @brief Record a server in the fixed-capacity set of servers touched in this
+ *        worker pass.
+ *
+ * @param server   Server to record.
+ * @param servers  Array holding the servers already seen in this pass.
+ * @param count    In/out number of entries in `servers`. Advanced only when a
+ *                 new entry is inserted.
+ * @param capacity Maximum number of entries `servers` can hold.
+ * @return 0 when the server was already tracked in this pass, 1 when it was
+ *         newly inserted, and -1 when the array is full and the sample could not
+ *         be tracked - callers count that as overflow rather than as a repeat.
+ */
+static int polardb_profile_track_pass_server(
+		PgSQL_SrvC* server, PgSQL_SrvC** servers,
+		unsigned int* count, unsigned int capacity) {
+	for (unsigned int i = 0; i < *count; i++) {
+		if (servers[i] == server) {
+			return 0;
+		}
+	}
+	if (*count == capacity) {
+		return -1;
+	}
+	servers[(*count)++] = server;
+	return 1;
+}
+#endif // POLARDB_PROFILE
+
+void PgSQL_Thread::polardb_begin_worker_pass() {
+	polardb_pass_lsn_update_count = 0;
+	polardb_worker_pass_active = true;
+#if POLARDB_PROFILE
+	polardb_profile_lsn_calls = 0;
+	polardb_profile_lsn_advances = 0;
+	polardb_profile_lsn_shared_updates = 0;
+	polardb_profile_lsn_overflow = 0;
+	polardb_profile_used_count_server_count = 0;
+	polardb_profile_used_count_reads = 0;
+	polardb_profile_used_count_overflow = 0;
+#endif // POLARDB_PROFILE
+}
+
+bool PgSQL_Thread::polardb_track_server_lsn_update(
+		PgSQL_SrvC* server, uint64_t lsn,
+		const PolarDB_WriterScope& writer_scope,
+		uint64_t observed_at_us) {
+	if (!polardb_worker_pass_active || !server || lsn == 0 ||
+			!writer_scope.valid()) {
+		return true;
+	}
+#if POLARDB_PROFILE
+	polardb_profile_lsn_calls++;
+#endif // POLARDB_PROFILE
+	const uint64_t server_instance_id = server->polardb_instance_id;
+	for (unsigned int i = 0; i < polardb_pass_lsn_update_count; i++) {
+		PolarDB_PassLsnUpdate& entry =
+			polardb_pass_lsn_updates[i];
+		if (entry.server_instance_id != server_instance_id ||
+				!entry.writer_scope.matches(writer_scope)) {
+			continue;
+		}
+		// Higher LSNs are immediately visible to other workers. Equal or lower
+		// observations still refresh the freshness timestamp at least once per
+		// millisecond, without touching the shared cache for every query.
+		const bool higher_lsn = lsn > entry.max_lsn;
+		const bool refresh_due =
+			observed_at_us < entry.last_updated_at_us ||
+			observed_at_us - entry.last_updated_at_us >=
+				POLARDB_LSN_UPDATE_MAX_DELAY_US;
+		if (!higher_lsn && !refresh_due) {
+			return false;
+		}
+		if (higher_lsn) {
+			entry.max_lsn = lsn;
+		}
+		entry.last_updated_at_us = observed_at_us;
+#if POLARDB_PROFILE
+		polardb_profile_lsn_shared_updates++;
+#endif // POLARDB_PROFILE
+		return true;
+	}
+	if (polardb_pass_lsn_update_count ==
+			POLARDB_LSN_PASS_CACHE_CAPACITY) {
+		POLARDB_THREAD_COUNT_ONE(this, lsn_update_pass_overflow);
+#if POLARDB_PROFILE
+		polardb_profile_lsn_overflow++;
+		polardb_profile_lsn_shared_updates++;
+#endif // POLARDB_PROFILE
+		return true;
+	}
+	polardb_pass_lsn_updates[polardb_pass_lsn_update_count++] =
+		PolarDB_PassLsnUpdate{
+			server_instance_id, writer_scope, lsn, observed_at_us};
+#if POLARDB_PROFILE
+	polardb_profile_lsn_shared_updates++;
+#endif // POLARDB_PROFILE
+	return true;
+}
+
+void PgSQL_Thread::polardb_finish_worker_pass() {
+	if (!polardb_worker_pass_active) {
+		return;
+	}
+#if POLARDB_PROFILE
+	POLARDB_PROFILE_THREAD_COUNT(
+		this, lsn_update_call, polardb_profile_lsn_calls);
+	POLARDB_PROFILE_THREAD_COUNT(
+		this, lsn_update_advance, polardb_profile_lsn_advances);
+	POLARDB_PROFILE_THREAD_COUNT(
+		this, lsn_update_refresh_only,
+		polardb_profile_lsn_shared_updates -
+			polardb_profile_lsn_advances);
+	POLARDB_PROFILE_THREAD_COUNT(
+		this, lsn_update_shared_update,
+		polardb_profile_lsn_shared_updates);
+	POLARDB_PROFILE_THREAD_COUNT(
+		this, lsn_update_coalesced,
+		polardb_profile_lsn_calls -
+			polardb_profile_lsn_shared_updates);
+	POLARDB_PROFILE_THREAD_COUNT(
+		this, lsn_update_pass_server,
+		polardb_pass_lsn_update_count);
+	POLARDB_PROFILE_THREAD_COUNT(
+		this, lsn_update_pass_repeat,
+		polardb_profile_lsn_calls -
+			polardb_pass_lsn_update_count -
+			polardb_profile_lsn_overflow);
+
+	POLARDB_PROFILE_THREAD_COUNT(
+		this, reader_pool_used_count_read,
+		polardb_profile_used_count_reads);
+	POLARDB_PROFILE_THREAD_COUNT(
+		this, reader_pool_used_count_pass_server,
+		polardb_profile_used_count_server_count);
+	POLARDB_PROFILE_THREAD_COUNT(
+		this, reader_pool_used_count_pass_repeat,
+		polardb_profile_used_count_reads -
+			polardb_profile_used_count_server_count -
+			polardb_profile_used_count_overflow);
+	POLARDB_PROFILE_THREAD_COUNT(
+		this, reader_pool_used_count_pass_overflow,
+		polardb_profile_used_count_overflow);
+#endif // POLARDB_PROFILE
+	polardb_worker_pass_active = false;
+}
+
+#if POLARDB_PROFILE
+void PgSQL_Thread::polardb_profile_note_lsn_update(bool advanced) {
+	if (polardb_worker_pass_active) {
+		polardb_profile_lsn_advances += advanced ? 1 : 0;
+	}
+}
+
+void PgSQL_Thread::polardb_profile_note_pool_used_count_read(
+		PgSQL_SrvC* server) {
+	if (!polardb_worker_pass_active || !server) {
+		return;
+	}
+	polardb_profile_used_count_reads++;
+	if (polardb_profile_track_pass_server(
+			server, polardb_profile_used_count_servers,
+			&polardb_profile_used_count_server_count,
+			POLARDB_PROFILE_PASS_SERVER_CAPACITY) < 0) {
+		polardb_profile_used_count_overflow++;
+	}
+}
+#endif // POLARDB_PROFILE
+#endif // POLARDB_PROXY
 
 #ifdef IDLE_THREADS
 void PgSQL_Thread::idle_thread_to_kill_idle_sessions() {
@@ -4521,520 +4817,6 @@ void PgSQL_Thread::ProcessAllSessions_MaintenanceLoop(PgSQL_Session * sess, unsi
 	}
 }
 
-#if POLARDB_PROXY
-bool PgSQL_Thread::polardb_reader_wait_scope_active(
-		uint64_t scope_hash) const {
-	if (scope_hash == 0) {
-		return false;
-	}
-	return std::any_of(
-		polardb_reader_capacity_wait_scopes.begin(),
-		polardb_reader_capacity_wait_scopes.end(),
-		[scope_hash](const PolarDB_ReaderWaitScopeCount& scope) {
-			return scope.scope_hash == scope_hash && scope.count > 0;
-		});
-}
-
-bool PgSQL_Thread::polardb_reader_connection_matches_wait(
-		PgSQL_Connection* conn, PgSQL_Session* waiting_session,
-		bool active_connection) const {
-	if (!conn || !waiting_session || !PgHGM || !conn->parent ||
-			!conn->reusable || conn->IsActiveTransaction() ||
-			conn->MultiplexDisabled() || conn->polardb_txn_split_xids_dirty ||
-			(!active_connection && conn->async_state_machine != ASYNC_IDLE)) {
-		return false;
-	}
-	const auto& wait = waiting_session->polardb_reader_capacity_wait;
-	if (!wait.active || wait.claim_profile_generation == 0 ||
-			wait.claim_pool_key.empty() ||
-			conn->polardb_startup_profile_generation !=
-				wait.claim_profile_generation ||
-			conn->polardb_pool_key != wait.claim_pool_key) {
-		return false;
-	}
-	PgSQL_SrvC* server = static_cast<PgSQL_SrvC*>(conn->parent);
-	return waiting_session->current_hostgroup >= 0 &&
-		PgHGM->polardb_reader_claim_server_eligible(
-			static_cast<unsigned int>(waiting_session->current_hostgroup),
-			server, waiting_session->polardb_query.reader_plan,
-			waiting_session->polardb_query.wait.spec);
-}
-
-bool PgSQL_Thread::polardb_reader_connection_matches_lease(
-		PgSQL_Connection* conn) const {
-	return polardb_reader_wait_scope_active(
-			polardb_reader_ownership_lease.scope_hash) &&
-		!polardb_reader_ownership_lease.yield_pending &&
-		polardb_reader_connection_matches_lease_contract(conn, false);
-}
-
-bool PgSQL_Thread::polardb_reader_connection_matches_lease_contract(
-		PgSQL_Connection* conn, bool active_connection) const {
-	if (!conn || !PgHGM || !conn->parent ||
-			!polardb_reader_ownership_lease.active() ||
-			!conn->reusable || conn->IsActiveTransaction() ||
-			conn->MultiplexDisabled() || conn->polardb_txn_split_xids_dirty ||
-			(!active_connection &&
-				conn->async_state_machine != ASYNC_IDLE) ||
-			conn->polardb_startup_profile_generation !=
-				polardb_reader_ownership_lease.profile_generation ||
-			conn->polardb_pool_key !=
-				polardb_reader_ownership_lease.pool_key) {
-		return false;
-	}
-	return PgHGM->polardb_reader_claim_server_eligible(
-		polardb_reader_ownership_lease.hostgroup_id,
-		static_cast<PgSQL_SrvC*>(conn->parent),
-		polardb_reader_ownership_lease.reader_plan,
-		polardb_reader_ownership_lease.wait_spec);
-}
-
-void PgSQL_Thread::polardb_reader_adopt_ownership_lease(
-		PgSQL_Session* sess) {
-	if (!sess || polardb_reader_ownership_lease.active()) {
-		return;
-	}
-	const auto& wait = sess->polardb_reader_capacity_wait;
-	if (!wait.active || sess->current_hostgroup < 0 ||
-			!wait.claim_server || !wait.claim_server->myhgc ||
-			wait.claim_profile_generation == 0 || wait.claim_pool_key.empty()) {
-		return;
-	}
-	polardb_reader_ownership_lease.scope_hash = wait.scope_hash;
-	polardb_reader_ownership_lease.hostgroup = wait.claim_server->myhgc;
-	polardb_reader_ownership_lease.hostgroup_id =
-		static_cast<unsigned int>(sess->current_hostgroup);
-	polardb_reader_ownership_lease.profile_generation =
-		wait.claim_profile_generation;
-	polardb_reader_ownership_lease.pool_key = wait.claim_pool_key;
-	polardb_reader_ownership_lease.reader_plan =
-		sess->polardb_query.reader_plan;
-	polardb_reader_ownership_lease.wait_spec =
-		sess->polardb_query.wait.spec;
-	polardb_reader_ownership_lease.yield_pending = false;
-	POLARDB_THREAD_COUNT_ONE(this, reader_ownership_lease_started);
-}
-
-void PgSQL_Thread::polardb_reader_cancel_yield_debt() {
-	if (!polardb_reader_ownership_lease.active() ||
-			!polardb_reader_ownership_lease.yield_pending) {
-		return;
-	}
-	polardb_reader_ownership_lease.yield_pending = false;
-	POLARDB_THREAD_COUNT_ONE(this, reader_yield_debt_cancelled);
-	if (!polardb_reader_wait_scope_active(
-			polardb_reader_ownership_lease.scope_hash)) {
-		polardb_reader_ownership_lease.reset();
-		POLARDB_THREAD_COUNT_ONE(this, reader_ownership_lease_released);
-	}
-}
-
-PolarDB_ReaderYieldResult PgSQL_Thread::polardb_reader_fulfill_yield_debt(
-		PgSQL_Connection* conn) {
-	if (!polardb_reader_ownership_lease.active() ||
-			!polardb_reader_ownership_lease.yield_pending || !PgHGM ||
-			!polardb_reader_connection_matches_lease_contract(conn, false)) {
-		polardb_reader_cancel_yield_debt();
-		return PolarDB_ReaderYieldResult::CONNECTION_INVALID;
-	}
-	const PgSQL_PoolMatchKey match_key = pgsql_pool_match_key(
-		polardb_reader_ownership_lease.profile_generation,
-		polardb_reader_ownership_lease.pool_key);
-	const PolarDB_ReaderYieldResult result =
-		PgHGM->yield_connection_to_reader_claim(
-			conn, match_key, polardb_worker_index);
-	if (result != PolarDB_ReaderYieldResult::CLAIM_PUBLISHED) {
-		polardb_reader_cancel_yield_debt();
-		return result;
-	}
-
-	polardb_reader_ownership_lease.yield_pending = false;
-	POLARDB_THREAD_COUNT_ONE(this, reader_yield_debt_fulfilled);
-	POLARDB_THREAD_COUNT_ONE(this, reader_ownership_lease_yielded);
-	if (!polardb_reader_wait_scope_active(
-			polardb_reader_ownership_lease.scope_hash)) {
-		polardb_reader_ownership_lease.reset();
-		POLARDB_THREAD_COUNT_ONE(this, reader_ownership_lease_released);
-	}
-	return result;
-}
-
-bool PgSQL_Thread::polardb_reader_set_yield_debt(
-		PgSQL_Connection* conn) {
-	if (!polardb_reader_ownership_lease.active() ||
-			polardb_worker_index == UINT_MAX ||
-			!polardb_reader_connection_matches_lease_contract(conn, false)) {
-		return false;
-	}
-	if (polardb_reader_ownership_lease.yield_pending) {
-		return true;
-	}
-	if (!polardb_reader_ownership_lease.hostgroup->
-			has_reader_claim_demand_fast()) {
-		return false;
-	}
-	POLARDB_THREAD_COUNT_ONE(this, reader_yield_debt_demand_observed);
-	polardb_reader_ownership_lease.yield_pending = true;
-	POLARDB_THREAD_COUNT_ONE(this, reader_yield_debt_set);
-	return true;
-}
-
-PolarDB_ReaderOwnership PgSQL_Thread::polardb_reader_ownership(
-		PgSQL_Session* waiting_session) {
-	if (!waiting_session ||
-			!waiting_session->polardb_reader_capacity_wait.active) {
-		return PolarDB_ReaderOwnership::NONE;
-	}
-	const auto& wait = waiting_session->polardb_reader_capacity_wait;
-	if (polardb_reader_claim.published() &&
-			polardb_reader_claim.scope_hash == wait.scope_hash &&
-			polardb_reader_claim.profile_generation ==
-				wait.claim_profile_generation &&
-			polardb_reader_claim.pool_key == wait.claim_pool_key &&
-			polardb_reader_claim.server && PgHGM &&
-			waiting_session->current_hostgroup >= 0 &&
-			PgHGM->polardb_reader_claim_server_eligible(
-				static_cast<unsigned int>(waiting_session->current_hostgroup),
-				polardb_reader_claim.server,
-				waiting_session->polardb_query.reader_plan,
-				waiting_session->polardb_query.wait.spec)) {
-		return PolarDB_ReaderOwnership::CLAIM;
-	}
-	if (cached_connections) {
-		for (unsigned int index = 0; index < cached_connections->len; index++) {
-			PgSQL_Connection* conn = static_cast<PgSQL_Connection*>(
-				cached_connections->index(index));
-			if (polardb_reader_connection_matches_wait(
-					conn, waiting_session, false)) {
-				return PolarDB_ReaderOwnership::LOCAL;
-			}
-		}
-	}
-	for (unsigned int index = 0; index < mysql_sessions->len; index++) {
-		PgSQL_Session* owner = static_cast<PgSQL_Session*>(
-			mysql_sessions->index(index));
-		PgSQL_Connection* conn = owner && owner->mybe &&
-			owner->mybe->server_myds
-			? owner->mybe->server_myds->myconn : nullptr;
-		if (polardb_reader_connection_matches_wait(
-				conn, waiting_session, true)) {
-			return PolarDB_ReaderOwnership::ACTIVE;
-		}
-	}
-	return PolarDB_ReaderOwnership::NONE;
-}
-
-bool PgSQL_Thread::register_polardb_reader_claim(PgSQL_Session* sess) {
-	if (!sess || polardb_reader_claim.active() ||
-			polardb_worker_index == UINT_MAX) {
-		return false;
-	}
-	auto& wait = sess->polardb_reader_capacity_wait;
-	if (!wait.active ||
-			wait.last_status != PolarDB_ReaderStatus::READER_GROUP_BUSY ||
-			!wait.claim_server || !wait.claim_server_snapshot ||
-			wait.claim_profile_generation == 0 || wait.claim_pool_key.empty()) {
-		return false;
-	}
-	const PolarDB_ReaderOwnership ownership =
-		polardb_reader_ownership(sess);
-	switch (ownership) {
-	case PolarDB_ReaderOwnership::LOCAL:
-		POLARDB_THREAD_COUNT_ONE(this, reader_claim_ownership_local);
-		polardb_reader_adopt_ownership_lease(sess);
-		break;
-	case PolarDB_ReaderOwnership::ACTIVE:
-		POLARDB_THREAD_COUNT_ONE(this, reader_claim_ownership_active);
-		polardb_reader_adopt_ownership_lease(sess);
-		break;
-	case PolarDB_ReaderOwnership::CLAIM:
-		POLARDB_THREAD_COUNT_ONE(this, reader_claim_ownership_claim);
-		break;
-	case PolarDB_ReaderOwnership::NONE:
-		POLARDB_THREAD_COUNT_ONE(this, reader_claim_ownership_zero);
-		break;
-	}
-	if (!polardb_reader_claim_should_register(wait.last_status, ownership)) {
-		return false;
-	}
-	static std::atomic<uint64_t> next_token{1};
-	uint64_t token = next_token.fetch_add(1, std::memory_order_relaxed);
-	if (token == 0) {
-		token = next_token.fetch_add(1, std::memory_order_relaxed);
-	}
-	const PgSQL_PoolMatchKey match_key = pgsql_pool_match_key(
-		wait.claim_profile_generation, wait.claim_pool_key);
-	PgSQL_HGC* hostgroup = wait.claim_server->myhgc;
-	// Capacity waiting is entered only by ordinary demand acquisition, whose
-	// ReaderPool call has no excluded endpoint. Pooled-only split/failure retries
-	// may use exclusions but do not enter this worker wait/claim path.
-	if (!hostgroup || !hostgroup->register_reader_claim_demand(
-			polardb_worker_index, token, wait.scope_hash, match_key,
-			sess->polardb_query.reader_plan,
-			sess->polardb_query.wait.spec)) {
-		return false;
-	}
-	polardb_reader_claim.token = token;
-	polardb_reader_claim.session_id = sess->thread_session_id;
-	polardb_reader_claim.scope_hash = wait.scope_hash;
-	polardb_reader_claim.hostgroup = hostgroup;
-	polardb_reader_claim.server = nullptr;
-	polardb_reader_claim.server_snapshot =
-		std::move(wait.claim_server_snapshot);
-	polardb_reader_claim.profile_generation =
-		wait.claim_profile_generation;
-	polardb_reader_claim.pool_key = wait.claim_pool_key;
-	return true;
-}
-
-void PgSQL_Thread::cancel_polardb_reader_claim(uint32_t session_id) {
-	if (!polardb_reader_claim.active() ||
-			(session_id != 0 && polardb_reader_claim.session_id != session_id)) {
-		return;
-	}
-	PgSQL_HGC* hostgroup = polardb_reader_claim.hostgroup;
-	PgSQL_SrvC* server = polardb_reader_claim.server;
-	const unsigned int worker_index = polardb_worker_index;
-	const uint64_t token = polardb_reader_claim.token;
-	std::shared_ptr<const void> server_snapshot =
-		std::move(polardb_reader_claim.server_snapshot);
-	(void)server_snapshot;
-	polardb_reader_claim.reset();
-	PolarDB_ReaderClaimWake next_wake;
-	const bool cancelled = server
-		? server->cancel_reader_claim(worker_index, token, &next_wake)
-		: hostgroup && hostgroup->cancel_reader_claim_demand(
-			worker_index, token);
-	if (cancelled && PgHGM && next_wake.valid()) {
-		PgHGM->signal_polardb_reader_claim(next_wake.server, next_wake);
-	}
-}
-
-PgSQL_Connection* PgSQL_Thread::take_polardb_reader_claim(
-		PgSQL_Session* sess) {
-	if (!sess || !polardb_reader_claim.published() ||
-			polardb_reader_claim.session_id != sess->thread_session_id) {
-		return nullptr;
-	}
-	PgSQL_SrvC* server = polardb_reader_claim.server;
-	const unsigned int hostgroup_id = server && server->myhgc
-		? server->myhgc->hid : UINT_MAX;
-	PgSQL_PoolMatchKey current_key;
-	const PgSQL_PoolMatchKey registered_key = pgsql_pool_match_key(
-		polardb_reader_claim.profile_generation,
-		polardb_reader_claim.pool_key);
-	const bool current = PgHGM && hostgroup_id != UINT_MAX &&
-		sess->current_hostgroup == static_cast<int>(hostgroup_id) &&
-		PgHGM->polardb_reader_claim_match_key(
-			hostgroup_id, sess, sess->polardb_query.wait.spec, &current_key) &&
-		current_key == registered_key &&
-		PgHGM->polardb_reader_claim_server_eligible(
-			hostgroup_id, server, sess->polardb_query.reader_plan,
-			sess->polardb_query.wait.spec);
-	if (!current) {
-		cancel_polardb_reader_claim(sess->thread_session_id);
-		return nullptr;
-	}
-	const PolarDB_ReaderClaimTakeResult result = server->take_reader_claim(
-		polardb_worker_index, polardb_reader_claim.token);
-	if (result.status == PolarDB_ReaderClaimTakeStatus::PENDING) {
-		return nullptr;
-	}
-	if (result.status == PolarDB_ReaderClaimTakeStatus::RETIRED) {
-		POLARDB_THREAD_COUNT_ONE(this, reader_claim_missing);
-		POLARDB_THREAD_COUNT_ONE(this, reader_claim_missing_retired);
-		polardb_reader_claim.reset();
-		return nullptr;
-	}
-	if (result.status == PolarDB_ReaderClaimTakeStatus::MISSING) {
-		POLARDB_THREAD_COUNT_ONE(this, reader_claim_missing);
-		POLARDB_THREAD_COUNT_ONE(this, reader_claim_missing_unknown);
-		polardb_reader_claim.reset();
-		return nullptr;
-	}
-	if (polardb_reader_ownership_lease.active()) {
-		POLARDB_THREAD_COUNT_ONE(this, reader_ownership_lease_released);
-	}
-	polardb_reader_ownership_lease.scope_hash =
-		polardb_reader_claim.scope_hash;
-	polardb_reader_ownership_lease.hostgroup =
-		polardb_reader_claim.hostgroup;
-	polardb_reader_ownership_lease.hostgroup_id = hostgroup_id;
-	polardb_reader_ownership_lease.profile_generation =
-		polardb_reader_claim.profile_generation;
-	polardb_reader_ownership_lease.pool_key =
-		polardb_reader_claim.pool_key;
-	polardb_reader_ownership_lease.reader_plan =
-		sess->polardb_query.reader_plan;
-	polardb_reader_ownership_lease.wait_spec =
-		sess->polardb_query.wait.spec;
-	polardb_reader_ownership_lease.yield_pending = false;
-	POLARDB_THREAD_COUNT_ONE(this, reader_ownership_lease_started);
-	polardb_reader_claim.reset();
-	return result.conn;
-}
-
-bool PgSQL_Thread::notify_polardb_reader_claim(
-		uint64_t token, PgSQL_SrvC* server,
-		std::shared_ptr<const void> server_snapshot) {
-	if (shutdown || token == 0 || !server || !server_snapshot) {
-		return false;
-	}
-	std::lock_guard<std::mutex> lock(polardb_reader_claim_wake_mutex);
-	polardb_reader_claim_wakes.push_back(
-		PolarDB_ReaderClaimWakeNotification{
-			token, server, std::move(server_snapshot)});
-	if (polardb_reader_claim_wake_pending.exchange(
-			true, std::memory_order_acq_rel)) {
-		POLARDB_THREAD_COUNT_ONE(this, reader_claim_wake_coalesced);
-		return true;
-	}
-	const unsigned char byte = 0;
-	if (write(pipefd[1], &byte, 1) == 1 || errno == EAGAIN) {
-		return true;
-	}
-	polardb_reader_claim_wakes.pop_back();
-	polardb_reader_claim_wake_pending.store(false, std::memory_order_release);
-	return false;
-}
-
-bool PgSQL_Thread::consume_polardb_reader_claim_wakes() {
-	if (!polardb_reader_claim_wake_pending.exchange(
-			false, std::memory_order_acq_rel)) {
-		return false;
-	}
-	std::vector<PolarDB_ReaderClaimWakeNotification> wakes;
-	{
-		std::lock_guard<std::mutex> lock(polardb_reader_claim_wake_mutex);
-		wakes.swap(polardb_reader_claim_wakes);
-	}
-	bool claim_ready = false;
-	for (PolarDB_ReaderClaimWakeNotification& wake : wakes) {
-		if (polardb_reader_claim.active() &&
-				polardb_reader_claim.token == wake.token) {
-			polardb_reader_claim.server = wake.server;
-			polardb_reader_claim.server_snapshot =
-				std::move(wake.server_snapshot);
-			claim_ready = true;
-			continue;
-		}
-		PolarDB_ReaderClaimWake next_wake;
-		if (wake.server->cancel_reader_claim(
-				polardb_worker_index, wake.token, &next_wake) && PgHGM &&
-				next_wake.valid()) {
-			PgHGM->signal_polardb_reader_claim(
-				next_wake.server, std::move(next_wake));
-		}
-	}
-	return claim_ready;
-}
-
-void PgSQL_Thread::process_polardb_reader_capacity_waiters(
-		bool deadline_due, bool claim_ready) {
-	POLARDB_THREAD_COUNT_ONE(this, reader_capacity_retry_pass);
-	if (deadline_due) {
-		POLARDB_THREAD_COUNT_ONE(this, reader_capacity_retry_pass_deadline);
-	} else {
-		POLARDB_THREAD_COUNT_ONE(this, reader_capacity_retry_pass_local);
-	}
-	polardb_reader_capacity_retry_sessions.clear();
-	polardb_reader_capacity_blocked_scopes.clear();
-	polardb_reader_capacity_retry_sessions.reserve(
-		polardb_reader_capacity_waiter_count);
-	for (unsigned int n = 0; n < mysql_sessions->len; n++) {
-		PgSQL_Session* sess =
-			static_cast<PgSQL_Session*>(mysql_sessions->index(n));
-		if (sess && sess->healthy && !sess->killed &&
-				sess->polardb_reader_capacity_wait.active) {
-			polardb_reader_capacity_retry_sessions.push_back(sess);
-		}
-	}
-	const uint32_t claim_session_id = claim_ready && polardb_reader_claim.active()
-		? polardb_reader_claim.session_id : 0;
-	std::sort(polardb_reader_capacity_retry_sessions.begin(),
-		polardb_reader_capacity_retry_sessions.end(),
-		[claim_session_id](const PgSQL_Session* lhs, const PgSQL_Session* rhs) {
-			const bool lhs_has_claim = claim_session_id != 0 &&
-				lhs->thread_session_id == claim_session_id;
-			const bool rhs_has_claim = claim_session_id != 0 &&
-				rhs->thread_session_id == claim_session_id;
-			if (lhs_has_claim != rhs_has_claim) {
-				return lhs_has_claim;
-			}
-			const auto& left = lhs->polardb_reader_capacity_wait;
-			const auto& right = rhs->polardb_reader_capacity_wait;
-			return left.started_at_us != right.started_at_us
-				? left.started_at_us < right.started_at_us
-				: lhs->thread_session_id < rhs->thread_session_id;
-		});
-
-	for (PgSQL_Session* sess : polardb_reader_capacity_retry_sessions) {
-		if (!deadline_due && !claim_ready &&
-				polardb_reader_local_connection_count == 0) {
-			break;
-		}
-		auto& wait = sess->polardb_reader_capacity_wait;
-		if (!wait.active || !sess->healthy || sess->killed) {
-			continue;
-		}
-		if (polardb_reader_capacity_scope_blocked(
-				polardb_reader_capacity_blocked_scopes, wait.scope_hash)) {
-			POLARDB_THREAD_COUNT_ONE(this, reader_capacity_retry_scope_skipped);
-			continue;
-		}
-
-		wait.retry_admitted = true;
-		wait.result_valid = false;
-		sess->to_process = 1;
-		POLARDB_THREAD_COUNT_ONE(this, reader_capacity_retry_attempt);
-		const int rc = sess->handler();
-		wait.retry_admitted = false;
-		if (rc == -1 || sess->killed) {
-			char buf[1024];
-			snprintf(buf, sizeof(buf), "%s:%d:%s()", __FILE__, __LINE__, __func__);
-			GloPgSQL_Logger->log_audit_entry(
-				PGSQL_LOG_EVENT_TYPE::AUTH_CLOSE, sess, NULL, buf);
-			(void)unregister_session(sess);
-			delete sess;
-			continue;
-		}
-		if (!wait.result_valid) {
-			continue;
-		}
-		if (wait.last_status == PolarDB_ReaderStatus::ACQUIRED) {
-			POLARDB_THREAD_COUNT_ONE(this, reader_capacity_retry_acquired);
-		} else if (wait.last_status ==
-				PolarDB_ReaderStatus::READER_GROUP_BUSY) {
-			POLARDB_THREAD_COUNT_ONE(this, reader_capacity_retry_group_busy);
-			polardb_reader_capacity_note_result(
-				polardb_reader_capacity_blocked_scopes,
-				wait.scope_hash, wait.last_status);
-			(void)register_polardb_reader_claim(sess);
-		} else if (wait.last_status == PolarDB_ReaderStatus::READER_BUSY) {
-			POLARDB_THREAD_COUNT_ONE(this, reader_capacity_retry_selected_busy);
-		}
-	}
-	if (deadline_due && polardb_reader_capacity_waiter_count > 0) {
-		polardb_reader_capacity_retry_at_us =
-			monotonic_time() + polardb_reader_capacity_retry_delay_us(
-				pgsql_thread___connect_retries_delay);
-	}
-}
-
-void PgSQL_Thread::tune_polardb_reader_capacity_retry_timeout() {
-	if (polardb_reader_capacity_waiter_count == 0) {
-		return;
-	}
-	if (polardb_reader_capacity_retry_at_us == 0) {
-		polardb_reader_capacity_retry_at_us =
-			curtime + polardb_reader_capacity_retry_delay_us(
-				pgsql_thread___connect_retries_delay);
-	}
-	mypolls.poll_timeout = polardb_reader_capacity_retry_poll_timeout(
-		polardb_reader_capacity_retry_at_us, curtime,
-		mypolls.poll_timeout);
-}
-#endif // POLARDB_PROXY
 
 void PgSQL_Thread::process_all_sessions() {
 	unsigned int n;
@@ -5055,7 +4837,7 @@ void PgSQL_Thread::process_all_sessions() {
 		polardb_reader_capacity_waiter_count > 0 &&
 		polardb_reader_capacity_retry_at_us != 0 &&
 		curtime >= polardb_reader_capacity_retry_at_us;
-	const bool reader_claim_ready = consume_polardb_reader_claim_wakes();
+	const bool reader_pool_reservation_ready = polardb_process_reader_reservation_wakes();
 #endif // POLARDB_PROXY
 	if (sess_sort && mysql_sessions->len > 3 && partition_wanted) {
 		ProcessAllSessions_Partition<PgSQL_Session>();
@@ -5182,11 +4964,11 @@ void PgSQL_Thread::process_all_sessions() {
 		polardb_reader_local_added_this_pass &&
 		polardb_reader_local_connection_count > 0;
 	if (reader_capacity_retry_due || reader_local_capacity_available ||
-			reader_claim_ready) {
-		process_polardb_reader_capacity_waiters(
-			reader_capacity_retry_due, reader_claim_ready);
+			reader_pool_reservation_ready) {
+		polardb_process_reader_capacity_waiters(
+			reader_capacity_retry_due, reader_pool_reservation_ready);
 	}
-	tune_polardb_reader_capacity_retry_timeout();
+	polardb_schedule_reader_capacity_retry();
 #endif // POLARDB_PROXY
 	if (maintenance_loop) {
 		unsigned int total_active_transactions_tmp;
@@ -5247,11 +5029,12 @@ void PgSQL_Thread::refresh_variables() {
 	// PolarDB session-consistency knobs. The integer/bool knobs refresh directly;
 	// parsed startup values are copied as one coherent committed value.
 	const PolarDB_ParsedGlobalConfigValue polardb_global_config =
-		GloPTH->polardb_global_config_locked();
-	pgsql_thread___polardb_lag_bytes = GloPTH->get_variable_int((char*)"polardb_lag_bytes");
-	pgsql_thread___polardb_lag_ms = GloPTH->get_variable_int((char*)"polardb_lag_ms");
-	pgsql_thread___polardb_lag_wait_ms = GloPTH->get_variable_int((char*)"polardb_lag_wait_ms");
-	pgsql_thread___polardb_lsn_freshness_ms = GloPTH->get_variable_int((char*)"polardb_lsn_freshness_ms");
+		GloPTH->get_polardb_global_config_unlocked();
+	pgsql_thread___polardb_max_reader_lsn_gap_bytes = GloPTH->get_variable_int((char*)"polardb_max_reader_lsn_gap_bytes");
+	pgsql_thread___polardb_max_reader_lag_ms = GloPTH->get_variable_int((char*)"polardb_max_reader_lag_ms");
+	pgsql_thread___polardb_lsn_wait_timeout_ms =
+		polardb_global_config.lsn_wait_timeout_ms;
+	pgsql_thread___polardb_reader_lsn_max_age_ms = GloPTH->get_variable_int((char*)"polardb_reader_lsn_max_age_ms");
 	pgsql_thread___polardb_lag_cap_freshness_ms =
 		GloPTH->get_variable_int((char*)"polardb_lag_cap_freshness_ms");
 	pgsql_thread___polardb_reader_lsn_lag_range_bytes =
@@ -5268,46 +5051,33 @@ void PgSQL_Thread::refresh_variables() {
 		GloPTH->get_variable_int((char*)"polardb_output_coalesce_bytes");
 	pgsql_thread___polardb_output_coalesce_packets =
 		GloPTH->get_variable_int((char*)"polardb_output_coalesce_packets");
-	pgsql_thread___polardb_monitor_lsn_updates = (bool)GloPTH->get_variable_int((char*)"polardb_monitor_lsn_updates");
-	pgsql_thread___polardb_lazy_warmup_split = (bool)GloPTH->get_variable_int((char*)"polardb_lazy_warmup_split");
+	pgsql_thread___polardb_monitor_lsn_updates =
+		polardb_global_config.monitor_lsn_updates;
+	pgsql_thread___polardb_lazy_warmup_split =
+		polardb_global_config.split_warmup;
 	pgsql_thread___polardb_writev_direct = (bool)GloPTH->get_variable_int((char*)"polardb_writev_direct");
 	pgsql_thread___polardb_result_fast_forward = (bool)GloPTH->get_variable_int((char*)"polardb_result_fast_forward");
 	pgsql_thread___polardb_split_warmup_max_connections_per_request =
-		GloPTH->get_variable_int((char*)"polardb_split_warmup_max_connections_per_request");
+		polardb_global_config.split_warmup_max_connections_per_request;
+	pgsql_thread___polardb_profile_off =
+		polardb_profile_from_int(polardb_global_config.profile) ==
+			PolarDB_Profile::OFF;
 	pgsql_thread___polardb_consistency_mode =
 		polardb_global_config.consistency_mode;
-	{
-		char* wm = GloPTH->get_variable_string((char*)"polardb_wait_timeout_mode");
-		pgsql_thread___polardb_wait_timeout_mode =
-			polardb_wait_mode_from_string(
-				wm, static_cast<int>(PolarDB_WaitMode::BEST_EFFORT));
-		if (wm) free(wm);
-	}
+	pgsql_thread___polardb_read_target =
+		polardb_global_config.read_target;
+	pgsql_thread___polardb_action_read_fallback =
+		polardb_global_config.read_fallback_action;
+	pgsql_thread___polardb_action_missing_lsn =
+		polardb_global_config.missing_lsn_action;
+	pgsql_thread___polardb_action_lsn_timeout =
+		polardb_global_config.lsn_wait_timeout_action;
+	pgsql_thread___polardb_action_replica_loss =
+		polardb_global_config.replica_loss_action;
+	pgsql_thread___polardb_action_replica_error =
+		polardb_global_config.replica_error_action;
 	pgsql_thread___polardb_proxy_protocol = static_cast<int>(
 		polardb_global_config.startup.proxy_protocol);
-	{
-		char* policy = GloPTH->get_variable_string((char*)"polardb_route_rfq_policy");
-		pgsql_thread___polardb_route_rfq_policy = polardb_route_rfq_policy_from_string(policy);
-		if (policy) free(policy);
-	}
-	{
-		char* action = GloPTH->get_variable_string((char*)"polardb_reader_death_action");
-		pgsql_thread___polardb_reader_death_action = polardb_reader_action_from_string(
-			action, static_cast<int>(PolarDB_ReaderAction::RETRY));
-		if (action) free(action);
-	}
-	{
-		char* action = GloPTH->get_variable_string((char*)"polardb_reader_timeout_action");
-		pgsql_thread___polardb_reader_timeout_action = polardb_reader_action_from_string(
-			action, static_cast<int>(PolarDB_ReaderAction::RETRY));
-		if (action) free(action);
-	}
-	{
-		char* action = GloPTH->get_variable_string((char*)"polardb_reader_error_action");
-		pgsql_thread___polardb_reader_error_action = polardb_reader_action_from_string(
-			action, static_cast<int>(PolarDB_ReaderAction::FORWARD));
-		if (action) free(action);
-	}
 	pgsql_thread___polardb_proxy_identity_mode = static_cast<int>(
 		polardb_global_config.startup.identity_mode);
 	if (pgsql_thread___polardb_proxy_identity_host) free(pgsql_thread___polardb_proxy_identity_host);
@@ -5744,8 +5514,23 @@ void PgSQL_Thread::listener_handle_new_connection(PgSQL_Data_Stream * myds, unsi
 }
 
 #if POLARDB_PROXY
-// Append PolarDB counters to the global status result. The counter list is the
-// single export table for the LSN consistency and transaction-split surfaces.
+/**
+ * @brief Append PolarDB counters to the global status result.
+ *
+ * The counter list is the single export table for the LSN consistency and
+ * transaction-split surfaces.
+ *
+ * @param handler Handler used to aggregate per-worker counters. Every
+ *                thread-counter row calls handler->get_polardb_counter(), which
+ *                takes polardb_worker_lifecycle_mutex_ once per row, so the
+ *                caller must not already hold that mutex and should expect work
+ *                proportional to rows x worker threads.
+ * @param result  Result set the rows are appended to.
+ * @param pta     Row buffer with room for 2 column pointers; reused for every
+ *                row, so the strings it points at must be consumed by add_row().
+ * @param buf     Scratch buffer large enough to hold a formatted %llu; also
+ *                reused for every row.
+ */
 static void polardb_export_stats(PgSQL_Threads_Handler* handler, SQLite3_result* result, char** pta, char* buf) {
 	auto thread_counter = [handler](
 		PolarDB_ThreadStatusVariable idx,
@@ -7007,9 +6792,10 @@ unsigned long long PgSQL_Threads_Handler::get_polardb_counter(
 	PolarDB_ThreadStatusVariable idx,
 	std::atomic<unsigned long long>& global_counter)
 {
+	std::lock_guard<std::mutex> lifecycle_lock(
+		polardb_worker_lifecycle_mutex_);
 	unsigned long long total = global_counter.load(std::memory_order_relaxed);
-	const bool aggregate_max =
-		idx == polardb_st_var_reader_capacity_wait_max_us;
+	const bool aggregate_max = polardb_thread_counter_aggregates_max(idx);
 	if ((__sync_fetch_and_add(&status_variables.threads_initialized, 0) == 0) ||
 			this->shutdown_) {
 		return total;
@@ -7019,8 +6805,12 @@ unsigned long long PgSQL_Threads_Handler::get_polardb_counter(
 		if (!pgsql_threads) break;
 		PgSQL_Thread* thr = (PgSQL_Thread*)pgsql_threads[i].worker;
 		if (thr) {
-			const unsigned long long value = __sync_fetch_and_add(
-				&(thr->polardb_status_variables.stvar[idx]), 0);
+			// The lifecycle lock keeps the worker slot valid. A load is enough
+			// for approximate status reporting and does not take exclusive
+			// ownership of the worker's counter cache line.
+			const unsigned long long value = __atomic_load_n(
+				&(thr->polardb_status_variables.stvar[idx]),
+				__ATOMIC_RELAXED);
 			if (aggregate_max) {
 				total = std::max(total, value);
 			} else {
@@ -7200,14 +6990,52 @@ PgSQL_Connection* PgSQL_Thread::get_MyConn_local(unsigned int _hid, PgSQL_Sessio
 	unsigned int i;
 	std::vector<PgSQL_SrvC*> parents; // this is a vector of srvers that needs to be excluded in case gtid_uuid is used
 	PgSQL_Connection* c = NULL;
+#if POLARDB_PROXY
+	const bool polardb_hostgroup =
+		PgHGM && PgHGM->is_polardb_hostgroup(_hid);
+	PolarDB_StartupProfile startup_profile;
+	PolarDB_StartupClientContext startup_client;
+	const PolarDB_StartupClientContext* startup_client_ptr = nullptr;
+	bool startup_request_ready = false;
+#endif // POLARDB_PROXY
 	for (i = 0; i < cached_connections->len; i++) {
 		c = (PgSQL_Connection*)cached_connections->index(i);
+		if (!c || !c->parent || !c->parent->myhgc ||
+				c->parent->myhgc->hid != _hid) {
+			continue;
+		}
 #if POLARDB_PROXY
 		if (!c->polardb_pool_key.empty()) {
 			continue;
 		}
+		// Removing a PolarDB hostgroup mapping does not make an RFQ-started
+		// backend compatible with ordinary PostgreSQL sessions.
+		if (!polardb_hostgroup &&
+				c->polardb_startup_settings_set &&
+				c->polardb_startup_profile.emits_startup_params()) {
+			continue;
+		}
+		if (polardb_hostgroup) {
+			if (!startup_request_ready) {
+				startup_profile =
+					PgHGM->polardb_startup_profile_for_hostgroup(
+						_hid, pgsql_thread___polardb_proxy_protocol);
+				if (startup_profile.emits_startup_params() &&
+						polardb_startup_client_from_session(
+							sess, &startup_client)) {
+					startup_client_ptr = &startup_client;
+				}
+				startup_request_ready = true;
+			}
+			if (!polardb_connection_startup_settings_match(
+					c, startup_profile, startup_client_ptr,
+					pgsql_thread___polardb_startup_config_generation,
+					pgsql_thread___polardb_proxy_identity_mode)) {
+				continue;
+			}
+		}
 #endif // POLARDB_PROXY
-		if (c->parent->myhgc->hid == _hid && sess->client_myds->myconn->has_same_connection_options(c)) { // options are all identical
+		if (sess->client_myds->myconn->has_same_connection_options(c)) { // options are all identical
 			if (
 				(gtid_uuid == NULL) || // gtid_uuid is not used
 				(gtid_uuid && find(parents.begin(), parents.end(), c->parent) == parents.end()) // the server is currently not excluded
@@ -7252,153 +7080,6 @@ PgSQL_Connection* PgSQL_Thread::get_MyConn_local(unsigned int _hid, PgSQL_Sessio
 	return NULL;
 }
 
-#if POLARDB_PROXY
-uint64_t PgSQL_Thread::next_polardb_reader_selection_sequence(
-		unsigned int hostgroup_id, uint64_t server_list_generation,
-		std::atomic<uint64_t>* selection_start) {
-	if (!polardb_reader_selection_generation_initialized ||
-			polardb_reader_selection_generation != server_list_generation) {
-		polardb_reader_selection_sequences.clear();
-		polardb_reader_selection_generation = server_list_generation;
-		polardb_reader_selection_generation_initialized = true;
-	}
-	for (PolarDB_ReaderSelectionState& state :
-			polardb_reader_selection_sequences) {
-		if (state.hostgroup_id == hostgroup_id) {
-			return state.next_sequence++;
-		}
-	}
-	const uint64_t first_sequence = selection_start
-		? selection_start->fetch_add(1, std::memory_order_relaxed) : 0;
-	polardb_reader_selection_sequences.push_back(
-		PolarDB_ReaderSelectionState{hostgroup_id, first_sequence + 1});
-	return first_sequence;
-}
-
-void PgSQL_Thread::polardb_reader_capacity_wait_started(
-		uint64_t scope_hash) {
-	++polardb_reader_capacity_waiter_count;
-	auto scope = std::find_if(
-		polardb_reader_capacity_wait_scopes.begin(),
-		polardb_reader_capacity_wait_scopes.end(),
-		[scope_hash](const PolarDB_ReaderWaitScopeCount& candidate) {
-			return candidate.scope_hash == scope_hash;
-		});
-	if (scope == polardb_reader_capacity_wait_scopes.end()) {
-		polardb_reader_capacity_wait_scopes.push_back(
-			PolarDB_ReaderWaitScopeCount{scope_hash, 1});
-	} else {
-		++scope->count;
-	}
-	if (polardb_reader_capacity_retry_at_us == 0) {
-		const uint64_t now = curtime ? curtime : monotonic_time();
-		polardb_reader_capacity_retry_at_us =
-			now + polardb_reader_capacity_retry_delay_us(
-				pgsql_thread___connect_retries_delay);
-	}
-}
-
-void PgSQL_Thread::polardb_reader_capacity_wait_scope_changed(
-		uint64_t old_scope_hash, uint64_t new_scope_hash) {
-	if (old_scope_hash == new_scope_hash) {
-		return;
-	}
-	auto old_scope = std::find_if(
-		polardb_reader_capacity_wait_scopes.begin(),
-		polardb_reader_capacity_wait_scopes.end(),
-		[old_scope_hash](const PolarDB_ReaderWaitScopeCount& candidate) {
-			return candidate.scope_hash == old_scope_hash;
-		});
-	assert(old_scope != polardb_reader_capacity_wait_scopes.end());
-	assert(old_scope->count > 0);
-	if (--old_scope->count == 0) {
-		polardb_reader_capacity_wait_scopes.erase(old_scope);
-		if (polardb_reader_ownership_lease.active() &&
-				polardb_reader_ownership_lease.scope_hash == old_scope_hash &&
-				!polardb_reader_ownership_lease.yield_pending) {
-			polardb_reader_ownership_lease.reset();
-			POLARDB_THREAD_COUNT_ONE(this, reader_ownership_lease_released);
-		}
-	}
-	auto new_scope = std::find_if(
-		polardb_reader_capacity_wait_scopes.begin(),
-		polardb_reader_capacity_wait_scopes.end(),
-		[new_scope_hash](const PolarDB_ReaderWaitScopeCount& candidate) {
-			return candidate.scope_hash == new_scope_hash;
-		});
-	if (new_scope == polardb_reader_capacity_wait_scopes.end()) {
-		polardb_reader_capacity_wait_scopes.push_back(
-			PolarDB_ReaderWaitScopeCount{new_scope_hash, 1});
-	} else {
-		++new_scope->count;
-	}
-}
-
-void PgSQL_Thread::polardb_reader_capacity_wait_finished(
-		uint64_t scope_hash) {
-	assert(polardb_reader_capacity_waiter_count > 0);
-	--polardb_reader_capacity_waiter_count;
-	auto scope = std::find_if(
-		polardb_reader_capacity_wait_scopes.begin(),
-		polardb_reader_capacity_wait_scopes.end(),
-		[scope_hash](const PolarDB_ReaderWaitScopeCount& candidate) {
-			return candidate.scope_hash == scope_hash;
-		});
-	assert(scope != polardb_reader_capacity_wait_scopes.end());
-	assert(scope->count > 0);
-	if (--scope->count == 0) {
-		polardb_reader_capacity_wait_scopes.erase(scope);
-		if (polardb_reader_ownership_lease.active() &&
-				polardb_reader_ownership_lease.scope_hash == scope_hash &&
-				!polardb_reader_ownership_lease.yield_pending) {
-			polardb_reader_ownership_lease.reset();
-			POLARDB_THREAD_COUNT_ONE(this, reader_ownership_lease_released);
-		}
-	}
-	if (polardb_reader_capacity_waiter_count == 0) {
-		polardb_reader_capacity_retry_at_us = 0;
-		polardb_reader_capacity_wait_scopes.clear();
-		polardb_reader_capacity_blocked_scopes.clear();
-		polardb_reader_capacity_retry_sessions.clear();
-		if (polardb_reader_ownership_lease.active() &&
-				!polardb_reader_ownership_lease.yield_pending) {
-			polardb_reader_ownership_lease.reset();
-			POLARDB_THREAD_COUNT_ONE(this, reader_ownership_lease_released);
-		}
-	}
-}
-
-static bool polardb_local_reader_connection_matches(
-		const PgSQL_Connection* conn, const PgSQL_SrvC* server,
-		uint32_t profile_generation, const PolarDB_PoolKey& pool_key) {
-	return conn && conn->parent == server &&
-		conn->polardb_startup_profile_generation == profile_generation &&
-		conn->polardb_pool_key == pool_key;
-}
-
-PgSQL_Connection* PgSQL_Thread::get_local_polardb_reader_connection(
-		PgSQL_SrvC* server, uint32_t profile_generation,
-		const PolarDB_PoolKey& pool_key) {
-	if (!server || pool_key.empty() || !cached_connections) {
-		return nullptr;
-	}
-	if (server->polardb_fast_status_value() != MYSQL_SERVER_STATUS_ONLINE) {
-		return nullptr;
-	}
-	for (unsigned int index = 0; index < cached_connections->len; index++) {
-		PgSQL_Connection* conn = static_cast<PgSQL_Connection*>(
-			cached_connections->index(index));
-		if (polardb_local_reader_connection_matches(
-				conn, server, profile_generation, pool_key)) {
-			assert(polardb_reader_local_connection_count > 0);
-			--polardb_reader_local_connection_count;
-			return static_cast<PgSQL_Connection*>(
-				cached_connections->remove_index_fast(index));
-		}
-	}
-	return nullptr;
-}
-#endif // POLARDB_PROXY
 
 void PgSQL_Thread::push_MyConn_local(PgSQL_Connection * c) {
 #if POLARDB_PROXY
@@ -7406,60 +7087,44 @@ void PgSQL_Thread::push_MyConn_local(PgSQL_Connection * c) {
 		static_cast<PgSQL_SrvC*>(c->parent)->polardb_finish_idle_ping(
 			c, false);
 	}
-	if (polardb_reader_set_yield_debt(c)) {
-		const PolarDB_ReaderYieldResult yield_result =
-			polardb_reader_fulfill_yield_debt(c);
-		if (yield_result ==
-				PolarDB_ReaderYieldResult::CLAIM_PUBLISHED) {
-			return;
-		}
-		if (yield_result ==
-				PolarDB_ReaderYieldResult::NO_REMOTE_DEMAND) {
-			if (!cached_connections) {
-				cached_connections = new PtrArray();
-			}
-			c->polardb_worker_cache_epoch = polardb_reader_cache_epoch;
-			POLARDB_HGM_PROFILE_STATUS_COUNT_ONE(
-				PgHGM->status, reader_pool_local_store_attempt);
-			POLARDB_HGM_PROFILE_STATUS_COUNT_ONE(
-				PgHGM->status, reader_pool_local_store_accepted);
-			cached_connections->add(c);
-			++polardb_reader_local_connection_count;
-			polardb_reader_local_added_this_pass = true;
-			return;
-		}
-		PgHGM->destroy_MyConn_from_pool(c);
+	const PolarDB_ReaderRemoteReservationResult reservation_result =
+		polardb_reader_try_reserve_retained_connection(c);
+	if (reservation_result ==
+			PolarDB_ReaderRemoteReservationResult::CONNECTION_RESERVED) {
 		return;
 	}
-	const PolarDB_ReaderLocalReturn local_return =
-		polardb_reader_connection_matches_lease(c)
-			? PolarDB_ReaderLocalReturn::KEEP_WITH_WORKER
-			: PgHGM
-				? PgHGM->polardb_reader_local_return_decision(c)
-				: PolarDB_ReaderLocalReturn::USE_SHARED_POOL;
-	if (local_return != PolarDB_ReaderLocalReturn::USE_SHARED_POOL) {
-		POLARDB_HGM_PROFILE_STATUS_COUNT_ONE(
-			PgHGM->status, reader_pool_local_store_attempt);
+	if (reservation_result ==
+			PolarDB_ReaderRemoteReservationResult::NO_REMOTE_REQUEST) {
+		POLARDB_PROFILE_THREAD_COUNT_ONE(
+			this, reader_pool_local_store_attempt);
+		polardb_store_reader_connection_locally(c);
+		return;
+	}
+	const PolarDB_ReaderLocalReturnDecision local_decision =
+		polardb_reader_local_return_decision(c);
+	const PolarDB_ReaderLocalReturn local_return = local_decision.action;
+	if (!polardb_reader_uses_shared_pool(local_return)) {
+		POLARDB_PROFILE_THREAD_COUNT_ONE(
+			this, reader_pool_local_store_attempt);
 	}
 	if (local_return == PolarDB_ReaderLocalReturn::KEEP_WITH_WORKER) {
-		if (!cached_connections) {
-			cached_connections = new PtrArray();
-		}
-		c->polardb_worker_cache_epoch = polardb_reader_cache_epoch;
-		POLARDB_HGM_PROFILE_STATUS_COUNT_ONE(
-			PgHGM->status, reader_pool_local_store_accepted);
-		cached_connections->add(c);
-		++polardb_reader_local_connection_count;
-		polardb_reader_local_added_this_pass = true;
+		polardb_store_reader_connection_locally(c);
 		return;
 	}
 	if (local_return == PolarDB_ReaderLocalReturn::REMOVE_CONNECTION) {
-		POLARDB_HGM_PROFILE_STATUS_COUNT_ONE(
-			PgHGM->status, reader_pool_local_store_rejected);
+		POLARDB_PROFILE_THREAD_COUNT_ONE(
+			this, reader_pool_local_store_rejected);
+		PgHGM->polardb_account_reader_return_rejection(
+			local_decision.connection_status);
 		PgHGM->destroy_MyConn_from_pool(c);
 		return;
 	}
-	if (PgHGM && PgHGM->return_connection_with_match_key(c)) {
+	if (PgHGM && PgHGM->return_connection_with_match_key(
+			c, local_return ==
+					PolarDB_ReaderLocalReturn::USE_SHARED_POOL_REUSE_CHECKED
+				? PgSQL_PoolReturnCheck::REUSE_LOCAL_RETURN_CHECK
+				: PgSQL_PoolReturnCheck::CHECK_CONNECTION,
+			RejectedConnectionAction::DESTROY, this).handled()) {
 		// Exact-key connections return to the selected server's shared pool.
 		return;
 	}
@@ -7477,7 +7142,7 @@ void PgSQL_Thread::push_MyConn_local(PgSQL_Connection * c) {
 					(GloPTH && GloPTH->num_threads > 0)
 						? GloPTH->num_threads : 1;
 				if ((push_local_counter++ % thread_count) != 0) {
-					PgHGM->push_MyConn_to_pool(c);
+					PgHGM->push_MyConn_to_pool(c, true, this);
 					return;
 				}
 			}
@@ -7485,15 +7150,25 @@ void PgSQL_Thread::push_MyConn_local(PgSQL_Connection * c) {
 			return;
 		}
 	}
-	PgHGM->push_MyConn_to_pool(c);
+	PgHGM->push_MyConn_to_pool(c, true, this);
 }
 
-void PgSQL_Thread::return_local_connections(bool return_polardb_connections) {
+void PgSQL_Thread::return_local_connections() {
+	return_local_connections_impl(false);
+}
+
+void PgSQL_Thread::return_local_connections_for_shutdown() {
+	return_local_connections_impl(true);
+}
+
+void PgSQL_Thread::return_local_connections_impl(bool shutdown) {
 	if (cached_connections->len == 0) {
 #if POLARDB_PROXY
+		polardb_repair_local_reader_count(
+			"empty cache", &polardb_reader_local_connection_count, 0);
 		assert(polardb_reader_local_connection_count == 0);
 		polardb_reader_local_added_this_pass = false;
-		if (!return_polardb_connections) {
+		if (!shutdown) {
 			polardb_reader_cache_epoch++;
 		}
 #endif // POLARDB_PROXY
@@ -7503,12 +7178,35 @@ void PgSQL_Thread::return_local_connections(bool return_polardb_connections) {
 
 #if POLARDB_PROXY
 	struct ReaderReturnGroup {
-		PgSQL_SrvC* server;
+		PgSQL_SrvC* server{nullptr};
+		PgSQL_Connection* single{nullptr};
 		std::vector<PgSQL_Connection*> connections;
+
+		void add(PgSQL_Connection* connection) {
+			if (!single && connections.empty()) {
+				single = connection;
+				return;
+			}
+			if (connections.empty()) {
+				connections.reserve(2);
+				connections.push_back(single);
+				single = nullptr;
+			}
+			connections.push_back(connection);
+		}
+
+		size_t size() const {
+			return connections.empty() ? (single ? 1 : 0) :
+				connections.size();
+		}
+
+		PgSQL_Connection* const* data() {
+			return connections.empty() ? &single : connections.data();
+		}
 	};
 	std::vector<ReaderReturnGroup> reader_groups;
-	bool ownership_lease_retained = false;
-	unsigned int debt_yielded_connections = 0;
+	bool retained_connection_kept = false;
+	unsigned int reserved_connection_count = 0;
 	for (unsigned int index = 0; index < cached_count; index++) {
 		PgSQL_Connection* connection = static_cast<PgSQL_Connection*>(
 			cached_connections->index(index));
@@ -7516,46 +7214,50 @@ void PgSQL_Thread::return_local_connections(bool return_polardb_connections) {
 				!connection->parent) {
 			continue;
 		}
-		if (!return_polardb_connections &&
-				polardb_reader_set_yield_debt(connection)) {
-			const PolarDB_ReaderYieldResult yield_result =
-				polardb_reader_fulfill_yield_debt(connection);
-			if (yield_result ==
-					PolarDB_ReaderYieldResult::CLAIM_PUBLISHED) {
-				cached_connections->pdata[index] = nullptr;
-				debt_yielded_connections++;
-				continue;
-			}
-			if (yield_result ==
-					PolarDB_ReaderYieldResult::NO_REMOTE_DEMAND) {
-				ownership_lease_retained = true;
-				continue;
-			}
+		const PolarDB_ReaderRemoteReservationResult reservation_result =
+			shutdown
+				? PolarDB_ReaderRemoteReservationResult::NOT_ATTEMPTED
+				: polardb_reader_try_reserve_retained_connection(connection);
+		if (reservation_result ==
+				PolarDB_ReaderRemoteReservationResult::CONNECTION_RESERVED) {
 			cached_connections->pdata[index] = nullptr;
-			debt_yielded_connections++;
-			PgHGM->destroy_MyConn_from_pool(connection);
+			reserved_connection_count++;
 			continue;
 		}
-		if (!return_polardb_connections && !ownership_lease_retained) {
-			const bool lease_matches =
-				polardb_reader_connection_matches_lease(connection);
-			if (lease_matches) {
-				const PolarDB_ReaderLocalReturn pool_decision = PgHGM
-					? PgHGM->polardb_reader_local_return_decision(connection)
-					: PolarDB_ReaderLocalReturn::USE_SHARED_POOL;
-				if (polardb_reader_ownership_lease_retains(
-						pool_decision, lease_matches)) {
-					ownership_lease_retained = true;
+		if (reservation_result ==
+				PolarDB_ReaderRemoteReservationResult::NO_REMOTE_REQUEST) {
+			retained_connection_kept = true;
+			continue;
+		}
+		bool must_leave_local_cache = false;
+		if (!shutdown) {
+			const bool retention_matches = !retained_connection_kept &&
+				polardb_reader_matches_retention(
+					connection);
+			const bool needs_local_decision = retention_matches ||
+				reservation_result ==
+					PolarDB_ReaderRemoteReservationResult::CONNECTION_INVALID;
+			if (needs_local_decision) {
+				const PolarDB_ReaderLocalReturnDecision pool_decision =
+					polardb_reader_local_return_decision(connection);
+				if (retention_matches &&
+						pool_decision.action ==
+							PolarDB_ReaderLocalReturn::KEEP_WITH_WORKER) {
+					retained_connection_kept = true;
 					continue;
 				}
-				if (pool_decision ==
-						PolarDB_ReaderLocalReturn::USE_SHARED_POOL) {
+				if (pool_decision.action !=
+						PolarDB_ReaderLocalReturn::KEEP_WITH_WORKER) {
+					must_leave_local_cache = true;
+				}
+				if (polardb_reader_uses_shared_pool(
+						pool_decision.action)) {
 					POLARDB_THREAD_COUNT_ONE(
-						this, reader_ownership_lease_yielded);
+						this, reader_pool_retained_connection_shared);
 				}
 			}
 		}
-		if (!return_polardb_connections &&
+		if (!shutdown && !must_leave_local_cache &&
 				pgsql_thread___polardb_reader_connection_retention != 0 &&
 				connection->polardb_worker_cache_epoch ==
 					polardb_reader_cache_epoch) {
@@ -7567,28 +7269,40 @@ void PgSQL_Thread::return_local_connections(bool return_polardb_connections) {
 				return candidate.server == server;
 		});
 		if (group == reader_groups.end()) {
-			reader_groups.push_back(ReaderReturnGroup{server, {}});
+			reader_groups.push_back(ReaderReturnGroup{});
 			group = reader_groups.end() - 1;
+			group->server = server;
 		}
-		group->connections.push_back(connection);
+		group->add(connection);
 		cached_connections->pdata[index] = nullptr;
 	}
-	unsigned int polardb_reader_connections = debt_yielded_connections;
+	unsigned int polardb_reader_connections = reserved_connection_count;
 	std::vector<PgSQL_Connection*> connections_to_delete;
-	for (ReaderReturnGroup& group : reader_groups) {
-		polardb_reader_connections += group.connections.size();
-		PgHGM->return_polardb_reader_connections(
-			this,
-			group.connections, connections_to_delete);
+	const size_t group_count = reader_groups.size();
+	const size_t group_start =
+		group_count != 0 && polardb_worker_index != UINT_MAX
+			? polardb_worker_index % group_count : 0;
+	for (size_t offset = 0; offset < group_count; offset++) {
+		ReaderReturnGroup& group =
+			reader_groups[(group_start + offset) % group_count];
+		polardb_reader_connections += group.size();
+		PgHGM->polardb_return_reader_connections(
+			this, group.data(), group.size(), connections_to_delete);
 		for (PgSQL_Connection* connection : connections_to_delete) {
 			delete connection;
 		}
 		connections_to_delete.clear();
 	}
-	assert(polardb_reader_local_connection_count >=
-		polardb_reader_connections);
-	polardb_reader_local_connection_count -= polardb_reader_connections;
-	POLARDB_HGM_PROFILE_STATUS_COUNT(PgHGM->status,
+	if (polardb_reader_local_connection_count < polardb_reader_connections) {
+		polardb_repair_local_reader_count(
+			"shared return",
+			&polardb_reader_local_connection_count,
+			polardb_scan_cached_readers(cached_connections));
+	} else {
+		polardb_reader_local_connection_count -=
+			polardb_reader_connections;
+	}
+	POLARDB_PROFILE_THREAD_COUNT(this,
 		reader_pool_local_return_to_shared, polardb_reader_connections);
 #endif // POLARDB_PROXY
 
@@ -7611,22 +7325,33 @@ void PgSQL_Thread::return_local_connections(bool return_polardb_connections) {
 	if (generic_count != 0) {
 		PgHGM->push_MyConn_to_pool_array(
 			reinterpret_cast<PgSQL_Connection**>(cached_connections->pdata),
-			generic_count);
+			generic_count, this);
 		for (unsigned int index = 0; index < generic_count; index++) {
 			cached_connections->pdata[index] = nullptr;
 		}
 	}
 	unsigned int retained_count = 0;
+#if POLARDB_PROXY
+	unsigned int retained_reader_count = 0;
+#endif // POLARDB_PROXY
 	for (unsigned int index = generic_count; index < cached_count; index++) {
 		PgSQL_Connection* conn = static_cast<PgSQL_Connection*>(
 			cached_connections->index(index));
 		if (conn) {
 			cached_connections->pdata[retained_count++] = conn;
+#if POLARDB_PROXY
+			if (!conn->polardb_pool_key.empty()) {
+				retained_reader_count++;
+			}
+#endif // POLARDB_PROXY
 		}
 	}
 	cached_connections->len = retained_count;
 #if POLARDB_PROXY
-	if (!return_polardb_connections) {
+	polardb_repair_local_reader_count(
+		"cache compaction", &polardb_reader_local_connection_count,
+		retained_reader_count);
+	if (!shutdown) {
 		polardb_reader_cache_epoch++;
 	}
 	polardb_reader_local_added_this_pass = false;

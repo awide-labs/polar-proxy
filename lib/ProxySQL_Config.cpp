@@ -4,6 +4,9 @@
 #include "cpp.h"
 #include "sqlite3db.h"
 #include "proxysql_debug.h"
+#if POLARDB_PROXY
+#include "PgSQL_PolarDB.h"
+#endif
 
 #include <sstream>
 #include <set>
@@ -1869,9 +1872,12 @@ int ProxySQL_Config::Read_PgSQL_Servers_from_configfile(std::string& error) {
 			}
 			line.lookupValue("consistency_mode", consistency_mode);
 			if (strcasecmp(consistency_mode.c_str(), (char*)"default") &&
-				strcasecmp(consistency_mode.c_str(), (char*)"off") &&
-				strcasecmp(consistency_mode.c_str(), (char*)"lsn") &&
-				strcasecmp(consistency_mode.c_str(), (char*)"primary")) {
+					polardb_consistency_mode_from_string(
+						consistency_mode.c_str(), -1) < 0) {
+				proxy_error(
+					"Admin: invalid PolarDB consistency_mode '%s' in "
+					"pgsql_replication_hostgroups; using default\n",
+					consistency_mode.c_str());
 				consistency_mode = "default";
 			}
 			line.lookupValue("max_lag_bytes", max_lag_bytes);

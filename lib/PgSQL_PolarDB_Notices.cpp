@@ -5,10 +5,10 @@
  * A best_effort LSN wait surfaces a timeout as a backend WARNING/NOTICE while
  * the wrapped user query obtains its snapshot. The prepended SET result sets are
  * consumed and dropped while the wrapped query runs (PgSQL_Connection::handler()),
- * so the client never sees them, and that consumption can rotate query_result.
- * These helpers capture the timeout notice and store it on the session; the
- * captured notice is later prepended to the client output ahead of the user
- * result (PgSQL_Session::PgSQL_Result_to_PgSQL_wire()).
+ * so they are never forwarded to the client, and that consumption can rotate
+ * query_result. These helpers capture the timeout notice and store it on the
+ * session; the captured notice is later prepended to the client output ahead of
+ * the user result (PgSQL_Session::PgSQL_Result_to_PgSQL_wire()).
  *
  * The same capture-and-forward path also delivers a WARNING that ProxySQL
  * generates itself (PostgreSQL did not send it) when a read is routed to a
@@ -32,6 +32,18 @@
 
 #if POLARDB_PROXY
 
+/**
+ * @brief Empty and destroy the pending-notice queue.
+ *
+ * The queue object is always deleted and the pointer nulled regardless of
+ * @p free_buffers; that flag only controls who frees the queued packet bytes.
+ *
+ * @param free_buffers  True to free every queued packet buffer here. False is
+ *                      legal only when ownership of all of them has already been
+ *                      transferred to another owner — the client PSarrayOUT after
+ *                      a flush, for instance. Passing false without that transfer
+ *                      leaks every queued packet.
+ */
 void PgSQL_Session::PolarDB_NoticeQueueState::clear(bool free_buffers) {
 	if (!pending) {
 		return;
@@ -51,6 +63,19 @@ void PgSQL_Session::PolarDB_NoticeQueueState::clear(bool free_buffers) {
 	pending = nullptr;
 }
 
+/**
+ * @brief Append a NoticeResponse packet to the pending queue.
+ *
+ * The backing PtrSizeArray is allocated on first use.
+ *
+ * Ownership transfer is conditional: the queue takes @p pkt only when it is
+ * non-null and @p size is non-zero. A null or zero-sized packet is neither stored
+ * nor freed, so it remains the caller's to release.
+ *
+ * @param pkt   Packet buffer from the local allocator. Ownership moves to the
+ *              queue when it is accepted.
+ * @param size  Packet size in bytes.
+ */
 void PgSQL_Session::PolarDB_NoticeQueueState::add(
 		unsigned char* pkt, unsigned int size) {
 	if (!pkt || size == 0) {
@@ -62,20 +87,12 @@ void PgSQL_Session::PolarDB_NoticeQueueState::add(
 	pending->add(pkt, size);
 }
 
-/**
- * @brief Clear any queued NoticeResponse packets for this session.
- *
- * Notices captured from skipped prepended-SET results are forwarded with the
- * SELECT result; we clear the queue on completion or error to avoid duplicates
- * and leaks.
- *
- * @note Always deletes and nullifies the notice queue, even if free_buffers is
- *       false (the packet bytes may have been transferred to the client output
- *       array, which then owns them).
- * @param free_buffers If true, free the packet buffers before clearing.
- */
-void PgSQL_Session::clear_pending_notices(bool free_buffers) {
-	polardb_notices.clear(free_buffers);
+void PgSQL_Session::discard_pending_notices() {
+	polardb_notices.clear(true);
+}
+
+void PgSQL_Session::forget_transferred_notices() {
+	polardb_notices.clear(false);
 }
 
 /**
@@ -97,17 +114,19 @@ void PgSQL_Session::polardb_flush_pending_notices_to_client() {
 			client_myds->PSarrayOUT->add(ps->ptr, ps->size);
 		}
 	}
-	clear_pending_notices(/*free_buffers=*/false);
+	forget_transferred_notices();
 }
 
 /**
  * @brief Enqueue a NoticeResponse packet to be forwarded with the next result.
  *
  * A best_effort LSN timeout can emit WARNING/NOTICE while the wrapped SELECT is
- * running. We capture the NoticeResponse packet here and forward it before the
+ * running. Capture the NoticeResponse packet here and it is forwarded before the
  * SELECT result.
  *
- * @param pkt  Packet buffer (owned by the session after enqueue).
+ * @param pkt  Packet buffer. The session takes ownership only when @p pkt is
+ *             non-null and @p size is non-zero; a null or empty packet is
+ *             ignored and stays the caller's to free.
  * @param size Packet size in bytes.
  */
 void PgSQL_Session::enqueue_pending_notice(unsigned char* pkt, unsigned int size) {
@@ -154,7 +173,7 @@ bool PgSQL_Session::polardb_enqueue_notice_packet(
  *
  * The ReadyForQuery (RFQ) message normally carries the writer's LSN, which a
  * replica read waits for to guarantee read-your-writes. When the admin variable
- * pgsql-polardb_route_rfq_policy is best_effort, ProxySQL may still send the
+ * pgsql-polardb_action_missing_lsn is warning, ProxySQL may still send the
  * read to a reader even though no enforceable wait target is available, so the
  * read can return stale data. This builds a client-visible WARNING (PostgreSQL
  * did not send it) so the application is told. The pending-notice flush sends
@@ -170,7 +189,7 @@ void PgSQL_Session::polardb_enqueue_degraded_rfq_notice(const char* reason,
 	const char* severity = "WARNING";
 	const char* sqlstate = "01000"; // SQL standard "warning" class (no subclass)
 	const char* primary =
-		"PolarDB best_effort RFQ route has no enforceable LSN wait target; read may be stale";
+		"PolarDB reader route has no enforceable LSN wait target; read may be stale";
 	char detail[192];
 	snprintf(detail, sizeof(detail),
 		"reason=%s reader_hg=%d writer_hg=%d",
@@ -203,10 +222,12 @@ void PgSQL_Session::polardb_enqueue_degraded_rfq_notice(
 }
 
 /**
- * @brief Handle PolarDB LSN wait-timeout notices emitted while a wrapped query runs.
+ * @brief Account for a PolarDB LSN wait-timeout notice emitted while a wrapped
+ *        query runs, and queue it for the client when the generic path would
+ *        drop it.
  *
  * Called from notice_handler_cb() for every backend notice. This helper first
- * shows that the notice belongs to the current active LSN wait using PolarDB's
+ * confirms that the notice belongs to the current active LSN wait using PolarDB's
  * stable proxy wait-timeout detail marker plus wrapper state. It then performs
  * timeout accounting and applies the forwarding ownership rule below: generic
  * forwarding owns user-result notices; the PolarDB pending path only rescues
@@ -222,7 +243,7 @@ void PgSQL_Session::polardb_enqueue_degraded_rfq_notice(
  * @param conn   Active backend connection supplied by the libpq notice receiver.
  * @param result libpq PGresult containing the notice fields.
  */
-void polardb_handle_notice(PgSQL_Connection* conn, const PGresult* result) {
+void polardb_handle_lsn_wait_timeout_notice(PgSQL_Connection* conn, const PGresult* result) {
 	if (!conn || !result) {
 		// libpq should never pass NULL, but check against it.
 		return;
@@ -243,7 +264,7 @@ void polardb_handle_notice(PgSQL_Connection* conn, const PGresult* result) {
 	POLARDB_TRACE("PolarDB WAIT: LSN timeout detected in notice: %s\n",
 		PQresultErrorMessage(result));
 
-	// show that an in-flight consistency wrapper is active before accounting.
+	// Confirm that an in-flight consistency wrapper is active before accounting.
 	// The best_effort timeout WARNING is emitted while the user's SELECT obtains
 	// its snapshot, after the leading SET results may already be consumed. Do not
 	// require stmt_pending > 0 here; an active PolarDB wait plus wrapper_kind is

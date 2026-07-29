@@ -54,22 +54,11 @@ struct PolarDB_WaitSpec;
 struct PolarDB_WaitProfileState;
 #endif // POLARDB_PROFILE
 
-// PolarDB consistency-mode integer constants used where an int plus -1 sentinel
-// is needed (thread variables, HG policy, admin SQL). The values align with
-// PolarDB_ConsistencyMode.
-constexpr int POLARDB_CONSISTENCY_OFF        = 0;  // No consistency routing
-constexpr int POLARDB_CONSISTENCY_LSN        = 1;  // LSN-based read-your-own-writes (per-session)
-constexpr int POLARDB_CONSISTENCY_GLOBAL_LSN = 2;  // LSN-based read-all-observed-writes
-constexpr int POLARDB_CONSISTENCY_PRIMARY    = 3;  // Force all reads to the primary
-
 // User-facing PolarDB proxy protocol dialect. Hostgroup config may use -1 to
 // inherit the global pgsql-polardb_proxy_protocol value.
 constexpr int POLARDB_PROXY_PROTOCOL_OFF    = 0;
 constexpr int POLARDB_PROXY_PROTOCOL_LEGACY = 1;
 constexpr int POLARDB_PROXY_PROTOCOL_V15    = 2;
-
-constexpr int POLARDB_RFQ_POLICY_BEST_EFFORT = 1;
-constexpr int POLARDB_RFQ_POLICY_STRICT      = 2;
 
 enum PolarDB_ThreadStatusVariable {
 #define X(name, display_name, prom_name, help) polardb_st_var_##name,
@@ -78,9 +67,32 @@ enum PolarDB_ThreadStatusVariable {
 	POLARDB_st_var_END
 };
 
+static constexpr bool polardb_thread_counter_aggregates_max(
+		PolarDB_ThreadStatusVariable idx) {
+	switch (idx) {
+#define X(name) case polardb_st_var_##name: return true;
+	POLARDB_THREAD_MAX_COUNTER_LIST(X)
+#undef X
+	default:
+		return false;
+	}
+}
+
 static_assert(POLARDB_st_var_END == POLARDB_THREAD_COUNTER_COUNT,
 	"Update PolarDB thread-counter aggregation/export coverage");
 
+/**
+ * @brief Per-worker PolarDB counter storage.
+ *
+ * Only the worker that owns this instance may write the array, and it writes
+ * plain non-atomic increments. The stats path reads the values cross-thread
+ * with relaxed atomic loads while holding the handler's
+ * polardb_worker_lifecycle_mutex_, so scraped values are approximate. At worker
+ * teardown the array is folded into the PgHGM global atomics exactly once.
+ *
+ * The 64-byte alignment is required: without it two workers' counter arrays can
+ * share a cache line and every increment bounces that line between cores.
+ */
 struct alignas(64) PolarDB_ThreadStatusVariables {
 	unsigned long long stvar[POLARDB_st_var_END] = {};
 };
@@ -244,9 +256,49 @@ private:
 	};
 	std::vector<PolarDB_ReaderWaitScopeCount>
 		polardb_reader_capacity_wait_scopes;
+	void polardb_reader_add_waiter_to_scope(uint64_t scope_hash);
+	bool polardb_reader_remove_waiter_from_scope(uint64_t scope_hash);
 	std::vector<uint64_t> polardb_reader_capacity_blocked_scopes;
 	std::vector<PgSQL_Session*> polardb_reader_capacity_retry_sessions;
-	struct PolarDB_ReaderWorkerClaimState {
+	static constexpr unsigned int POLARDB_LSN_PASS_CACHE_CAPACITY = 16;
+	static constexpr uint64_t POLARDB_LSN_UPDATE_MAX_DELAY_US = 1000;
+	struct PolarDB_PassLsnUpdate {
+		uint64_t server_instance_id{0};
+		PolarDB_WriterScope writer_scope;
+		uint64_t max_lsn{0};
+		uint64_t last_updated_at_us{0};
+	};
+	PolarDB_PassLsnUpdate
+		polardb_pass_lsn_updates[POLARDB_LSN_PASS_CACHE_CAPACITY]{};
+	unsigned int polardb_pass_lsn_update_count{0};
+	bool polardb_worker_pass_active{false};
+#if POLARDB_PROFILE
+	static constexpr unsigned int POLARDB_PROFILE_PASS_SERVER_CAPACITY = 16;
+	// Profile builds track the first 16 servers touched in one worker pass.
+	// Further samples are counted as overflow rather than silently misclassified.
+	PgSQL_SrvC* polardb_profile_used_count_servers[
+		POLARDB_PROFILE_PASS_SERVER_CAPACITY]{};
+	unsigned int polardb_profile_lsn_calls{0};
+	unsigned int polardb_profile_lsn_advances{0};
+	unsigned int polardb_profile_lsn_shared_updates{0};
+	unsigned int polardb_profile_lsn_overflow{0};
+	unsigned int polardb_profile_used_count_server_count{0};
+	unsigned int polardb_profile_used_count_reads{0};
+	unsigned int polardb_profile_used_count_overflow{0};
+#endif // POLARDB_PROFILE
+	/**
+	 * @brief Worker-local view of the one reader pool reservation this worker
+	 *        may hold.
+	 *
+	 * All fields are owned by the worker thread and carry no locking of their
+	 * own. `hostgroup` needs no lifetime protection because HGCs are
+	 * manager-owned and outlive all PostgreSQL workers, but `server` may only be
+	 * dereferenced while `server_snapshot` is still held: the snapshot is what
+	 * keeps the PgSQL_SrvC alive across a server list rebuild.
+	 *
+	 * Pool-side cancellation must complete before local state is cleared.
+	 */
+	struct PolarDB_ReaderPoolWorkerReservationState {
 		uint64_t token{0};
 		uint32_t session_id{0};
 		uint64_t scope_hash{0};
@@ -260,10 +312,12 @@ private:
 		bool active() const {
 			return token != 0 && hostgroup != nullptr;
 		}
-		bool published() const {
+		bool has_connection() const {
 			return active() && server != nullptr;
 		}
-		void reset() {
+	private:
+		friend class PgSQL_Thread;
+		void clear_local() {
 			token = 0;
 			session_id = 0;
 			scope_hash = 0;
@@ -274,10 +328,13 @@ private:
 			pool_key = PolarDB_PoolKey{};
 		}
 	};
-	PolarDB_ReaderWorkerClaimState polardb_reader_claim;
-	struct PolarDB_ReaderOwnershipLeaseState {
-		// scope_hash tracks local wait-set lifetime only. Handoff correctness uses
-		// the exact hostgroup, pool key, reader plan and wait specification below.
+	PolarDB_ReaderPoolWorkerReservationState polardb_reader_pool_reservation;
+	// After taking a reserved connection, the worker may retain one compatible
+	// reader while the same local wait scope remains active. A matching remote
+	// request causes the next completed reader to be reserved for that worker.
+	struct PolarDB_ReaderRetentionState {
+		// scope_hash tracks local wait-set lifetime only. Remote reservation
+		// matching uses the exact request fields below.
 		uint64_t scope_hash{0};
 		// HGCs are manager-owned and outlive all PostgreSQL workers.
 		PgSQL_HGC* hostgroup{nullptr};
@@ -286,7 +343,6 @@ private:
 		PolarDB_PoolKey pool_key;
 		PolarDB_Query_ReaderPlan reader_plan;
 		PolarDB_WaitSpec wait_spec;
-		bool yield_pending{false};
 
 		bool active() const {
 			return scope_hash != 0 && hostgroup != nullptr &&
@@ -301,20 +357,36 @@ private:
 			pool_key = PolarDB_PoolKey{};
 			reader_plan.reset();
 			wait_spec.reset();
-			yield_pending = false;
 		}
 	};
-	PolarDB_ReaderOwnershipLeaseState polardb_reader_ownership_lease;
-	struct PolarDB_ReaderClaimWakeNotification {
+	PolarDB_ReaderRetentionState polardb_reader_retention;
+	/**
+	 * @brief One queued "your reservation now has a connection" notification.
+	 *
+	 * Entries are produced by a different (donor) worker thread through
+	 * polardb_queue_reader_reservation_wake() and are drained only by the
+	 * worker that owns this queue, in
+	 * polardb_process_reader_reservation_wakes(). Keep server_snapshot
+	 * attached until the entry is consumed: it is what keeps `server` alive
+	 * between the push and the consume, across a server list rebuild.
+	 */
+	struct PolarDB_ReaderPoolReservationWakeNotification {
 		uint64_t token{0};
 		PgSQL_SrvC* server{nullptr};
 		std::shared_ptr<const void> server_snapshot;
 	};
-	std::mutex polardb_reader_claim_wake_mutex;
-	std::vector<PolarDB_ReaderClaimWakeNotification>
-		polardb_reader_claim_wakes;
-	std::atomic<bool> polardb_reader_claim_wake_pending{false};
+	// Guards polardb_reader_pool_reservation_wakes. Producers are remote
+	// workers; the single consumer is the worker that owns this thread object.
+	std::mutex polardb_reader_pool_reservation_wake_mutex;
+	std::vector<PolarDB_ReaderPoolReservationWakeNotification>
+		polardb_reader_pool_reservation_wakes;
+	// Set by a producer that also writes the wake byte to pipefd[1], cleared by
+	// the owning worker before it drains the vector. Coalesces repeated wakes.
+	std::atomic<bool> polardb_reader_pool_reservation_wake_pending{false};
 	unsigned int polardb_worker_index{UINT_MAX};
+	friend class PgSQL_Threads_Handler;
+	friend struct PolarDB_ReaderRetentionUnitAccess;
+	friend struct PolarDB_WorkerLifecycleUnitAccess;
 #endif // POLARDB_PROXY
 
 #ifdef IDLE_THREADS
@@ -579,6 +651,18 @@ public:
 	 */
 	void unregister_session(int);
 #if POLARDB_PROXY
+	/**
+	 * @brief Unregister a session identified by pointer.
+	 *
+	 * Scan `mysql_sessions` linearly for the pointer and remove the first match.
+	 * Like the index overload, this never deletes the session object; the caller
+	 * remains responsible for that.
+	 *
+	 * @param sess Session to remove. A null pointer is accepted and reports false.
+	 * @return true when the session was found and removed, false when the session
+	 *         array is empty, the pointer is null, or the session is not
+	 *         registered on this thread.
+	 */
 	bool unregister_session(PgSQL_Session*);
 #endif // POLARDB_PROXY
 
@@ -680,31 +764,277 @@ public:
 	 */
 	void process_all_sessions();
 #if POLARDB_PROXY
-	void process_polardb_reader_capacity_waiters(
-		bool deadline_due, bool claim_ready = false);
-	void tune_polardb_reader_capacity_retry_timeout();
-	bool register_polardb_reader_claim(PgSQL_Session* sess);
+	/**
+	 * @brief Open a worker pass on the calling worker thread.
+	 *
+	 * Mark the pass active and clear the per-pass record of LSNs already stored
+	 * into the shared LSN cache (and, in profile builds, the per-pass profile
+	 * accumulators). The coalescing done by
+	 * polardb_track_server_lsn_update() works only inside an active pass.
+	 *
+	 * Worker-thread-local; takes no locks. Every path that opens a pass must
+	 * close it with polardb_finish_worker_pass().
+	 */
+	void polardb_begin_worker_pass();
+	/**
+	 * @brief Close the current worker pass on the calling worker thread.
+	 *
+	 * Flush the accumulated per-pass profile counters into this worker's counter
+	 * array and clear the active flag. A no-op when no pass is open.
+	 *
+	 * Once this returns, the coalescing is disabled:
+	 * polardb_track_server_lsn_update() returns true for every call until
+	 * the next polardb_begin_worker_pass().
+	 */
+	void polardb_finish_worker_pass();
+	/**
+	 * @brief Return whether an observed server LSN must be stored in the shared
+	 *        LSN cache, and record that store.
+	 *
+	 * This is not a pure predicate. Every call that returns true also inserts or
+	 * updates the per-pass cache entry for (server, writer_scope), raising its
+	 * max_lsn and stamping last_updated_at_us. Call it exactly once per
+	 * intended store: a second call for the same observation returns false and
+	 * silently suppresses a store the caller still needed.
+	 *
+	 * Within a pass the cache suppresses repeat stores of an LSN that is not
+	 * higher than one already stored, except that a refresh is allowed once
+	 * every POLARDB_LSN_UPDATE_MAX_DELAY_US so freshness timestamps do not
+	 * go stale under a steady stream of equal observations.
+	 *
+	 * @param server        Server the LSN was observed on.
+	 * @param lsn           Observed LSN.
+	 * @param writer_scope  Writer scope the LSN belongs to.
+	 * @param observed_at_us Monotonic time of the observation, in microseconds.
+	 * @return true when the caller must store this observation in the shared LSN
+	 *         cache. Fails open: true is also returned when no pass is active,
+	 *         when server is null, when lsn is 0, when writer_scope is invalid,
+	 *         and when the 16-entry pass cache is full.
+	 */
+	bool polardb_track_server_lsn_update(
+		PgSQL_SrvC* server, uint64_t lsn,
+		const PolarDB_WriterScope& writer_scope,
+		uint64_t observed_at_us);
+	#if POLARDB_PROFILE
+	void polardb_profile_note_lsn_update(bool advanced);
+	void polardb_profile_note_pool_used_count_read(PgSQL_SrvC* server);
+	#endif // POLARDB_PROFILE
+	/**
+	 * @brief Retry the sessions on this worker that are waiting for reader
+	 *        capacity.
+	 *
+	 * Collect every healthy, unkilled session with an active reader-capacity
+	 * wait, order it so the session holding this worker's reservation runs
+	 * first and the rest run oldest-wait-first, then re-enter each session's
+	 * handler() to attempt acquisition again. A scope that reports
+	 * READER_GROUP_BUSY blocks the remaining sessions in the same scope for this
+	 * pass and registers a pool capacity request. A session whose handler fails
+	 * or that becomes killed is unregistered and deleted here.
+	 *
+	 * Runs on the owning worker thread only.
+	 *
+	 * @param deadline_due      true when the reader-capacity retry deadline
+	 *                          fired. Retries run even without a locally
+	 *                          available connection, and the next deadline is set
+	 *                          before returning.
+	 * @param reservation_ready true when a reservation wake was just consumed, so
+	 *                          the session owning the reservation is retried
+	 *                          first. When both flags are false, retrying stops
+	 *                          as soon as no locally cached reader remains.
+	 */
+	void polardb_process_reader_capacity_waiters(
+		bool deadline_due, bool reservation_ready = false);
+	/**
+	 * @brief Schedule the reader-capacity retry and make the poll loop wake
+	 *        for it.
+	 *
+	 * A no-op when this worker has no capacity waiters. Otherwise set
+	 * polardb_reader_capacity_retry_at_us if no retry is pending, and shorten
+	 * this->mypolls.poll_timeout so the worker's poll returns at that deadline.
+	 * Call it after poll_timeout has been given its normal value, or the clamp is
+	 * overwritten.
+	 */
+	void polardb_schedule_reader_capacity_retry();
+	/**
+	 * @brief Register a shared reader pool capacity request for a waiting
+	 *        session and record the resulting reservation on this worker.
+	 *
+	 * A worker may hold at most one reservation at a time, so this rejects the
+	 * request outright while another one is outstanding. It also classifies who
+	 * already owns a matching reader (see polardb_reader_ownership()) and
+	 * declines to queue when the session can be served locally, adopting reader
+	 * retention instead. Every ownership check updates its corresponding
+	 * diagnostic counter, whether or not a request is registered.
+	 *
+	 * @param sess Session with an active reader-capacity wait whose last status is
+	 *             READER_GROUP_BUSY.
+	 */
+	void polardb_register_reader_capacity_request(PgSQL_Session* sess);
+	/**
+	 * @brief Report whether this worker already controls a reader that satisfies
+	 *        a waiting session.
+	 *
+	 * Checked in order: this worker's reservation, the worker-local connection
+	 * cache, then readers currently attached to other sessions on this worker.
+	 * Meaningful only on the owning worker thread, because all three sources are
+	 * worker-local.
+	 *
+	 * @param waiting_session Session whose reader plan and wait spec the
+	 *                        candidates are matched against.
+	 * @return RESERVATION when this worker's reservation already holds an
+	 *         eligible connection for that session; LOCAL when an eligible reader
+	 *         sits in the worker-local cache; ACTIVE when another session on this
+	 *         worker is currently using an eligible reader; NONE when nothing
+	 *         matches - which also covers a null session and a session with no
+	 *         active reader-capacity wait.
+	 */
 	PolarDB_ReaderOwnership polardb_reader_ownership(
 		PgSQL_Session* waiting_session);
+	// Wait and retention callers supply their saved request requirements. The
+	// common helper checks connection reuse state and current reader eligibility.
+	// Retention also requires a worker-local waiter for the same scope.
 	bool polardb_reader_connection_matches_wait(
 		PgSQL_Connection* conn, PgSQL_Session* waiting_session,
 		bool active_connection) const;
-	bool polardb_reader_connection_matches_lease(
+	bool polardb_reader_matches_retention(
 		PgSQL_Connection* conn) const;
-	bool polardb_reader_connection_matches_lease_contract(
+	bool polardb_reader_connection_matches_retention_requirements(
 		PgSQL_Connection* conn, bool active_connection) const;
-	void polardb_reader_adopt_ownership_lease(PgSQL_Session* sess);
-	bool polardb_reader_set_yield_debt(PgSQL_Connection* conn);
-	PolarDB_ReaderYieldResult polardb_reader_fulfill_yield_debt(
-		PgSQL_Connection* conn);
-	void polardb_reader_cancel_yield_debt();
+	bool polardb_reader_connection_matches_requirements(
+		PgSQL_Connection* conn, bool active_connection,
+		uint32_t profile_generation, const PolarDB_PoolKey& pool_key,
+		unsigned int hostgroup_id,
+		const PolarDB_Query_ReaderPlan& reader_plan,
+		const PolarDB_WaitSpec& wait_spec) const;
+	void polardb_reader_start_retention(
+		uint64_t scope_hash, PgSQL_HGC* hostgroup,
+		unsigned int hostgroup_id, uint32_t profile_generation,
+		const PolarDB_PoolKey& pool_key,
+		const PolarDB_Query_ReaderPlan& reader_plan,
+		const PolarDB_WaitSpec& wait_spec);
+	void polardb_reader_adopt_retention(PgSQL_Session* sess);
+	void polardb_reader_clear_inactive_retention();
+	/**
+	 * @brief Offer a reader this worker was about to keep to a capacity request
+	 *        raised by a different worker.
+	 *
+	 * The connection is matched against this worker's retention key first, and
+	 * unrelated or self-only requests are discarded before the server pool lock
+	 * is taken, so the common case costs no shared-state contention.
+	 *
+	 * @param conn   Connection being returned. Must be idle and reusable to be
+	 *               eligible.
+	 * @return Reservation disposition. CONNECTION_RESERVED transfers ownership;
+	 *         NO_REMOTE_REQUEST keeps it local; other values use normal return.
+	 */
+	PolarDB_ReaderRemoteReservationResult
+		polardb_reader_try_reserve_retained_connection(PgSQL_Connection* conn);
+	/**
+	 * @brief Select the destination for a reader connection this worker is
+	 *        returning.
+	 *
+	 * Does not move the connection; the caller performs the disposition and each
+	 * value obliges a different action.
+	 *
+	 * @param conn Connection being returned.
+	 * @return Destination action plus rejection status. REMOVE_CONNECTION
+	 *         carries the classified reason; other actions are not rejections.
+	 */
+	PolarDB_ReaderLocalReturnDecision polardb_reader_local_return_decision(
+		PgSQL_Connection* conn) const;
+	/**
+	 * @brief Take ownership of a reader connection into the worker-local cache.
+	 *
+	 * Stamp the connection with the current polardb_reader_cache_epoch, append it
+	 * to cached_connections, and update the local reader accounting
+	 * (polardb_reader_local_connection_count and
+	 * polardb_reader_local_added_this_pass). The caller must not touch the
+	 * connection after this returns.
+	 *
+	 * @param conn Connection to cache. Must not be null.
+	 */
+	void polardb_store_reader_connection_locally(PgSQL_Connection* conn);
 	bool polardb_reader_wait_scope_active(uint64_t scope_hash) const;
-	PgSQL_Connection* take_polardb_reader_claim(PgSQL_Session* sess);
-	void cancel_polardb_reader_claim(uint32_t session_id = 0);
-	bool notify_polardb_reader_claim(
+	/**
+	 * @brief Take the connection held by this worker's reservation for a session.
+	 *
+	 * The reservation is revalidated against the session's current hostgroup,
+	 * pool match key, reader plan and wait spec before it is taken, because the
+	 * session's requirements may have moved on since the request was queued. A
+	 * reservation that no longer matches is cancelled here.
+	 *
+	 * On success the reservation slot is cleared, reader retention is started for
+	 * the same scope, and ownership of the connection passes to the caller, which
+	 * must attach it to the session or return/destroy it.
+	 *
+	 * @param sess Session taking the reservation. Must be the session the
+	 *             reservation was registered for.
+	 * @return The reserved connection, now owned by the caller, or nullptr when
+	 *         there is no reserved connection, the reservation belongs to a
+	 *         different session, the reservation no longer matches the session's
+	 *         requirements, or the pool reports the reservation as still pending,
+	 *         retired, or missing.
+	 */
+	PgSQL_Connection* polardb_take_reader_reservation(PgSQL_Session* sess);
+	/**
+	 * @brief Give up this worker's reader pool reservation.
+	 *
+	 * Clears the worker-local reservation state, releases the retained server
+	 * snapshot, and cancels the request on the pool side - on the server when a
+	 * connection had already been assigned, otherwise on the hostgroup. If the
+	 * cancellation frees a connection for a queued waiter, that waiter is woken
+	 * through PgHGM->polardb_route_reader_reservation_wake().
+	 *
+	 * @param session_id 0 cancels whatever reservation is active, which is what
+	 *                   worker teardown needs. A non-zero value cancels only when
+	 *                   the reservation belongs to that session and otherwise
+	 *                   does nothing.
+	 */
+	void polardb_cancel_reader_reservation(uint32_t session_id = 0);
+	/**
+	 * @brief Queue a "reservation is ready" wake on this worker.
+	 *
+	 * Called from a foreign thread through
+	 * PgSQL_Threads_Handler::polardb_queue_reader_reservation_wake(), which
+	 * holds polardb_worker_lifecycle_mutex_ across the call to keep this worker
+	 * alive. This method then takes
+	 * polardb_reader_pool_reservation_wake_mutex, so the lock order is
+	 * lifecycle mutex first, wake mutex second; never take them the other way
+	 * round. The first wake of a batch also writes a byte to pipefd[1] to break
+	 * the target worker out of poll.
+	 *
+	 * @param token           Reservation token the wake refers to.
+	 * @param server          Server holding the reserved connection.
+	 * @param server_snapshot Snapshot keeping `server` alive until the wake is
+	 *                        consumed. Must not be empty.
+	 * @return true when the wake was queued and ownership of the connection and
+	 *         snapshot passed to this worker. false when it was not queued -
+	 *         this worker is shutting down, an argument is invalid, or the wake
+	 *         pipe write failed - in which case the queued entry is removed again
+	 *         and the caller still owns the connection and snapshot and must
+	 *         dispose of them.
+	 */
+	bool polardb_queue_reader_reservation_wake(
 		uint64_t token, PgSQL_SrvC* server,
 		std::shared_ptr<const void> server_snapshot);
-	bool consume_polardb_reader_claim_wakes();
+	/**
+	 * @brief Drain the queued reservation wakes on the owning worker thread.
+	 *
+	 * Swaps the wake vector out under
+	 * polardb_reader_pool_reservation_wake_mutex and processes it outside the
+	 * lock. A wake whose token matches this worker's outstanding reservation
+	 * fills in the reserved server and snapshot. Any other wake is not dropped:
+	 * its reservation is cancelled and handed on to the next queued waiter.
+	 *
+	 * Worker destruction must call this before cancelling the reservation, so
+	 * that cancellation targets the server the wake actually assigned.
+	 *
+	 * @return true when this worker's own reservation became ready, meaning a
+	 *         connection can now be taken with
+	 *         polardb_take_reader_reservation(). false when no wake was
+	 *         pending or none matched this worker.
+	 */
+	bool polardb_process_reader_reservation_wakes();
 #endif // POLARDB_PROXY
 
 	/**
@@ -816,31 +1146,97 @@ public:
 	 */
 	PgSQL_Connection* get_MyConn_local(unsigned int, PgSQL_Session * sess, char* gtid_uuid, uint64_t gtid_trxid, int max_lag_ms);
 #if POLARDB_PROXY
-	uint64_t next_polardb_reader_selection_sequence(
+	/**
+	 * @brief Return the next round-robin sequence number this worker should use
+	 *        when picking a reader in a hostgroup.
+	 *
+	 * The sequence is kept worker-locally so the common case costs no shared
+	 * atomic traffic. Only the first call for a hostgroup takes a starting slot
+	 * from the shared *selection_start with a relaxed fetch_add, spreading
+	 * workers over different replicas instead of having them all start at 0;
+	 * later calls are served purely from the local counter.
+	 *
+	 * @param hostgroup_id          Hostgroup the reader is being selected from.
+	 * @param server_list_generation Current server list generation. When it
+	 *                              differs from the cached generation the whole
+	 *                              worker-local sequence cache is discarded and
+	 *                              every hostgroup starts over.
+	 * @param selection_start       Shared starting-slot counter for the
+	 *                              hostgroup. May be null, in which case the
+	 *                              local sequence starts at 0.
+	 * @return A sequence value that increases by one per call for this
+	 *         (worker, hostgroup) pair until server_list_generation changes.
+	 */
+	uint64_t polardb_next_reader_selection_sequence(
 		unsigned int hostgroup_id, uint64_t server_list_generation,
 		std::atomic<uint64_t>* selection_start);
-	PgSQL_Connection* get_local_polardb_reader_connection(
+	/**
+	 * @brief Take a matching reader out of this worker's local connection cache.
+	 *
+	 * A connection matches only when all of these hold: its parent is exactly
+	 * `server`, the server is currently ONLINE, its
+	 * polardb_startup_profile_generation equals `profile_generation`, and its
+	 * polardb_pool_key equals `pool_key`.
+	 *
+	 * @param server            Server the connection must belong to.
+	 * @param profile_generation Startup profile generation the connection must
+	 *                          have been created under.
+	 * @param pool_key          Pool key the connection must carry.
+	 * @return The matching connection, removed from cached_connections and now
+	 *         owned by the caller, or nullptr when nothing in the local cache
+	 *         satisfies all of the criteria above.
+	 */
+	PgSQL_Connection* polardb_take_local_reader_connection(
 		PgSQL_SrvC* server, uint32_t profile_generation,
 		const PolarDB_PoolKey& pool_key);
+	/**
+	 * @brief Record that one more session on this worker started waiting for
+	 *        reader capacity.
+	 *
+	 * Increments the worker's waiter count and the per-scope waiter refcount, and
+	 * sets polardb_reader_capacity_retry_at_us when no retry deadline is pending.
+	 *
+	 * Every call must be balanced by exactly one
+	 * polardb_reader_capacity_wait_finished() for the same scope, or re-keyed
+	 * with polardb_reader_capacity_wait_scope_changed(). An unbalanced call leaks
+	 * the scope refcount, which keeps reader retention alive and pins a reader to
+	 * this worker indefinitely.
+	 *
+	 * @param scope_hash Routing scope the session is waiting in.
+	 */
 	void polardb_reader_capacity_wait_started(uint64_t scope_hash);
 	void polardb_reader_capacity_wait_scope_changed(
 		uint64_t old_scope_hash, uint64_t new_scope_hash);
 	void polardb_reader_capacity_wait_finished(uint64_t scope_hash);
+	// Shared return paths exclude their donor worker from reservation selection.
+	unsigned int get_polardb_worker_index() const {
+		return polardb_worker_index;
+	}
 #endif // POLARDB_PROXY
 
 	/**
 	 * @brief Adds a connection to the thread's local connection cache.
 	 *
-	 * @param c The `PgSQL_Connection` object to add to the cache.
+	 * @param c The `PgSQL_Connection` object to hand back. Must not be null.
 	 *
-	 * @details This function checks the status of the connection's parent server
-	 * (`c->parent->status`) and the connection's asynchronous state machine
-	 * (`c->async_state_machine`). If the server is online and the connection is idle,
-	 * the connection is added to the `cached_connections` pool. Otherwise, the
-	 * connection is pushed to the global connection pool using
-	 * `PgHGM->push_MyConn_to_pool()`.
+	 * @details Ownership of the connection always leaves the caller. Under
+	 * POLARDB_PROXY the disposition is selected in this order:
+	 *   - any in-flight idle ping on the connection is finished first;
+	 *   - polardb_reader_try_reserve_retained_connection() may hand the
+	 *     connection to another worker's outstanding capacity request, or mark it
+	 *     for local retention;
+	 *   - otherwise polardb_reader_local_return_decision() selects:
+	 *     KEEP_WITH_WORKER stores it in `cached_connections`, REMOVE_CONNECTION
+	 *     destroys it through `PgHGM->destroy_MyConn_from_pool()`, and the shared
+	 *     pool values return it with `PgHGM->return_connection_with_match_key()`.
+	 * Only a connection that none of those paths took reaches the generic
+	 * tail, where a connection is cached locally when its server is online and it
+	 * is idle - and when `pgsql_thread___bounded_local_connection_cache` is
+	 * enabled only one in every `num_threads` such connections is kept, the rest
+	 * going straight to the global pool with `PgHGM->push_MyConn_to_pool()`.
 	 *
-	 * @note This function is used to manage the thread's local connection cache.
+	 * @note The caller must not touch the connection after this returns: it may
+	 * already be owned by another worker, by the global pool, or destroyed.
 	 *
 	 */
 	void push_MyConn_local(PgSQL_Connection*);
@@ -856,7 +1252,14 @@ public:
 	 * ensure that unused connections are returned to the global pool.
 	 *
 	 */
-	void return_local_connections(bool return_polardb_connections = false);
+	void return_local_connections();
+	/**
+	 * @brief Return every local connection during worker shutdown.
+	 *
+	 * PolarDB reader retention and remote handoff are skipped. All retained
+	 * readers go back to the shared pool.
+	 */
+	void return_local_connections_for_shutdown();
 
 	/**
      * Pseudocode (plan)
@@ -936,6 +1339,9 @@ public:
 	 *
 	 */
 	void Scan_Sessions_to_Kill_All();
+
+private:
+	void return_local_connections_impl(bool shutdown);
 };
 
 #if POLARDB_PROXY
@@ -943,6 +1349,21 @@ public:
 #define POLARDB_THREAD_COUNTERS 1
 #endif
 
+/**
+ * @brief Add to a PolarDB counter, preferring the calling worker's private slot.
+ *
+ * When `thread` is non-null the increment is a plain non-atomic += on that
+ * thread's counter array, so `thread` must be the calling worker. Passing
+ * another worker's PgSQL_Thread* is a data race; code that runs on a foreign
+ * thread must pass nullptr instead, as
+ * polardb_queue_reader_reservation_wake() does.
+ *
+ * @param thread         Calling worker, or nullptr to count on the global atomic.
+ * @param idx            Counter to update.
+ * @param global_counter Global atomic used when `thread` is nullptr; it also
+ *                       receives the worker slot at thread teardown.
+ * @param value          Amount to add.
+ */
 static inline void polardb_thread_count(
 	PgSQL_Thread* thread,
 	PolarDB_ThreadStatusVariable idx,
@@ -956,7 +1377,27 @@ static inline void polardb_thread_count(
 	}
 }
 
-static inline void polardb_thread_max(
+/**
+ * @brief Raise a PolarDB counter to a running maximum, preferring the calling
+ *        worker's private slot.
+ *
+ * Same thread-affinity rule as polardb_thread_count(): with a non-null `thread`
+ * this is a non-atomic read-modify-write of that worker's slot, so `thread` must
+ * be the calling worker and any other thread must pass nullptr.
+ *
+ * The stored value is a maximum, not a sum. The counter must also be listed in
+ * POLARDB_THREAD_MAX_COUNTER_LIST, otherwise the teardown fold and
+ * PgSQL_Threads_Handler::get_polardb_counter() add the per-worker values instead
+ * of taking their maximum. Only the POLARDB_THREAD_MAX macro checks that
+ * registration; this function does not.
+ *
+ * @param thread         Calling worker, or nullptr to update the global atomic.
+ * @param idx            Counter to update.
+ * @param global_counter Global atomic used when `thread` is nullptr.
+ * @param value          Candidate maximum; ignored when it is not larger than
+ *                       the value already stored.
+ */
+static inline void polardb_thread_raise_max(
 	PgSQL_Thread* thread,
 	PolarDB_ThreadStatusVariable idx,
 	std::atomic<unsigned long long>& global_counter,
@@ -986,8 +1427,13 @@ static inline void polardb_thread_max(
 	POLARDB_THREAD_COUNT((thread), name, 1)
 
 #define POLARDB_THREAD_MAX(thread, name, value) \
-	polardb_thread_max((thread), polardb_st_var_##name, \
-		PgHGM->status.polardb_##name, (value))
+	do { \
+		static_assert(polardb_thread_counter_aggregates_max( \
+			polardb_st_var_##name), \
+			"Register POLARDB_THREAD_MAX counters in the max-counter list"); \
+		polardb_thread_raise_max((thread), polardb_st_var_##name, \
+			PgHGM->status.polardb_##name, (value)); \
+	} while (0)
 #else
 #define POLARDB_THREAD_COUNT(thread, name, value) do { } while (0)
 #define POLARDB_THREAD_COUNT_ONE(thread, name) do { } while (0)
@@ -998,11 +1444,43 @@ void polardb_count_lsn_wait_elapsed_bucket(
 	PgSQL_Thread* thread,
 	unsigned long long elapsed_us,
 	bool transaction_split);
+/**
+ * @brief Bucket how far a selected reader's LSN is behind the target LSN.
+ *
+ * Exactly one counter is bumped per call. A zero target_lsn or reader_lsn is
+ * classified as 'lsn_unknown' and a reader LSN that is not fresh as 'lsn_stale';
+ * in both cases no gap bucket is recorded at all. A reader that is at or ahead
+ * of the target is recorded in the zero-gap bucket, never as a negative gap.
+ *
+ * @param thread           Calling worker, or nullptr (see polardb_thread_count()).
+ * @param target_lsn       LSN the request needs the reader to have reached.
+ * @param reader_lsn       LSN observed on the selected reader.
+ * @param reader_lsn_fresh Whether that observation is still considered current.
+ */
 void polardb_count_reader_target_lsn_gap_bucket(
 	PgSQL_Thread* thread,
 	uint64_t target_lsn,
 	uint64_t reader_lsn,
 	bool reader_lsn_fresh);
+/**
+ * @brief Record the quality of one LSN-targeted reader selection.
+ *
+ * Emits the target/gap buckets itself by calling
+ * polardb_count_reader_target_lsn_gap_bucket(); a caller that also calls that
+ * helper for the same selection double-counts the histogram. On top of that it
+ * accumulates the selected gap, and compares the selected reader against the
+ * best reader that was considered - those comparison counters are emitted only
+ * when both LSNs are non-zero and fresh.
+ *
+ * A complete no-op when target_lsn is 0.
+ *
+ * @param thread                          Calling worker, or nullptr.
+ * @param target_lsn                      LSN the request needs.
+ * @param selected_reader_lsn             LSN of the reader that was chosen.
+ * @param selected_reader_lsn_fresh       Whether that observation is current.
+ * @param best_considered_reader_lsn      Highest LSN among the candidates seen.
+ * @param best_considered_reader_lsn_fresh Whether that observation is current.
+ */
 void polardb_count_reader_target_selection(
 	PgSQL_Thread* thread,
 	uint64_t target_lsn,
@@ -1152,6 +1630,24 @@ typedef struct _PgSQL_Client_Host_Cache_Entry {
 	uint32_t error_count;
 } PgSQL_Client_Host_Cache_Entry;
 
+#if POLARDB_PROXY
+/**
+ * @brief Outcome of PgSQL_Threads_Handler::polardb_attach_worker().
+ */
+enum class PolarDB_WorkerAttachResult : uint8_t {
+	/// The worker owns the slot and can receive reservation notifications. It
+	/// must be released again with polardb_detach_worker().
+	ATTACHED,
+	/// The handler is shutting down. The worker must abandon startup rather than
+	/// retry.
+	SHUTDOWN_STARTED,
+	/// The attach was rejected: the worker pointer is null, the thread array does
+	/// not exist, the index is out of range, or - the case a retrying caller must
+	/// detect - the slot is already occupied by a different worker.
+	INVALID_SLOT
+};
+#endif // POLARDB_PROXY
+
 class PgSQL_Threads_Handler
 {
 private:
@@ -1176,9 +1672,28 @@ private:
 	//   special variable : if true, further input validation is required
 	std::unordered_map<std::string, std::tuple<bool*, bool>> VariablesPointers_bool;
 #if POLARDB_PROXY
+	friend struct PolarDB_WorkerLifecycleUnitAccess;
+	// Keeps reservation notification from outliving its target worker.
+	std::mutex polardb_worker_lifecycle_mutex_;
 	PolarDB_ParsedGlobalConfigValue polardb_global_config_;
 	std::atomic<uint64_t> polardb_startup_config_generation_{1};
-	PolarDB_ParsedGlobalConfigValue build_polardb_global_config_locked(
+	/**
+	 * @brief Parse the current `variables.polardb_*` strings into a config value.
+	 *
+	 * Reads the raw variable strings directly, so the caller must hold the
+	 * handler rwlock for writing (commit() does; the constructor relies on being
+	 * single-threaded).
+	 *
+	 * @param startup_generation Generation to stamp into config.startup. The
+	 *        method only stores what it is given - it never bumps the generation.
+	 *        Detecting a startup-input change with
+	 *        polardb_same_startup_config_inputs() and incrementing the generation
+	 *        is the caller's job; a caller that skips it stores a stale
+	 *        generation.
+	 * @return The parsed configuration value, not yet stored into
+	 *         polardb_global_config_.
+	 */
+	PolarDB_ParsedGlobalConfigValue polardb_build_global_config_unlocked(
 		uint64_t startup_generation) const;
 #endif // POLARDB_PROXY
 	/**
@@ -1309,18 +1824,20 @@ public:
 		bool verbose_query_error;
 		int max_allowed_packet;
 #if POLARDB_PROXY
-		// PolarDB LSN session-consistency knobs. The mode knobs are word-valued
-		// (validated to off|lsn|primary and best_effort|strict); the
-		// rest are integer/bool.
-		char* polardb_consistency_mode;       // off | lsn | global_lsn | primary
-		int polardb_lag_bytes;                // reader lag-cap (bytes); 0=off
-		int polardb_lag_ms;                   // reserved ms lag cap; T13 accepts only 0, no PgSQL producer yet
-		int polardb_lag_wait_ms;              // polar_xact_split_wait_lsn timeout (ms); 0=wait indefinitely
-		int polardb_lsn_freshness_ms;         // max age of a cached per-server LSN to trust
+		// PolarDB LSN session-consistency knobs. Policy actions are word-valued
+		// and name their final client-visible outcome.
+		char* polardb_profile;                // named preset or custom
+		char* polardb_consistency_mode;       // off | eventual | session_lsn | global_lsn
+		char* polardb_read_target;            // primary | replica
+		char* polardb_action_read_fallback;   // primary | error
+		int polardb_max_reader_lsn_gap_bytes;    // reader lag cap in bytes; 0=off
+		int polardb_max_reader_lag_ms;            // reserved; only 0 is accepted until a real lag-time producer exists
+		int polardb_lsn_wait_timeout_ms;          // polar_xact_split_wait_lsn timeout; 0=wait indefinitely
+		int polardb_reader_lsn_max_age_ms;        // maximum age of a cached per-server LSN
 		int polardb_lag_cap_freshness_ms;     // max LSN-cache age under byte-lag cap + finite wait; 0=wait-fraction only
 		int polardb_reader_lsn_lag_range_bytes; // 0 keeps exact best-behind reader choice
-		bool polardb_reader_prefer_freshest_below_target; // experimental; balanced selection remains the default
-		bool polardb_reader_prefer_less_loaded; // experimental strict freshness/load dominance
+		bool polardb_reader_prefer_freshest_below_target; // experimental two-reader policy; balanced selection remains the default
+		bool polardb_reader_prefer_less_loaded; // experimental two-reader strict freshness/load dominance
 		int polardb_reader_connection_retention; // 0 returns after each pass; 1 retains active readers
 		int polardb_output_coalesce_bytes;   // 0 disables incomplete streaming output coalescing by bytes
 		int polardb_output_coalesce_packets; // 0 disables incomplete streaming output coalescing by packets
@@ -1329,12 +1846,11 @@ public:
 		bool polardb_writev_direct;           // plaintext frontend direct scatter/gather send path
 		bool polardb_result_fast_forward;     // batch contiguous backend DataRow frames into one result packet
 		int polardb_split_warmup_max_connections_per_request; // max backend connections per warmup request
-		char* polardb_wait_timeout_mode;      // best_effort | strict
+		char* polardb_action_lsn_timeout;      // warning | primary | error | disconnect
 		char* polardb_proxy_protocol;         // v15 | legacy | off
-		char* polardb_route_rfq_policy;       // strict | best_effort
-		char* polardb_reader_death_action;    // retry | forward | terminate
-		char* polardb_reader_timeout_action;  // retry | forward | terminate
-		char* polardb_reader_error_action;    // retry | forward | terminate
+		char* polardb_action_missing_lsn;      // primary | warning | error
+		char* polardb_action_replica_loss;     // replica_then_primary | replica_then_error | primary | error | disconnect
+		char* polardb_action_replica_error;    // primary | error | disconnect
 		char* polardb_proxy_identity_mode;    // client | proxy
 		char* polardb_proxy_identity_host;    // empty or IP literal
 		int polardb_proxy_identity_port;      // 0..65535
@@ -1565,6 +2081,9 @@ public:
 	 */
 	void wrlock();
 
+	/** Acquire a shared lock on the thread variables. */
+	void rdlock();
+
 	/**
 	 * @brief Releases a write lock on the thread variables.
 	 *
@@ -1577,6 +2096,9 @@ public:
 	 *
 	 */
 	void wrunlock();
+
+	/** Releases a shared lock acquired with `rdlock()`. */
+	void rdunlock();
 
 	/**
 	 * @brief Commits changes to thread variables and increments the global version.
@@ -1593,11 +2115,40 @@ public:
 
 #if POLARDB_PROXY
 	/** Copy the canonical parsed PolarDB values while the caller holds rwlock. */
-	PolarDB_ParsedGlobalConfigValue polardb_global_config_locked() const;
+	PolarDB_ParsedGlobalConfigValue get_polardb_global_config_unlocked() const;
 
-	/** Copy parsed PolarDB values for cold callers. */
+	/**
+	 * @brief Replace every profile-owned raw setting from one validated bundle.
+	 *
+	 * The caller must hold wrlock(). This changes the candidate variables only;
+	 * call commit() afterwards to publish them to workers.
+	 */
+	void apply_polardb_global_config_unlocked(
+		const PolarDB_ParsedGlobalConfigValue& config);
+
+	/**
+	 * @brief Copy the parsed PolarDB values for cold callers.
+	 *
+	 * Takes the handler rwlock in read mode around the copy. The caller must not
+	 * already hold that lock in either mode - doing so self-deadlocks. A caller
+	 * that is already inside rdlock()/wrlock() must use
+	 * get_polardb_global_config_unlocked() instead.
+	 *
+	 * @return A snapshot of the configuration values stored by commit().
+	 */
 	PolarDB_ParsedGlobalConfigValue get_polardb_global_config();
 
+	/**
+	 * @brief Read the startup configuration generation.
+	 *
+	 * Lock-free acquire load. commit() increments the counter only when a
+	 * startup-affecting input actually changes - proxy protocol dialect, proxy
+	 * identity mode, identity host or identity port - not on every commit. That
+	 * makes the value usable as a cache-invalidation stamp for anything derived
+	 * from the startup identity.
+	 *
+	 * @return The current startup configuration generation.
+	 */
 	uint64_t get_polardb_startup_config_generation() const;
 #endif // POLARDB_PROXY
 
@@ -1794,7 +2345,61 @@ public:
 	 */
 	void shutdown_threads();
 #if POLARDB_PROXY
-	bool signal_polardb_reader_claim(
+	/**
+	 * Registers a worker for reservation notifications while distinguishing normal
+	 * shutdown from an invalid or already occupied worker slot.
+	 *
+	 * Acquires polardb_worker_lifecycle_mutex_ internally, so the caller must not
+	 * already hold it - in particular this cannot be called from under
+	 * shutdown_threads()'s lock. On ATTACHED it also stamps
+	 * worker->polardb_worker_index, which every reservation and donor-exclusion
+	 * path relies on, and the attach must later be paired with
+	 * polardb_detach_worker().
+	 *
+	 * @param worker_index Slot to use.
+	 * @param worker       Worker assigned to the slot. Must not be null.
+	 * @return See PolarDB_WorkerAttachResult.
+	 */
+	PolarDB_WorkerAttachResult polardb_attach_worker(
+		unsigned int worker_index, PgSQL_Thread* worker);
+	/**
+	 * @brief Release a worker's reservation notification slot.
+	 *
+	 * Acquires polardb_worker_lifecycle_mutex_, so the caller must not already
+	 * hold it. Because the slot is cleared under that mutex, a true return also
+	 * guarantees that no polardb_queue_reader_reservation_wake() call is still
+	 * inside this worker - that guarantee is the reason the mutex exists.
+	 * worker->polardb_worker_index is deliberately left set.
+	 *
+	 * @param worker_index Slot to release.
+	 * @param worker       Worker that owns the slot.
+	 * @return true when the slot still held exactly this worker and was cleared;
+	 *         false when the worker is null, the thread array is missing, the
+	 *         index is out of range, or the slot holds someone else.
+	 */
+	bool polardb_detach_worker(
+		unsigned int worker_index, PgSQL_Thread* worker);
+	/**
+	 * @brief Deliver a reader pool reservation wake to another worker.
+	 *
+	 * Holds polardb_worker_lifecycle_mutex_ across the call into
+	 * worker->polardb_queue_reader_reservation_wake(). That is what keeps the
+	 * target worker alive for the duration of the notification, and it fixes the
+	 * lock order as lifecycle mutex first, then the target's
+	 * polardb_reader_pool_reservation_wake_mutex.
+	 *
+	 * @param worker_index    Worker to wake.
+	 * @param token           Reservation token the wake refers to.
+	 * @param server          Server holding the reserved connection.
+	 * @param server_snapshot Snapshot keeping `server` alive until the target
+	 *                        consumes the wake.
+	 * @return true when the wake was queued on the target worker, which then owns
+	 *         the connection and snapshot. false when it was not delivered -
+	 *         shutdown has started, the index is out of range, the slot is empty,
+	 *         or the target rejected the wake - and the caller still owns the
+	 *         connection and the snapshot.
+	 */
+	bool polardb_queue_reader_reservation_wake(
 		unsigned int worker_index, uint64_t token, PgSQL_SrvC* server,
 		std::shared_ptr<const void> server_snapshot);
 #endif // POLARDB_PROXY
@@ -2009,6 +2614,27 @@ public:
 	unsigned long long get_tx_poisoned_rejected_statements_total();
 
 #if POLARDB_PROXY
+	/**
+	 * @brief Aggregate one PolarDB counter across the global atomic and every
+	 *        live worker.
+	 *
+	 * Acquires polardb_worker_lifecycle_mutex_ for the whole scan, which keeps
+	 * the worker slots valid, so this must not be called from a context that
+	 * already holds that mutex.
+	 *
+	 * The aggregation depends on the counter's registration: counters listed in
+	 * POLARDB_THREAD_MAX_COUNTER_LIST are combined with max, all others with sum.
+	 * A caller that assumes summation misreports max-style counters.
+	 *
+	 * The result is approximate: per-worker slots are read with relaxed loads
+	 * while their owners keep writing them, and before threads are initialized or
+	 * once shutdown has started only the global atomic is returned.
+	 *
+	 * @param idx            Counter to aggregate.
+	 * @param global_counter Global atomic holding the folded contributions of
+	 *                       already-destroyed workers.
+	 * @return The aggregated value.
+	 */
 	unsigned long long get_polardb_counter(
 		PolarDB_ThreadStatusVariable idx,
 		std::atomic<unsigned long long>& global_counter);

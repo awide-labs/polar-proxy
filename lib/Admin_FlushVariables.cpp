@@ -906,11 +906,141 @@ FlushVariableStats ProxySQL_Admin::flush_pgsql_variables___database_to_runtime(S
 		return FlushVariableStats{};
 	}
 	else {
+#if POLARDB_PROXY
+		// Parse the complete profile-owned bundle before taking the write lock.
+		// A named profile switch ignores stale expanded rows from the previous
+		// profile. Individual changes under the current profile become CUSTOM.
+		const PolarDB_ParsedGlobalConfigValue current =
+			GloPTH->get_polardb_global_config();
+		PolarDB_ParsedGlobalConfigValue candidate = current;
+		PolarDB_Profile requested_profile =
+			polardb_profile_from_int(current.profile);
+		bool invalid_profile_value = false;
+		for (SQLite3_row* row : resultset->rows) {
+			if (strcmp(row->fields[0], "polardb_profile") != 0) {
+				continue;
+			}
+			const int parsed = polardb_profile_from_string(
+				row->fields[1], -1);
+			if (parsed < 0) {
+				invalid_profile_value = true;
+			} else {
+				requested_profile = polardb_profile_from_int(parsed);
+			}
+			break;
+		}
+
+		const PolarDB_Profile current_profile =
+			polardb_profile_from_int(current.profile);
+		const bool named_profile_switch =
+			polardb_profile_is_named(requested_profile) &&
+			requested_profile != current_profile;
+		std::string staged_profile_override;
+		if (!invalid_profile_value && named_profile_switch) {
+			for (SQLite3_row* row : resultset->rows) {
+				const char* name = row->fields[0];
+				if (!polardb_profile_owns_setting(name) ||
+						strcmp(name, "polardb_profile") == 0) {
+					continue;
+				}
+				PolarDB_ParsedGlobalConfigValue staged = current;
+				if (polardb_update_profile_setting(
+						&staged, name, row->fields[1]) !=
+						PolarDB_ProfileSettingResult::UPDATED) {
+					invalid_profile_value = true;
+					break;
+				}
+				if (!polardb_same_profile_owned_settings(current, staged)) {
+					staged_profile_override = name;
+					break;
+				}
+			}
+		}
+		if (!invalid_profile_value && named_profile_switch) {
+			if (staged_profile_override.empty()) {
+				polardb_apply_profile(requested_profile, &candidate);
+			}
+		} else if (!invalid_profile_value) {
+			candidate.profile = static_cast<int>(requested_profile);
+			for (SQLite3_row* row : resultset->rows) {
+				const char* name = row->fields[0];
+				if (!polardb_profile_owns_setting(name) ||
+						strcmp(name, "polardb_profile") == 0) {
+					continue;
+				}
+				if (polardb_update_profile_setting(
+						&candidate, name, row->fields[1]) !=
+						PolarDB_ProfileSettingResult::UPDATED) {
+					invalid_profile_value = true;
+					break;
+				}
+			}
+			if (polardb_profile_is_named(requested_profile)) {
+				candidate.profile = static_cast<int>(
+					polardb_config_matches_profile(
+						candidate, requested_profile)
+						? requested_profile
+						: PolarDB_Profile::CUSTOM);
+			}
+		}
+
+		if (!staged_profile_override.empty()) {
+			proxy_error(
+				"Cannot load PostgreSQL variables: pgsql-polardb_profile and "
+				"pgsql-%s were changed together. Runtime variables were not "
+				"changed. Load the profile first, then change and load the "
+				"individual setting.\n",
+				staged_profile_override.c_str());
+			stats.records = static_cast<int>(resultset->rows.size());
+			stats.rejected = 1;
+			delete resultset;
+			return stats;
+		}
+
+		const char* policy_error = polardb_global_policy_error(candidate);
+		const char* global_hostgroup_error =
+			PgHGM && PgHGM->polardb_has_effective_global_lsn(
+				candidate.consistency_mode)
+				? polardb_consistency_policy_error(
+					PolarDB_ConsistencyMode::GLOBAL_LSN,
+					polardb_missing_lsn_action_from_int(
+						candidate.missing_lsn_action),
+					polardb_lsn_wait_timeout_action_from_int(
+						candidate.lsn_wait_timeout_action))
+				: nullptr;
+		const std::string loaded_hostgroup_error = PgHGM
+			? PgHGM->polardb_loaded_hostgroup_policy_error(candidate)
+			: std::string();
+		if (invalid_profile_value || policy_error || global_hostgroup_error ||
+				!loaded_hostgroup_error.empty()) {
+			proxy_error(
+				"Cannot load PostgreSQL variables: invalid PolarDB policy: %s. "
+				"Runtime variables were not changed.\n",
+				invalid_profile_value
+					? "a profile-owned setting has an invalid value"
+					: policy_error ? policy_error :
+					global_hostgroup_error ? global_hostgroup_error :
+					loaded_hostgroup_error.c_str());
+			stats.records = static_cast<int>(resultset->rows.size());
+			stats.rejected = 1;
+			delete resultset;
+			return stats;
+		}
+#endif // POLARDB_PROXY
 		GloPTH->wrlock();
+#if POLARDB_PROXY
+		GloPTH->apply_polardb_global_config_unlocked(candidate);
+#endif // POLARDB_PROXY
 		for (std::vector<SQLite3_row*>::iterator it = resultset->rows.begin(); it != resultset->rows.end(); ++it) {
 			SQLite3_row* r = *it;
 			const char* value = r->fields[1];
 			stats.records++;
+#if POLARDB_PROXY
+			if (polardb_profile_owns_setting(r->fields[0])) {
+				stats.updated++;
+				continue;
+			}
+#endif // POLARDB_PROXY
 			bool rc = GloPTH->set_variable(r->fields[0], value);
 			if (rc == false) {
 				proxy_debug(PROXY_DEBUG_ADMIN, 4, "Impossible to set variable %s with value \"%s\"\n", r->fields[0], value);
@@ -981,6 +1111,26 @@ FlushVariableStats ProxySQL_Admin::flush_pgsql_variables___database_to_runtime(S
 			}
 			//			}
 		}
+
+#if POLARDB_PROXY
+		// Keep MEMORY coherent with the profile that is about to be published,
+		// so SAVE persists one complete bundle and a later individual change can
+		// be recognized as CUSTOM.
+		for (const PolarDB_ProfileSettingDefinition& setting :
+				polardb_profile_settings()) {
+			const char* name = setting.name;
+			char* value = GloPTH->get_variable((char*)name);
+			if (!value) {
+				continue;
+			}
+			char update[1024];
+			snprintf(update, sizeof(update),
+				"INSERT OR REPLACE INTO global_variables VALUES("
+				"\"pgsql-%s\",\"%s\")", name, value);
+			db->execute(update);
+			free(value);
+		}
+#endif // POLARDB_PROXY
 		
 		char q[1000];
 		char* default_client_encoding = GloPTH->get_variable_string((char*)"default_client_encoding");
@@ -999,13 +1149,17 @@ FlushVariableStats ProxySQL_Admin::flush_pgsql_variables___database_to_runtime(S
 				db->execute(q);
 				GloPTH->set_variable((char*)"default_client_encoding", p);
 		}
-		free(default_client_encoding);
-		GloPTH->commit();
-		GloPTH->wrunlock();
-#if POLARDB_PROXY
-		if (PgHGM) {
-			PgHGM->polardb_warn_config_mismatches();
-		}
+			free(default_client_encoding);
+			GloPTH->commit();
+			GloPTH->wrunlock();
+	#if POLARDB_PROXY
+			// Break every worker out of poll() so the committed policy generation is
+			// adopted on its next processing pass instead of waiting up to
+			// pgsql-poll_timeout.
+			GloPTH->signal_all_threads(0);
+			if (PgHGM) {
+				PgHGM->polardb_warn_config_mismatches();
+			}
 #endif // POLARDB_PROXY
 
 			{

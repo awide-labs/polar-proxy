@@ -47,6 +47,11 @@
 /* new style V3 packet header len - type:1b, len:4b */
 #define NEW_HEADER_LEN  5
 
+static constexpr size_t PGSQL_V3_MESSAGE_HEADER_SIZE = NEW_HEADER_LEN;
+static constexpr size_t PGSQL_SIMPLE_QUERY_TERMINATOR_SIZE = 1;
+static constexpr size_t PGSQL_SIMPLE_QUERY_MESSAGE_OVERHEAD =
+	PGSQL_V3_MESSAGE_HEADER_SIZE + PGSQL_SIMPLE_QUERY_TERMINATOR_SIZE;
+
 #define PGSQL_RESULTSET_BUFLEN		(16 * 1024)
 
 class ProxySQL_Admin;

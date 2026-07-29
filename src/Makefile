@@ -209,8 +209,9 @@ EXECUTABLE := proxysql
 
 _OBJ := main.o proxysql_global.o SQLite3_Server.o proxy_tls.o
 OBJ := $(patsubst %,$(ODIR)/%,$(_OBJ))
+HEADERS := ../include/*.h ../include/*.hpp
 
-$(ODIR)/%.o: %.cpp $(OBJECT_BUILD_VARIANT_FILE)
+$(ODIR)/%.o: %.cpp $(HEADERS) $(OBJECT_BUILD_VARIANT_FILE)
 	$(CXX) -c -o $@ $< $(MYCXXFLAGS) $(CXXFLAGS) -Wall
 
 $(EXECUTABLE): $(ODIR) $(OBJ) $(LIBPROXYSQLAR)

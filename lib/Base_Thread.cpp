@@ -518,6 +518,11 @@ bool Base_Thread::set_backend_to_be_skipped_if_frontend_is_slow(DS * myds, unsig
 template<typename T, typename DS>
 bool Base_Thread::move_session_to_idle_mysql_sessions(DS * myds, unsigned int n) {
 	T* thr = static_cast<T*>(this);
+#if POLARDB_PROXY
+	if constexpr (std::is_same_v<T, PgSQL_Thread>) {
+		if (myds->sess->polardb_reader_capacity_wait.active) return false;
+	}
+#endif
 	unsigned long long _tmp_idle = thr->mypolls.last_recv[n] > thr->mypolls.last_sent[n] ? thr->mypolls.last_recv[n] : thr->mypolls.last_sent[n] ;
 
 	int session_idle_ms = 0;

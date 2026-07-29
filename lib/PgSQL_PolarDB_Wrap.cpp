@@ -2,18 +2,18 @@
  * @file PgSQL_PolarDB_Wrap.cpp
  * @brief Builds the wait wrapper that gives a replica read read-your-writes consistency.
  *
- * When the planner decides to send a read to a replica but wants it to first
- * catch up to the client's last write, this file rewrites the outgoing query.
+ * When the planner routes a read to a replica that must first catch up to the
+ * client's last write, this file rewrites the outgoing query.
  * It prepends three SET statements ahead of the user query:
  *   SET polar_consistency_mode = '<best_effort|strict>';     -- behavior on timeout
  *   SET polar_proxy_wait_timeout_ms = <ms>;                  -- how long to wait
  *   SET polar_xact_split_wait_lsn = '<session target LSN>';  -- the wait condition
  * The replica blocks on the last SET until it has replayed past the session's
- * last write, so the read sees that write instead of stale data.
+ * last write, so the read returns that write instead of stale data.
  *
- * The whole thing is sent as one simple-query ('Q') packet. The client never
- * sees the change: the connection layer drops the three leading SET results and
- * forwards only the user query's result (PgSQL_Connection.cpp). See
+ * The whole thing is sent as one simple-query ('Q') packet. The rewrite is not
+ * visible to the client: the connection layer drops the three leading SET results
+ * and forwards only the user query's result (PgSQL_Connection.cpp). See
  * doc/polardb-arch/07-QUERY-WRAPPING.md for the end-to-end flow.
  *
  * These SET statements are per-query backend instructions, not ProxySQL session
@@ -27,12 +27,12 @@
  * would make the query succeed without making the replica wait run.
  *
  * The pipeline in PgSQL_PolarDB_Flow.cpp drives the helpers here:
- *   - build_polar_consistency_mode_set() — the consistency-mode SET
+ *   - polardb_wait_mode_set_statement() — the consistency-mode SET
  *   - build_wrapped_wait_query()         — assemble the multi-statement string
- *   - finalize_wait_timeout_injection()  — the one place the wrap is installed
+ *   - polardb_install_wait_wrapper()  — the one place the wrap is installed
  *
  * This file also owns the wait-latency and wait-timeout accounting
- * (record_wait_latency, polardb_account_wait_timeout) and the wait-state
+ * (polardb_finish_wait, polardb_account_wait_timeout) and the wait-state
  * teardown on RESET/DISCARD (polardb_clear_staged_wait_state_for_reset),
  * because it owns the per-query wait state and the wrapped-query buffer.
  */
@@ -69,6 +69,21 @@
 }
 
 #if POLARDB_PROFILE
+/**
+ * @brief Record the reader-selection sample of the per-query wait profile.
+ *
+ * At most one sample is kept per query: the first call is recorded and every
+ * later call is dropped. The call is also a silent no-op unless the wait profile is active,
+ * @p wait_spec stages a wait, and @p result reports an acquired reader — so a new
+ * call site placed outside those conditions loses its data with no indication.
+ *
+ * Fills in the selected server token, the LSN gap against the wait target, and
+ * the comparison against the best considered reader (only meaningful when both
+ * LSN samples are fresh and non-zero), then emits the consistency trace event.
+ *
+ * @param wait_spec  Wait staged for this query; must report has_wait().
+ * @param result     Outcome of reader selection; must report acquired().
+ */
 void PgSQL_Session::polardb_profile_note_reader_selection(
 		const PolarDB_WaitSpec& wait_spec,
 		const PolarDB_ReaderResult& result) {
@@ -109,8 +124,54 @@ void PgSQL_Session::polardb_profile_note_reader_selection(
 			profile.selected_lsn_age_us = now_us - updated_at;
 		}
 	}
+
+	uint32_t flags = 0;
+	if (result.selected_reader_lsn_fresh) {
+		flags |= POLARDB_CONSISTENCY_TRACE_SELECTED_LSN_FRESH;
+	}
+	if (result.best_considered_reader_lsn_fresh) {
+		flags |= POLARDB_CONSISTENCY_TRACE_BEST_LSN_FRESH;
+	}
+	const int hostgroup_id =
+		result.srv && result.srv->myhgc
+			? static_cast<int>(result.srv->myhgc->hid) : -1;
+	const PolarDB_ConsistencyTraceEvent event =
+		result.wait_bypass_allowed
+			? PolarDB_ConsistencyTraceEvent::READER_WAIT_BYPASSED
+			: PolarDB_ConsistencyTraceEvent::READER_WAIT_REQUIRED;
+	if (result.wait_bypass_allowed) {
+		POLARDB_PROFILE_THREAD_COUNT_ONE(
+			thread, consistency_reader_wait_bypassed);
+	} else {
+		POLARDB_PROFILE_THREAD_COUNT_ONE(
+			thread, consistency_reader_wait_required);
+	}
+	proxysql_polardb_consistency_trace(
+		static_cast<uint64_t>(event), thread_session_id,
+		wait_spec.target, result.selected_reader_lsn,
+		result.best_considered_reader_lsn,
+		polardb_consistency_trace_detail(hostgroup_id, flags));
 }
 
+/**
+ * @brief Record a reader-selection profile sample for a connection obtained
+ *        without going through the reader selector.
+ *
+ * This is the fallback profiling entry. Because no selector result exists, the
+ * server LSN is re-sampled here through srv->polardb_sample_lsn() using a
+ * freshness window derived from the wait timeout and the reader plan lag cap, and
+ * a synthetic PolarDB_ReaderResult with status ACQUIRED is handed to
+ * polardb_profile_note_reader_selection(). The sample therefore reflects the LSN
+ * at connection time rather than at selection time, and the best-considered
+ * fields stay zero so the profile records no comparison.
+ *
+ * No-ops unless the wait profile is active, no selection has been recorded yet,
+ * @p wait_spec stages a wait, and @p conn has a parent server.
+ *
+ * @param wait_spec    Wait staged for this query.
+ * @param reader_plan  Reader plan whose max_lag_bytes bounds the freshness window.
+ * @param conn         Reader connection in use. Ownership stays with the caller.
+ */
 void PgSQL_Session::polardb_profile_note_reader_connection(
 		const PolarDB_WaitSpec& wait_spec,
 		const PolarDB_Query_ReaderPlan& reader_plan,
@@ -123,23 +184,21 @@ void PgSQL_Session::polardb_profile_note_reader_connection(
 
 	PgSQL_SrvC* srv = static_cast<PgSQL_SrvC*>(conn->parent);
 	const uint64_t now_us = monotonic_time();
-	const uint64_t updated_at = srv->lsn_updated_at.load(
-		std::memory_order_relaxed);
 	const uint32_t fresh_ms = polardb_effective_lsn_freshness_ms(
-		pgsql_thread___polardb_lsn_freshness_ms,
+		pgsql_thread___polardb_reader_lsn_max_age_ms,
 		wait_spec.timeout_ms,
 		reader_plan.max_lag_bytes,
 		pgsql_thread___polardb_lag_cap_freshness_ms,
 		nullptr);
+	const PolarDB_ReaderLsnSample sample =
+		srv->polardb_sample_lsn(now_us, fresh_ms);
 
 	PolarDB_ReaderResult result;
 	result.conn = conn;
 	result.srv = srv;
 	result.status = PolarDB_ReaderStatus::ACQUIRED;
-	result.selected_reader_lsn = srv->polardb_current_lsn.load(
-		std::memory_order_relaxed);
-	result.selected_reader_lsn_fresh = polardb_lsn_cache_fresh(
-		updated_at, now_us, fresh_ms);
+	result.selected_reader_lsn = sample.lsn;
+	result.selected_reader_lsn_fresh = sample.fresh;
 	polardb_profile_note_reader_selection(wait_spec, result);
 }
 
@@ -183,6 +242,20 @@ void PgSQL_Session::polardb_profile_note_wait_set_completed(
 	}
 }
 
+/**
+ * @brief Emit the wait-profile histograms for the finished query and clear the
+ *        per-query profile.
+ *
+ * The reported wait interval is the correlated dispatch-to-wait-set interval when
+ * both timestamps were captured; @p fallback_elapsed_us is used only when they
+ * cannot produce one. The wait-set to query-end interval is counted separately.
+ *
+ * Call exactly once per query, and last: this ends with profile.reset(), so every
+ * subsequent profiling call for the same query silently no-ops.
+ *
+ * @param fallback_elapsed_us  Wait duration in microseconds to report when the
+ *                             dispatch and wait-set timestamps do not correlate.
+ */
 void PgSQL_Session::polardb_profile_record_wait_completion(
 		unsigned long long fallback_elapsed_us) {
 	PolarDB_WaitProfileState& profile = polardb_query.wait_profile;
@@ -226,12 +299,16 @@ void PgSQL_Session::polardb_profile_record_wait_completion(
  */
 static void replace_simple_query_packet(PgSQL_Data_Stream* myds, const std::string& query) {
 	PtrSize_t& pkt = myds->pgsql_real_query.pkt;
-	size_t new_size = 1 + 4 + query.length() + 1;
+	size_t new_size =
+		PGSQL_SIMPLE_QUERY_MESSAGE_OVERHEAD + query.length();
 	unsigned char* new_ptr = (unsigned char*)l_alloc(new_size);
 	new_ptr[0] = 'Q';
-	uint32_t packet_len = htonl((uint32_t)(4 + query.length() + 1));
-	memcpy(new_ptr + 1, &packet_len, 4);
-	memcpy(new_ptr + 5, query.c_str(), query.length());
+	uint32_t packet_len = htonl(static_cast<uint32_t>(
+		query.length() + PGSQL_SIMPLE_QUERY_MESSAGE_OVERHEAD - 1));
+	memcpy(new_ptr + 1, &packet_len, sizeof(packet_len));
+	memcpy(
+		new_ptr + PGSQL_V3_MESSAGE_HEADER_SIZE,
+		query.c_str(), query.length());
 	new_ptr[new_size - 1] = '\0';
 
 	l_free(pkt.size, pkt.ptr);
@@ -239,8 +316,10 @@ static void replace_simple_query_packet(PgSQL_Data_Stream* myds, const std::stri
 	pkt.size = new_size;
 	// QueryPtr/QuerySize address the query body only (after the 'Q' byte and the
 	// 4-byte length header), matching how the rest of the data stream reads them.
-	myds->pgsql_real_query.QueryPtr = (char*)new_ptr + 5;
-	myds->pgsql_real_query.QuerySize = new_size - 5;
+	myds->pgsql_real_query.QueryPtr =
+		(char*)new_ptr + PGSQL_V3_MESSAGE_HEADER_SIZE;
+	myds->pgsql_real_query.QuerySize =
+		new_size - PGSQL_V3_MESSAGE_HEADER_SIZE;
 }
 
 #if POLARDB_PROXY && POLARDB_DEBUG
@@ -269,13 +348,13 @@ static bool polardb_debug_fail_wrap_finalize_once() {
  *
  * Tests use this to make the first injected SET fail on the backend without
  * simulating an LSN wait timeout. The fault file is consumed when it contains
- * "1", so the next wrapped read sees an ordinary wrapper SET ERROR while later
- * reads continue normally. Compiled only in debug builds.
+ * "1", so the next wrapped read receives an ordinary wrapper SET ERROR while
+ * later reads continue normally. Compiled only in debug builds.
  */
 static bool polardb_debug_fail_wait_set_once() {
 	char buf[16] = {0};
 	bool enabled = false;
-	if (polardb_debug_consume_fault_file(
+	if (polardb_debug_read_fault_file(
 			"POLARDB_DEBUG_WRAP_SET_ERROR_FILE", buf, sizeof(buf))) {
 		enabled = strcmp(buf, "1") == 0;
 	}
@@ -291,7 +370,7 @@ static bool polardb_debug_fail_wait_set_once() {
 /**
  * @brief Return the `SET polar_consistency_mode = '...'` statement for a wait mode.
  *
- * This is the first SET in the wait wrapper. It tells the replica what to do
+ * This is the first SET in the wait wrapper. It configures what the replica does
  * when the wait times out: best_effort returns possibly-stale data with a
  * WARNING; strict raises an ERROR. The text never varies, so the two possible
  * statements are function-static literals and a reference to one is returned.
@@ -304,10 +383,10 @@ static bool polardb_debug_fail_wait_set_once() {
  *   1 = best_effort -> SET polar_consistency_mode = 'best_effort' (stale + WARNING on timeout)
  *   2 = strict      -> SET polar_consistency_mode = 'strict'      (ERROR on timeout)
  */
-const std::string& PgSQL_Session::build_polar_consistency_mode_set(
+const std::string& PgSQL_Session::polardb_wait_mode_set_statement(
 	PolarDB_WaitMode wait_mode) {
 	int desired_mode = (int)wait_mode;
-	POLARDB_TRACE("PolarDB WAIT: build_polar_consistency_mode_set desired_mode=%d\n",
+	POLARDB_TRACE("PolarDB WAIT: polardb_wait_mode_set_statement desired_mode=%d\n",
 		desired_mode);
 
 	static const std::string strict_mode_set =
@@ -325,29 +404,28 @@ const std::string& PgSQL_Session::build_polar_consistency_mode_set(
 }
 
 /**
- * @brief Assemble the wrapped multi-statement wait query into @p out.
+ * @brief Append the wrapped multi-statement wait query to @p out.
  *
- * Builds one SQL string from four parts:
+ * Appends four parts, in order, to whatever @p out already holds:
  *   SET polar_consistency_mode = '...';      (passed in via @p mode_set)
  *   SET polar_proxy_wait_timeout_ms = <ms>;
  *   SET polar_xact_split_wait_lsn = '<target>';
  *   <original user query>
  *
- * The backend runs all four statements; the connection layer
- * (PgSQL_Connection.cpp) drops the SET results and forwards only the user
- * query's result.
+ * The backend runs all of them; the connection layer (PgSQL_Connection.cpp) drops
+ * the SET results and forwards only the user query's result.
  *
- * Safety contract: @p out is left empty (no wrapper produced) when there is
- * nothing safe to wrap — an empty query, no wait, or an LSN wait whose target is
- * zero. The caller treats an empty buffer as a build failure and must not send
- * the read to a replica unwrapped.
+ * On failure @p out is unchanged, including any transaction-split prefix already
+ * present. A return of 0 means no wrapper was appended and the read must not be
+ * sent to a replica unwrapped.
  *
  * @param orig_query  Original user query text.
  * @param orig_len    Length of @p orig_query in bytes.
  * @param wait_state  The query's wait state (wait type + LSN target + timeout).
- * @param mode_set    Consistency-mode SET from build_polar_consistency_mode_set().
- * @param out         Output buffer for the wrapped SQL; unchanged on skip.
- * @return Number of SET results prepended before the user query, or 0 on skip.
+ * @param mode_set    Consistency-mode SET from polardb_wait_mode_set_statement().
+ * @param out         Buffer the wrapper is appended to.
+ * @return Number of SET results prepended before the user query, or 0 when no
+ *         wrapper was appended.
  */
 uint32_t PgSQL_Session::append_wrapped_wait_query(const char* orig_query, size_t orig_len,
 	const PolarDB_Query_WaitState& wait_state, const std::string& mode_set, std::string& out) {
@@ -368,7 +446,8 @@ uint32_t PgSQL_Session::append_wrapped_wait_query(const char* orig_query, size_t
 		return 0;
 	}
 
-	// 128 bytes of slack covers the three SET statements; the buffer grows if needed.
+	const size_t original_size = out.size();
+	// 128 bytes of slack covers the three SET statements.
 	out.reserve(out.size() + mode_set.size() + orig_len + 128);
 	uint32_t wrapper_stmts = 0;
 #if POLARDB_PROXY && POLARDB_DEBUG
@@ -391,7 +470,7 @@ uint32_t PgSQL_Session::append_wrapped_wait_query(const char* orig_query, size_t
 		wait_state.spec.timeout_ms);
 	if (!PolarDB_Protocol::append_polar_wait_set(wait_state.spec.type, target, out)) {
 		POLARDB_TRACE("PolarDB WAIT WRAP: skip — wait statement unavailable\n");
-		out.clear();
+		out.resize(original_size);
 		return 0;
 	}
 	wrapper_stmts++;
@@ -402,6 +481,26 @@ uint32_t PgSQL_Session::append_wrapped_wait_query(const char* orig_query, size_t
 	return wrapper_stmts;
 }
 
+/**
+ * @brief Build the wrapped multi-statement wait query into a fresh @p out.
+ *
+ * Clears @p out and then delegates to append_wrapped_wait_query(), so any content
+ * the caller left in the buffer is discarded. Use this variant when @p out carries
+ * nothing worth keeping; use append_wrapped_wait_query() when the caller has
+ * already placed statements of its own in front of the wrapper.
+ *
+ * Because the buffer starts empty, a return of 0 always leaves @p out empty — the
+ * caller can treat an empty buffer as the build failure signal and must not send
+ * the read to a replica unwrapped.
+ *
+ * @param orig_query  Original user query text.
+ * @param orig_len    Length of @p orig_query in bytes.
+ * @param wait_state  The query's wait state (wait type + LSN target + timeout).
+ * @param mode_set    Consistency-mode SET from polardb_wait_mode_set_statement().
+ * @param out         Output buffer; cleared on entry.
+ * @return Number of SET results prepended before the user query, or 0 when no
+ *         wrapper could be built.
+ */
 uint32_t PgSQL_Session::build_wrapped_wait_query(const char* orig_query, size_t orig_len,
 	const PolarDB_Query_WaitState& wait_state, const std::string& mode_set, std::string& out) {
 	out.clear();
@@ -421,7 +520,9 @@ uint32_t PgSQL_Session::build_wrapped_wait_query(const char* orig_query, size_t 
  * @param reason  Short human-readable cause, included in the error log.
  * @return Always PolarDB_WrapFinalizeResult::FAILED.
  */
-PolarDB_WrapFinalizeResult PgSQL_Session::fail_wait_wrap_finalize(const char* reason) {
+PolarDB_WrapFinalizeResult
+PgSQL_Session::polardb_fail_wrap_and_disable_session_waits(
+		const char* reason) {
 	PgHGM->status.polardb_wait_wrap_safety_abort.fetch_add(1, std::memory_order_relaxed);
 	proxy_error("PolarDB WRAP: finalize failed: %s, sess=%p\n",
 		reason ? reason : "unknown", this);
@@ -443,19 +544,21 @@ PolarDB_WrapFinalizeResult PgSQL_Session::fail_wait_wrap_finalize(const char* re
  * ASYNC_IDLE state, after a backend connection and data stream exist. It returns
  * CONTINUE immediately unless the plan/execute stage already staged a wait
  * (wait_stage == WAITING), so an un-staged query is a safe no-op here. When a
- * wait is staged, the plan stage already saved the intent (the prepared wait spec
- * and a snapshot of the original query text); this method assembles the wrapped
- * multi-statement string exactly once and swaps it into the outgoing simple-query
- * ('Q') packet, then records how many leading SET results the connection must drop.
+ * wait is staged, the plan stage already saved the prepared wait spec. This
+ * method copies the original SQL only when a wrapper is really needed, assembles
+ * the wrapped multi-statement string exactly once, and swaps it into the outgoing
+ * simple-query ('Q') packet. It then records how many leading SET results the
+ * connection must drop.
  *
  * Idempotent: a second call after success is a no-op (protected by
  * wrapper_finalized), so re-entering ASYNC_IDLE is safe.
  *
- * Safety path: any missing precondition routes through fail_wait_wrap_finalize()
+ * Safety path: any missing precondition routes through
+ * polardb_fail_wrap_and_disable_session_waits()
  * and returns FAILED; the caller must then abort the query rather than send it
  * unwrapped. See doc/polardb-arch/07-QUERY-WRAPPING.md sections 4 and 7.
  *
- * The replica is assumed to understand the PolarDB wait/timeout GUCs; there is
+ * The replica is assumed to support the PolarDB wait/timeout GUCs; there is
  * no per-connection capability probe. On a backend that does not, the first SET
  * errors and that error reaches the client (it is not a silent stale read).
  *
@@ -464,7 +567,9 @@ PolarDB_WrapFinalizeResult PgSQL_Session::fail_wait_wrap_finalize(const char* re
  * @return CONTINUE when the query is safe to run (no wrap needed, or wrap
  *         installed); FAILED when a needed wrapper could not be installed.
  */
-PolarDB_WrapFinalizeResult PgSQL_Session::finalize_wait_timeout_injection(PgSQL_Connection* conn, PgSQL_Data_Stream* myds) {
+PolarDB_WrapFinalizeResult
+PgSQL_Session::polardb_install_wait_wrapper(
+		PgSQL_Connection* conn, PgSQL_Data_Stream* myds) {
 	if (!polardb_wait_active()) return PolarDB_WrapFinalizeResult::CONTINUE;
 	if (polardb_query.wait.wrapper_finalized) {
 		POLARDB_TRACE("PolarDB WRAP FINALIZE: already finalized, skip\n");
@@ -473,22 +578,38 @@ PolarDB_WrapFinalizeResult PgSQL_Session::finalize_wait_timeout_injection(PgSQL_
 
 #if POLARDB_PROXY && POLARDB_DEBUG
 	if (polardb_debug_fail_wrap_finalize_once()) {
-		return fail_wait_wrap_finalize("debug fault injection");
+		return polardb_fail_wrap_and_disable_session_waits(
+			"debug fault injection");
 	}
 #endif
 
 	if (!conn || !myds) {
-		return fail_wait_wrap_finalize("missing backend connection or data stream");
+		return polardb_fail_wrap_and_disable_session_waits(
+			"missing backend connection or data stream");
 	}
 
-	if (polardb_query.wait.original_query.empty()) {
-		return fail_wait_wrap_finalize("missing original query snapshot");
+	// Most selected readers already satisfy the target, so the wait is bypassed
+	// before this function. Copy the SQL only for the uncommon query that will
+	// actually be wrapped. QuerySize includes the trailing NUL.
+	if (polardb_query.original_query.empty() &&
+			myds->pgsql_real_query.QueryPtr &&
+			myds->pgsql_real_query.QuerySize > 0) {
+		size_t query_size = myds->pgsql_real_query.QuerySize;
+		if (myds->pgsql_real_query.QueryPtr[query_size - 1] == '\0') {
+			--query_size;
+		}
+		polardb_query.original_query.assign(
+			myds->pgsql_real_query.QueryPtr, query_size);
+	}
+	if (polardb_query.original_query.empty()) {
+		return polardb_fail_wrap_and_disable_session_waits(
+			"missing original query snapshot");
 	}
 
 	// Build the wrapped query once with all SETs.
 	const std::string& mode_set =
-		build_polar_consistency_mode_set(polardb_query.wait.spec.mode);
-	const std::string& original_query = polardb_query.wait.original_query;
+		polardb_wait_mode_set_statement(polardb_query.wait.spec.mode);
+	const std::string& original_query = polardb_query.original_query;
 #if POLARDB_PROFILE
 	const unsigned long long build_start_us = monotonic_time();
 #endif // POLARDB_PROFILE
@@ -503,7 +624,8 @@ PolarDB_WrapFinalizeResult PgSQL_Session::finalize_wait_timeout_injection(PgSQL_
 #endif // POLARDB_PROFILE
 
 	if (wrapper_stmts == 0) {
-		return fail_wait_wrap_finalize("wrapper builder produced no statements");
+		return polardb_fail_wrap_and_disable_session_waits(
+			"wrapper builder produced no statements");
 	}
 	polardb_query.wait.wrapper_stmts = wrapper_stmts;
 
@@ -518,6 +640,14 @@ PolarDB_WrapFinalizeResult PgSQL_Session::finalize_wait_timeout_injection(PgSQL_
 		const unsigned long long install_start_us = monotonic_time();
 #endif // POLARDB_PROFILE
 		replace_simple_query_packet(myds, polardb_query.wrapped_query_buf);
+		// The backend stream now owns the wrapper packet, while CurrentQuery
+		// must continue to describe the client's SQL through RequestEnd and
+		// query logging. Point it at the request-owned stable copy before the
+		// state machine resumes.
+		CurrentQuery.QueryPointer = reinterpret_cast<unsigned char*>(
+			polardb_query.original_query.data());
+		CurrentQuery.QueryLength =
+			static_cast<unsigned int>(polardb_query.original_query.size() + 1);
 		polardb_query.dispatch_wrapper_stmts = polardb_query.wait.wrapper_stmts;
 		polardb_query.dispatch_wrapper_kind = PolarDB_Query_WrapperKind::CONSISTENCY_WAIT;
 		if (polardb_query.wait.spec.type == PolarDB_WaitType::LSN) {
@@ -525,6 +655,15 @@ PolarDB_WrapFinalizeResult PgSQL_Session::finalize_wait_timeout_injection(PgSQL_
 		}
 		// Only the LSN wait type has a per-type sent counter today.
 #if POLARDB_PROFILE
+		POLARDB_PROFILE_THREAD_COUNT_ONE(
+			thread, consistency_wait_wrapper_installed);
+		proxysql_polardb_consistency_trace(
+			static_cast<uint64_t>(
+				PolarDB_ConsistencyTraceEvent::WAIT_WRAPPER_INSTALLED),
+			thread_session_id, polardb_query.wait.spec.target,
+			polardb_query.wait.wrapper_stmts, 0,
+			polardb_consistency_trace_detail(
+				myds->mybe ? myds->mybe->hostgroup_id : -1, 0));
 		const unsigned long long install_end_us = monotonic_time();
 		POLARDB_PROFILE_THREAD_COUNT(thread, wait_wrap_install_sum_us,
 			install_end_us >= install_start_us
@@ -532,32 +671,93 @@ PolarDB_WrapFinalizeResult PgSQL_Session::finalize_wait_timeout_injection(PgSQL_
 		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, wait_wrap_install_count);
 #endif // POLARDB_PROFILE
 	} else {
-		return fail_wait_wrap_finalize("wrapped query is empty");
+		return polardb_fail_wrap_and_disable_session_waits(
+			"wrapped query is empty");
 	}
 
 	polardb_query.wait.wrapper_finalized = true;
 	return PolarDB_WrapFinalizeResult::CONTINUE;
 }
 
+/**
+ * @brief Turn a reader-selection result into direct dispatch or a real wait.
+ *
+ * The route planner records only reader_wait_spec. This is the first point at
+ * which the concrete backend is known. A fresh cached LSN at or above the target
+ * is a complete proof for this dispatch, so keep wait inactive and remember the
+ * confirmed target for RFQ and failure handling. Only a behind reader activates
+ * the wrapper state and its timer.
+ */
+bool PgSQL_Session::polardb_finish_reader_wait_selection(
+		const PolarDB_WaitSpec& wait_spec, bool target_reached,
+		int fallback_writer_hg) {
+	if (!wait_spec.has_wait()) {
+		polardb_query.reset_wait();
+		return false;
+	}
+
+	if (target_reached) {
+		polardb_query.wait_bypass_target = wait_spec.target;
+		polardb_query.reset_wait();
+		POLARDB_THREAD_COUNT_ONE(thread, wait_wrap_bypassed);
+		POLARDB_TRACE(
+			"PolarDB DIRECT READ: selected reader reached target_lsn=%lu\n",
+			(unsigned long)wait_spec.target);
+		return false;
+	}
+
+	polardb_query.wait_bypass_target = 0;
+	polardb_query.wait.prepare_from_spec(wait_spec);
+	polardb_query.wait.wait_stage = PolarDB_WaitStage::WAITING;
+	polardb_query.wait.wait_started_at_us = monotonic_time();
+	polardb_query.wait.fallback_writer_hg = fallback_writer_hg;
+	POLARDB_THREAD_COUNT_ONE(thread, wait_wrap_prepared);
+	POLARDB_TRACE(
+		"PolarDB WAIT: selected reader is behind target_lsn=%lu; "
+		"wrapper activated\n",
+		(unsigned long)wait_spec.target);
+	return true;
+}
+
 
 /**
- * @brief Record an LSN wait's elapsed latency and clear its start timer.
- *
- * Called when a wrapped wait read finishes, on every path: normal query end, a
- * confirmed wait timeout, and a failed wrapper SET. It adds the elapsed wait time
- * to the running total PolarDB_Wait_LSN_Sum_Us. Repeat calls are safe: once the
- * timer is zeroed the next call returns early, so the same wait is never counted
- * twice. The matching count PolarDB_Wait_LSN_Sent (the divisor for an average
- * wait) is bumped separately at install time in finalize_wait_timeout_injection(),
- * not here. Only LSN waits add to the sum; PolarDB_WaitType is NONE or LSN only.
- *
- * @param state The query wait state whose wait_started_at_us is consumed and zeroed.
+ * @brief Finish one wait, update the reader LSN after success, and stop timing.
  */
-void PgSQL_Session::record_wait_latency(PolarDB_Query_WaitState& state) {
-	if (state.wait_started_at_us == 0) {
-		return;   // no wait was active (or already accounted)
+void PgSQL_Session::polardb_finish_wait(PgSQL_Data_Stream* myds) {
+	PolarDB_Query_WaitState& state = polardb_query.wait;
+	if (state.wait_started_at_us == 0) return;
+
+	const bool update_reader_lsn = polardb_config.is_polardb_enabled &&
+		state.wrapper_finalized && !state.timeout_error &&
+		state.spec.type == PolarDB_WaitType::LSN &&
+		state.spec.target != 0 && myds && myds->myconn &&
+		myds->myconn->polardb_query_wrap_state.wrapper_set_succeeded();
+	if (update_reader_lsn) {
+		PgSQL_SrvC* srv = myds->myconn->parent;
+		if (srv && srv->myhgc && PgHGM) {
+			const unsigned int backend_hg = srv->myhgc->hid;
+			const bool accepted = PgHGM->polardb_accept_rfq_server_lsn(
+				srv, backend_hg, state.spec.target,
+				polardb_query.request_writer_scope, thread);
+			if (accepted) {
+				POLARDB_PROFILE_THREAD_COUNT_ONE(
+					thread, wait_target_lsn_cache_advanced);
+				POLARDB_TRACE(
+					"PolarDB WAIT: advanced reader LSN cache "
+					"hg=%u lsn=%lu\n",
+					backend_hg, (unsigned long)state.spec.target);
+			} else {
+				POLARDB_PROFILE_THREAD_COUNT_ONE(
+					thread, wait_target_lsn_cache_rejected);
+			}
+		} else {
+			POLARDB_PROFILE_THREAD_COUNT_ONE(
+				thread, wait_target_lsn_cache_rejected);
+		}
 	}
-	uint64_t elapsed_us = monotonic_time() - state.wait_started_at_us;
+
+	const uint64_t elapsed_us =
+		monotonic_time() - state.wait_started_at_us;
 	if (state.spec.type == PolarDB_WaitType::LSN) {
 		POLARDB_THREAD_COUNT(thread, wait_lsn_sum_us,
 			static_cast<unsigned long long>(elapsed_us));
@@ -572,59 +772,13 @@ void PgSQL_Session::record_wait_latency(PolarDB_Query_WaitState& state) {
 	state.wait_started_at_us = 0;
 }
 
-void PgSQL_Session::polardb_note_successful_wait_target(PgSQL_Data_Stream* myds,
-		bool called_on_failure) {
-	if (called_on_failure || !polardb_config.is_polardb_enabled) {
-		return;
-	}
-	const PolarDB_Query_WaitState& state = polardb_query.wait;
-	// Timeout accounting clears wait_started_at_us. If it is already clear, the
-	// reader did not show it reached this target, so do not update its LSN cache.
-	if (!state.wrapper_finalized || state.timeout_error ||
-			state.spec.type != PolarDB_WaitType::LSN ||
-			state.spec.target == 0 ||
-			state.wait_started_at_us == 0 ||
-			!myds || !myds->myconn ||
-			!myds->myconn->polardb_query_wrap_state.wrapper_set_succeeded()) {
-		return;
-	}
-	if (!myds->myconn->parent ||
-			!myds->myconn->parent->myhgc || !PgHGM) {
-		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, wait_target_lsn_cache_rejected);
-		return;
-	}
-
-	PgSQL_SrvC* srv = myds->myconn->parent;
-	const unsigned int backend_hg = srv->myhgc->hid;
-	const PgSQL_HostGroups_Manager::PolarDB_HG_Config* backend_config =
-		PgHGM->find_polardb_hg_config(backend_hg);
-	if (!backend_config) {
-		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, wait_target_lsn_cache_rejected);
-		return;
-	}
-
-	const bool accepted = PgHGM->polardb_update_server_lsn(
-		srv, backend_hg, *backend_config, state.spec.target,
-		polardb_query.request_writer_scope);
-	if (accepted) {
-		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, wait_target_lsn_cache_advanced);
-		POLARDB_TRACE(
-			"PolarDB WAIT: advanced reader LSN cache after successful wait "
-			"hg=%u lsn=%lu\n",
-			backend_hg, (unsigned long)state.spec.target);
-	} else {
-		POLARDB_PROFILE_THREAD_COUNT_ONE(thread, wait_target_lsn_cache_rejected);
-	}
-}
-
 /**
  * @brief Account one confirmed PolarDB wait timeout.
  *
  * Call this only after the caller has confirmed the backend event is a PolarDB
  * proxy wait timeout, for example by checking PG_DIAG_MESSAGE_DETAIL against
  * POLARDB_LSN_WAIT_TIMEOUT_DETAIL. The helper owns counter updates and consumes
- * wait_started_at_us through record_wait_latency(), so repeated observations of
- * the same backend event do not double-count.
+ * the wait timer, so repeated observations do not double-count.
  */
 bool PgSQL_Session::polardb_account_wait_timeout(const char* source) {
 	if (!polardb_wait_active()) {
@@ -642,7 +796,7 @@ bool PgSQL_Session::polardb_account_wait_timeout(const char* source) {
 	if (polardb_query.wait.spec.type == PolarDB_WaitType::LSN) {
 		POLARDB_THREAD_COUNT_ONE(thread, wait_error_lsn_wait_timeout);
 	}
-	record_wait_latency(polardb_query.wait);
+	polardb_finish_wait(nullptr);
 
 	POLARDB_TRACE("PolarDB WAIT: timeout accounted source=%s wait_type=%d\n",
 		source ? source : "", (int)polardb_query.wait.spec.type);
@@ -654,48 +808,88 @@ bool PgSQL_Session::polardb_account_wait_timeout(const char* source) {
  *        DISCARD ALL / RESET CONNECTION command.
  *
  * Tears down the per-query wait, reader, and wrapper state and any pending
- * notices, and clears the per-session writer-fallback and degraded-route log
- * flags. Replica reads can therefore resume after a RESET.
+ * notices, leaves and clears any reader-capacity wait this session is parked in,
+ * and clears the per-session writer-fallback and degraded-route log flags.
+ * Replica reads can therefore resume after a RESET.
  *
  * It does NOT return or destroy backend connections and does NOT clear the session
  * write/observed LSNs. Those LSNs record committed positions this client has
  * already observed; a RESET clears session configuration, not that history, so
- * read-your-writes still holds after a RESET. PolarDB session overrides are
- * cleared only when @p reset_override is true.
+ * read-your-writes still holds after a RESET. It also deliberately leaves the
+ * transaction-split reader state and polardb_txn_has_no_write_xids alone — those
+ * belong to the session-recycle path and are cleared only by
+ * polardb_clear_session_state_for_recycle().
  *
- * @param reset_override When true, also clears per-session PolarDB overrides.
- *                       Callers set it for RESET ALL, DISCARD ALL, and
- *                       RESET CONNECTION. RESET proxysql.<name> clears only the
- *                       named override after this helper clears transient state.
+ * @param reset_override When true, also clears the per-session PolarDB
+ *                       consistency-mode override and the transaction-split
+ *                       warmup mode. Callers set it for RESET ALL, DISCARD ALL,
+ *                       and RESET CONNECTION. RESET proxysql.<name> clears only
+ *                       the named override after this helper clears transient
+ *                       state.
  */
 void PgSQL_Session::polardb_clear_staged_wait_state_for_reset(bool reset_override) {
 	polardb_leave_reader_capacity_wait(
 		PolarDB_ReaderStatus::READER_UNAVAILABLE);
 	polardb_reader_capacity_wait.reset();
 	polardb_query.reset_for_new_query();
-	clear_pending_notices(/*free_buffers=*/true);  // FREE the queue, not just null it
+	discard_pending_notices();
 	polardb_route_state.clear_resettable();
 	if (reset_override) {
-		polardb_set_session_override(-1);
+		polardb_set_session_consistency_mode(-1);
 		polardb_set_txn_split_warmup_mode(-1);
 	}
 }
 
-void PgSQL_Session::polardb_clear_session_state_for_reset() {
-	polardb_txn_has_no_writes = false;
+/**
+ * @brief Tear down all PolarDB session state when the session itself is recycled.
+ *
+ * This is the full teardown, wider than the RESET / DISCARD handler
+ * polardb_clear_staged_wait_state_for_reset(). On top of the per-query wait,
+ * reader-capacity wait and pending notices, it clears
+ * polardb_txn_has_no_write_xids and the transaction-split reader state, and it
+ * uses polardb_route_state.clear_session() — which drops the negotiated client
+ * RFQ-LSN capability and the cached ReaderPool identity hash, not just the
+ * resettable flags. Nothing carries over to the next client on this session.
+ *
+ * The per-session PolarDB overrides are not touched here; those belong to the
+ * RESET ALL / DISCARD ALL / RESET CONNECTION handler.
+ */
+void PgSQL_Session::polardb_clear_session_state_for_recycle() {
+	polardb_txn_has_no_write_xids = false;
 	polardb_leave_reader_capacity_wait(
 		PolarDB_ReaderStatus::READER_UNAVAILABLE);
 	polardb_reader_capacity_wait.reset();
 	polardb_query.reset_for_new_query();
 	polardb_route_state.clear_session();
-	polardb_clear_transaction_split_state("session_reset", /*want_reuse=*/false);
-	clear_pending_notices(/*free_buffers=*/true);
+	polardb_teardown_transaction_reader_state("session_reset", /*want_reuse=*/false);
+	discard_pending_notices();
 }
 
+/**
+ * @brief Run the single per-request PolarDB teardown at the end of a query.
+ *
+ * Call once per request, with the backend data stream that request ran on. The
+ * steps are order-sensitive: any transaction-split reader that no longer belongs
+ * to @p myds is reconciled first (debug builds assert that an active split reader
+ * is the one for @p myds), then polardb_finish_wait() updates the reader LSN
+ * after success and consumes the timer. Finally the query state and pending
+ * notices are reset.
+ *
+ * Parse or Describe may finish while Bind/Execute messages from the same
+ * extended-protocol Sync frame are still queued. On that successful
+ * intermediate boundary, transient state is cleared while the captured route
+ * and response policy are retained for Execute. Failure and final-Execute paths
+ * always perform the full reset.
+ *
+ * @param myds  Backend data stream the request used. Ownership is unaffected.
+ * @param called_on_failure  True when the request ended in failure: also clears
+ *              polardb_txn_has_no_write_xids and suppresses the shared LSN-cache
+ *              advance, because the reader proved nothing about the wait target.
+ */
 void PgSQL_Session::polardb_clear_request_state_for_query_end(
 		PgSQL_Data_Stream* myds, bool called_on_failure) {
 	if (called_on_failure) {
-		polardb_txn_has_no_writes = false;
+		polardb_txn_has_no_write_xids = false;
 	}
 	if (polardb_reader_capacity_wait.active) {
 		polardb_leave_reader_capacity_wait(
@@ -715,10 +909,19 @@ void PgSQL_Session::polardb_clear_request_state_for_query_end(
 		POLARDB_THREAD_COUNT_ONE(thread, txn_wait_reader_reconciled);
 		polardb_reconcile_txn_wait_read_end("request_end_stale", false);
 	}
-	polardb_note_successful_wait_target(myds, called_on_failure);
-	record_wait_latency(polardb_query.wait);
-	polardb_query.reset_for_new_query();
-	clear_pending_notices(/*free_buffers=*/true);
+	polardb_finish_wait(called_on_failure ? nullptr : myds);
+	const bool continue_extended_request =
+		!called_on_failure &&
+		!extended_query_frame.empty() &&
+		(extended_query_phase &
+			(EXTQ_PHASE_PROCESSING_PARSE |
+			 EXTQ_PHASE_PROCESSING_DESCRIBE));
+	if (continue_extended_request) {
+		polardb_query.reset_between_extended_messages();
+	} else {
+		polardb_query.reset_for_new_query();
+	}
+	discard_pending_notices();
 }
 
 #endif // POLARDB_PROXY

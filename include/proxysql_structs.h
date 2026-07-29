@@ -947,6 +947,7 @@ struct _proxysql_mysql_thread_t {
 struct _proxysql_pgsql_thread_t {
 	PgSQL_Thread* worker;
 	pthread_t thread_id;
+	bool thread_created;
 };
 
 /* Every communication between client and proxysql, and between proxysql and mysql server is
@@ -1144,19 +1145,20 @@ __thread bool pgsql_thread___kill_backend_connection_when_disconnect;
 __thread int pgsql_thread___max_allowed_packet;
 
 #if POLARDB_PROXY
-/* PolarDB LSN session-consistency knobs. The consistency/wait mode knobs are
- * stored here as ints (off=0/lsn=1/global_lsn=2/primary=3,
- * best_effort=1/strict=2); the admin string<->int mapping lives in
- * PgSQL_Thread.cpp. */
-__thread int pgsql_thread___polardb_consistency_mode;        // off=0, lsn=1, global_lsn=2, primary=3
-__thread int pgsql_thread___polardb_lag_bytes;               // reader lag-cap (bytes); 0=off
-__thread int pgsql_thread___polardb_lag_ms;                  // reserved ms lag cap; T13 accepts only 0, no PgSQL producer yet
-__thread int pgsql_thread___polardb_lag_wait_ms;             // polar_xact_split_wait_lsn timeout (ms); 0=wait indefinitely
-__thread int pgsql_thread___polardb_lsn_freshness_ms;        // max age of a cached per-server LSN to trust
+/* PolarDB LSN session-consistency knobs. Word-valued settings are parsed into
+ * the corresponding enums before they reach these worker-local integers. */
+__thread bool pgsql_thread___polardb_profile_off;            // absolute profile=off gate
+__thread int pgsql_thread___polardb_consistency_mode;        // off=0, session_lsn=1, global_lsn=2, eventual=3
+__thread int pgsql_thread___polardb_read_target;             // primary=0, replica=1
+__thread int pgsql_thread___polardb_action_read_fallback;    // primary=0, error=1
+__thread int pgsql_thread___polardb_max_reader_lsn_gap_bytes; // reader lag cap in bytes; 0=off
+__thread int pgsql_thread___polardb_max_reader_lag_ms;         // reserved; only 0 is currently accepted
+__thread int pgsql_thread___polardb_lsn_wait_timeout_ms;       // LSN wait timeout; 0=wait indefinitely
+__thread int pgsql_thread___polardb_reader_lsn_max_age_ms;     // maximum age of a cached per-server LSN
 __thread int pgsql_thread___polardb_lag_cap_freshness_ms;    // max LSN-cache age under byte-lag cap + finite wait; 0=wait-fraction only
 __thread int pgsql_thread___polardb_reader_lsn_lag_range_bytes; // 0=exact best-behind reader only
-__thread bool pgsql_thread___polardb_reader_prefer_freshest_below_target; // experimental best-behind selection policy
-__thread bool pgsql_thread___polardb_reader_prefer_less_loaded; // experimental strict-dominance policy
+__thread bool pgsql_thread___polardb_reader_prefer_freshest_below_target; // experimental two-reader best-behind policy
+__thread bool pgsql_thread___polardb_reader_prefer_less_loaded; // experimental two-reader strict-dominance policy
 __thread int pgsql_thread___polardb_reader_connection_retention; // 0=end-of-pass return, 1=retain active readers
 __thread int pgsql_thread___polardb_output_coalesce_bytes;   // 0=disabled; hold incomplete streaming output up to byte budget
 __thread int pgsql_thread___polardb_output_coalesce_packets; // 0=disabled; hold incomplete streaming output up to packet budget
@@ -1165,12 +1167,11 @@ __thread bool pgsql_thread___polardb_lazy_warmup_split;      // demand-warm conn
 __thread bool pgsql_thread___polardb_writev_direct;           // enable plaintext PgSQL frontend direct scatter/gather sends
 __thread bool pgsql_thread___polardb_result_fast_forward;     // batch contiguous backend DataRow frames into one result copy
 __thread int pgsql_thread___polardb_split_warmup_max_connections_per_request; // max backend connections per warmup request
-__thread int pgsql_thread___polardb_wait_timeout_mode;       // best_effort=1, strict=2
+__thread int pgsql_thread___polardb_action_lsn_timeout;      // PolarDB_LsnWaitTimeoutAction
 __thread int pgsql_thread___polardb_proxy_protocol;          // off=0, legacy=1, v15=2
-__thread int pgsql_thread___polardb_route_rfq_policy;        // best_effort=1, strict=2
-__thread int pgsql_thread___polardb_reader_death_action;     // retry=0, forward=1, terminate=2
-__thread int pgsql_thread___polardb_reader_timeout_action;   // retry=0, forward=1, terminate=2
-__thread int pgsql_thread___polardb_reader_error_action;     // retry=0, forward=1, terminate=2
+__thread int pgsql_thread___polardb_action_missing_lsn;      // PolarDB_MissingLsnAction
+__thread int pgsql_thread___polardb_action_replica_loss;     // PolarDB_ReplicaLossAction
+__thread int pgsql_thread___polardb_action_replica_error;    // PolarDB_ReplicaErrorAction
 __thread int pgsql_thread___polardb_proxy_identity_mode;     // client=0, proxy=1
 __thread char* pgsql_thread___polardb_proxy_identity_host;   // empty or IP literal
 __thread int pgsql_thread___polardb_proxy_identity_port;     // 0..65535
@@ -1522,11 +1523,14 @@ extern __thread bool pgsql_thread___kill_backend_connection_when_disconnect;
 extern __thread int pgsql_thread___max_allowed_packet;
 
 #if POLARDB_PROXY
+extern __thread bool pgsql_thread___polardb_profile_off;
 extern __thread int pgsql_thread___polardb_consistency_mode;
-extern __thread int pgsql_thread___polardb_lag_bytes;
-extern __thread int pgsql_thread___polardb_lag_ms;
-extern __thread int pgsql_thread___polardb_lag_wait_ms;
-extern __thread int pgsql_thread___polardb_lsn_freshness_ms;
+extern __thread int pgsql_thread___polardb_read_target;
+extern __thread int pgsql_thread___polardb_action_read_fallback;
+extern __thread int pgsql_thread___polardb_max_reader_lsn_gap_bytes;
+extern __thread int pgsql_thread___polardb_max_reader_lag_ms;
+extern __thread int pgsql_thread___polardb_lsn_wait_timeout_ms;
+extern __thread int pgsql_thread___polardb_reader_lsn_max_age_ms;
 extern __thread int pgsql_thread___polardb_lag_cap_freshness_ms;
 extern __thread int pgsql_thread___polardb_reader_lsn_lag_range_bytes;
 extern __thread bool pgsql_thread___polardb_reader_prefer_freshest_below_target;
@@ -1535,12 +1539,11 @@ extern __thread int pgsql_thread___polardb_reader_connection_retention;
 extern __thread bool pgsql_thread___polardb_monitor_lsn_updates;
 extern __thread bool pgsql_thread___polardb_lazy_warmup_split;
 extern __thread int pgsql_thread___polardb_split_warmup_max_connections_per_request;
-extern __thread int pgsql_thread___polardb_wait_timeout_mode;
+extern __thread int pgsql_thread___polardb_action_lsn_timeout;
 extern __thread int pgsql_thread___polardb_proxy_protocol;
-extern __thread int pgsql_thread___polardb_route_rfq_policy;
-extern __thread int pgsql_thread___polardb_reader_death_action;
-extern __thread int pgsql_thread___polardb_reader_timeout_action;
-extern __thread int pgsql_thread___polardb_reader_error_action;
+extern __thread int pgsql_thread___polardb_action_missing_lsn;
+extern __thread int pgsql_thread___polardb_action_replica_loss;
+extern __thread int pgsql_thread___polardb_action_replica_error;
 extern __thread int pgsql_thread___polardb_proxy_identity_mode;
 extern __thread int pgsql_thread___polardb_output_coalesce_bytes;
 extern __thread int pgsql_thread___polardb_output_coalesce_packets;

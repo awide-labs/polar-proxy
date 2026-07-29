@@ -16,8 +16,8 @@
  * body of this file is empty.
  *
  * Verified: a POLARDB_PROXY=0 build links clean and is byte-for-byte equivalent
- * to a build of ProxySQL without this feature at all. This equivalence is a
- * design contract; see doc/polardb-arch/02-BUILD-TOGGLE-AND-LIBPQ.md.
+ * to a build of ProxySQL without this feature at all. Every change must keep
+ * that equivalence; see doc/polardb-arch/02-BUILD-TOGGLE-AND-LIBPQ.md.
  *
  * Maintenance rule: if a future change adds an UNGUARDED core call to a PolarDB
  * symbol, put its no-op definition below. Such a stub must NOT name any PolarDB

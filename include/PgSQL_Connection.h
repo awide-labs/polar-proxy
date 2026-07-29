@@ -37,13 +37,11 @@ class PgSQL_Bind_Info;
 
 
 #if POLARDB_PROXY
-enum class PolarDB_ParentBytesFlushReason {
-	Manual,
-	ThresholdRecv,
-	ThresholdSent,
-	ThresholdQueries,
-	Detach,
-	Destructor,
+enum class PolarDB_ParentCounterFlushReason : uint8_t {
+	THRESHOLD_RECV,
+	THRESHOLD_SENT,
+	THRESHOLD_QUERIES,
+	DESTRUCTOR,
 };
 #endif // POLARDB_PROXY
 
@@ -497,9 +495,45 @@ public:
 	void next_multi_statement_result(PGresult* result);
 	bool set_single_row_mode();
 #if POLARDB_PROXY
-	void update_queries_sent();
+	/**
+	 * @brief Count one query against this connection's deferred query counter.
+	 *
+	 * The parent PgSQL_SrvC counter is not touched per query. The count is kept in
+	 * connection-local pending state and merged into the parent only once every
+	 * POLARDB_PARENT_QUERIES_FLUSH_THRESHOLD queries, or by an explicit flush, so
+	 * server statistics report a parent queries_sent that lags by up to that many
+	 * queries on each open connection.
+	 */
+	void polardb_note_query_sent();
+	/**
+	 * @brief Merge only the deferred queries_sent count into the parent PgSQL_SrvC.
+	 *
+	 * The deferred byte counters are deliberately left alone — use
+	 * polardb_flush_parent_counters() for those. The two are the pair used when a
+	 * connection is detached from its data stream.
+	 *
+	 * Call this while `parent` is still valid: with a null parent the pending query
+	 * count is cleared anyway, so those queries are lost rather than deferred.
+	 */
 	void polardb_flush_parent_queries();
-	void polardb_flush_parent_bytes(PolarDB_ParentBytesFlushReason reason = PolarDB_ParentBytesFlushReason::Manual);
+	/**
+	 * @brief Merge every deferred byte and query counter into the parent PgSQL_SrvC.
+	 *
+	 * Adds the pending bytes_recv, bytes_sent, and queries_sent to the parent with
+	 * atomic adds, zeroes the pending values, and restarts the query batch count.
+	 * Runs implicitly from update_bytes_recv() / update_bytes_sent() once the
+	 * deferred byte total crosses its threshold, from polardb_note_query_sent() on its
+	 * query threshold, and from the destructor — so no caller may assume the parent
+	 * counters are current at any other moment.
+	 *
+	 * With a null parent all pending counts are zeroed and their contribution is
+	 * lost.
+	 *
+	 * @param reason  Selects which flush-attribution counter is bumped and appears in
+	 *                trace output; it does not change what is flushed.
+	 */
+	void polardb_flush_parent_counters(
+		PolarDB_ParentCounterFlushReason reason);
 #endif
 	void update_bytes_recv(uint64_t bytes_recv);
 	void update_bytes_sent(uint64_t bytes_sent);
@@ -605,7 +639,7 @@ public:
 	 *
 	 * Warmup connections are opened without a client session, so they do not run
 	 * the client-variable copy path in connect_start(). Before entering the pool,
-	 * they still need the same critical baseline that reset/reuse code expects.
+	 * they still need the same critical baseline that reset/reuse code requires.
 	 */
 	void init_startup_parameters_from_server();
 
@@ -688,7 +722,17 @@ public:
 	 *
 	 * Snapshotted at submit time (async_query ASYNC_IDLE) and consumed by
 	 * query_start(). This decouples the connection layer from session state — it
-	 * only needs to know how many prepended SET results to skip.
+	 * only needs the number of prepended SET results to skip.
+	 *
+	 * The connection layer may add wrapper state of its own on top of the session
+	 * snapshot. When polardb_txn_split_xids_dirty is set on a simple query that is
+	 * not already a split wait, async_query() builds
+	 * "SET polar_xact_split_xids = ''; " followed by the user query into
+	 * polardb_txn_split_xids_reset_query_buf, raises wrapper_stmts, sets
+	 * txn_split_xids_reset, and promotes wrapper_kind to TXN_SPLIT_XIDS_RESET when
+	 * the session asked for no wrapper. The dispatched query text then aliases that
+	 * connection-owned buffer, which must stay alive for the whole dispatch; the
+	 * non-dirty simple-query path clears it.
 	 */
 	struct PolarDB_Query_DispatchState {
 		uint32_t wrapper_stmts{0};  // wrapper statements whose result sets to consume (0 = none)
@@ -713,14 +757,45 @@ public:
 	 * For a straight, non-wrapped query it carries no state (was_wrapped == false,
 	 * stmt_pending == 0) and the result path skips it entirely.
 	 *
-	 * How the wrapped consistency read is sent:
+	 * wrapper_kind names which of three wrapper shapes was sent, and the
+	 * is_consistency_wait() / is_txn_split_wait() / is_txn_split_xids_reset()
+	 * helpers test it.
+	 *
+	 * CONSISTENCY_WAIT — an autocommit read routed to a replica with an LSN wait:
 	 *
 	 *     SET polar_consistency_mode = 'best_effort'|'strict';
 	 *     SET polar_proxy_wait_timeout_ms = <resolved_ms>;
 	 *     SET polar_xact_split_wait_lsn = '<target>';
 	 *     <user query>
 	 *
-	 * ProxySQL owns all three values for a wrapped read. The first two SETs are
+	 * TXN_SPLIT_WAIT — a read split out of an open transaction onto a replica. It
+	 * prepends a fourth statement naming the transaction's XIDs, so the replica can
+	 * read the uncommitted transaction's rows, and its wait always runs in strict
+	 * mode because continuing past a timeout would read without those XIDs:
+	 *
+	 *     SET polar_xact_split_xids = '<xids>';
+	 *     SET polar_consistency_mode = 'strict';
+	 *     SET polar_proxy_wait_timeout_ms = <resolved_ms>;
+	 *     SET polar_xact_split_wait_lsn = '<target>';
+	 *     <user query>
+	 *
+	 * When the selected reader already reached the target, the three wait SETs are
+	 * dropped and only the XID SET remains ahead of the user query.
+	 *
+	 * TXN_SPLIT_XIDS_RESET — generated by the connection layer, not the session. A
+	 * pooled reader that ran a split read carries backend-local split-XID context,
+	 * tracked by polardb_txn_split_xids_dirty. The next simple query on that
+	 * connection, which is usually an ordinary query unrelated to any split, is
+	 * prefixed to clear it:
+	 *
+	 *     SET polar_xact_split_xids = '';
+	 *     <user query>
+	 *
+	 * txn_split_xids_reset_pending marks that leading SET, and
+	 * consuming_txn_split_xids_reset() is true only while its result is the one
+	 * being consumed.
+	 *
+	 * ProxySQL owns all three consistency values for a wrapped read. The first two SETs are
 	 * always emitted, so a pooled backend connection cannot reuse an old wait mode
 	 * or timeout from a previous client session. <resolved_ms> can be 0; in
 	 * PolarDB that means the wait has no PolarDB wait-timeout limit. It is not an
@@ -749,7 +824,8 @@ public:
 	 *  - With polar_proxy_wait_timeout_ms=0, the finite-timeout branch is not
 	 *    reached. For the wait itself, best_effort and strict both mean "wait
 	 *    until the target LSN is replayed or the statement is interrupted by
-	 *    PostgreSQL/client/admin timeout/cancel handling."
+	 *    PostgreSQL statement_timeout, a client cancel, or administrator
+	 *    termination."
 	 *  - guc.c defines polar_xact_split_wait_lsn as a transactional PGC_USERSET
 	 *    GUC; its assign hook treats an empty string as InvalidXLogRecPtr
 	 *    (guc.c:6274-6281, guc.c:15837-15848).
@@ -762,9 +838,9 @@ public:
 	 *  1. Whether the wrapped read reaches the target, times out (best_effort
 	 *     WARNING), or errors (strict), the backend consumes polar_xact_split_wait_lsn
 	 *     after the first wait, so the wait target never survives on the pooled
-	 *     backend connection. A later straight read sees an Invalid target and never
-	 *     waits, so ProxySQL does not need a second wrapper kind just to clear
-	 *     the wait target.
+	 *     backend connection. On a later straight read the target is Invalid and the
+	 *     backend never waits, so ProxySQL does not need a second wrapper kind just
+	 *     to clear the wait target.
 	 *  2. A strict finite-timeout ERROR or user-query ERROR additionally aborts the
 	 *     multi-statement batch; PostgreSQL transactional GUC behavior rolls back the
 	 *     wrapper SETs.
@@ -786,7 +862,6 @@ public:
 		PolarDB_Query_WrapperKind wrapper_kind{PolarDB_Query_WrapperKind::NONE};
 		bool txn_split_xids_reset_pending{false}; // true only for the first wrapper SET
 
-		bool has_pending() const { return stmt_pending > 0; }  // still consuming wrapper result sets
 		bool consuming_wrapper_set() const { return stmt_pending > 0; }
 		bool consuming_txn_split_xids_reset() const {
 			return txn_split_xids_reset_pending && stmt_pending == stmt_total;
@@ -842,12 +917,11 @@ public:
 	PolarDB_Query_WrapState polardb_query_wrap_state;
 
 	/**
-	 * @brief Backend connection may retain polar_xact_split_xids after split use.
+	 * @brief A split-XID wrapper has not yet reached a safe query boundary.
 	 *
-	 * Transaction-split readers are pooled physical backend connections. Once a
-	 * split read sends `SET polar_xact_split_xids = ...`, the next non-split read
-	 * on that same connection must first send `SET polar_xact_split_xids = ''` so
-	 * the backend never applies the old split-XID context to an unrelated query.
+	 * PolarDB clears its mock split transaction on commit or abort. Keep this
+	 * marker until the complete wrapped query succeeds; incomplete or uncertain
+	 * paths must reset the backend before reuse.
 	 */
 	bool polardb_txn_split_xids_dirty{false};
 	bool polardb_txn_split_xids_reset_consumed{false};
@@ -858,14 +932,14 @@ public:
 	 *
 	 * It records only what ProxySQL asked for in the startup packet; it does not show
 	 * whether the backend returned RFQ payloads. When picking a pooled reader for an
-	 * LSN-targeted read, the connection pool checks has_rfq_lsn() on this profile to
+	 * LSN-targeted read, the connection pool checks requests_rfq_lsn() on this profile to
 	 * confirm the backend was asked to append the RFQ LSN.
 	 */
 	PolarDB_StartupProfile polardb_startup_profile;
 	uint32_t polardb_startup_profile_generation;
 	uint64_t polardb_startup_config_generation;
 	int polardb_startup_identity_mode;
-	bool polardb_startup_contract_installed;
+	bool polardb_startup_settings_set;
 
 	/**
 	 * @brief Explicit endpoint to advertise in PolarDB startup params.
@@ -881,14 +955,22 @@ public:
 	 *
 	 * The identity is populated when PolarDB startup keys are appended. SSL and
 	 * proxy session/cancel fields are reserved placeholders until those backend
-	 * startup keys are wired. Pool reuse compares this object so later fields are
-	 * not forgotten when they become active.
+	 * startup keys are wired. Pool reuse compares this whole object, so fields added
+	 * later are included in the comparison as soon as they become active.
 	 */
 	PolarDB_StartupClientContext polardb_startup_client;
 
 	PolarDB_PoolKey polardb_pool_key;
 	uint32_t polardb_core_pool_position{UINT32_MAX};
 	uint64_t polardb_worker_cache_epoch{0};
+	/**
+	 * True after this backend has entered the exact-key pool.
+	 *
+	 * Session-state changes can clear polardb_pool_key while the connection is
+	 * in USED. This bit keeps its exact return path without making every
+	 * classic keyless return lock the server merely to inspect the USED list.
+	 */
+	bool polardb_exact_pool_connection{false};
 	std::atomic<bool> polardb_idle_ping_inflight{false};
 	std::atomic<bool> polardb_reader_pool_connect_pending{false};
 	bool polardb_reader_pool_created{false};
@@ -930,16 +1012,16 @@ public:
 	 * Turns on libpq parsing only for payloads this connection requested in its
 	 * startup profile. No-op when there is no live connection.
 	 */
-	void polardb_init_connection_tracking();
+	void polardb_enable_requested_rfq_parsing();
 
 	/**
-	 * @brief Install the startup contract chosen by ReaderPool creation.
+	 * @brief Install the startup settings chosen by ReaderPool creation.
 	 *
 	 * Demand creation resolves this state before asynchronous connect begins.
-	 * connect_start() must then emit this exact contract rather than rereading
+	 * connect_start() must then emit these exact settings rather than rereading
 	 * thread-local configuration that may have changed after server selection.
 	 */
-	void install_polardb_startup_contract(
+	void set_polardb_startup_settings(
 		const PolarDB_StartupProfile& profile,
 		int identity_mode,
 		uint64_t startup_config_generation,
@@ -1014,38 +1096,68 @@ private:
 	 * @brief Resolve the PolarDB startup profile for this backend hostgroup.
 	 *
 	 * @param hid hostgroup id used to resolve the per-hostgroup proxy protocol.
+	 * @return A profile built from PolarDB_ProxyProtocol::OFF when this connection
+	 *         has no parent or parent hostgroup container, or when @p hid is not a
+	 *         PolarDB hostgroup — such a connection gets no PolarDB startup
+	 *         parameters. Otherwise a profile for the hostgroup's own
+	 *         policy.proxy_protocol when that is set (>= 0), falling back to the
+	 *         global pgsql-polardb_proxy_protocol default.
 	 */
-	PolarDB_StartupProfile build_polardb_startup_profile(unsigned int hid) const;
+	PolarDB_StartupProfile polardb_build_startup_profile(unsigned int hid) const;
 
 	/**
 	 * @brief Append profile-driven PolarDB startup params to a conninfo.
 	 *
 	 * Emits no parameters when the profile requests no RFQ payloads (which includes
-	 * proxy_protocol=off). For RFQ-requesting profiles, this resolves
-	 * client/listener/fallback identity first and fails the connection before
-	 * PQconnectStart when no valid identity is available.
+	 * proxy_protocol=off). For RFQ-requesting profiles, this resolves the startup
+	 * identity first and fails the connection before PQconnectStart when no valid
+	 * identity is available.
+	 *
+	 * This rewrites the connection's own startup state, which pool reuse compares:
+	 * when no startup settings is installed it resets polardb_startup_client and
+	 * re-reads polardb_startup_identity_mode from the thread variable, and on
+	 * success it stores the resolved endpoint in polardb_startup_client.identity.
+	 * Before returning false it also fills in the connection's error_info via
+	 * set_error() and logs the reason, so the caller can surface it to the client.
 	 *
 	 * @param conninfo       conninfo string being built for the connection.
 	 * @param profile        resolved startup profile.
 	 * @param hid            hostgroup id for diagnostics.
 	 * @return true on success, false when the connection should fail early.
 	 */
-	bool append_polardb_startup_params(std::ostringstream& conninfo,
+	bool polardb_append_startup_params(std::ostringstream& conninfo,
 		const PolarDB_StartupProfile& profile, unsigned int hid);
 
 	/**
-	 * @brief Choose the client endpoint to advertise in the PolarDB startup params.
+	 * @brief Choose the endpoint to advertise in the PolarDB startup params.
 	 *
-	 * Tries sources in order and returns the first valid one: the client's
-	 * connection address, the client's raw socket address, the local
-	 * listener/proxy address, then the configured fallback identity. Returns an
-	 * identity with source NONE when none is usable; the caller then fails an
-	 * RFQ-requesting connection before it is opened.
+	 * Two short-circuits come first. When startup settings are set,
+	 * polardb_startup_client.identity is returned as-is. Otherwise, when
+	 * polardb_forced_startup_identity carries a source, that is returned — unless its
+	 * source contradicts the identity mode or it fails its validity check, in which
+	 * case the result is source NONE and no further source is tried.
 	 *
-	 * The profile argument is accepted for symmetry with the caller but does not
-	 * affect the chosen identity; identity selection is the same for every profile.
+	 * Only then does polardb_startup_identity_mode select between two disjoint
+	 * chains; neither falls through to the other:
+	 *  - client mode: the client endpoint resolved on the session, then the raw
+	 *    client socket address. If both fail the result is NONE. The listener/proxy
+	 *    address and pgsql-polardb_proxy_identity_host are never consulted, so a
+	 *    configured fallback cannot rescue a client-mode connection that has no
+	 *    usable client address.
+	 *  - proxy mode: the ProxySQL listener/proxy address, rejecting a wildcard
+	 *    listener because it names no real endpoint, then the operator-configured
+	 *    fallback identity. The client sources are never consulted. This is also the
+	 *    only chain available to connections with no client session, such as
+	 *    monitor and other internal connections.
+	 *
+	 * @param profile Accepted for symmetry with the caller; identity selection does
+	 *                not depend on it.
+	 * @return The chosen identity, or an identity with source NONE when nothing
+	 *         usable was found. polardb_append_startup_params() turns NONE into a
+	 *         hard failure for any profile that requests an RFQ LSN, so the
+	 *         connection is never opened without the parameters.
 	 */
-	PolarDB_StartupIdentity resolve_polardb_startup_identity(
+	PolarDB_StartupIdentity polardb_resolve_startup_identity(
 		const PolarDB_StartupProfile& profile) const;
 #endif // POLARDB_PROXY
 

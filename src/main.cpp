@@ -599,8 +599,28 @@ void* pgsql_worker_thread_func(void* arg) {
 
 	proxysql_pgsql_thread_t* pgsql_thread = (proxysql_pgsql_thread_t*)arg;
 	PgSQL_Thread* worker = new PgSQL_Thread();
-	pgsql_thread->worker = worker;
 	worker->init();
+#if POLARDB_PROXY
+	const unsigned int worker_index = static_cast<unsigned int>(
+		pgsql_thread - GloPTH->pgsql_threads);
+	const PolarDB_WorkerAttachResult attach_result =
+		GloPTH->polardb_attach_worker(worker_index, worker);
+	if (attach_result == PolarDB_WorkerAttachResult::SHUTDOWN_STARTED) {
+		// This thread was counted in the startup barrier but shutdown began
+		// before it published its worker. Release the barrier before leaving.
+		load_ -= 1;
+		delete worker;
+		__sync_fetch_and_sub(
+			&GloVars.statuses.stack_memory_pgsql_threads, tmp_stack_size);
+		return NULL;
+	}
+	if (attach_result != PolarDB_WorkerAttachResult::ATTACHED) {
+		proxy_error("Unable to attach PostgreSQL worker %u\n", worker_index);
+		abort();
+	}
+#else
+	pgsql_thread->worker = worker;
+#endif // POLARDB_PROXY
 	//	worker->poll_listener_add(listen_fd);
 	//	worker->poll_listener_add(socket_fd);
 	load_ -= 1;
@@ -608,9 +628,17 @@ void* pgsql_worker_thread_func(void* arg) {
 	do { sleep_iter(++iter); } while (load_);
 
 	worker->run();
+#if POLARDB_PROXY
+	if (!GloPTH->polardb_detach_worker(worker_index, worker)) {
+		proxy_error("Unable to detach PostgreSQL worker %u\n", worker_index);
+		abort();
+	}
+	delete worker;
+#else
 	//delete worker;
 	delete worker;
 	pgsql_thread->worker = NULL;
+#endif // POLARDB_PROXY
 	//	l_mem_destroy(__thr_sfp);
 	__sync_fetch_and_sub(&GloVars.statuses.stack_memory_pgsql_threads, tmp_stack_size);
 	return NULL;
