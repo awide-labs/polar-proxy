@@ -19,9 +19,10 @@ BRANCH_RE = re.compile(r"^\s*branch\s+[0-9]+\s+(?:taken\s+([^ ]+)|never executed
 CALL_RE = re.compile(r"^\s*call\s+[0-9]+\s+(?:returned\s+([^ ]+)|never executed)")
 
 DEFAULT_FUNCTION_INCLUDE = (
-    "polardb|polar|rfq|build_simple_query_packet|record_wait_latency|"
-    "clear_pending_notices|enqueue_pending_notice|finalize_wait_timeout_injection|"
-    "fail_wait_wrap_finalize|build_wrapped_wait_query|"
+    "polardb|polar|rfq|polardb_build_simple_query_packet|polardb_finish_wait|"
+    "discard_pending_notices|forget_transferred_notices|enqueue_pending_notice|"
+    "polardb_install_wait_wrapper|"
+    "polardb_fail_wrap_and_disable_session_waits|build_wrapped_wait_query|"
     "handle_async_check_cont|get_task_query|perf_readonly_actions"
 )
 NOISE_FUNCTION_PREFIXES = (

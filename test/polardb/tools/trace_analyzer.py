@@ -11,6 +11,7 @@ Usage:
   python3 test/polardb/tools/trace_analyzer.py
   python3 test/polardb/tools/trace_analyzer.py test/polardb/test_output/<run_dir>
   python3 test/polardb/tools/trace_analyzer.py --latest 6
+  python3 test/polardb/tools/trace_analyzer.py --all --output-dir <run_dir>
 """
 
 from __future__ import annotations
@@ -66,22 +67,24 @@ TRACE = {
     "wrap_finalize_stmts3": "PolarDB WRAP FINALIZE: wrapper_stmts=3",
     "wait_timeout_accounted": "PolarDB WAIT: timeout accounted",
     "writer_retry": (
-        "PolarDB WAIT: strict wait timeout before user result; redirecting original"
+        "PolarDB FAILURE: LSN wait timeout before user result; "
+        "redirecting original query to primary_hg="
     ),
 
     # OFF mode.
     "mode_off_final": "consistency_mode: off",
-    "plan_off_passthrough": "PolarDB PLAN: mode=OFF -> PASSTHROUGH",
+    "plan_off_passthrough":
+        "PolarDB PLAN: consistency=off -> ordinary ProxySQL routing",
     "replica_with_wait": "REPLICA_WITH_WAIT",
     "wait_wrap": "PolarDB WAIT WRAP:",
 
-    # PRIMARY mode.
-    "mode_primary_final": "consistency_mode: primary",
-    "plan_primary_force": "PolarDB PLAN: mode=PRIMARY -> FORCE_PRIMARY",
+    # Primary read target.
+    "mode_session_lsn_final": "consistency_mode: session_lsn",
+    "plan_primary_target_force": (
+        f"PolarDB PLAN: read_target=primary -> FORCE_PRIMARY writer={WRITER_HG}"),
     "execute_force_primary": f"PolarDB EXECUTE: FORCE_PRIMARY writer={WRITER_HG}",
 
-    # LSN mode.
-    "mode_lsn_final": "consistency_mode: lsn",
+    # Session-LSN mode.
     "conninfo_reader_params_re": (
         rf"PolarDB CONNINFO: adding startup params to HG {READER_HG} "
         r"protocol=(v15|legacy)"),
@@ -119,29 +122,36 @@ TRACE = {
         "PolarDB TXN_WAIT: pre-write reader waits blocked by transaction local state"),
     "txn_wait_plan_blocked_rc": (
         "PolarDB PLAN: transaction pre-write reader wait blocked read_committed=0"),
+    "txn_read_force_primary": (
+        "PolarDB PLAN: transaction read not split-readable "
+        "reason=in_transaction -> FORCE_PRIMARY"),
     "txn_wait_plan_blocked_local_state": (
         "PolarDB PLAN: transaction pre-write reader wait blocked read_committed=1 local_state_clean=0"),
     "txn_split_warmup_queued": "PolarDB WARMUP: queued split pool request",
     "txn_split_warmup_added": "PolarDB WARMUP: added connected split pool connection",
     "txn_split_warmup_disabled": "PolarDB WARMUP: split lazy warmup disabled; skip request",
     "txn_split_warmup_suppressed_off": "PolarDB WARMUP: demand request suppressed mode=off",
-    "txn_split_warmup_request_demand": "PolarDB WARMUP: requested split pool reason=demand",
+    "txn_split_warmup_request_demand":
+        "PolarDB WARMUP: requested split pool reason=selected_pool_miss",
     "txn_split_warmup_request_begin": "PolarDB WARMUP: requested split pool reason=begin",
     "set_warmup_off": "PolarDB SET: txn_split_warmup_mode=off",
     "set_warmup_demand": "PolarDB SET: txn_split_warmup_mode=demand",
     "set_warmup_begin": "PolarDB SET: txn_split_warmup_mode=begin",
     "set_warmup_both": "PolarDB SET: txn_split_warmup_mode=both",
-    "txn_split_failure_policy_retry": "PolarDB FAILURE: policy action=retry",
+    "txn_split_failure_policy_retry": (
+        "PolarDB FAILURE: policy kind=wait_timeout "
+        "action=retry target=writer"),
     "txn_split_failure_retry_writer": "PolarDB FAILURE: retry split read on writer_hg",
-    "txn_split_wrapper_result_retry": "PolarDB FAILURE: wrapper-result handler action=retry",
+    "txn_split_wrapper_result_retry":
+        "PolarDB FAILURE: result kind=wrapper action=retry",
 }
 
 # Test-log markers asserted by the wait-timeout audit.
 TEST_LOG = {
     "timeout_cleanup_done": "timeout cleanup assertions completed: failed=0",
     "client_warning_once": "client-visible 'LSN wait timeout' WARNING count = 1",
-    "timeout0_best_effort": "timeout 0/best_effort emits no timeout warning",
-    "timeout0_strict": "timeout 0/strict emits no timeout error",
+    "timeout0_warning": "timeout 0/warning emits no timeout warning",
+    "timeout0_primary": "timeout 0/primary emits no timeout error",
 }
 
 
@@ -153,26 +163,29 @@ LSN_WAIT_RE = re.compile(
 @dataclass(frozen=True)
 class RunKind:
     mode: str
-    wait_mode: str
+    read_target: str
+    timeout_action: str
     outcome: str
     split: bool = False
     split_variant: str = ""
 
     @property
     def lsn_mode(self) -> bool:
-        return self.mode == "lsn"
+        return self.mode in {"session_lsn", "global_lsn"}
 
     @property
     def failure(self) -> bool:
         return self.outcome == "failure"
 
     @property
-    def strict(self) -> bool:
-        return self.wait_mode == "strict"
+    def strict_wire(self) -> bool:
+        return self.timeout_action in {
+            "primary", "error", "disconnect"
+        }
 
     @property
-    def best_effort(self) -> bool:
-        return self.wait_mode == "best_effort"
+    def warning(self) -> bool:
+        return self.timeout_action == "warning"
 
 
 class Audit:
@@ -196,17 +209,24 @@ class Audit:
 
     def _detect_kind(self) -> RunKind:
         mode = self._match(r"pgsql-polardb_consistency_mode\|([A-Za-z_]+)", "unknown")
-        wait_mode = self._match(r"pgsql-polardb_wait_timeout_mode\|([A-Za-z_]+)", "unknown")
-        outcome = self._match(r"polar_mode=[A-Za-z_]+ outcome=([A-Za-z_]+)", "unknown")
-        split = re.search(r"mode=\d+\s+split=1\s+xact=1", self.test_log) is not None
+        read_target = self._match(
+            r"pgsql-polardb_read_target\|([A-Za-z_]+)", "unknown")
+        timeout_action = self._match(
+            r"pgsql-polardb_action_lsn_timeout\|([A-Za-z_]+)", "unknown")
+        outcome = self._match(
+            r"lsn_wait_timeout_action=[A-Za-z_]+ outcome=([A-Za-z_]+)",
+            "unknown")
+        split = re.search(r"mode=\S+\s+split=1\s+xact=1", self.test_log) is not None
         split_variant = self._detect_split_variant() if split else ""
         if self.is_wait_timeout:
             mode = "mixed"
-            wait_mode = self._match(r"wait_mode=([A-Za-z_]+)", "mixed")
+            timeout_action = self._match(
+                r"lsn_wait_timeout_action=([A-Za-z_]+)", "mixed")
             outcome = "success"
             split = False
             split_variant = ""
-        return RunKind(mode=mode, wait_mode=wait_mode, outcome=outcome,
+        return RunKind(mode=mode, read_target=read_target,
+                       timeout_action=timeout_action, outcome=outcome,
                        split=split, split_variant=split_variant)
 
     def _detect_split_variant(self) -> str:
@@ -282,11 +302,11 @@ class Audit:
             return
         if self.kind.mode == "off":
             self._audit_off()
-        elif self.kind.mode == "primary":
-            self._audit_primary()
-        elif self.kind.mode == "lsn" and self.kind.split:
+        elif self.kind.read_target == "primary":
+            self._audit_primary_target()
+        elif self.kind.lsn_mode and self.kind.split:
             self._audit_split()
-        elif self.kind.mode == "lsn":
+        elif self.kind.lsn_mode:
             self._audit_lsn()
         else:
             self.failures.append(f"unknown consistency mode {self.kind.mode!r}")
@@ -309,10 +329,10 @@ class Audit:
                    "wait-timeout TAP did not finish with failed=0")
         self.check(TEST_LOG["client_warning_once"] in self.test_log,
                    "missing exact-once client warning assertion")
-        self.check(TEST_LOG["timeout0_best_effort"] in self.test_log,
-                   "missing timeout 0 best_effort assertion")
-        self.check(TEST_LOG["timeout0_strict"] in self.test_log,
-                   "missing timeout 0 strict assertion")
+        self.check(TEST_LOG["timeout0_warning"] in self.test_log,
+                   "missing timeout 0 warning assertion")
+        self.check(TEST_LOG["timeout0_primary"] in self.test_log,
+                   "missing timeout 0 primary assertion")
         self.check(TRACE["wrap_finalize_stmts3"] in self.proxy_debug,
                    "missing consistency wrapper finalize trace")
         self.check(TRACE["wait_timeout_accounted"] in self.proxy_debug,
@@ -333,21 +353,23 @@ class Audit:
         self.check(self._hostgroup_queries(READER_HG) == 0,
                    f"off mode used reader HG{READER_HG}")
 
-    def _audit_primary(self) -> None:
-        self.check(TRACE["mode_primary_final"] in self.proxy_debug, "missing final primary mode")
-        self.check(TRACE["plan_primary_force"] in self.proxy_debug,
-                   "missing primary FORCE_PRIMARY plan")
+    def _audit_primary_target(self) -> None:
+        self.check(TRACE["mode_session_lsn_final"] in self.proxy_debug,
+                   "missing final session_lsn consistency mode")
+        self.check(TRACE["plan_primary_target_force"] in self.proxy_debug,
+                   "missing primary-target FORCE_PRIMARY plan")
         self.check(TRACE["execute_force_primary"] in self.proxy_debug,
                    "missing primary FORCE_PRIMARY execute")
         self.check(TRACE["replica_with_wait"] not in self.proxy_debug,
-                   "primary mode unexpectedly used REPLICA_WITH_WAIT")
+                   "primary target unexpectedly used REPLICA_WITH_WAIT")
         self.check(TRACE["wait_wrap"] not in self.proxy_debug,
-                   "primary mode unexpectedly wrapped a wait")
+                   "primary target unexpectedly wrapped a wait")
         self.check(self._hostgroup_queries(READER_HG) == 0,
-                   f"primary mode used reader HG{READER_HG}")
+                   f"primary target used reader HG{READER_HG}")
 
     def _audit_lsn(self) -> None:
-        self.check(TRACE["mode_lsn_final"] in self.proxy_debug, "missing final lsn mode")
+        self.check(TRACE["mode_session_lsn_final"] in self.proxy_debug,
+                   "missing final session_lsn mode")
         self.check(re.search(TRACE["conninfo_reader_params_re"],
                              self.proxy_debug) is not None,
                    f"missing HG{READER_HG} startup params")
@@ -378,18 +400,18 @@ class Audit:
         else:
             self.failures.append("missing INSERT process_result session_write_lsn")
 
-        if self.kind.strict:
+        if self.kind.strict_wire:
             self.check(TRACE["set_mode_strict"] in self.proxy_debug,
                        "missing strict mode SET in wrapped query")
             self.check(TRACE["inject_strict"] in self.proxy_debug,
                        "missing strict injection trace")
-        elif self.kind.best_effort:
+        elif self.kind.warning:
             self.check(TRACE["set_mode_best_effort"] in self.proxy_debug,
                        "missing best_effort mode SET in wrapped query")
             self.check(TRACE["inject_best_effort"] in self.proxy_debug,
                        "missing best_effort injection trace")
 
-        if self.kind.failure and self.kind.best_effort:
+        if self.kind.failure and self.kind.warning:
             self.check(TRACE["best_effort_notice_save"] in self.proxy_debug,
                        "missing best-effort timeout notice save")
             self.check(TRACE["sqlstate_57014"] not in self.proxy_debug,
@@ -397,7 +419,7 @@ class Audit:
             self.check(TRACE["backend_warning_100ms"] in self.replica_log,
                        "best-effort backend warning missing")
 
-        if self.kind.failure and self.kind.strict:
+        if self.kind.failure and self.kind.strict_wire:
             self.check(TRACE["sqlstate_57014"] in self.proxy_debug,
                        "strict timeout missing SQLSTATE 57014 in ProxySQL trace")
             self.check(TRACE["reader_query_error"] in self.proxy_debug,
@@ -406,25 +428,16 @@ class Audit:
                        "strict backend ERROR missing")
 
     def _audit_split(self) -> None:
-        self.check(TRACE["mode_lsn_final"] in self.proxy_debug, "missing final lsn mode")
+        self.check(TRACE["mode_session_lsn_final"] in self.proxy_debug,
+                   "missing final session_lsn mode")
         self.check(TRACE["txn_split_observed_primary"] in self.proxy_debug,
                    "missing primary RFQ observation for split run")
 
         variant = self.kind.split_variant
         if variant in ("basic", "multi", "combined"):
-            self._check_count_eq(TRACE["plan_txn_split"], 2,
-                                 "split plan count")
-            self._check_count_eq(TRACE["txn_split_prepared"], 2,
-                                 "split prepared count")
-            self._check_count_eq(TRACE["txn_split_completed"], 2,
-                                 "split completion count")
+            self._audit_observed_split_counts()
         elif variant == "prewrite":
-            self._check_count_eq(TRACE["plan_txn_split"], 2,
-                                 "split plan count")
-            self._check_count_eq(TRACE["txn_split_prepared"], 2,
-                                 "split prepared count")
-            self._check_count_eq(TRACE["txn_split_completed"], 2,
-                                 "split completion count")
+            self._audit_observed_split_counts()
             self._check_count_ge(TRACE["txn_wait_plan"], 1,
                                  "pre-write reader-wait plan count")
             self._check_count_ge(TRACE["txn_wait_prepared"], 1,
@@ -483,8 +496,10 @@ class Audit:
         elif variant == "readonly_repeatable":
             self.check(TRACE["txn_wait_blocked_isolation"] in self.proxy_debug,
                        "missing repeatable-read isolation veto trace")
-            self.check(TRACE["txn_wait_plan_blocked_rc"] in self.proxy_debug,
-                       "missing repeatable-read primary plan trace")
+            self.check(
+                TRACE["txn_wait_plan_blocked_rc"] in self.proxy_debug
+                or TRACE["txn_read_force_primary"] in self.proxy_debug,
+                "missing repeatable-read primary plan trace")
             self.check(TRACE["txn_wait_prepared"] not in self.proxy_debug,
                        "repeatable-read case unexpectedly prepared reader wait")
             self.check(TRACE["plan_txn_split"] not in self.proxy_debug,
@@ -515,6 +530,29 @@ class Audit:
         else:
             self.failures.append(f"unknown split variant {variant!r}")
 
+    def _counter_delta(self, name: str) -> int:
+        match = re.search(
+            rf"^{re.escape(name)}\s+\d+\s+\d+\s+\+(\d+)\s*$",
+            self.test_log, re.MULTILINE)
+        return int(match.group(1)) if match else 0
+
+    def _audit_observed_split_counts(self) -> None:
+        """Match trace events to the case's measured counter deltas."""
+        total = self._counter_delta("PolarDB_Split_Reads_Total")
+        success = self._counter_delta("PolarDB_Split_Reads_Success")
+        plan_count = self.count(self.proxy_debug, TRACE["plan_txn_split"])
+        prepared_count = self.count(
+            self.proxy_debug, TRACE["txn_split_prepared"])
+        completed_count = self.count(
+            self.proxy_debug, TRACE["txn_split_completed"])
+
+        self.check(plan_count >= max(total, 1),
+                   f"split plan count: expected >= {max(total, 1)}, got {plan_count}")
+        self.check(prepared_count == total,
+                   f"split prepared count: expected {total}, got {prepared_count}")
+        self.check(completed_count == success,
+                   f"split completion count: expected {success}, got {completed_count}")
+
     def _check_count_eq(self, needle: str, expected: int, label: str) -> None:
         actual = self.count(self.proxy_debug, needle)
         self.check(actual == expected,
@@ -533,7 +571,9 @@ class Audit:
         status = "PASS" if not self.failures else "FAIL"
         split = f" split={self.kind.split_variant}" if self.kind.split else ""
         print(f"{status} {self.run_dir.name}: mode={self.kind.mode} "
-              f"wait_mode={self.kind.wait_mode} outcome={self.kind.outcome}{split}")
+              f"read_target={self.kind.read_target} "
+              f"lsn_wait_timeout_action={self.kind.timeout_action} "
+              f"outcome={self.kind.outcome}{split}")
         print(f"  debug: COLLECT={self.count(self.proxy_debug, TRACE['collect'])} "
               f"PLAN={self.count(self.proxy_debug, TRACE['plan'])} "
               f"EXECUTE={self.count(self.proxy_debug, TRACE['execute'])} "
@@ -553,9 +593,20 @@ def default_output_dir() -> Path:
     return Path(__file__).resolve().parents[1] / "test_output"
 
 
+def discover_runs(output_dir: Path) -> list[Path]:
+    """Return scenario directories containing the analyzer's three log files."""
+    runs = {
+        debug_log.parent
+        for debug_log in output_dir.rglob("proxysql_debug.log")
+        if (debug_log.parent / "test.log").is_file()
+        and (debug_log.parent / "proxysql.log").is_file()
+    }
+    return sorted(runs, key=lambda p: p.stat().st_mtime)
+
+
 def latest_runs(n: int, output_dir: Path) -> list[Path]:
-    runs = [p for p in output_dir.glob("run_*") if p.is_dir()]
-    return sorted(runs, key=lambda p: p.stat().st_mtime, reverse=True)[:n][::-1]
+    runs = discover_runs(output_dir)
+    return runs[-n:]
 
 
 def parse_args() -> argparse.Namespace:
@@ -564,6 +615,8 @@ def parse_args() -> argparse.Namespace:
                         help="Run directories to audit. Defaults to --latest 6.")
     parser.add_argument("--latest", type=int, default=6,
                         help="Audit the newest N run directories when no runs are supplied.")
+    parser.add_argument("--all", action="store_true",
+                        help="Audit every compatible scenario directory below --output-dir.")
     parser.add_argument("--output-dir", type=Path, default=default_output_dir(),
                         help="Integration test output directory.")
     return parser.parse_args()
@@ -571,7 +624,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    runs = args.runs or latest_runs(args.latest, args.output_dir)
+    if args.runs:
+        runs = args.runs
+    elif args.all:
+        runs = discover_runs(args.output_dir)
+    else:
+        runs = latest_runs(args.latest, args.output_dir)
     if not runs:
         print(f"no run directories found under {args.output_dir}", file=sys.stderr)
         return 2

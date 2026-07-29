@@ -57,14 +57,14 @@ RFQ LSN alone does not expose ProxySQL's internal route decision. A
 `CONSISTENT` read might have been served by:
 
 - a replica after ProxySQL injected an LSN wait,
-- the primary because the planner forced writer routing,
+- the primary because the planner forced primary routing,
 - a transaction-split read that completed on a replica.
 
 To expose that stronger statement to applications, ProxySQL would need an
 additional client-visible RFQ metadata payload or a diagnostic notice/API with
 at least:
 
-- route action (`writer`, `replica_with_wait`, `txn_split`, `degraded`)
+- route action (`primary`, `replica_with_wait`, `txn_split`, `degraded`)
 - wait type and target LSN
 - whether the wait was applied or skipped
 - whether the route was best-effort degraded

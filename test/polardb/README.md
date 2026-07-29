@@ -21,7 +21,7 @@ own:
 
 - the primary reports its LSN, and the session tracks it so a client reads its own writes;
 - simple-query reads get wrapped with a wait, and the wrapper's own results are hidden;
-- timeouts behave correctly for `best_effort`, `strict`, and timeout `0`;
+- all four LSN wait timeout actions behave correctly, including timeout `0`;
 - a real backend timeout is told apart from a user warning that just looks like one;
 - reads respect the byte-lag cap when a replica is chosen;
 - only simple-query reads are wrapped (extended protocol is out of scope here);
@@ -54,13 +54,22 @@ Directory layout:
 
 - `common/env.sh` loads the single untracked `test/polardb/.env`.
 - `lib/tap_core.sh` provides shared TAP output and prerequisite-skip helpers.
+- `lib/tap_polardb.sh` provides the reusable PolarDB TAP API: SQL wrappers,
+  counters, polling, query-rule setup, fault controls, and routing assertions.
 - `lib/scenario_harness.sh` provides shared topology, DCS/GUC, ProxySQL admin, logging, counter, and scenario-runner helpers.
-- CSN and transaction-split helpers inside `lib/scenario_harness.sh` are postponed scaffold for the next feature round. v1 tests exercise only `off`, `lsn`, and `primary` LSN behavior.
+- The active consistency modes are `off`, `eventual`, `session_lsn`, and
+  `global_lsn`. Normal read placement is configured separately with
+  `pgsql-polardb_read_target=primary|replica`; replica failure uses
+  `pgsql-polardb_action_read_fallback=primary|error`.
 - `lib/bench_harness.sh` provides benchmark-only worker, stats, and pgbench helpers.
 - `test-c/run_helper.sh` is the only C-helper runner; use `make -C test/polardb run-c-*` targets in normal workflows.
 - `tools/trace_analyzer.py` and `tools/coverage_summary.py` are standalone review tooling.
 - `test-tap/` contains TAP integration tests.
 - `test-bench/` contains manual benchmark scripts.
+
+Shared shell helpers must have a tracked caller. A future interface may remain
+reserved in production code or an architecture document when its contract is
+explicit, but unused executable shell scaffolding is not treated as a test API.
 
 ## 3. Topology Selection
 
@@ -161,7 +170,7 @@ verify ProxySQL consumption only when the backend extension is present.
 split contract directly: after an in-transaction write, the backend must be
 able to emit the WAL-pending `w` marker. The normal helper run probes the same
 path but skips if timing or backend support prevents observing `w`; the TAP
-split suite uses the strict mode so missing backend support is not hidden.
+split suite uses a strict backend wait so missing backend support is not hidden.
 
 `make -C test/polardb build` delegates to `make -C test polardb`, which checks for PolarDB LSN symbols in the vendored libpq before compiling bundled pgbench and the helpers. If the check fails, rebuild with
 `make polardb-libpq`; the helpers must not fall back to system libpq.
@@ -224,6 +233,21 @@ Known backend-exclusive groups are `global-timeout`, `split-timeout`,
 `split-failure-policy`, and `wait-timeout`. `wait-timeout` intentionally remains
 sequential as one group.
 
+To run the trace and fault-injection assertions, first build `polardb-debug`,
+then run:
+
+```bash
+make -C test/polardb tap-debug-trace
+```
+
+This target rejects a normal PolarDB binary instead of silently skipping
+debug-only checks. Trace assertions stay beside the TAP behavior they verify.
+Each invocation gives all child TAP runs one dedicated output directory. After
+the scripts finish, `tools/trace_analyzer.py --all --output-dir <that-directory>`
+processes every compatible scenario directory containing `test.log`,
+`proxysql.log`, and `proxysql_debug.log`. It never guesses from unrelated older
+runs.
+
 ### `config_roundtrip_tap.sh`
 
 A standalone admin/config test. It starts its own ProxySQL (via
@@ -233,6 +257,20 @@ A standalone admin/config test. It starts its own ProxySQL (via
 - the columns after `replica_eligible` keep their position (nothing shifts);
 - the PolarDB policy columns in `pgsql_replication_hostgroups` survive a save and reload;
 - the admin and cluster views list the columns in the same order.
+
+### `frontend_output_tap.sh`
+
+A read-only data-integrity test for the normal synchronous frontend output
+paths. It compares the exact 4096-row result from the writer with results sent
+through ProxySQL using:
+
+- ordinary buffered output;
+- direct `writev`;
+- row-run result forwarding;
+- output coalescing;
+- all three synchronous optimizations together.
+
+The test requires the corresponding synchronous-output counters to move.
 
 ### `lsn_session_consistency_tap.sh`
 
@@ -246,9 +284,9 @@ for maintainers reading the executable test body.
 - **Extended protocol routing** — Parse/Bind/Execute reads are not wait-wrapped in this version; manual routes are still honored.
 - **Proxy-protocol RFQ scope** — `v15`/`legacy`/`off` and hostgroup-override negotiation of RFQ-LSN capability.
 - **Startup identity fallback** — where the RFQ startup client address comes from, and rejecting the backend connection when it cannot be formed.
-- **RFQ availability policy** — `strict` vs `best_effort` when no RFQ LSN is available, and the missing-LSN flags.
+- **Missing-LSN actions** — primary fallback, a warned replica route, or an error when no required RFQ LSN is available, plus the missing-LSN flags.
 - **Route hints and session overrides** — `route=primary`, multi-statement queries, the session-level mode override, and `RESET ALL`.
-- **Replica acquisition faults** — debug-fault coverage of the busy and unknown-LSN fallback paths.
+- **Replica acquisition faults** — debug-fault coverage of the busy and unknown-LSN fallback paths, plus reset timeout after a target-ready reader skipped its wait wrapper.
 - **Monitor LSN updates** — the background monitor LSN cache, kept separate from the per-query RFQ path.
 - **Lag-cap and freshness routing** — the byte-lag cap, freshness checks, and cold-pool replica creation.
 - **RFQ connection-profile reuse** — pooled replica connections reused or evicted by protocol compatibility.
@@ -257,13 +295,36 @@ for maintainers reading the executable test body.
 Timeout-edge scenarios change the replica's replay lag, so they run only when you
 set `POLARDB_TIMEOUT_EDGE_TESTS=1`.
 
+### `rfq_lsn_lifecycle_tap.sh`
+
+Checks that missing, present-zero, and positioned RFQ-LSN payloads retain their
+distinct meanings across setup statements and later reads.
+
+### `global_lsn_consistency_tap.sh`
+
+Checks GLOBAL_LSN routing, group-LSN targets, transaction routing, split
+behavior, and the writer fallback used when the group LSN is unavailable.
+Its replay-lag timeout group is backend-exclusive.
+
+### `txn_split_tap.sh`
+
+Runs the transaction-split scenarios from `lib/scenario_harness.sh`, including
+pre-write reads, warmup modes, retry routing, and reuse of a completed split
+reader by a later ordinary read and transaction.
+
+### `txn_split_failure_policy_tap.sh`
+
+Exercises DEBUG-only split reader failures and verifies retry, writer redirect,
+termination, cleanup, and routing precedence. It is backend-exclusive.
+
 ### `wait_timeout_cleanup_tap.sh`
 
 A focused test for timeout and notice behavior. It checks:
 
-- `best_effort` with a finite timeout — both when the replica catches up in time and
-  when it times out;
-- `strict` with a finite timeout — both success and timeout;
+- `warning` with a finite timeout — both when the reader catches up
+  and when it returns stale rows with a warning;
+- `primary` with a finite timeout — both success and primary retry;
+- `error` and `disconnect` policy behavior;
 - timeout `0`, which waits until the replica catches up;
 - that exactly one timeout warning reaches the client after the backend consumes the
   wait target;
@@ -275,19 +336,15 @@ A focused test for timeout and notice behavior. It checks:
 
 ## 7. Unit And Coverage Targets
 
-The PolarDB unit tests live under `test/polardb/test-unit/` and are built by the
-PolarDB-owned Makefile target:
+The PolarDB unit tests live under `test/polardb/test-unit/`. The
+[unit-test guide](test-unit/README.md) explains focused tests, component tests,
+HGM test domains, shared helpers, and how to add new coverage.
 
-- `polardb_routing_lsn_unit-t` — zero-target first reads, monotonic session and
-  GLOBAL_LSN targets, wait plans, RFQ-unavailable route policy, query-shape
-  checks, and the writer-scope matrix
-- `polardb_protocol_parse_unit-t` — node-type name mapping, monitor-health parsers,
-  multi-statement detection
-- `polardb_status_policy_unit-t` — route-action / reader-status names,
-  NoticeResponse packet helpers, wrapper-error accounting, server-LSN cache reset
-- `polardb_query_state_unit-t` — query-state named-reset subsets
-- `polardb_startup_profile_unit-t`
-- `polardb_hgm_lsn_unit-t`
+Build and run the complete unit set with:
+
+```bash
+make -C test/polardb/test-unit -j128 check
+```
 
 The protocol-parse unit covers the monitor health parsing helpers and the
 rules for accepting monitor LSN updates. Live monitor scheduling, invalid health roles/values, and
@@ -300,8 +357,9 @@ make -C test/polardb coverage
 ```
 
 The coverage target builds the dedicated `-O0` gcov/debug binary, runs the TAP
-suite and PolarDB units, analyzes debug traces, and writes focused reports under
-`COVERAGE_DIR` (default `/tmp/proxysql-polardb-coverage`).
+trace/fault assertions and trace analyzer, runs the PolarDB units, and writes
+focused reports under `COVERAGE_DIR` (default
+`/tmp/proxysql-polardb-coverage`).
 Coverage percentage controls default to report-only during development. Set
 `POLARDB_DEDICATED_TAKEN_MIN` or `POLARDB_FUNCTION_TAKEN_MIN` explicitly when a
 branch wants enforced coverage floors.
@@ -314,7 +372,7 @@ Short test scenarios are the small committed baseline set and are run by
 `make -C test/polardb test-cases`:
 
 - `test-case1.sh` - eventual-consistency baseline.
-- `test-case2.sh` - session-LSN mode, including best_effort warning timeout and strict writer-retry timeout variants.
+- `test-case2.sh` - session-LSN mode, including `warning` and `primary` timeout variants.
 - `test-case5.sh` - primary-only baseline.
 
 `make -C test/polardb bench` is kept as a compatibility alias for the short

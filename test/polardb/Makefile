@@ -2,8 +2,11 @@
 
 PROXYSQL_ROOT := $(shell while [ ! -f ./src/proxysql_global.cpp ]; do cd ..; done; pwd)
 POLARDB_TEST_DIR := $(PROXYSQL_ROOT)/test/polardb
+PROXYSQL_BINARY ?= $(PROXYSQL_ROOT)/src/proxysql
 TEST_MAKE := $(MAKE) -C $(PROXYSQL_ROOT)/test
-TRACE_ANALYZE_ARGS ?= --latest 1
+POLARDB_DEBUG_TRACE_RUN_ID := $(shell date +%Y%m%d_%H%M%S_%N)
+POLARDB_DEBUG_TRACE_OUTPUT_DIR ?= $(POLARDB_TEST_DIR)/test_output/debug_trace_$(POLARDB_DEBUG_TRACE_RUN_ID)
+POLARDB_DEBUG_TRACE_BINARY := $(POLARDB_DEBUG_TRACE_OUTPUT_DIR)/proxysql-debug
 COVERAGE_DIR ?= /tmp/proxysql-polardb-coverage
 GCOVR ?= $(shell if command -v gcovr >/dev/null 2>&1; then \
 		echo gcovr; \
@@ -39,6 +42,7 @@ POLARDB_UNIT_TESTS := \
 	$(POLARDB_UNIT_BIN_DIR)/polardb_startup_profile_unit-t \
 	$(POLARDB_UNIT_BIN_DIR)/pgsql_status_variables_unit-t \
 	$(POLARDB_UNIT_BIN_DIR)/polardb_client_rfq_unit-t \
+	$(POLARDB_UNIT_BIN_DIR)/polardb_query_digest_unit-t \
 	$(POLARDB_UNIT_BIN_DIR)/polardb_hgm_lsn_unit-t
 POLARDB_DEDICATED_IMPL_FILES := \
 	PgSQL_PolarDB_Wrap.cpp \
@@ -47,14 +51,18 @@ POLARDB_DEDICATED_IMPL_FILES := \
 	PgSQL_PolarDB_Notices.cpp \
 	PgSQL_PolarDB_Failure.cpp \
 	PgSQL_PolarDB_Split.cpp \
-	PgSQL_PolarDB.cpp
+	PgSQL_PolarDB_Protocol.cpp \
+	PgSQL_PolarDB_Topology.cpp \
+	PgSQL_PolarDB_ReaderPool_Connections.cpp \
+	PgSQL_PolarDB_ReaderPool_Warmup.cpp \
+	PgSQL_PolarDB_ReaderPool_Worker.cpp
 POLARDB_DEDICATED_THRESHOLD_FILES := \
 	PgSQL_PolarDB_Wrap.cpp \
 	PgSQL_PolarDB_Flow.cpp \
 	PgSQL_PolarDB_Notices.cpp \
 	PgSQL_PolarDB_Failure.cpp \
 	PgSQL_PolarDB_Split.cpp \
-	PgSQL_PolarDB.cpp
+	PgSQL_PolarDB_Protocol.cpp
 POLARDB_SHARED_IMPL_FILES := \
 	PgSQL_Data_Stream.cpp \
 	PgSQL_Session.cpp \
@@ -102,15 +110,28 @@ $(word 1,$(subst :, ,$(1))):
 	$$(POLARDB_RUN_LOGGED) $(word 1,$(subst :, ,$(1))) $$(POLARDB_TEST_DIR)/test-bench/$(word 2,$(subst :, ,$(1))).sh $$(ARGS)
 endef
 
+# Run one sequential TAP gate on an unused three-port ProxySQL shard. A caller
+# may set POLARDB_TEST_SHARD explicitly; otherwise the lifecycle helper selects
+# one without stopping or replacing an existing listener.
+define POLARDB_RUN_ISOLATED_TAP
+	+@shard="$(POLARDB_TEST_SHARD)"; \
+	if test -z "$$shard"; then \
+		shard="$$(POLARDB_PARALLEL_RUN=1 $(POLARDB_TEST_DIR)/common/proxysql_lifecycle.sh find-free-shard)" || exit 1; \
+	fi; \
+	echo "Selected isolated ProxySQL listener shard: $$shard"; \
+	$(MAKE) --no-print-directory -C $(POLARDB_TEST_DIR) $(1) \
+		POLARDB_TEST_SHARD="$$shard" $(2)
+endef
+
 .PHONY: help build clean \
 	run-c-libpq-lsn run-c-libpq-xact run-c-libpq-row-run run-c-extended-protocol \
 	run-pgbench-lsn run-sysbench-lsn \
 	build-pgbench-polar-rfq build-sysbench-polar-rfq rfq-bench-tools-check \
-	tap-config tap-lsn tap-rfq-lifecycle tap-global-lsn tap-split tap-split-failure-policy tap-wait-timeout \
-	tap-parallel-list tap-parallel-safe tap-exclusive tap-parallel tap tap-debug-trace \
+	tap-config tap-frontend-output tap-lsn tap-rfq-lifecycle tap-global-lsn tap-split tap-split-failure-policy tap-wait-timeout \
+	tap-parallel-list tap-parallel-safe tap-exclusive tap-parallel tap tap-run tap-debug-binary-check tap-debug-binary-copy tap-port-check tap-debug-trace tap-debug-trace-run \
 	unit \
-	test-case1 test-case2 test-case2-best-effort-success test-case2-best-effort-failure \
-	test-case2-strict-success test-case2-strict-failure test-case5 test-cases \
+	test-case1 test-case2 test-case2-stale-with-warning-success test-case2-stale-with-warning-failure \
+	test-case2-use-writer-success test-case2-use-writer-failure test-case5 test-cases \
 	bench-case1 bench-case2 bench-case5 bench \
 	bench1 bench2 bench3 bench4 bench5 bench5-report bench-heavy \
 	pgo-hotpath-smoke pgo-hotpath-core pgo-hotpath-full pgo-hotpath-edge \
@@ -119,7 +140,7 @@ endef
 	bolt-train-smoke bolt-train-core bolt-train-full \
 	trace-analyze analyze-traces coverage-tools-unit coverage-parser-selftest coverage
 
-.NOTPARALLEL: tap tap-debug-trace
+.NOTPARALLEL: tap tap-run tap-debug-trace tap-debug-binary-copy tap-debug-trace-run
 
 help:
 	@echo "PolarDB test targets:"
@@ -135,6 +156,7 @@ help:
 	@echo "  make -C test/polardb run-pgbench-lsn        run the pgbench RFQ-LSN consistency check"
 	@echo "  make -C test/polardb run-sysbench-lsn       run the sysbench RFQ-LSN consistency check"
 	@echo "  make -C test/polardb tap-config             run config round-trip TAP"
+	@echo "  make -C test/polardb tap-frontend-output    run synchronous frontend output TAP"
 	@echo "  make -C test/polardb tap-lsn                run main LSN TAP"
 	@echo "  make -C test/polardb tap-rfq-lifecycle      run focused RFQ-LSN result lifecycle TAP"
 	@echo "  make -C test/polardb tap-global-lsn         run global LSN consistency TAP"
@@ -146,7 +168,7 @@ help:
 	@echo "  make -C test/polardb tap-exclusive          run only backend-exclusive TAP groups sequentially"
 	@echo "  make -C test/polardb tap-parallel-list      show TAP group scheduling metadata"
 	@echo "  make -C test/polardb tap                    run all TAP scripts"
-	@echo "  make -C test/polardb tap-debug-trace        run TAP scripts and debug trace analysis"
+	@echo "  make -C test/polardb tap-debug-trace        require a polardb-debug binary and run TAP trace/fault assertions"
 	@echo "  make -C test/polardb unit                   build and run PolarDB-owned unit tests"
 	@echo "  make -C test/polardb coverage               run gcov build, TAP/unit tests, trace analysis, and reports"
 	@echo "                                               coverage uses POLARDB_COVERAGE_BUILD_TARGET=polardb-coverage-debug (-O0)"
@@ -220,6 +242,9 @@ run-sysbench-lsn:
 tap-config:
 	$(POLARDB_RUN_LOGGED) tap-config $(POLARDB_TEST_DIR)/test-tap/config_roundtrip_tap.sh
 
+tap-frontend-output:
+	$(POLARDB_RUN_LOGGED) tap-frontend-output $(POLARDB_TEST_DIR)/test-tap/frontend_output_tap.sh
+
 tap-lsn:
 	$(POLARDB_RUN_LOGGED) tap-lsn $(POLARDB_TEST_DIR)/test-tap/lsn_session_consistency_tap.sh
 
@@ -250,16 +275,52 @@ tap-exclusive:
 tap-parallel:
 	$(POLARDB_RUN_LOGGED) tap-parallel env POLARDB_TAP_PARALLEL_JOBS="$(POLARDB_TAP_PARALLEL_JOBS)" $(POLARDB_TAP_RUNNER) all
 
-tap: tap-config tap-lsn tap-rfq-lifecycle tap-global-lsn tap-split tap-split-failure-policy tap-wait-timeout
+tap:
+	$(call POLARDB_RUN_ISOLATED_TAP,tap-run,)
 
-tap-debug-trace: tap-lsn tap-rfq-lifecycle tap-global-lsn tap-split tap-split-failure-policy tap-wait-timeout
-	+$(MAKE) -C $(POLARDB_TEST_DIR) trace-analyze ARGS="$(or $(ARGS),$(TRACE_ANALYZE_ARGS))"
+tap-run: export POLARDB_PARALLEL_RUN := 1
+tap-run: tap-port-check tap-config tap-frontend-output tap-lsn tap-rfq-lifecycle tap-global-lsn tap-split tap-split-failure-policy tap-wait-timeout
+
+tap-debug-binary-check:
+	@test -x "$(PROXYSQL_BINARY)" || { echo "Missing ProxySQL binary: $(PROXYSQL_BINARY)" >&2; exit 1; }
+	@grep -aFq "POLARDB_DEBUG_WAIT_RETRY_FAULT_FILE" "$(PROXYSQL_BINARY)" || { \
+		echo "$(PROXYSQL_BINARY) does not contain POLARDB_DEBUG trace/fault support." >&2; \
+		echo "Build it first with: make -C $(PROXYSQL_ROOT) -j128 polardb-debug" >&2; \
+		exit 1; \
+	}
+	@echo "Verified POLARDB_DEBUG trace/fault support in $(PROXYSQL_BINARY)"
+
+# Run every debug suite with one private binary copy. A build in the source tree
+# must not replace the executable halfway through this gate and turn later
+# fault-path checks into skips.
+tap-debug-binary-copy: tap-debug-binary-check
+	@mkdir -p "$(POLARDB_DEBUG_TRACE_OUTPUT_DIR)"
+	@cp -p "$(PROXYSQL_BINARY)" "$(POLARDB_DEBUG_TRACE_BINARY)"
+	@cd "$(POLARDB_DEBUG_TRACE_OUTPUT_DIR)" && sha256sum proxysql-debug > proxysql-debug.sha256
+	@echo "Copied debug binary to $(POLARDB_DEBUG_TRACE_BINARY)"
+
+tap-port-check: export POLARDB_PARALLEL_RUN := 1
+tap-port-check:
+	@$(POLARDB_TEST_DIR)/common/proxysql_lifecycle.sh check-ports
+
+tap-debug-trace: tap-debug-binary-copy
+	$(call POLARDB_RUN_ISOLATED_TAP,tap-debug-trace-run,POLARDB_DEBUG_TRACE_OUTPUT_DIR="$(POLARDB_DEBUG_TRACE_OUTPUT_DIR)" PROXYSQL_BINARY="$(POLARDB_DEBUG_TRACE_BINARY)")
+
+tap-debug-trace-run: export POLARDB_PARALLEL_RUN := 1
+tap-debug-trace-run: export POLARDB_MAKE_OUTPUT_DIR := $(POLARDB_DEBUG_TRACE_OUTPUT_DIR)
+tap-debug-trace-run: export POLARDB_REQUIRE_DEBUG_TRACES := 1
+tap-debug-trace-run: tap-debug-binary-check tap-port-check tap-lsn tap-rfq-lifecycle tap-global-lsn tap-split tap-split-failure-policy tap-wait-timeout
+	@echo "Debug TAP listener shard: $(POLARDB_TEST_SHARD)"
+	@cd "$(POLARDB_DEBUG_TRACE_OUTPUT_DIR)" && sha256sum --check proxysql-debug.sha256
+	@echo "Analyzing debug artifacts in $(POLARDB_DEBUG_TRACE_OUTPUT_DIR)"
+	python3 $(POLARDB_TEST_DIR)/tools/trace_analyzer.py \
+		--all --output-dir "$(POLARDB_DEBUG_TRACE_OUTPUT_DIR)"
 
 # Unit objects share one build directory across normal and WITHGCOV builds.
 # Clean before the normal unit run so a previous coverage run cannot leave
 # gcov-enabled objects that later fail to link without libgcov.
 unit:
-	$(POLARDB_RUN_LOGGED) unit bash -o pipefail -c 'make -C "$(POLARDB_UNIT_DIR)" clean && make -C "$(POLARDB_UNIT_DIR)" -j$(JOBS) && for t in $(POLARDB_UNIT_TESTS); do "$$t"; done'
+	+$(POLARDB_RUN_LOGGED) unit bash -o pipefail -c '$(MAKE) -C "$(POLARDB_UNIT_DIR)" clean && $(MAKE) -C "$(POLARDB_UNIT_DIR)" && for t in $(POLARDB_UNIT_TESTS); do "$$t"; done'
 
 test-case1:
 	$(POLARDB_RUN_LOGGED) test-case1 $(POLARDB_TEST_DIR)/test-bench/test-case1.sh $(ARGS)
@@ -267,17 +328,17 @@ test-case1:
 test-case2:
 	$(POLARDB_RUN_LOGGED) test-case2 $(POLARDB_TEST_DIR)/test-bench/test-case2.sh $(ARGS)
 
-test-case2-best-effort-success:
-	$(POLARDB_RUN_LOGGED) test-case2-best-effort-success $(POLARDB_TEST_DIR)/test-bench/test-case2.sh -a -success
+test-case2-stale-with-warning-success:
+	$(POLARDB_RUN_LOGGED) test-case2-stale-with-warning-success $(POLARDB_TEST_DIR)/test-bench/test-case2.sh -a -success
 
-test-case2-best-effort-failure:
-	$(POLARDB_RUN_LOGGED) test-case2-best-effort-failure $(POLARDB_TEST_DIR)/test-bench/test-case2.sh -a -failure
+test-case2-stale-with-warning-failure:
+	$(POLARDB_RUN_LOGGED) test-case2-stale-with-warning-failure $(POLARDB_TEST_DIR)/test-bench/test-case2.sh -a -failure
 
-test-case2-strict-success:
-	$(POLARDB_RUN_LOGGED) test-case2-strict-success $(POLARDB_TEST_DIR)/test-bench/test-case2.sh -b -success
+test-case2-use-writer-success:
+	$(POLARDB_RUN_LOGGED) test-case2-use-writer-success $(POLARDB_TEST_DIR)/test-bench/test-case2.sh -b -success
 
-test-case2-strict-failure:
-	$(POLARDB_RUN_LOGGED) test-case2-strict-failure $(POLARDB_TEST_DIR)/test-bench/test-case2.sh -b -failure
+test-case2-use-writer-failure:
+	$(POLARDB_RUN_LOGGED) test-case2-use-writer-failure $(POLARDB_TEST_DIR)/test-bench/test-case2.sh -b -failure
 
 test-case5:
 	$(POLARDB_RUN_LOGGED) test-case5 $(POLARDB_TEST_DIR)/test-bench/test-case5.sh $(ARGS)
@@ -286,8 +347,8 @@ bench-case1: test-case1
 bench-case2: test-case2
 bench-case5: test-case5
 
-test-cases: test-case1 test-case2-best-effort-success test-case2-best-effort-failure \
-	test-case2-strict-success test-case2-strict-failure test-case5
+test-cases: test-case1 test-case2-stale-with-warning-success test-case2-stale-with-warning-failure \
+	test-case2-use-writer-success test-case2-use-writer-failure test-case5
 
 bench: test-cases
 

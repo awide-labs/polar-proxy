@@ -4,23 +4,13 @@
 #
 # Combines shared topology, ProxySQL, stats, logging, and scenario helpers.
 #
-# POSTPONED SURFACE:
-# CSN helper blocks are kept as near-term scaffolding, not as active v1
-# coverage. The committed active surface is off/lsn/global_lsn/primary LSN
-# session consistency plus LSN transaction split. Do not run CONSISTENCY_MODE=4
-# from this harness until the matching CSN code path and assertions are restored.
-#
-# ACTIVE SLICE (what the committed TAP scripts actually source from here):
-#   init_logging / stop_logging, start_proxysql / stop_proxysql,
-#   enable_replay_lag / disable_replay_lag, wait_for_replica_lsn_catchup,
-#   get_counter, extract_logs, setup_test_table, start_wal_generator /
-#   stop_wal_generator, proxysql_admin (+ their logging/topology dependencies).
-#   The run_consistency_test split branch is active for XACT_SPLIT=1 with
-#   CONSISTENCY_MODE=1 or 2. Everything else below is reference material or
-#   postponed scaffold.
+# This file contains the helpers and runner used by test-bench/test-case*.sh.
+# General TAP tests use lib/tap_polardb.sh instead. Keep helpers here only when
+# the scenario runner or one of those case scripts calls them; future feature
+# designs belong in the architecture documents until an executable test exists.
 #
 # vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
-# COUNTER CATALOGUE -- active LSN + split counters, postponed CSN counters.
+# COUNTER CATALOGUE -- active LSN + split counters.
 # This block enumerates stats_pgsql_global counters with their C++ source-line
 # citations. Treat the lib/*.cpp:NNN line numbers as stale hints, not guarantees.
 # vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
@@ -159,8 +149,7 @@
 # =============================================================================
 # POLARDB SPLIT READ STATS
 # =============================================================================
-# Transaction-split counters are active for XACT_SPLIT=1 cases. CSN-related
-# counters below remain postponed until the matching CSN code path returns.
+# Transaction-split counters are active for XACT_SPLIT=1 cases.
 # Source: PgHGM->status (PgSQL_HostGroups_Manager.h:795-879)
 # All PolarDB stats are atomic counters for thread-safe access.
 #
@@ -178,6 +167,7 @@
 #   PolarDB_Split_Rejected_For_Update  - Rejected: FOR UPDATE/SHARE
 #   PolarDB_Split_Rejected_Write_LSN_Unknown - Rejected: prior write RFQ missed LSN
 #   PolarDB_Split_Rejected_Observed_LSN_Unknown - Rejected: tracked read RFQ missed LSN
+#   PolarDB_Split_Rejected_No_Marker   - Rejected: no usable split or pre-write RFQ marker
 #
 # --- Transaction Lifecycle (lines 801-809) ---
 #   PolarDB_XIDs_Received              - XID parse events from primary
@@ -196,13 +186,6 @@
 #   PolarDB_Split_LSN_Wait_Count       - Number of LSN waits
 #   PolarDB_Wait_Wrap_Bypassed         - Wait wrapper skipped because selected reader was already fresh
 #   PolarDB_Split_LSN_Wait_Sum_Us      - Total LSN wait time (us)
-#
-# --- CSN Tracking (lines 848-853) ---
-#   PolarDB_CSN_Updates_From_Query     - CSN from INSERT/UPDATE/DELETE
-#   PolarDB_CSN_Updates_From_Monitor   - CSN from monitor thread
-#   PolarDB_CSN_Stale_Count            - Stale CSN detections
-#   (PolarDB_Split_CSN_Wait_Count removed - split always uses LSN)
-#   PolarDB_Global_CSN_Routing         - Global CSN routing (mode=4)
 #
 # --- Connection Pool (lines 823-830, 855-857) ---
 #   PolarDB_Split_Pool_Hit             - Connection from pool
@@ -261,11 +244,8 @@ source "$POLARDB_TEST_DIR/common/env.sh"
 #------------------------------------------------------------------------------
 
 # Keep all psql invocation details behind functions. Older versions of this
-# harness used string-built P/R/PROXY commands and eval; these wrappers preserve
-# the same behavior without word-splitting surprises. Primary/replica helpers are
-# semantic aliases over the shared direct-endpoint implementation from env.sh.
-polardb_primary_psql() { polardb_direct_psql "$PRIMARY_HOST" "$PRIMARY_PORT" "$@"; }
-polardb_replica_psql() { polardb_direct_psql "$REPLICA_HOST" "$REPLICA_PORT" "$@"; }
+# harness used string-built commands and eval; these wrappers preserve the same
+# behavior without word-splitting surprises.
 polardb_primary_sql() { polardb_direct_sql "$PRIMARY_HOST" "$PRIMARY_PORT" "$1"; }
 polardb_replica_sql() { polardb_direct_sql "$REPLICA_HOST" "$REPLICA_PORT" "$1"; }
 
@@ -301,16 +281,11 @@ polardb_pgbench_script() {
 
 # State tracking
 WAL_GEN_PID=""
-TXN_PID=""
-POLARDB_BG_PIDS=()
 TEST_TABLE="${TEST_TABLE:-$(polardb_test_identifier consistency_test)}"
 
 # Colors
 RED='\033[0;31m'
-GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
 NC='\033[0m'
 
 #------------------------------------------------------------------------------
@@ -319,24 +294,8 @@ NC='\033[0m'
 
 ts() { date "+%H:%M:%S.%3N"; }
 
-log_header() {
-	echo ""
-	echo -e "${BLUE}================================================================${NC}"
-	echo -e "${BLUE}$1${NC}"
-	echo -e "${BLUE}================================================================${NC}"
-}
-
-log_section() {
-	echo ""
-	echo -e "${CYAN}--- $1 ---${NC}"
-}
-
 log_info() {
 	echo -e "[$(ts)] $1"
-}
-
-log_success() {
-	echo -e "${GREEN}[$(ts)] ✓ $1${NC}"
 }
 
 log_warning() {
@@ -345,20 +304,6 @@ log_warning() {
 
 log_error() {
 	echo -e "${RED}[$(ts)] ✗ $1${NC}"
-}
-
-log_result() {
-	local expected="$1"
-	local actual="$2"
-	local msg="$3"
-
-	if [ "$expected" = "$actual" ]; then
-		log_success "$msg (expected: $expected, got: $actual)"
-		return 0
-	else
-		log_error "$msg (expected: $expected, got: $actual)"
-		return 1
-	fi
 }
 
 #------------------------------------------------------------------------------
@@ -396,39 +341,6 @@ polardb_register_pgsql_servers() {
 	done
 }
 
-polardb_register_bg_pid() {
-	local pid="$1"
-	[ -n "$pid" ] || return 0
-	POLARDB_BG_PIDS+=("$pid")
-}
-
-polardb_forget_bg_pid() {
-	local target="$1"
-	local kept=()
-	local pid
-
-	for pid in "${POLARDB_BG_PIDS[@]:-}"; do
-		[ "$pid" = "$target" ] || kept+=("$pid")
-	done
-	POLARDB_BG_PIDS=("${kept[@]}")
-}
-
-polardb_stop_pid() {
-	local pid="$1"
-	[ -n "$pid" ] || return 0
-	kill "$pid" 2>/dev/null || true
-	wait "$pid" 2>/dev/null || true
-}
-
-polardb_stop_registered_pids() {
-	local pid
-
-	for pid in "${POLARDB_BG_PIDS[@]:-}"; do
-		polardb_stop_pid "$pid"
-	done
-	POLARDB_BG_PIDS=()
-}
-
 #------------------------------------------------------------------------------
 # Setup/Teardown Functions
 #------------------------------------------------------------------------------
@@ -441,11 +353,8 @@ setup_test_table() {
 cleanup_all() {
 	log_info "Cleaning up..."
 
-	# Stop only harness-owned background processes. Do not kill every job in the
-	# caller shell: tests can be sourced or run under wrappers with their own jobs.
+	# Stop only the WAL generator started by this harness.
 	stop_wal_generator
-	stop_uncommitted_transaction
-	polardb_stop_registered_pids
 
 	# Reset replica settings
 	polardb_set_local_sighup_guc polar_replay_min_lag_size 0 >/dev/null 2>&1 || true
@@ -465,6 +374,13 @@ polardb_dcs_set() {
 polardb_set_local_sighup_guc() {
 	local key="$1"
 	local value="$2"
+	local current
+
+	current=$(polardb_direct_sql "$REPLICA_HOST" "$REPLICA_PORT" \
+		"SELECT current_setting('$key', true);" 2>/dev/null | tr -d '[:space:]')
+	if [ "$current" = "$value" ]; then
+		return 0
+	fi
 
 	if [ "${POLARDB_DCS_MODE:-docker}" != "docker" ]; then
 		polardb_dcs_set "$key=$value"
@@ -515,6 +431,10 @@ wait_for_guc_value() {
 			if [ "$current" = "${expected_ms}ms" ]; then
 				return 0
 			fi
+			if [ "$expected_ms" -eq 0 ] &&
+				{ [ "$current" = "0" ] || [ "$current" = "0s" ]; }; then
+				return 0
+			fi
 			if [ $((expected_ms % 1000)) -eq 0 ] && [ "$current" = "$((expected_ms / 1000))s" ]; then
 				return 0
 			fi
@@ -532,8 +452,8 @@ wait_for_guc_value() {
 
 set_polar_proxy_wait_timeout_ms() {
 	local timeout_ms="$1"
-	if [ -z "$timeout_ms" ] || [ "$timeout_ms" = "0" ]; then
-		log_info "polar_proxy_wait_timeout_ms not set (timeout_ms=$timeout_ms)"
+	if [ -z "$timeout_ms" ]; then
+		log_info "polar_proxy_wait_timeout_ms not set"
 		return 0
 	fi
 
@@ -541,6 +461,20 @@ set_polar_proxy_wait_timeout_ms() {
 	polardb_dcs_set "polar_proxy_wait_timeout_ms=$timeout_ms" >/dev/null || return 1
 	wait_for_guc_value "$PRIMARY_HOST" "$PRIMARY_PORT" polar_proxy_wait_timeout_ms "${timeout_ms}ms" 10 || return 1
 	wait_for_guc_value "$REPLICA_HOST" "$REPLICA_PORT" polar_proxy_wait_timeout_ms "${timeout_ms}ms" 10 || return 1
+}
+
+get_polar_proxy_wait_timeout_ms() {
+	polardb_direct_sql "$PRIMARY_HOST" "$PRIMARY_PORT" \
+		"SELECT (extract(epoch FROM current_setting('polar_proxy_wait_timeout_ms')::interval) * 1000)::bigint;" \
+		2>/dev/null | tr -d '[:space:]'
+}
+
+restore_polar_proxy_wait_timeout_ms() {
+	local timeout_ms="$1"
+
+	[ -n "$timeout_ms" ] || return 0
+	log_info "Restoring polar_proxy_wait_timeout_ms=$timeout_ms through Patroni DCS"
+	set_polar_proxy_wait_timeout_ms "$timeout_ms"
 }
 
 get_polar_query_delay_us() {
@@ -672,24 +606,17 @@ stop_wal_generator() {
 		log_info "Stopping WAL generator..."
 		kill "$WAL_GEN_PID" 2>/dev/null
 		wait "$WAL_GEN_PID" 2>/dev/null || true
-		polardb_forget_bg_pid "$WAL_GEN_PID"
 		WAL_GEN_PID=""
 	fi
 }
 
 #------------------------------------------------------------------------------
-# LSN/CSN Functions (direct to PolarDB)
+# LSN Functions (direct to PolarDB)
 #------------------------------------------------------------------------------
 
 # Active LSN getters (used by wait_for_replica_lsn_catchup, the LSN TAP slice).
 get_primary_lsn() { polardb_primary_sql "SELECT pg_current_wal_lsn();"; }
 get_replica_replay_lsn() { polardb_replica_sql "SELECT pg_last_wal_replay_lsn();"; }
-get_replica_receive_lsn() { polardb_replica_sql "SELECT pg_last_wal_receive_lsn();"; }
-# POSTPONED scaffold (CSN): no active TAP slice reads these; kept for the
-# postponed CSN consistency feature work alongside wait_for_replica_csn_catchup.
-get_primary_csn() { polardb_primary_sql "SELECT polar_get_csn();" 2>/dev/null; }
-get_replica_csn() { polardb_replica_sql "SELECT polar_get_csn();" 2>/dev/null; }
-
 #------------------------------------------------------------------------------
 # Catch-up Helpers (replica)
 #------------------------------------------------------------------------------
@@ -703,21 +630,6 @@ wait_for_replica_lsn_catchup() {
 		local pd=$(lsn_to_decimal "$p")
 		local rd=$(lsn_to_decimal "$r")
 		[ "$rd" -ge "$pd" ] && return 0
-		if [ $(($(date +%s) - start_ts)) -ge "$timeout_sec" ]; then
-			return 1
-		fi
-		sleep 0.2
-	done
-}
-
-# POSTPONED scaffold (CSN catch-up): inactive in v1; restored with CSN feature.
-wait_for_replica_csn_catchup() {
-	local timeout_sec="${1:-10}"
-	local start_ts=$(date +%s)
-	while true; do
-		local p=$(get_primary_csn)
-		local r=$(get_replica_csn)
-		[ -n "$p" ] && [ -n "$r" ] && [ "$r" -ge "$p" ] && return 0
 		if [ $(($(date +%s) - start_ts)) -ge "$timeout_sec" ]; then
 			return 1
 		fi
@@ -739,124 +651,64 @@ lsn_to_decimal() {
 
 proxysql_admin() {
 	local query="$1"
+	# One ProxySQL admin operation per call. In particular, issue the MEMORY
+	# UPDATE and LOAD ... TO RUNTIME as separate calls; a combined string can
+	# execute only its first statement.
 	PGPASSWORD="$PROXYSQL_ADMIN_PASSWORD" PGSSLMODE="$PROXYSQL_ADMIN_PGSSLMODE" psql \
 		-h "$PROXYSQL_HOST" -p "$PROXYSQL_ADMIN_PORT" \
 		-U "$PROXYSQL_ADMIN_USER" -d "$PROXYSQL_ADMIN_DATABASE" \
 		-A -t -c "$query"
 }
 
-set_consistency_mode() {
-	local mode="$1" # 0=off, 1=lsn, 2=csn, 3=primary, 4=csn_global
-	log_info "Setting ProxySQL consistency mode to $mode"
-	proxysql_admin "UPDATE global_variables SET variable_value='$mode' WHERE variable_name='pgsql-polardb_consistency_mode'; LOAD PGSQL VARIABLES TO RUNTIME;"
-}
-
-# CSN/split-mode scaffold kept for a later feature round. Transaction split is
-# controlled by the per-hostgroup txn_split_enabled column; this branch has no
-# separate pgsql-polardb_split_mode runtime surface. Disabling the old split-mode
-# knob only records the requested disabled state in the scenario log. Enabling it
-# still fails loudly so a scenario cannot accidentally depend on a missing knob.
-set_split_mode() {
-	local enabled="$1" # 0=disabled, 1=enabled
-	if [ "$enabled" = "0" ]; then
-		log_info "Split mode disabled (no separate split-mode runtime knob in this branch)"
-		return 0
-	fi
-	log_error "pgsql-polardb_split_mode is not present in this branch; use txn_split_enabled"
-	return 1
-}
-
-# Transaction-split hostgroup flag. Enabling requests/observes RFQ XID data and
-# allows split-readable transaction reads to take a replica connection from the
-# pool and return it after each read.
-set_txn_split_enabled() {
-	local writer_hg="$1"
-	local enabled="$2" # 0=disabled, 1=enabled
-	if [ "$enabled" != "0" ] && [ "$enabled" != "1" ]; then
-		log_error "txn_split_enabled=$enabled requested for writer_hostgroup=$writer_hg, expected 0 or 1"
-		return 1
-	fi
-	log_info "txn_split_enabled=$enabled for writer_hostgroup=$writer_hg"
-	proxysql_admin "UPDATE pgsql_replication_hostgroups SET txn_split_enabled=$enabled WHERE writer_hostgroup=$writer_hg"
-}
-
-# Set ProxySQL lag threshold (pgsql-polardb_lag_bytes)
-set_lag_threshold() {
-	local lag_bytes="$1"
-	log_info "Setting ProxySQL lag threshold to ${lag_bytes} bytes"
-	proxysql_admin "UPDATE global_variables SET variable_value='$lag_bytes' WHERE variable_name='pgsql-polardb_lag_bytes'; LOAD PGSQL VARIABLES TO RUNTIME;"
-}
-
-# Show current ProxySQL PolarDB configuration
-show_proxysql_config() {
-	log_section "ProxySQL PolarDB Configuration"
-	echo "Variables:"
-	proxysql_admin "SELECT variable_name, variable_value FROM global_variables WHERE variable_name LIKE 'pgsql-polardb%';"
-	echo ""
-	echo "Hostgroups:"
-	proxysql_admin "SELECT writer_hostgroup, reader_hostgroup, check_type, txn_split_enabled, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms FROM runtime_pgsql_replication_hostgroups;"
-}
-
-# Configure ProxySQL for specific test scenario
-# Usage: configure_proxysql <scenario>
-#   eventual      - no consistency, no split
-#   session_lsn   - LSN-based session consistency
-#   session_csn   - CSN-based session consistency
-#   global_csn    - Global CSN consistency
-#   split_auto    - Automatic transaction split
-configure_proxysql() {
-	local scenario="$1"
-	local writer_hg="${2:-$POLARDB_WRITER_HG}"
-
-	log_section "Configuring ProxySQL for: $scenario"
-
-	case "$scenario" in
-	eventual)
-		set_consistency_mode 0
-		set_split_mode 0
-		set_txn_split_enabled "$writer_hg" 0
-		;;
-	session_lsn)
-		set_consistency_mode 1
-		set_split_mode 0
-		set_txn_split_enabled "$writer_hg" 0
-		;;
-	session_csn)
-		set_consistency_mode 2
-		set_split_mode 0
-		set_txn_split_enabled "$writer_hg" 0
-		;;
-	global_csn)
-		set_consistency_mode 4
-		set_split_mode 0
-		set_txn_split_enabled "$writer_hg" 0
-		;;
-	primary_only)
-		set_consistency_mode 3
-		set_split_mode 0
-		set_txn_split_enabled "$writer_hg" 0
-		;;
-	split_auto)
-		set_consistency_mode 2 # CSN for committed data consistency
-		set_split_mode 1
-		set_txn_split_enabled "$writer_hg" 1
-		;;
-	split_only)
-		set_consistency_mode 0 # No wait for committed
-		set_split_mode 1
-		set_txn_split_enabled "$writer_hg" 1
-		;;
-	*)
-		log_error "Unknown scenario: $scenario"
-		return 1
-		;;
+polardb_consistency_uses_lsn_wait() {
+	case "$1" in
+	session_lsn | global_lsn) return 0 ;;
+	*) return 1 ;;
 	esac
-
-	show_proxysql_config
 }
 
-get_split_stats() {
-	proxysql_admin "SELECT Variable_Name, Variable_Value FROM stats_pgsql_global WHERE Variable_Name LIKE '%polardb%';"
+# Configure the global and hostgroup policy used by one scenario, then load
+# each table once. Keeping the updates together prevents tests from observing a
+# partially applied policy.
+configure_polardb_scenario_policy() {
+	local consistency_mode="$1"
+	local timeout_action="$2"
+	local transaction_split="$3"
+	local wait_timeout_ms="$4"
+	local split_variant="$5"
+	local max_lag_bytes="${POLARDB_MAX_LAG_BYTES:--1}"
+	local connect_timeout_ms="${POLARDB_SPLIT_CONNECT_TIMEOUT_MS:-5000}"
+	local lazy_warmup_split="${POLARDB_LAZY_WARMUP_SPLIT:-1}"
+	local proxy_identity_mode="${POLARDB_PROXY_IDENTITY_MODE:-proxy}"
+	local read_target="${READ_TARGET:-replica}"
+	local read_fallback_action="${READ_FALLBACK_ACTION:-primary}"
+
+	[ "$split_variant" = "lazy_disabled" ] && lazy_warmup_split=0
+	case "$split_variant" in
+	proxy_identity_client) proxy_identity_mode="client" ;;
+	proxy_identity_proxy) proxy_identity_mode="proxy" ;;
+	esac
+	proxysql_admin "UPDATE global_variables SET variable_value='$consistency_mode' WHERE variable_name='pgsql-polardb_consistency_mode'"
+	proxysql_admin "UPDATE global_variables SET variable_value='$read_target' WHERE variable_name='pgsql-polardb_read_target'"
+	proxysql_admin "UPDATE global_variables SET variable_value='$read_fallback_action' WHERE variable_name='pgsql-polardb_action_read_fallback'"
+	proxysql_admin "UPDATE global_variables SET variable_value='$timeout_action' WHERE variable_name='pgsql-polardb_action_lsn_timeout'"
+	proxysql_admin "UPDATE global_variables SET variable_value='v15' WHERE variable_name='pgsql-polardb_proxy_protocol'"
+	proxysql_admin "UPDATE global_variables SET variable_value='$lazy_warmup_split' WHERE variable_name='pgsql-polardb_lazy_warmup_split'"
+	proxysql_admin "UPDATE global_variables SET variable_value='$proxy_identity_mode' WHERE variable_name='pgsql-polardb_proxy_identity_mode'"
+	if [ "$transaction_split" = "1" ]; then
+		# Keep backend creation timing stable in split tests so they measure the
+		# split behavior rather than temporary host load.
+		proxysql_admin "UPDATE global_variables SET variable_value='$connect_timeout_ms' WHERE variable_name='pgsql-connect_timeout_server'"
+	fi
+	proxysql_admin "LOAD PGSQL VARIABLES TO RUNTIME"
+
+	proxysql_admin "UPDATE pgsql_replication_hostgroups SET txn_split_enabled=$transaction_split, lsn_wait_timeout_ms=$wait_timeout_ms, consistency_mode='$consistency_mode', max_lag_bytes=$max_lag_bytes, proxy_protocol='v15'"
+	proxysql_admin "LOAD PGSQL SERVERS TO RUNTIME"
+}
+
+show_polardb_runtime_policy() {
+	proxysql_admin "SELECT variable_name, variable_value FROM runtime_global_variables WHERE variable_name LIKE 'pgsql-polardb%';"
+	proxysql_admin "SELECT writer_hostgroup, txn_split_enabled, lsn_wait_timeout_ms, consistency_mode, max_lag_bytes, proxy_protocol FROM runtime_pgsql_replication_hostgroups;"
 }
 
 #------------------------------------------------------------------------------
@@ -868,83 +720,6 @@ get_counter() {
 	local name="$1"
 	local val=$(proxysql_admin "SELECT Variable_Value FROM stats_pgsql_global WHERE Variable_Name='$name';" | tr -d ' \n')
 	echo "${val:-0}"
-}
-
-wait_for_counter_delta() {
-	local name="$1"
-	local before="$2"
-	local min_delta="${3:-1}"
-	local timeout_sec="${4:-10}"
-	local start_ts current delta
-
-	start_ts=$(date +%s)
-	while true; do
-		current=$(get_counter "$name")
-		delta=$((current - before))
-		if [ "$delta" -ge "$min_delta" ]; then
-			return 0
-		fi
-		if [ $(($(date +%s) - start_ts)) -ge "$timeout_sec" ]; then
-			log_warning "Timed out waiting for $name delta >= $min_delta (before=$before current=$current)"
-			return 1
-		fi
-		sleep 0.2
-	done
-}
-
-# Snapshot all PolarDB counters
-snapshot_counters() {
-	local prefix="${1:-}"
-	export ${prefix}SPLIT_TOTAL=$(get_counter "PolarDB_Split_Reads_Total")
-	export ${prefix}SPLIT_SUCCESS=$(get_counter "PolarDB_Split_Reads_Success")
-	export ${prefix}SPLIT_FALLBACK=$(get_counter "PolarDB_Split_Reads_Fallback")
-	export ${prefix}SPLIT_ERROR=$(get_counter "PolarDB_Split_Reads_Error")
-	export ${prefix}LSN_WAIT=$(get_counter "PolarDB_Split_LSN_Wait_Count")
-	export ${prefix}XIDS_RECV=$(get_counter "PolarDB_XIDs_Received")
-	export ${prefix}TXN_SPLITTABLE=$(get_counter "PolarDB_Txn_Became_Splittable")
-	export ${prefix}CSN_UPDATES=$(get_counter "PolarDB_CSN_Updates_From_Query")
-}
-
-# Compare counter delta and assert
-assert_counter_delta() {
-	local counter_name="$1"
-	local expected_min="$2"
-	local expected_max="${3:-999999}"
-	local before_var="BEFORE_${counter_name}"
-	local after_val=$(get_counter "PolarDB_${counter_name}")
-	local before_val="${!before_var:-0}"
-	local delta=$((after_val - before_val))
-
-	if [ "$delta" -ge "$expected_min" ] && [ "$delta" -le "$expected_max" ]; then
-		log_success "Counter $counter_name: delta=$delta (expected: >=$expected_min)"
-		return 0
-	else
-		log_error "Counter $counter_name: delta=$delta (expected: >=$expected_min)"
-		return 1
-	fi
-}
-
-# Assert counter did NOT change
-assert_counter_unchanged() {
-	local counter_name="$1"
-	assert_counter_delta "$counter_name" 0 0
-}
-
-# Print counter diff
-print_counter_diff() {
-	log_section "Counter Changes"
-	local counters="Split_Reads_Total Split_Reads_Success Split_Reads_Fallback Split_Reads_Error"
-	counters="$counters Split_LSN_Wait_Count XIDs_Received Txn_Became_Splittable"
-
-	for c in $counters; do
-		local before_var="BEFORE_${c}"
-		local after=$(get_counter "PolarDB_${c}")
-		local before="${!before_var:-0}"
-		local delta=$((after - before))
-		if [ "$delta" -ne 0 ]; then
-			log_info "$c: $before -> $after (delta: $delta)"
-		fi
-	done
 }
 
 #------------------------------------------------------------------------------
@@ -962,7 +737,10 @@ wait_for_proxy_frontend() {
 	local waited=0
 
 	while [ "$waited" -lt "$timeout_sec" ]; do
-		if query_proxy "SELECT 1" >/dev/null 2>&1; then
+		# VALUES reaches the PostgreSQL frontend and the default primary
+		# hostgroup without matching this harness's replica-eligible ^SELECT
+		# rule. Readiness must not warm the replica pool before cold-pool tests.
+		if query_proxy "VALUES (1)" >/dev/null 2>&1; then
 			return 0
 		fi
 		sleep 1
@@ -971,230 +749,9 @@ wait_for_proxy_frontend() {
 	return 1
 }
 
-# Postponed CSN scaffold. Kept for the next feature round; v1 scripts should not
-# call this helper.
-query_proxy_with_csn_wait() {
-	local csn="$1"
-	local query="$2"
-	local mode="${3:-best_effort}"
-	local timeout="${4:-5000}"
-
-	polardb_proxy_sql "
-        SET polar_consistency_mode = '$mode';
-        SET polar_proxy_wait_timeout_ms = $timeout;
-        SET polar_wait_csn = '$csn';
-        $query
-    " 2>&1
-}
-
-# Execute query via ProxySQL with session-level LSN wait
-query_proxy_with_lsn_wait() {
-	local lsn="$1"
-	local query="$2"
-	local mode="${3:-best_effort}"
-	local timeout="${4:-5000}"
-	local xids="${5:-1,0}"
-
-	polardb_proxy_sql "
-        SET polar_consistency_mode = '$mode';
-        SET polar_proxy_wait_timeout_ms = $timeout;
-        SET polar_xact_split_xids = '$xids';
-        SET polar_xact_split_wait_lsn = '$lsn';
-        $query
-    " 2>&1
-}
-
-# Postponed transaction-split scaffold. Kept for the next feature round; v1
-# scripts should not call this helper.
-# Split always uses LSN wait (CSN doesn't advance mid-transaction)
-query_proxy_with_split() {
-	local xids="$1"
-	local lsn="$2"
-	local query="$3"
-	local mode="${4:-best_effort}"
-	local timeout="${5:-5000}"
-
-	polardb_proxy_sql "
-        SET polar_consistency_mode = '$mode';
-        SET polar_proxy_wait_timeout_ms = $timeout;
-        SET polar_xact_split_xids = '$xids';
-        SET polar_xact_split_wait_lsn = '$lsn';
-        $query
-    " 2>&1
-}
-
-#------------------------------------------------------------------------------
-# Transaction Functions
-#------------------------------------------------------------------------------
-
-# Start a long-running transaction with INSERT
-start_uncommitted_transaction() {
-	local id="$1"
-	local sleep_time="${2:-15}"
-
-	log_info "Starting uncommitted transaction (id=$id, sleep=${sleep_time}s)..."
-	(
-		polardb_primary_sql "BEGIN; INSERT INTO $TEST_TABLE VALUES ($id, 'uncommitted_data'); SELECT pg_sleep($sleep_time); COMMIT;"
-	) &
-	TXN_PID=$!
-	polardb_register_bg_pid "$TXN_PID"
-	sleep 2
-}
-
-# Get XID of active transaction
-get_active_xid() {
-	polardb_primary_sql "SELECT backend_xid FROM pg_stat_activity WHERE state='active' AND query LIKE '%pg_sleep%' LIMIT 1;"
-}
-
-# Stop uncommitted transaction
-stop_uncommitted_transaction() {
-	if [ -n "$TXN_PID" ]; then
-		log_info "Stopping uncommitted transaction..."
-		kill "$TXN_PID" 2>/dev/null
-		wait "$TXN_PID" 2>/dev/null || true
-		polardb_forget_bg_pid "$TXN_PID"
-		TXN_PID=""
-	fi
-}
-
-#------------------------------------------------------------------------------
-# Assertion Functions
-#------------------------------------------------------------------------------
-
-assert_count() {
-	local expected="$1"
-	local actual="$2"
-	local msg="$3"
-
-	if [ "$expected" = "$actual" ]; then
-		log_success "ASSERT PASSED: $msg (count=$actual)"
-		return 0
-	else
-		log_error "ASSERT FAILED: $msg (expected=$expected, actual=$actual)"
-		return 1
-	fi
-}
-
-assert_contains() {
-	local needle="$1"
-	local haystack="$2"
-	local msg="$3"
-
-	if echo "$haystack" | grep -q "$needle"; then
-		log_success "ASSERT PASSED: $msg (contains '$needle')"
-		return 0
-	else
-		log_error "ASSERT FAILED: $msg (does not contain '$needle')"
-		return 1
-	fi
-}
-
-assert_error() {
-	local result="$1"
-	local msg="$2"
-
-	if echo "$result" | grep -q "ERROR"; then
-		log_success "ASSERT PASSED: $msg (got ERROR as expected)"
-		return 0
-	else
-		log_error "ASSERT FAILED: $msg (expected ERROR but got: $result)"
-		return 1
-	fi
-}
-
-assert_warning() {
-	local result="$1"
-	local msg="$2"
-
-	if echo "$result" | grep -q "WARNING"; then
-		log_success "ASSERT PASSED: $msg (got WARNING as expected)"
-		return 0
-	else
-		log_error "ASSERT FAILED: $msg (expected WARNING but got: $result)"
-		return 1
-	fi
-}
-
-#------------------------------------------------------------------------------
-# Check Prerequisites
-#------------------------------------------------------------------------------
-
-check_prerequisites() {
-	log_info "Checking prerequisites..."
-
-	# Check ProxySQL is running
-	if ! query_proxy "SELECT 1" >/dev/null 2>&1; then
-		log_error "Cannot connect to ProxySQL on $PROXYSQL_HOST:$PROXYSQL_PORT"
-		log_info "Start ProxySQL with: make -C test/polardb tap"
-		return 1
-	fi
-	log_info "ProxySQL is accessible"
-
-	# Check CSN enabled on PolarDB
-	local csn_enabled
-	csn_enabled=$(polardb_primary_sql "SHOW polar_csn_enable;" 2>/dev/null | tr -d ' ')
-	if [ "$csn_enabled" != "on" ]; then
-		log_error "polar_csn_enable must be ON"
-		return 1
-	fi
-	log_info "polar_csn_enable = $csn_enabled"
-
-	# Check consistency mode available
-	local mode
-	mode=$(polardb_replica_sql "SHOW polar_consistency_mode;" 2>/dev/null | tr -d ' ')
-	log_info "polar_consistency_mode = $mode"
-
-	# Check replica is in replica mode
-	local is_replica
-	is_replica=$(polardb_replica_sql "SELECT pg_is_in_recovery();" 2>/dev/null | tr -d ' ')
-	if [ "$is_replica" != "t" ]; then
-		log_error "Replica is not in recovery mode"
-		return 1
-	fi
-	log_info "Replica is in recovery mode"
-
-	return 0
-}
-
 #------------------------------------------------------------------------------
 # Query Rules Functions
 #------------------------------------------------------------------------------
-
-# Add a query rule to ProxySQL
-# Usage: add_query_rule <rule_id> <pattern> <dest_hg> <comment>
-add_query_rule() {
-	local rule_id="$1"
-	local pattern="$2"
-	local dest_hg="$3"
-	local comment="$4"
-
-	log_info "Adding query rule: $comment (pattern='$pattern' -> HG $dest_hg)"
-	proxysql_admin "DELETE FROM pgsql_query_rules WHERE comment='$comment';" >/dev/null 2>&1
-	proxysql_admin "INSERT INTO pgsql_query_rules (rule_id, active, match_pattern, destination_hostgroup, apply, comment) VALUES ($rule_id, 1, '$pattern', $dest_hg, 1, '$comment');" >/dev/null 2>&1
-	proxysql_admin "LOAD PGSQL QUERY RULES TO RUNTIME;" >/dev/null 2>&1
-}
-
-# Add rule to route SELECTs to reader hostgroup
-# Usage: add_select_to_reader_rule [reader_hg]
-add_select_to_reader_rule() {
-	local reader_hg="${1:-$POLARDB_READER_HG}"
-	add_query_rule 10 "^SELECT" "$reader_hg" "select_to_reader"
-}
-
-# Add warmup rule (routes queries with /*WARMUP*/ comment to reader)
-# Usage: add_warmup_rule [reader_hg]
-add_warmup_rule() {
-	local reader_hg="${1:-$POLARDB_READER_HG}"
-	add_query_rule 1 ".*WARMUP.*" "$reader_hg" "warmup_rule"
-}
-
-# Remove a query rule by comment
-# Usage: remove_query_rule <comment>
-remove_query_rule() {
-	local comment="$1"
-	log_info "Removing query rule: $comment"
-	proxysql_admin "DELETE FROM pgsql_query_rules WHERE comment='$comment'; LOAD PGSQL QUERY RULES TO RUNTIME;" >/dev/null 2>&1
-}
 
 #------------------------------------------------------------------------------
 # Connection Pool Warmup Functions
@@ -1228,7 +785,7 @@ warmup_hostgroup() {
 	local waited=0
 	while [ "$waited" -lt "$max_wait" ]; do
 		local conn_free
-		conn_free=$(proxysql_admin "SELECT ConnFree FROM stats_pgsql_connection_pool WHERE hostgroup=$hg;" 2>/dev/null | grep -E '^[0-9]+$' | head -1)
+		conn_free=$(hostgroup_free_connection_count "$hg")
 		if [ -n "$conn_free" ] && [ "$conn_free" -gt 0 ]; then
 			log_info "Warmup done: HG $hg has $conn_free free connections (waited ${waited}s)"
 			return 0
@@ -1241,6 +798,12 @@ warmup_hostgroup() {
 
 	log_warning "No pooled connections in HG $hg after ${max_wait}s"
 	return 1
+}
+
+hostgroup_free_connection_count() {
+	local hostgroup="$1"
+	proxysql_admin "SELECT COALESCE(SUM(ConnFree), 0) FROM stats_pgsql_connection_pool WHERE hostgroup=$hostgroup;" \
+		2>/dev/null | grep -E '^[0-9]+$' | head -1
 }
 
 # Warmup replica pool (HG 11 by default)
@@ -1260,22 +823,6 @@ setup_reader_routing() {
 	log_info "Setting up reader routing to HG $reader_hg..."
 	ensure_polardb_rules_loaded
 	warmup_replica_pool "$reader_hg" "$max_wait"
-}
-
-# Get connection pool stats for a hostgroup
-# Usage: get_pool_stats <hostgroup>
-get_pool_stats() {
-	local hg="$1"
-	proxysql_admin "SELECT srv_host, srv_port, ConnUsed, ConnFree, ConnOK, ConnERR, Queries FROM stats_pgsql_connection_pool WHERE hostgroup=$hg;"
-}
-
-# Check if hostgroup has free connections
-# Usage: has_free_connections <hostgroup>
-has_free_connections() {
-	local hg="$1"
-	local conn_free
-	conn_free=$(proxysql_admin "SELECT SUM(ConnFree) FROM stats_pgsql_connection_pool WHERE hostgroup=$hg;" 2>/dev/null | grep -E '^[0-9]+$' | head -1)
-	[ -n "$conn_free" ] && [ "$conn_free" -gt 0 ]
 }
 
 #------------------------------------------------------------------------------
@@ -1592,8 +1139,7 @@ stop_proxysql() {
 # Everything from here to EOF -- run_test, the snapshot/delta/pool/error/stat
 # print helpers, verify_preset, parse_common_args, enable_proxysql_debug, and
 # run_consistency_test -- is the scenario-style runner. The active TAP slice uses
-# it for LSN/global_lsn transaction split; CSN/global-CSN scenarios remain
-# postponed until their matching code paths and assertions are restored.
+# it for LSN/global_lsn transaction split.
 # vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
 # =============================================================================
 
@@ -1636,25 +1182,20 @@ EVENTUAL_STATS=(
 # LSN mode (mode=1): LSN tracking (non-split waits)
 LSN_STATS=(
 	"PolarDB_Server_LSN_Updates_From_RFQ|+|+|Server LSN updated from query RFQ"
-	"PolarDB_Wait_Wrap_Prepared|+|+|Wait wrapper prepared"
-	"PolarDB_Wait_LSN_Sent|+|+|LSN wait wrapped (non-split)"
+	"PolarDB_Session_LSN_Routing|+|+|Session-LSN reader route planned"
+	"PolarDB_Wait_Wrap_Prepared|?|+|Behind reader activates a wait wrapper"
+	"PolarDB_Wait_Wrap_Bypassed|?|?|Target-ready reader dispatches directly"
+	"PolarDB_Wait_LSN_Sent|?|+|LSN wait sent when the selected reader is behind"
 	"PolarDB_Wait_Error_LSN_Wait_Timeout|0|+|LSN timeout"
 )
 
-# Deferred full-feature template: legacy CSN stats. Numeric mode 2 is now
-# GLOBAL_LSN; keep this preset only for the postponed CSN scaffolding.
-CSN_STATS=(
-	"PolarDB_CSN_Updates_From_Query|+|+|CSN captured from INSERT"
-	"PolarDB_Wait_CSN_Sent|+|+|CSN wait wrapped (non-split)"
-	"PolarDB_Wait_Error_Timeout|0|+|CSN timeout"
-)
-
-# Global LSN mode (mode=2): every automatic read uses the writer mirror as part
+# Global LSN mode (mode=2): every automatic read uses the group LSN as part
 # of the target, then waits through the normal LSN wrapper path.
 GLOBAL_LSN_STATS=(
 	"PolarDB_Global_LSN_Routing|+|+|Global LSN routing"
-	"PolarDB_Wait_Wrap_Prepared|+|+|Wait wrapper prepared"
-	"PolarDB_Wait_LSN_Sent|+|+|LSN wait wrapped (non-split)"
+	"PolarDB_Wait_Wrap_Prepared|?|+|Behind reader activates a wait wrapper"
+	"PolarDB_Wait_Wrap_Bypassed|?|?|Target-ready reader dispatches directly"
+	"PolarDB_Wait_LSN_Sent|?|+|LSN wait sent when the selected reader is behind"
 	"PolarDB_Wait_Error_LSN_Wait_Timeout|0|+|LSN timeout"
 )
 
@@ -1663,23 +1204,11 @@ PRIMARY_STATS=(
 	"PolarDB_Split_Reads_Total|0|0|No split reads"
 )
 
-# Global CSN mode (mode=4): global routing (non-split waits)
-GLOBAL_CSN_STATS=(
-	"PolarDB_Global_CSN_Routing|+|+|Global CSN routing"
-	"PolarDB_Wait_CSN_Sent|+|+|CSN wait wrapped (non-split)"
-	"PolarDB_Wait_Error_Timeout|0|+|CSN timeout"
-)
-
 # Split LSN wait stats (split path)
 SPLIT_LSN_STATS=(
 	"PolarDB_Split_LSN_Wait_Count|+|+|LSN wait wrapped (split)"
 	"PolarDB_Split_Error_LSN_Wait_Timeout|0|+|LSN timeout (split)"
 )
-
-# Split with CSN consistency mode: split always uses LSN wait internally,
-# even when the consistency mode is CSN/CSN_GLOBAL. CSN doesn't advance
-# mid-transaction, so only LSN can guarantee replica visibility for split reads.
-# Cases 7/8 still verify split behavior under CSN modes — they just check LSN wait stats.
 
 # Split transaction stats (when XACT_SPLIT=1, SPLIT_VARIANT=basic)
 SPLIT_STATS=(
@@ -1702,6 +1231,8 @@ SPLIT_PREWRITE_STATS=(
 	"PolarDB_Wait_LSN_Sent|?|?|Pre-write transaction wait may send or bypass the wait SET"
 	"PolarDB_Split_LSN_Wait_Count|?|?|Post-write split read may wait or bypass on a fresh reader"
 	"PolarDB_Wait_Wrap_Bypassed|?|?|Fresh-reader wait bypass"
+	"PolarDB_Txn_Reader_Reuse_Bypass_Checked|+|?|Retained reader checked before the second pre-write read"
+	"PolarDB_Txn_Reader_Reuse_Bypass_Allowed|+|?|Retained reader RFQ LSN allowed the second pre-write wait bypass"
 	"PolarDB_Split_Error_LSN_Wait_Timeout|0|?|Split LSN timeout"
 	"PolarDB_XIDs_Received|+|?|XIDs captured after INSERT"
 	"PolarDB_Txn_Became_Splittable|+|?|Transaction became splittable"
@@ -1723,6 +1254,20 @@ SPLIT_MULTI_STATS=(
 	"PolarDB_Split_Reads_Success|+|0|Split successes"
 	"PolarDB_Txn_Committed_With_Split|+|?|Commit classified as split"
 	"PolarDB_Txn_Lost_Splittable|0|0|Splittable not lost mid-txn"
+)
+
+# Completed split readers must return cleanly and remain usable by later work on
+# the same frontend session.
+SPLIT_REUSE_AFTER_COMMIT_STATS=(
+	"PolarDB_XIDs_Received|+|+|XIDs captured in both transactions"
+	"PolarDB_Txn_Became_Splittable|+|+|Both transactions became splittable"
+	"PolarDB_Split_Reads_Total|+|+|Split reads attempted across transactions"
+	"PolarDB_Split_Reads_Success|+|0|Split reads completed"
+	"PolarDB_Split_Pool_Hit|+|+|Split reader acquired from the compatible pool"
+	"PolarDB_Split_Conn_Reused|+|+|Attached split reader reused within a transaction"
+	"PolarDB_Split_Conn_Cleanup_Success|+|+|Completed split reader returned for reuse"
+	"PolarDB_Split_Conn_Cleanup_Failed|0|0|Completed split reader cleanup did not fail"
+	"PolarDB_Txn_Lost_Splittable|0|0|Splittable state remained valid"
 )
 
 # Split timeout stats (SPLIT_VARIANT=timeout). The split wait is always strict
@@ -1851,7 +1396,9 @@ SPLIT_FOR_UPDATE_STATS=(
 # No writes in txn → FSM stays TXN_ON_PRIMARY → no XIDs → no split.
 # Safe in-transaction reads without split evidence use reader wait protection.
 READONLY_TXN_STATS=(
-	"PolarDB_Wait_Wrap_Prepared|+|?|Read-only transaction reads used reader wait protection"
+	"PolarDB_Session_LSN_Routing|+|?|Read-only transaction reads used reader consistency routing"
+	"PolarDB_Wait_Wrap_Prepared|?|?|A behind transaction reader may activate a wait"
+	"PolarDB_Wait_Wrap_Bypassed|?|?|A target-ready transaction reader may dispatch directly"
 	"PolarDB_Wait_LSN_Sent|?|?|Read-only transaction wait may send or bypass the wait SET"
 	"PolarDB_Wait_Error_LSN_Wait_Timeout|0|0|No LSN timeout for primary reads"
 	"PolarDB_Split_Reads_Total|0|0|No split reads (no XIDs in txn)"
@@ -1861,9 +1408,9 @@ READONLY_TXN_STATS=(
 	"PolarDB_Txn_Committed_No_Split|0|0|No no-split commit (was_splittable never set)"
 )
 
-# Fail-closed read-only transaction stats. Higher isolation levels and
-# transaction-local SET state keep pre-write reads on the primary because the
-# temporary reader cannot share that transaction snapshot or local GUC state.
+# Read-only transaction stats for cases that stay on the primary. Higher
+# isolation levels and transaction-local SET state keep pre-write reads on the
+# primary because the temporary reader cannot share that snapshot or local GUC state.
 READONLY_TXN_PRIMARY_STATS=(
 	"PolarDB_Wait_Wrap_Prepared|0|0|Pre-write reader wait was vetoed"
 	"PolarDB_Wait_LSN_Sent|0|0|No transaction reader wait was sent"
@@ -1887,9 +1434,11 @@ EXTENDED_VETO_STATS=(
 # Combined workload stats (SPLIT_VARIANT=combined)
 # Mixed script: autocommit read, write+protected read, split txn, read-only txn.
 # The protected read may either send a wait SET or bypass it when the selected
-# reader is already fresh; Wait_Wrap_Prepared is the stable protection counter.
+# reader is already fresh; Session_LSN_Routing is the stable route counter.
 COMBINED_WORKLOAD_STATS=(
-	"PolarDB_Wait_Wrap_Prepared|+|+|Consistency protection was prepared"
+	"PolarDB_Session_LSN_Routing|+|+|Session consistency route was planned"
+	"PolarDB_Wait_Wrap_Prepared|?|?|A behind reader may activate a wait wrapper"
+	"PolarDB_Wait_Wrap_Bypassed|?|?|A target-ready reader may dispatch directly"
 	"PolarDB_Server_LSN_Updates_From_RFQ|+|+|Query RFQs refreshed server LSN cache"
 	"PolarDB_XIDs_Received|+|?|XIDs captured in split txn"
 	"PolarDB_Txn_Became_Splittable|+|?|Split txn became splittable"
@@ -1913,25 +1462,28 @@ declare -A BEFORE AFTER BEFORE_PRESENT AFTER_PRESENT
 
 snapshot() {
 	local prefix="$1"
+	local raw c name value
+	local -A wanted=()
 	# All PolarDB counters from PgSQL_Thread.cpp - see AVAILABLE COUNTERS above
 	local counters="
         PolarDB_Split_Reads_Total PolarDB_Split_Reads_Success PolarDB_Split_Reads_Fallback
         PolarDB_Split_Reads_Error PolarDB_Split_Rejected_Not_Select PolarDB_Split_Rejected_For_Update
         PolarDB_Split_Rejected_Write_LSN_Unknown PolarDB_Split_Rejected_Observed_LSN_Unknown
+        PolarDB_Split_Rejected_No_Marker
         PolarDB_Txn_Became_Splittable PolarDB_Txn_Lost_Splittable PolarDB_Txn_Committed_With_Split
         PolarDB_Txn_Committed_No_Split PolarDB_Queries_In_Splittable_Txn PolarDB_Queries_Split_Eligible
-        PolarDB_XIDs_Received
+        PolarDB_XIDs_Received PolarDB_Split_WAL_Pending PolarDB_Split_Invariant_Violations
         PolarDB_Server_LSN_Updates_From_RFQ PolarDB_LSN_Updates_From_Monitor
         PolarDB_Monitor_Health_Invalid_Role PolarDB_Monitor_Health_Invalid_Values
         PolarDB_LSN_Stale_Count
         PolarDB_Write_Missing_LSN
         PolarDB_Split_LSN_Wait_Count PolarDB_Wait_Wrap_Prepared PolarDB_Wait_Wrap_Bypassed
+        PolarDB_Txn_Reader_Reuse_Bypass_Checked PolarDB_Txn_Reader_Reuse_Bypass_Allowed
         PolarDB_Wait_LSN_Sent PolarDB_Wait_Wrap_Safety_Abort
         PolarDB_Split_LSN_Wait_Sum_Us PolarDB_Split_Error_LSN_Wait_Timeout
         PolarDB_Wait_Error_LSN_Wait_Timeout PolarDB_Wait_Error_Timeout
         PolarDB_Wait_Error_Connection_Lost PolarDB_Wait_Reads_Retried_On_Writer
-        PolarDB_CSN_Updates_From_Query PolarDB_CSN_Updates_From_Monitor PolarDB_CSN_Stale_Count
-        PolarDB_Wait_CSN_Sent PolarDB_Global_CSN_Routing
+        PolarDB_Session_LSN_Routing PolarDB_Global_LSN_Routing
         PolarDB_Split_Error_Connection_Lost PolarDB_Split_Error_Query_Failed PolarDB_Split_Error_Timeout
         PolarDB_Split_No_Backend PolarDB_Split_Send_Failed
         PolarDB_Split_Reads_Retried PolarDB_Split_Reads_Forwarded PolarDB_Reader_Terminations
@@ -1948,19 +1500,32 @@ snapshot() {
     "
 
 	for c in $counters; do
-		local raw v present
-		raw=$(proxysql_admin "SELECT Variable_Value FROM stats_pgsql_global WHERE Variable_Name='$c';" 2>/dev/null)
-		v=$(printf '%s' "$raw" | tr -d ' \n')
-		present=0
-		[ -n "$v" ] && present=1
+		wanted["$c"]=1
 		if [ "$prefix" = "B" ]; then
-			BEFORE[$c]="${v:-0}"
-			BEFORE_PRESENT[$c]="$present"
+			BEFORE[$c]=0
+			BEFORE_PRESENT[$c]=0
 		else
-			AFTER[$c]="${v:-0}"
-			AFTER_PRESENT[$c]="$present"
+			AFTER[$c]=0
+			AFTER_PRESENT[$c]=0
 		fi
 	done
+
+	# Read one coherent status snapshot. Querying once per counter repeatedly
+	# rebuilt the admin table and could mix values from different refreshes.
+	raw=$(proxysql_admin \
+		"SELECT Variable_Name, Variable_Value FROM stats_pgsql_global WHERE Variable_Name LIKE 'PolarDB_%';" \
+		2>/dev/null) || raw=""
+	while IFS='|' read -r name value; do
+		[ -n "$name" ] || continue
+		[ -n "${wanted[$name]+present}" ] || continue
+		if [ "$prefix" = "B" ]; then
+			BEFORE[$name]="${value:-0}"
+			BEFORE_PRESENT[$name]=1
+		else
+			AFTER[$name]="${value:-0}"
+			AFTER_PRESENT[$name]=1
+		fi
+	done <<<"$raw"
 }
 
 delta() { echo $((${AFTER[$1]:-0} - ${BEFORE[$1]:-0})); }
@@ -2100,7 +1665,7 @@ print_errors() {
 
 #------------------------------------------------------------------------------
 # Check a stat against expectation
-# Returns: 0=pass, 1=fail, 2=skip (expectation is ? or profile counter absent)
+# Returns: 0=pass, 1=fail, 2=skip, 3=required counter absent
 #------------------------------------------------------------------------------
 check_stat() {
 	local name="$1"
@@ -2108,8 +1673,9 @@ check_stat() {
 	local actual="$3"
 
 	[ "$expect" = "?" ] && return 2
-	if [[ "$expect" == P* ]] && ! counter_present_in_snapshots "$name"; then
-		return 2
+	if ! counter_present_in_snapshots "$name"; then
+		[[ "$expect" == P* ]] && return 2
+		return 3
 	fi
 	case "$expect" in
 	0)
@@ -2172,6 +1738,10 @@ verify_preset() {
 			echo "[$(ts)]   FAIL: $desc | delta=$actual (want $expect_desc)"
 			FAIL=$((FAIL + 1))
 			;;
+		3)
+			echo "[$(ts)]   FAIL: $desc | required counter $name is absent"
+			FAIL=$((FAIL + 1))
+			;;
 		2) ;; # skip
 		esac
 	done
@@ -2197,12 +1767,12 @@ verify_split_wait_or_bypass() {
 # Main test runner
 #------------------------------------------------------------------------------
 parse_common_args() {
-	POLAR_MODE="best_effort"
+	LSN_WAIT_TIMEOUT_ACTION="warning"
 	EXPECT_OUTCOME="success"
 	for arg in "$@"; do
 		case $arg in
-		-a) POLAR_MODE="best_effort" ;;
-		-b) POLAR_MODE="strict" ;;
+		-a) LSN_WAIT_TIMEOUT_ACTION="warning" ;;
+		-b) LSN_WAIT_TIMEOUT_ACTION="primary" ;;
 		-success | -s) EXPECT_OUTCOME="success" ;;
 		-failure | -f) EXPECT_OUTCOME="failure" ;;
 		esac
@@ -2224,15 +1794,16 @@ enable_proxysql_debug() {
 }
 
 run_consistency_test() {
-	local polar_mode="${POLAR_MODE:-best_effort}"
+	local timeout_action="${LSN_WAIT_TIMEOUT_ACTION:-warning}"
 	local outcome="${EXPECT_OUTCOME:-success}"
-	local timeout_ms=$([[ "$outcome" = "failure" ]] && echo 100 || echo 5000)
+	local timeout_ms=$([[ "$outcome" = "failure" ]] && echo 100 || echo 1000)
 	local test_id="${TEST_ID:-$CASE_NUM}"
 	local global_wait_timeout_ms="${POLARDB_GLOBAL_WAIT_TIMEOUT_MS:-}"
 
 	# Build case identifier for log file
 	local case_id="case${CASE_NUM}"
-	[ -n "$polar_mode" ] && [ "$polar_mode" != "best_effort" ] && case_id="${case_id}_${polar_mode}"
+	[ "$timeout_action" != "warning" ] &&
+		case_id="${case_id}_${timeout_action}"
 	[ "$outcome" = "failure" ] && case_id="${case_id}_failure"
 
 	# Initialize logging
@@ -2240,17 +1811,12 @@ run_consistency_test() {
 
 	PASS=0 FAIL=0
 
-	if [ "$CONSISTENCY_MODE" = "4" ]; then
-		echo "[$(ts)] POSTPONED: CSN scenarios are kept as scaffold but are not active in the LSN/global_lsn split branch"
-		return 1
-	fi
-
 	echo ""
 	echo "================================================================"
 	echo "[$(ts)] CASE $CASE_NUM: $CASE_NAME"
 	echo "================================================================"
 	echo "[$(ts)] mode=$CONSISTENCY_MODE split=$SPLIT_ENABLED xact=$XACT_SPLIT"
-	echo "[$(ts)] polar_mode=$polar_mode outcome=$outcome timeout=${timeout_ms}ms"
+	echo "[$(ts)] lsn_wait_timeout_action=$timeout_action outcome=$outcome timeout=${timeout_ms}ms"
 	echo ""
 
 	if ! polardb_require_pgbench; then
@@ -2269,20 +1835,14 @@ run_consistency_test() {
 	echo "[$(ts)] ProxySQL debug enabled via PROXYSQL_DEBUG=1"
 
 	# Auto-assign global polar_proxy_wait_timeout_ms per test when not explicitly set:
-	# - consistency modes with waits (LSN/GLOBAL_LSN/CSN_GLOBAL): success -> 5000ms, failure -> 10ms
-	# - modes without waits (OFF/PRIMARY): leave unset
+	# - consistency modes with waits (LSN/GLOBAL_LSN): success -> 1000ms, failure -> 10ms
+	# - modes without waits (OFF/EVENTUAL): leave unset
 	if [ -z "$global_wait_timeout_ms" ]; then
-		if [ "$CONSISTENCY_MODE" = "1" ] || [ "$CONSISTENCY_MODE" = "2" ] || [ "$CONSISTENCY_MODE" = "4" ]; then
+		if polardb_consistency_uses_lsn_wait "$CONSISTENCY_MODE"; then
 			if [ "$outcome" = "failure" ]; then
 				global_wait_timeout_ms=10
 			else
-				# CSN modes can lag behind for a while in steady state.
-				# Use a larger timeout to avoid false WARN/ERROR in success runs.
-				if [ "$CONSISTENCY_MODE" = "4" ]; then
-					global_wait_timeout_ms=2000
-				else
-					global_wait_timeout_ms=5000
-				fi
+				global_wait_timeout_ms=1000
 			fi
 		fi
 	fi
@@ -2302,59 +1862,14 @@ run_consistency_test() {
 	# STEP 1: Configure
 	echo ""
 	echo "[$(ts)] STEP 1: Configure ProxySQL"
-	# Note: UPDATE and LOAD must be separate commands (combined with semicolon doesn't work)
-	#
-	# The PolarDB LSN runtime uses string-valued knobs:
-	#   pgsql-polardb_consistency_mode   in {off, lsn, global_lsn, primary}
-	#   pgsql-polardb_wait_timeout_mode  in {best_effort, strict}
-	# (The source tree used integer knobs plus a split_mode knob; neither exists
-	# here, so the numeric CONSISTENCY_MODE / polar_mode are mapped to strings.)
-	local cmode="off"
-	case "$CONSISTENCY_MODE" in
-	0) cmode="off" ;;
-	1) cmode="lsn" ;;
-	2) cmode="global_lsn" ;;
-	3) cmode="primary" ;;
-	*)
-		echo "[$(ts)] WARN: CONSISTENCY_MODE=$CONSISTENCY_MODE has no LSN-only mapping; using 'off'"
-		cmode="off"
-		;;
-	esac
-	local wait_mode="best_effort"
-	[[ "$polar_mode" = "best_effort" ]] && wait_mode="best_effort"
-	[[ "$polar_mode" = "strict" ]] && wait_mode="strict"
-	local max_lag_bytes="${POLARDB_MAX_LAG_BYTES:--1}"
-	local split_connect_timeout_ms="${POLARDB_SPLIT_CONNECT_TIMEOUT_MS:-5000}"
-	local lazy_warmup_split="${POLARDB_LAZY_WARMUP_SPLIT:-1}"
-	local proxy_identity_mode="${POLARDB_PROXY_IDENTITY_MODE:-proxy}"
-	[ "${SPLIT_VARIANT:-basic}" = "lazy_disabled" ] && lazy_warmup_split=0
-	case "${SPLIT_VARIANT:-basic}" in
-	proxy_identity_client) proxy_identity_mode="client" ;;
-	proxy_identity_proxy) proxy_identity_mode="proxy" ;;
-	esac
-
-	proxysql_admin "UPDATE global_variables SET variable_value='$cmode' WHERE variable_name='pgsql-polardb_consistency_mode'"
-	proxysql_admin "UPDATE global_variables SET variable_value='$wait_mode' WHERE variable_name='pgsql-polardb_wait_timeout_mode'"
-	proxysql_admin "UPDATE global_variables SET variable_value='v15' WHERE variable_name='pgsql-polardb_proxy_protocol'"
-	proxysql_admin "UPDATE global_variables SET variable_value='$lazy_warmup_split' WHERE variable_name='pgsql-polardb_lazy_warmup_split'"
-	proxysql_admin "UPDATE global_variables SET variable_value='$proxy_identity_mode' WHERE variable_name='pgsql-polardb_proxy_identity_mode'"
-	if [ "$XACT_SPLIT" = "1" ]; then
-		# Lazy split warmup creates a connected reader-pool entry. Keep the
-		# backend-connect timeout stable so the TAP validates split behavior
-		# rather than incidental host-load timing.
-		proxysql_admin "UPDATE global_variables SET variable_value='$split_connect_timeout_ms' WHERE variable_name='pgsql-connect_timeout_server'"
-	fi
-	proxysql_admin "LOAD PGSQL VARIABLES TO RUNTIME"
-
 	# Per-HG policy. txn_split_enabled requests/observes RFQ XID data and allows
-	# split-readable transaction reads to take a replica connection from the pool. Mirror the global consistency_mode so
-	# routing resolves the same effective mode whether it reads the HG column or
-	# the global fallback.
-	proxysql_admin "UPDATE pgsql_replication_hostgroups SET txn_split_enabled=$XACT_SPLIT, lsn_wait_timeout_ms=$timeout_ms, consistency_mode='$cmode', max_lag_bytes=$max_lag_bytes, proxy_protocol='v15'"
-	proxysql_admin "LOAD PGSQL SERVERS TO RUNTIME"
+	# split-readable transaction reads to take a replica connection from the
+	# pool. Mirror the global consistency mode in the hostgroup policy.
+	configure_polardb_scenario_policy \
+		"$CONSISTENCY_MODE" "$timeout_action" "$XACT_SPLIT" "$timeout_ms" \
+		"${SPLIT_VARIANT:-basic}"
 
-	proxysql_admin "SELECT variable_name, variable_value FROM runtime_global_variables WHERE variable_name LIKE 'pgsql-polardb%';" | sed 's/^/    /'
-	proxysql_admin "SELECT writer_hostgroup, txn_split_enabled, lsn_wait_timeout_ms, consistency_mode, max_lag_bytes, proxy_protocol FROM runtime_pgsql_replication_hostgroups;" | sed 's/^/    /'
+	show_polardb_runtime_policy | sed 's/^/    /'
 
 	# STEP 2: Baseline
 	echo ""
@@ -2362,8 +1877,7 @@ run_consistency_test() {
 	snapshot "B"
 	snapshot_pool "B"
 
-	# STEP 3: LSN state. The committed PR benchmark surface is LSN-only;
-	# reserved CSN helpers must not probe missing backend functions here.
+	# STEP 3: LSN state.
 	echo ""
 	echo "[$(ts)] STEP 3: LSN state"
 	echo "[$(ts)]   Primary: LSN=$(get_primary_lsn)"
@@ -2391,14 +1905,9 @@ run_consistency_test() {
 			early_fail=1
 		fi
 		# For success paths, wait for replica to catch up before running waits.
-		if [ "$CONSISTENCY_MODE" = "1" ] || [ "$CONSISTENCY_MODE" = "2" ]; then
+		if polardb_consistency_uses_lsn_wait "$CONSISTENCY_MODE"; then
 			if ! wait_for_replica_lsn_catchup 3; then
 				echo "[$(ts)]   FAIL: replica LSN not caught up after 3s"
-				early_fail=1
-			fi
-		elif [ "$CONSISTENCY_MODE" = "4" ]; then
-			if ! wait_for_replica_csn_catchup 3; then
-				echo "[$(ts)]   FAIL: replica CSN not caught up after 3s"
 				early_fail=1
 			fi
 		fi
@@ -2487,6 +1996,7 @@ INSERT INTO $TEST_TABLE VALUES ($test_id, 'prewrite_setup$CASE_NUM') ON CONFLICT
 \sleep ${sleep_ms}ms
 BEGIN;
 SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
+SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
 INSERT INTO $TEST_TABLE VALUES ($test_id, 'split_test_case$CASE_NUM') ON CONFLICT (id) DO UPDATE SET data = 'split_test_case$CASE_NUM';
 \sleep ${sleep_ms}ms
 SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
@@ -2509,13 +2019,38 @@ SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
 COMMIT;
 EOSQL
 				;;
+			reuse_after_commit)
+				# After each write, the first read can complete the writer's
+				# WAL-pending stage, the second attaches a split reader, and the
+				# third reuses it. COMMIT then returns the completed split reader
+				# for the autocommit read and the next transaction.
+				cat >"$split_sql" <<EOSQL
+$split_session_preamble
+SELECT 1;
+BEGIN;
+INSERT INTO $TEST_TABLE VALUES ($test_id, 'split_reuse_first$CASE_NUM') ON CONFLICT (id) DO UPDATE SET data = 'split_reuse_first$CASE_NUM';
+\sleep ${sleep_ms}ms
+SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
+SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
+SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
+COMMIT;
+SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
+BEGIN;
+INSERT INTO $TEST_TABLE VALUES ($test_id, 'split_reuse_second$CASE_NUM') ON CONFLICT (id) DO UPDATE SET data = 'split_reuse_second$CASE_NUM';
+\sleep ${sleep_ms}ms
+SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
+SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
+SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
+COMMIT;
+EOSQL
+				;;
 			timeout)
 				# Timeout path: the first split read dispatches to a replica and
 				# times out waiting for the transaction LSN. Split wait is strict
-				# internally even if pgsql-polardb_wait_timeout_mode=best_effort,
-				# so the original SELECT retries on the primary transaction
-				# backend. The next SELECT shows the transaction stays alive but
-				# split is blocked for the remainder of that transaction.
+				# on the wire when the configured timeout action is writer.
+				# The original SELECT then retries on the primary transaction
+				# backend. The next SELECT shows the transaction stays alive, but
+				# split is blocked for the rest of that transaction.
 				cat >"$split_sql" <<EOSQL
 $split_session_preamble
 SELECT 1;
@@ -2531,8 +2066,9 @@ EOSQL
 				# First transaction creates a real warmed reader. The short
 				# BEGIN/COMMIT then asks for begin-time warmup again while that
 				# reader is idle, so the drain can show it skips duplicate
-				# backend creation. The final transaction shows the warmed
-				# reader still handles split reads.
+				# backend creation. The primary can report wal_pending for either
+				# of the first two final reads, so a third read verifies that the
+				# warmed reader is used after the split-readable boundary.
 				local warmup_wait_sec="${POLARDB_SPLIT_WARMUP_WAIT_SEC:-3}"
 				cat >"$split_sql" <<EOSQL
 $split_session_preamble
@@ -2550,6 +2086,7 @@ INSERT INTO $TEST_TABLE VALUES ($test_id, 'split_prompt_warm$CASE_NUM') ON CONFL
 \sleep ${sleep_ms}ms
 SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
 \sleep ${sleep_ms}ms
+SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
 SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
 COMMIT;
 EOSQL
@@ -2650,7 +2187,7 @@ EOSQL
 				# REPEATABLE READ fixes the transaction snapshot at the first
 				# statement. A pre-write reader wait would create that snapshot on
 				# the replica and later continue the transaction on the primary, so
-				# it must fail closed to the primary.
+				# the read must stay on the primary.
 				cat >"$split_sql" <<EOSQL
 $split_session_preamble
 INSERT INTO $TEST_TABLE VALUES ($test_id, 'readonly_rr_setup$CASE_NUM') ON CONFLICT (id) DO UPDATE SET data = 'readonly_rr_setup$CASE_NUM';
@@ -2808,9 +2345,8 @@ EOSQL
 		# Non-split: simple INSERT then SELECT
 		echo "[$(ts)]   INSERT then SELECT (non-split)"
 
-		# For consistency modes that need reader routing (LSN=1, GLOBAL_LSN=2, CSN_GLOBAL=4),
-		# setup query rules to send SELECTs to HG 11 and warmup the pool
-		if [ "$CONSISTENCY_MODE" = "1" ] || [ "$CONSISTENCY_MODE" = "2" ] || [ "$CONSISTENCY_MODE" = "4" ]; then
+		# LSN and global-LSN modes route SELECTs to readers and warm the pool.
+		if polardb_consistency_uses_lsn_wait "$CONSISTENCY_MODE"; then
 			if ! setup_reader_routing "$POLARDB_READER_HG" 3; then
 				echo "[$(ts)]   FAIL: reader routing warmup failed"
 				early_fail=1
@@ -2819,7 +2355,7 @@ EOSQL
 		fi
 
 		if [ "$early_fail" -eq 0 ]; then
-			if [ "$CONSISTENCY_MODE" = "1" ] || [ "$CONSISTENCY_MODE" = "2" ]; then
+			if polardb_consistency_uses_lsn_wait "$CONSISTENCY_MODE"; then
 				# For session/global LSN, keep the same session so ProxySQL can apply wait logic.
 				if [ "$outcome" = "failure" ]; then
 					cat >"$session_sql" <<EOSQL
@@ -2882,7 +2418,8 @@ EOSQL
 
 	if [ "$early_fail" -eq 0 ]; then
 		local qtime=$((t1 - t0))
-		if [ "$XACT_SPLIT" = "1" ] || [ "$CONSISTENCY_MODE" = "1" ] || [ "$CONSISTENCY_MODE" = "2" ]; then
+		if [ "$XACT_SPLIT" = "1" ] ||
+				polardb_consistency_uses_lsn_wait "$CONSISTENCY_MODE"; then
 			# In split tests, the wait/timeout happens inside pgbench.
 			# Use pgbench output to detect WARNING/ERROR, since the follow-up
 			# query runs on a new session and won't see the split error.
@@ -2965,6 +2502,10 @@ EOSQL
 				verify_preset "$outcome" "${SPLIT_MULTI_STATS[@]}"
 				verify_split_wait_or_bypass "Split read waited or used a fresh reader"
 				;;
+			reuse_after_commit)
+				verify_preset "$outcome" "${SPLIT_REUSE_AFTER_COMMIT_STATS[@]}"
+				verify_split_wait_or_bypass "Cross-transaction split reads waited or used a fresh reader"
+				;;
 			timeout) verify_preset "$outcome" "${SPLIT_TIMEOUT_STATS[@]}" ;;
 			for_update) verify_preset "$outcome" "${SPLIT_FOR_UPDATE_STATS[@]}" ;;
 			readonly) verify_preset "$outcome" "${READONLY_TXN_STATS[@]}" ;;
@@ -2982,13 +2523,15 @@ EOSQL
 			esac
 		else
 			# Non-split path: use wait/timeout counters
-			case "$CONSISTENCY_MODE" in
-			0) verify_preset "$outcome" "${EVENTUAL_STATS[@]}" ;;
-			1) verify_preset "$outcome" "${LSN_STATS[@]}" ;;
-			2) verify_preset "$outcome" "${GLOBAL_LSN_STATS[@]}" ;;
-			3) verify_preset "$outcome" "${PRIMARY_STATS[@]}" ;;
-			4) verify_preset "$outcome" "${GLOBAL_CSN_STATS[@]}" ;;
-			esac
+			if [ "${READ_TARGET:-replica}" = "primary" ]; then
+				verify_preset "$outcome" "${PRIMARY_STATS[@]}"
+			else
+				case "$CONSISTENCY_MODE" in
+				off | eventual) verify_preset "$outcome" "${EVENTUAL_STATS[@]}" ;;
+				session_lsn) verify_preset "$outcome" "${LSN_STATS[@]}" ;;
+				global_lsn) verify_preset "$outcome" "${GLOBAL_LSN_STATS[@]}" ;;
+				esac
+			fi
 		fi
 
 		# Result checks
@@ -3022,7 +2565,7 @@ EOSQL
 					echo "[$(ts)]   FAIL: Split timeout primary retry mismatch COUNT=$count WARN=$has_warn ERR=$has_err"
 					FAIL=$((FAIL + 1))
 				fi
-			elif [ "$polar_mode" = "best_effort" ]; then
+			elif [ "$timeout_action" = "warning" ]; then
 				if [ "$has_warn" -ge 1 ]; then
 					echo "[$(ts)]   PASS: Got WARNING"
 					PASS=$((PASS + 1))
@@ -3049,7 +2592,8 @@ EOSQL
 	echo "[$(ts)] STEP 8: Cleanup"
 	stop_wal_generator 2>/dev/null || true
 	disable_replay_lag 2>/dev/null || true
-	proxysql_admin "UPDATE pgsql_replication_hostgroups SET lsn_wait_timeout_ms=5000; LOAD PGSQL SERVERS TO RUNTIME;" 2>/dev/null || true
+	proxysql_admin "UPDATE pgsql_replication_hostgroups SET lsn_wait_timeout_ms=1000;" 2>/dev/null || true
+	proxysql_admin "LOAD PGSQL SERVERS TO RUNTIME;" 2>/dev/null || true
 
 	# Extract logs BEFORE stopping ProxySQL (while log is still being written)
 	extract_logs

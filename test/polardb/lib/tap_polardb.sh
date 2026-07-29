@@ -17,6 +17,27 @@
 #     relies on ok()/diag());
 #   - export the connection variables this file reads (documented per function);
 #   - the assert_* helpers call ok() exactly once each.
+#
+# ProxySQL configuration layers:
+#
+#   MEMORY (pgsql_servers) -- LOAD ... TO RUNTIME --> RUNTIME
+#   RUNTIME                -- SAVE ... FROM RUNTIME -> MEMORY
+#   MEMORY                 -- SAVE ... TO DISK ----> DISK
+#
+# A temporary TAP change normally uses three separate admin requests:
+#
+#   1. UPDATE the MEMORY table.
+#   2. LOAD that module TO RUNTIME.
+#   3. Read the runtime_* table when the runtime state is part of the test.
+#
+# Do not combine UPDATE and LOAD in one admin_sql string. ProxySQL's admin
+# SQLite path prepares one statement from that request, so "UPDATE ...; LOAD
+# ..." can update MEMORY without changing RUNTIME. SAVE ... FROM RUNTIME is the
+# reverse operation: it replaces MEMORY with live state. Use it only before an
+# edit when the live state must become the edit base, never after an UPDATE.
+# SAVE ... TO DISK is persistence and is not needed by isolated TAP scenarios.
+# An OFFLINE_HARD server may be absent from runtime_pgsql_servers; verify that
+# it is not ONLINE rather than requiring a literal OFFLINE_HARD runtime row.
 
 if [ -n "${POLARDB_TAP_POLARDB_LOADED:-}" ]; then
     return 0
@@ -31,8 +52,9 @@ source "$POLARDB_TAP_LIB_DIR/../common/env.sh"
 # Admin / proxy SQL wrappers
 # -----------------------------------------------------------------------------
 
-# Run one statement against the ProxySQL PostgreSQL admin interface and print
-# the bare result. Uses ON_ERROR_STOP so callers can rely on the exit status.
+# Run exactly one statement against the ProxySQL PostgreSQL admin interface and
+# print the bare result. Uses ON_ERROR_STOP so callers can rely on the exit
+# status. Configuration sequences must call admin_sql once per operation.
 # Reads: PROXYSQL_HOST, PROXYSQL_ADMIN_PORT, and PROXYSQL_ADMIN_*.
 admin_sql() {
     PGPASSWORD="$PROXYSQL_ADMIN_PASSWORD" PGSSLMODE="$PROXYSQL_ADMIN_PGSSLMODE" \

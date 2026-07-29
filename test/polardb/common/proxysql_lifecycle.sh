@@ -6,6 +6,8 @@
 #   ./proxysql_lifecycle.sh start [--config FILE] [--data-dir DIR] [--admin-port PORT] [--proxy-port PORT] [--mysql-admin-port PORT]
 #   ./proxysql_lifecycle.sh stop
 #   ./proxysql_lifecycle.sh status
+#   ./proxysql_lifecycle.sh check-ports
+#   ./proxysql_lifecycle.sh find-free-shard [--first N] [--last N]
 #   ./proxysql_lifecycle.sh restart [options...]
 #
 # This script ensures clean ProxySQL lifecycle management:
@@ -51,21 +53,103 @@ wait_for_pid_exit() {
     return 1
 }
 
-port_is_listening() {
+listener_details() {
     local port="$1"
-    command -v ss >/dev/null 2>&1 || return 1
-    ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .
+    local output
+
+    if ! command -v ss >/dev/null 2>&1; then
+        log_error "The 'ss' command is required to verify listener ports" >&2
+        return 2
+    fi
+    if ! output=$(ss -H -ltnp "sport = :$port" 2>&1); then
+        log_error "Cannot inspect listener port $port: $output" >&2
+        return 2
+    fi
+    if [ -n "$output" ] && [ "${output#LISTEN }" = "$output" ]; then
+        log_error "Cannot inspect listener port $port: $output" >&2
+        return 2
+    fi
+    printf '%s\n' "$output"
 }
 
 require_ports_free() {
-    local port
+    local port details
     for port in "$@"; do
-        if port_is_listening "$port"; then
+        if ! details=$(listener_details "$port"); then
+            return 1
+        fi
+        if [ -n "$details" ]; then
             log_error "Port already has a listener: $port"
-            ss -H -ltnp "sport = :$port" 2>/dev/null || true
+            printf '%s\n' "$details"
             return 1
         fi
     done
+}
+
+cmd_find_free_shard() {
+    local first=200
+    local last=400
+    local shard mysql_admin_port admin_port proxy_port details port busy
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --first)
+            first=$(require_option_value "$1" "${2:-}")
+            shift 2
+            ;;
+        --last)
+            last=$(require_option_value "$1" "${2:-}")
+            shift 2
+            ;;
+        *)
+            log_error "Unknown option: $1" >&2
+            return 2
+            ;;
+        esac
+    done
+    case "$first:$last" in
+    *[!0-9:]* | :* | *:)
+        log_error "Shard range must contain non-negative integers: first=$first last=$last" >&2
+        return 2
+        ;;
+    esac
+    if [ "$first" -gt "$last" ]; then
+        log_error "Invalid shard range: first=$first is greater than last=$last" >&2
+        return 2
+    fi
+
+    shard="$first"
+    while [ "$shard" -le "$last" ]; do
+        mysql_admin_port=$((POLARDB_PARALLEL_PORT_BASE + shard * POLARDB_PROXY_SHARD_STRIDE))
+        admin_port=$((mysql_admin_port + 1))
+        proxy_port=$((mysql_admin_port + 2))
+        [ "$proxy_port" -le 65535 ] || break
+
+        busy=0
+        for port in "$mysql_admin_port" "$admin_port" "$proxy_port"; do
+            if ! details=$(listener_details "$port"); then
+                return 1
+            fi
+            if [ -n "$details" ]; then
+                busy=1
+                break
+            fi
+        done
+        if [ "$busy" -eq 0 ]; then
+            printf '%s\n' "$shard"
+            return 0
+        fi
+        shard=$((shard + 1))
+    done
+
+    log_error "No unused ProxySQL port set in shard range $first..$last" >&2
+    return 1
+}
+
+cmd_check_ports() {
+    log_info "Checking ProxySQL listener ports: admin=$PROXYSQL_ADMIN_PORT proxy=$PROXYSQL_PORT mysql_admin=$PROXYSQL_MYSQL_ADMIN_PORT"
+    require_ports_free "$PROXYSQL_ADMIN_PORT" "$PROXYSQL_PORT" "$PROXYSQL_MYSQL_ADMIN_PORT"
+    log_info "ProxySQL listener ports are available"
 }
 
 listener_is_owned_by_pid() {
@@ -328,9 +412,8 @@ pgsql_variables=
     interfaces="$PROXYSQL_LISTEN_HOST:$proxy_port"
     monitor_username="$PROXYSQL_MONITOR_USER"
     monitor_password="$PROXYSQL_MONITOR_PASSWORD"
-    polardb_consistency_mode="off"
-    polardb_lag_ms=0
-    polardb_lag_bytes=0
+    polardb_max_reader_lag_ms=0
+    polardb_max_reader_lsn_gap_bytes=0
 }
 EOF
         if [ -n "$PROXYSQL_DEBUG" ] && [ "$PROXYSQL_DEBUG" != "0" ]; then
@@ -437,6 +520,18 @@ status)
     shift
     cmd_status "$@"
     ;;
+check-ports)
+    shift
+    [ "$#" -eq 0 ] || {
+        log_error "check-ports does not accept options"
+        exit 2
+    }
+    cmd_check_ports
+    ;;
+find-free-shard)
+    shift
+    cmd_find_free_shard "$@"
+    ;;
 restart)
     shift
     restart_data_dir=$(proxysql_data_dir_from_start_args "$@")
@@ -445,16 +540,20 @@ restart)
     cmd_start "$@"
     ;;
 *)
-    echo "Usage: $0 {start|stop|status|restart} [options]"
+    echo "Usage: $0 {start|stop|status|restart|check-ports|find-free-shard} [options]"
     echo ""
     echo "Commands:"
     echo "  start   Start ProxySQL (kills existing test instances first)"
     echo "  stop    Stop ProxySQL test instance"
     echo "  status  Show status of ProxySQL instances"
     echo "  restart Stop then start ProxySQL"
+    echo "  check-ports  Verify that the configured ProxySQL listener ports are unused"
+    echo "  find-free-shard  Print an unused isolated ProxySQL port shard"
     echo ""
     echo "Options:"
     echo "  --data-dir DIR     Use specified data directory (default: $DEFAULT_DATA_DIR)"
+    echo "  --first N          First shard considered by find-free-shard (default: 200)"
+    echo "  --last N           Last shard considered by find-free-shard (default: 400)"
     echo ""
     echo "Options for start/restart only:"
     echo "  --config FILE      Use specified config file"

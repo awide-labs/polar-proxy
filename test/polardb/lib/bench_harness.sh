@@ -486,24 +486,27 @@ polardb_bench_write_shape_worker_script() {
 polardb_bench_configure_mode() {
     local label="$1"
     local consistency="$2"
-    local wait_mode="$3"
-    local timeout_ms="$4"
-    local max_lag_bytes="$5"
-    local reset_lag_globals="${6:-0}"
+    local read_target="$3"
+    local timeout_action="$4"
+    local timeout_ms="$5"
+    local max_lag_bytes="$6"
+    local reset_lag_globals="${7:-0}"
     local rule_sql
 
-    echo "[$(ts)] Configuring ${label}: consistency=${consistency} wait_mode=${wait_mode} timeout=${timeout_ms}ms max_lag_bytes=${max_lag_bytes}"
+    echo "[$(ts)] Configuring ${label}: consistency=${consistency} read_target=${read_target} timeout_action=${timeout_action} timeout=${timeout_ms}ms max_lag_bytes=${max_lag_bytes}"
     polardb_bench_admin "UPDATE global_variables SET variable_value='${consistency}' WHERE variable_name='pgsql-polardb_consistency_mode'" || return 1
-    polardb_bench_admin "UPDATE global_variables SET variable_value='${wait_mode}' WHERE variable_name='pgsql-polardb_wait_timeout_mode'" || return 1
+    polardb_bench_admin "UPDATE global_variables SET variable_value='${read_target}' WHERE variable_name='pgsql-polardb_read_target'" || return 1
+    polardb_bench_admin "UPDATE global_variables SET variable_value='primary' WHERE variable_name='pgsql-polardb_action_read_fallback'" || return 1
+    polardb_bench_admin "UPDATE global_variables SET variable_value='${timeout_action}' WHERE variable_name='pgsql-polardb_action_lsn_timeout'" || return 1
     if [ "$reset_lag_globals" = "1" ]; then
-        polardb_bench_admin "UPDATE global_variables SET variable_value='0' WHERE variable_name='pgsql-polardb_lag_bytes'" || return 1
-        polardb_bench_admin "UPDATE global_variables SET variable_value='0' WHERE variable_name='pgsql-polardb_lag_ms'" || return 1
+        polardb_bench_admin "UPDATE global_variables SET variable_value='0' WHERE variable_name='pgsql-polardb_max_reader_lsn_gap_bytes'" || return 1
+        polardb_bench_admin "UPDATE global_variables SET variable_value='0' WHERE variable_name='pgsql-polardb_max_reader_lag_ms'" || return 1
     fi
     polardb_bench_admin "LOAD PGSQL VARIABLES TO RUNTIME" || return 1
     polardb_bench_admin "UPDATE pgsql_replication_hostgroups SET consistency_mode='${consistency}', max_lag_bytes=${max_lag_bytes}, lsn_wait_timeout_ms=${timeout_ms} WHERE writer_hostgroup=${POLARDB_BENCH_WRITER_HG}" || return 1
     polardb_bench_admin "LOAD PGSQL SERVERS TO RUNTIME" || return 1
 
-    # The eventual-consistency/off baseline must explicitly route reads to the
+    # The feature-off baseline must explicitly route reads to the
     # reader. All other modes use replica_eligible=1 so the PolarDB planner can
     # choose writer, reader+wait, or writer fallback according to policy.
     polardb_bench_admin "DELETE FROM pgsql_query_rules" || return 1

@@ -48,6 +48,11 @@ polardb_build_suggestion() {
     printf 'make -C %s %s' "${PROXYSQL_ROOT:-.}" "$tier"
 }
 
+polardb_binary_has_debug_support() {
+    local binary="$1"
+    grep -aFq "POLARDB_DEBUG_WAIT_RETRY_FAULT_FILE" "$binary" 2>/dev/null
+}
+
 polardb_require_command_or_skip_all() {
     local cmd="$1"
     local label="${2:-$cmd}"
@@ -62,15 +67,21 @@ polardb_require_command_or_skip_all() {
 polardb_require_proxysql_or_skip_all() {
     local tier="${1:-polardb}"
     local binary="${PROXYSQL_BINARY:-${PROXYSQL_ROOT:-.}/src/proxysql}"
-    if [ -x "$binary" ]; then
-        return 0
+    if [ ! -x "$binary" ]; then
+        diag "ProxySQL binary is not built or not executable: $binary"
+        diag "Build it first with: $(polardb_build_suggestion "$tier")"
+        diag "Use 'polardb-debug' instead when running tests that assert debug-only traces or fault injection."
+        polardb_skip_remaining "ProxySQL binary not built"
+        exit 0
     fi
 
-    diag "ProxySQL binary is not built or not executable: $binary"
-    diag "Build it first with: $(polardb_build_suggestion "$tier")"
-    diag "Use 'polardb-debug' instead when running tests that assert debug-only traces or fault injection."
-    polardb_skip_remaining "ProxySQL binary not built"
-    exit 0
+    if [ "$tier" = "polardb-debug" ] &&
+        ! polardb_binary_has_debug_support "$binary"; then
+        diag "ProxySQL binary does not contain POLARDB_DEBUG trace/fault support: $binary"
+        diag "Build it first with: $(polardb_build_suggestion polardb-debug)"
+        polardb_skip_remaining "POLARDB_DEBUG binary required"
+        exit 0
+    fi
 }
 
 tap_trace_count() {
@@ -90,7 +101,23 @@ tap_trace_has() {
 
 tap_trace_checks_enabled() {
     local log_file="$1"
-    [ -f "$log_file" ] && tap_trace_has "$log_file" "PolarDB "
+    local binary="${PROXYSQL_BINARY:-${PROXYSQL_ROOT:-.}/src/proxysql}"
+
+    [ -f "$log_file" ] &&
+        polardb_binary_has_debug_support "$binary" &&
+        tap_trace_has "$log_file" "PolarDB "
+}
+
+tap_debug_traces_required() {
+    [ "${POLARDB_REQUIRE_DEBUG_TRACES:-0}" = "1" ]
+}
+
+tap_trace_unavailable_delta() {
+    if tap_debug_traces_required; then
+        printf '%s\n' -2
+    else
+        printf '%s\n' -1
+    fi
 }
 
 tap_trace_expect_count() {

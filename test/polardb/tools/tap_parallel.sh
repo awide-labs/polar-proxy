@@ -47,7 +47,7 @@ __run-job)
 	;;
 esac
 
-DEFAULT_SAFE_JOBS="config rfq-lifecycle lsn-session global-core global-split split-core split-warmup"
+DEFAULT_SAFE_JOBS="config frontend-output rfq-lifecycle lsn-session global-core global-split split-core split-warmup"
 DEFAULT_EXCLUSIVE_JOBS="global-timeout split-timeout split-failure-policy wait-timeout"
 SAFE_JOBS="${POLARDB_TAP_SAFE_JOBS:-$DEFAULT_SAFE_JOBS}"
 EXCLUSIVE_JOBS="${POLARDB_TAP_EXCLUSIVE_JOBS:-$DEFAULT_EXCLUSIVE_JOBS}"
@@ -100,16 +100,29 @@ parallel_port() {
 	printf '%s\n' $((POLARDB_PARALLEL_PORT_BASE + shard * POLARDB_PROXY_SHARD_STRIDE + offset))
 }
 
-port_is_listening() {
+listener_details() {
 	local port="$1"
-	command -v ss >/dev/null 2>&1 || return 1
-	ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .
+	local output
+
+	if ! command -v ss >/dev/null 2>&1; then
+		echo "[tap] the 'ss' command is required to verify listener ports" >&2
+		return 2
+	fi
+	if ! output=$(ss -H -ltnp "sport = :$port" 2>&1); then
+		echo "[tap] cannot inspect listener port $port: $output" >&2
+		return 2
+	fi
+	if [ -n "$output" ] && [ "${output#LISTEN }" = "$output" ]; then
+		echo "[tap] cannot inspect listener port $port: $output" >&2
+		return 2
+	fi
+	printf '%s\n' "$output"
 }
 
 check_job_ports() {
 	local job="$1"
 	local shard="$2"
-	local mysql_admin_port pg_admin_port proxy_port port owner
+	local mysql_admin_port pg_admin_port proxy_port port owner details
 
 	mysql_admin_port=$(parallel_port "$shard" 0)
 	pg_admin_port=$(parallel_port "$shard" 1)
@@ -128,9 +141,12 @@ check_job_ports() {
 			return 1
 		fi
 		seen_ports[$port]="$job"
-		if port_is_listening "$port"; then
+		if ! details=$(listener_details "$port"); then
+			return 1
+		fi
+		if [ -n "$details" ]; then
 			echo "[tap] port already has a listener: job=$job shard=$shard port=$port" >&2
-			ss -H -ltnp "sport = :$port" 2>/dev/null >&2 || true
+			printf '%s\n' "$details" >&2
 			return 1
 		fi
 	done
@@ -163,13 +179,14 @@ safe_job_log_name() {
 list_manifest() {
 	cat <<'EOF'
 case_id | group | tag | plan_count | function
-config | config | parallel | 16 | config_roundtrip_tap.sh
+config | config | parallel | 77 | config_roundtrip_tap.sh
+frontend-output | frontend-output | parallel | 13 | frontend_output_tap.sh
 rfq-lifecycle | rfq-lifecycle | parallel | 8 | rfq_lsn_lifecycle_tap.sh
-lsn-session | lsn-session | parallel | 67 | lsn_session_consistency_tap.sh
+lsn-session | lsn-session | parallel | 75 | lsn_session_consistency_tap.sh
 global:1-5 | global-core | parallel | 11 total | GLOBAL_LSN selected cases
 global:7-9 | global-split | parallel | 10 total | GLOBAL_LSN selected cases
 global:6 | global-timeout | backend_exclusive | 7 total | GLOBAL_LSN timeout case
-split:6,7,8,10,12,13,14,21,22 | split-core | parallel | 12 total | txn_split core selected cases
+split:6,7,8,10,12,13,14,21,22,26 | split-core | parallel | 13 total | txn_split core selected cases
 split:9,11,17,18,19,20,23,24,25 | split-warmup | parallel | 10 total | txn_split warmup selected cases
 split:15,16 | split-timeout | backend_exclusive | 3 total | txn_split timeout selected cases
 split-failure-policy | split-failure-policy | backend_exclusive | 19 | txn_split_failure_policy_tap.sh
@@ -183,6 +200,9 @@ job_command() {
 	case "$job" in
 	config)
 		exec "$TAP_DIR/config_roundtrip_tap.sh"
+		;;
+	frontend-output)
+		exec "$TAP_DIR/frontend_output_tap.sh"
 		;;
 	rfq-lifecycle)
 		exec "$TAP_DIR/rfq_lsn_lifecycle_tap.sh"
