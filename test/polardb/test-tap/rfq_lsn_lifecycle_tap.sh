@@ -129,7 +129,6 @@ configure_proxy() {
     admin_sql "UPDATE global_variables SET variable_value='lsn' WHERE variable_name='pgsql-polardb_consistency_mode';" >/dev/null
     admin_sql "UPDATE global_variables SET variable_value='v15' WHERE variable_name='pgsql-polardb_proxy_protocol';" >/dev/null
     admin_sql "UPDATE global_variables SET variable_value='strict' WHERE variable_name='pgsql-polardb_route_rfq_policy';" >/dev/null
-    admin_sql "UPDATE global_variables SET variable_value='observed' WHERE variable_name='pgsql-polardb_session_lsn_baseline';" >/dev/null
     admin_sql "UPDATE global_variables SET variable_value='1' WHERE variable_name='pgsql-polardb_monitor_lsn_updates';" >/dev/null
     admin_sql "UPDATE global_variables SET variable_value='0' WHERE variable_name IN ('pgsql-polardb_lag_ms','pgsql-polardb_lag_bytes');" >/dev/null
     admin_sql "UPDATE global_variables SET variable_value='5000' WHERE variable_name='pgsql-polardb_lsn_freshness_ms';" >/dev/null

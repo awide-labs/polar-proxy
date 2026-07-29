@@ -66,9 +66,6 @@ constexpr int POLARDB_PROXY_PROTOCOL_V15    = 2;
 constexpr int POLARDB_RFQ_POLICY_BEST_EFFORT = 1;
 constexpr int POLARDB_RFQ_POLICY_STRICT      = 2;
 
-constexpr int POLARDB_SESSION_LSN_BASELINE_OBSERVED = 1;
-constexpr int POLARDB_SESSION_LSN_BASELINE_PRIMARY  = 2;
-
 enum PolarDB_ThreadStatusVariable {
 #define X(name, display_name, prom_name, help) polardb_st_var_##name,
 	POLARDB_THREAD_COUNTER_LIST(X)
@@ -222,6 +219,17 @@ private:
 
 	PtrArray* cached_connections;
 	unsigned int push_local_counter;	// round-robin counter for bounded local caching: cache 1-in-N where N = pgsql_threads
+#if POLARDB_PROXY
+	struct PolarDB_ReaderSelectionState {
+		unsigned int hostgroup_id{0};
+		uint64_t next_sequence{0};
+	};
+	uint64_t polardb_reader_selection_generation{0};
+	bool polardb_reader_selection_generation_initialized{false};
+	std::vector<PolarDB_ReaderSelectionState>
+		polardb_reader_selection_sequences;
+	uint64_t polardb_reader_cache_epoch{1};
+#endif // POLARDB_PROXY
 
 #ifdef IDLE_THREADS
 	struct epoll_event events[MY_EPOLL_THREAD_MAXEVENTS];
@@ -694,6 +702,9 @@ public:
 	 */
 	PgSQL_Connection* get_MyConn_local(unsigned int, PgSQL_Session * sess, char* gtid_uuid, uint64_t gtid_trxid, int max_lag_ms);
 #if POLARDB_PROXY
+	uint64_t next_polardb_reader_selection_sequence(
+		unsigned int hostgroup_id, uint64_t server_list_generation,
+		std::atomic<uint64_t>* selection_start);
 	PgSQL_Connection* get_local_polardb_reader_connection(
 		PgSQL_SrvC* server, uint32_t profile_generation,
 		const PolarDB_PoolKey& pool_key);
@@ -719,16 +730,15 @@ public:
 	/**
 	 * @brief Returns all connections in the thread's local cache to the global pool.
 	 *
-	 * @details This function iterates through the `cached_connections` pool and
-	 * pushes each connection to the global connection pool using
-	 * `PgHGM->push_MyConn_to_pool_array()`. After pushing the connections, the
-	 * local cache is cleared.
+	 * @details This function returns generic connections after each worker pass.
+	 * When PolarDB reader retention is enabled, reader connections used in the
+	 * latest pass remain local and are returned after one pass without reuse.
 	 *
 	 * @note This function is called periodically by `PgSQL_Thread::run()` to
 	 * ensure that unused connections are returned to the global pool.
 	 *
 	 */
-	void return_local_connections();
+	void return_local_connections(bool return_polardb_connections = false);
 
 	/**
      * Pseudocode (plan)
@@ -811,6 +821,10 @@ public:
 };
 
 #if POLARDB_PROXY
+#ifndef POLARDB_THREAD_COUNTERS
+#define POLARDB_THREAD_COUNTERS 1
+#endif
+
 static inline void polardb_thread_count(
 	PgSQL_Thread* thread,
 	PolarDB_ThreadStatusVariable idx,
@@ -824,12 +838,17 @@ static inline void polardb_thread_count(
 	}
 }
 
+#if POLARDB_THREAD_COUNTERS
 #define POLARDB_THREAD_COUNT(thread, name, value) \
 	polardb_thread_count((thread), polardb_st_var_##name, \
 		PgHGM->status.polardb_##name, (value))
 
 #define POLARDB_THREAD_COUNT_ONE(thread, name) \
 	POLARDB_THREAD_COUNT((thread), name, 1)
+#else
+#define POLARDB_THREAD_COUNT(thread, name, value) do { } while (0)
+#define POLARDB_THREAD_COUNT_ONE(thread, name) do { } while (0)
+#endif // POLARDB_THREAD_COUNTERS
 
 void polardb_count_lsn_wait_elapsed_bucket(
 	PgSQL_Thread* thread,
@@ -1079,6 +1098,9 @@ public:
 		int unshun_algorithm;
 		int query_retries_on_failure;
 		bool connection_warming;
+		// 0 keeps the ProxySQL 3.0.7 worker-local cache behavior.
+		// 1 enables the ProxySQL 3.0.9 bounded 1-in-pgsql_threads behavior.
+		int bounded_local_connection_cache;
 		int client_host_cache_size;
 		int client_host_error_counts;
 		int connect_retries_on_failure;
@@ -1133,6 +1155,7 @@ public:
 		int polardb_lsn_freshness_ms;         // max age of a cached per-server LSN to trust
 		int polardb_lag_cap_freshness_ms;     // max LSN-cache age under byte-lag cap + finite wait; 0=wait-fraction only
 		int polardb_reader_lsn_lag_range_bytes; // 0 keeps exact best-behind reader choice
+		int polardb_reader_connection_retention; // 0 returns after each pass; 1 retains active readers
 		int polardb_output_coalesce_bytes;   // 0 disables incomplete streaming output coalescing by bytes
 		int polardb_output_coalesce_packets; // 0 disables incomplete streaming output coalescing by packets
 		bool polardb_monitor_lsn_updates;     // enable monitor LSN cache updates
@@ -1143,7 +1166,6 @@ public:
 		char* polardb_wait_timeout_mode;      // best_effort | strict
 		char* polardb_proxy_protocol;         // v15 | legacy | off
 		char* polardb_route_rfq_policy;       // strict | best_effort
-		char* polardb_session_lsn_baseline;   // observed | primary
 		char* polardb_reader_death_action;    // retry | forward | terminate
 		char* polardb_reader_timeout_action;  // retry | forward | terminate
 		char* polardb_reader_error_action;    // retry | forward | terminate

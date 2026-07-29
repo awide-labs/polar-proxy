@@ -1086,12 +1086,13 @@ bool PgSQL_Data_Stream::polardb_can_writev_direct() const {
 }
 
 bool PgSQL_Data_Stream::polardb_should_writev_direct() const {
-	if (!polardb_can_writev_direct()) return false;
-	return polardb_direct_write_batch_ready();
+	if (!polardb_direct_write_batch_ready()) return false;
+	return polardb_can_writev_direct();
 }
 
 bool PgSQL_Data_Stream::polardb_direct_write_batch_ready() const {
 	if (polardb_write_head_partial != 0) return true;
+	if (PSarrayOUT == nullptr || PSarrayOUT->len == 0) return false;
 
 	size_t pending = 0;
 	unsigned int packets = 0;
@@ -1176,13 +1177,17 @@ int PgSQL_Data_Stream::polardb_writev_to_net_poll(size_t byte_budget) {
 	if (byte_budget == 0) {
 		byte_budget = polardb_frontend_direct_write_budget();
 	}
+	if (!polardb_direct_write_batch_ready()) {
+		if ((pgsql_thread___polardb_writev_direct ||
+				polardb_write_head_partial != 0) &&
+				PSarrayOUT != nullptr && PSarrayOUT->len != 0) {
+			POLARDB_WRITEV_COUNT(this, writev_small_batch_fallback, 1);
+		}
+		return 0;
+	}
 	if (!polardb_can_writev_direct()) {
 		polardb_perf_count_writev_skip_reason(this);
 		POLARDB_WRITEV_COUNT(this, writev_buffered_fallback, 1);
-		return 0;
-	}
-	if (!polardb_direct_write_batch_ready()) {
-		POLARDB_WRITEV_COUNT(this, writev_small_batch_fallback, 1);
 		return 0;
 	}
 	return polardb_writev_to_net_poll_ready(byte_budget);
@@ -1373,7 +1378,7 @@ int PgSQL_Data_Stream::write_to_net_poll() {
 		}
 	}
 #if POLARDB_PROXY
-	if (polardb_can_writev_direct() && polardb_direct_write_batch_ready()) {
+	if (polardb_should_writev_direct()) {
 		return polardb_writev_to_net_poll_ready(polardb_frontend_direct_write_budget());
 	}
 #endif // POLARDB_PROXY
@@ -1573,12 +1578,8 @@ void PgSQL_Data_Stream::copy_buffer_to_resultset(PtrSizeArray* resultset, unsign
 
 int PgSQL_Data_Stream::array2buffer_full() {
 #if POLARDB_PROXY
-	if (polardb_can_writev_direct()) {
-		if (polardb_direct_write_batch_ready()) {
-			return 0;
-		}
-		POLARDB_PROFILE_THREAD_COUNT(polardb_writev_counter_thread(this),
-			writev_small_batch_fallback, 1);
+	if (polardb_direct_write_batch_ready() && polardb_can_writev_direct()) {
+		return 0;
 	}
 #endif // POLARDB_PROXY
 	int rc = 0;

@@ -216,6 +216,7 @@ enum class PgSQL_PoolGetSource : uint8_t {
 struct PgSQL_PoolGetResult {
 	PgSQL_Connection* conn{nullptr};
 	PgSQL_PoolGetSource source{PgSQL_PoolGetSource::NONE};
+	bool server_saturated{false};
 };
 
 class PgSQL_SrvConnList {
@@ -237,7 +238,9 @@ class PgSQL_SrvConnList {
 		PgSQL_PoolMatchKey* key) const;
 	void unindex_unlocked(PgSQL_Connection*);
 #endif // POLARDB_PROXY
+	void detach_all_unlocked(std::vector<PgSQL_Connection*>& connections);
 	friend class PgSQL_SrvC;
+	friend class PgSQL_HostGroups_Manager;
 	public:
 	PtrArray *conns;
 	PgSQL_SrvConnList(PgSQL_SrvC *, bool used);
@@ -245,7 +248,9 @@ class PgSQL_SrvConnList {
 	void add(PgSQL_Connection *);
 	void remove(PgSQL_Connection *c);
 	PgSQL_Connection *remove(int);
-	PgSQL_Connection * get_random_MyConn(PgSQL_Session *sess, bool ff, bool only_pooled = false);
+	PgSQL_Connection * get_random_MyConn(PgSQL_Session *sess, bool ff,
+		bool only_pooled = false,
+		std::vector<PgSQL_Connection*>* connections_to_delete = nullptr);
 	void get_random_MyConn_inner_search(unsigned int start, unsigned int end, unsigned int& conn_found_idx, unsigned int& connection_quality_level, unsigned int& number_of_matching_session_variables, const PgSQL_Connection * client_conn);
 	unsigned int conns_length();
 	void drop_all_connections();
@@ -288,7 +293,23 @@ class PgSQL_SrvC {	// MySQL Server Container
 	unsigned int connect_ERR;
 	unsigned int cur_replication_lag_count;
 	// note that these variables are in microsecond, while user defines max latency in millisecond
+#if !POLARDB_PROXY
 	unsigned int current_latency_us;
+#endif // POLARDB_PROXY
+	unsigned int current_latency_us_value() const {
+#if POLARDB_PROXY
+		return current_latency_us.load(std::memory_order_relaxed);
+#else
+		return current_latency_us;
+#endif // POLARDB_PROXY
+	}
+	void set_current_latency_us_value(unsigned int value) {
+#if POLARDB_PROXY
+		current_latency_us.store(value, std::memory_order_relaxed);
+#else
+		current_latency_us = value;
+#endif // POLARDB_PROXY
+	}
 	unsigned int max_latency_us;
 	time_t time_last_detected_error;
 	unsigned int connect_ERR_at_time_last_detected_error;
@@ -312,6 +333,7 @@ class PgSQL_SrvC {	// MySQL Server Container
 	PgSQL_Connection* take_matching_connection(const PgSQL_PoolMatchKey& key);
 	PgSQL_PoolGetResult take_existing_connection(PgSQL_Session* sess,
 		const PgSQL_PoolMatchKey& key, PgSQL_PoolGetMode mode,
+		unsigned int selected_max_connections = 0,
 		unsigned long long* lock_wait_us = nullptr,
 		unsigned long long* lock_hold_us = nullptr);
 	bool add_matching_connection(PgSQL_Connection* conn,
@@ -335,6 +357,7 @@ class PgSQL_SrvC {	// MySQL Server Container
 		return pool_used_count.load(std::memory_order_relaxed);
 	}
 	alignas(64) std::atomic<int> polardb_fast_status{0};
+	std::atomic<unsigned int> current_latency_us{0};
 
 	// =========================================================================
 	// PolarDB per-server LSN tracking (read-your-writes consistency)
@@ -476,9 +499,10 @@ class PgSQL_HGC: public BaseHGC<PgSQL_HGC> {
 		std::string polardb_writer_identity; // sorted non-OFFLINE_HARD address:port set
 		bool polardb_writer_identity_initialized{false};
 	} repl_config;
-	// Shared through the immutable server-list snapshot. Selection state is
-	// hostgroup-global, never worker-local and never derived from pool contents.
-	std::shared_ptr<std::atomic<uint64_t>> polardb_reader_selection_sequence{
+	// Shared through the immutable server-list snapshot. Each worker uses this
+	// once per server-list generation to start at a different weighted position,
+	// then advances its own per-hostgroup sequence without shared writes.
+	std::shared_ptr<std::atomic<uint64_t>> polardb_reader_selection_start{
 		std::make_shared<std::atomic<uint64_t>>(0)
 	};
 #endif // POLARDB_PROXY
@@ -895,7 +919,7 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 		std::atomic<unsigned long long> polardb_client_rfq_lsn_raised_to_target{0}; // client RFQ LSN raised to a confirmed session/wait target
 		std::atomic<unsigned long long> polardb_client_rfq_lsn_raised_by_writer{0}; // client RFQ LSN raised because response used the writer
 		std::atomic<unsigned long long> polardb_client_rfq_lsn_raised_by_wait{0}; // client RFQ LSN raised because an LSN wait completed
-		std::atomic<unsigned long long> polardb_primary_lsn_unknown{0};      // PRIMARY baseline requested but writer mirror had no LSN
+		std::atomic<unsigned long long> polardb_primary_lsn_unknown{0};      // GLOBAL_LSN had no shared group-LSN observation
 		std::atomic<unsigned long long> polardb_rfq_best_effort_degraded_routes{0}; // RFQ-unavailable reads sent to reader without wait
 		std::atomic<unsigned long long> polardb_consistency_writer_fallback{0}; // consistency reads redirected to writer after reader selection failed
 		std::atomic<unsigned long long> polardb_lag_cap_freshness_clamped{0}; // byte-lag cap reduced the allowed age of a cached reader LSN
@@ -922,7 +946,6 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 		std::atomic<unsigned long long> polardb_rfq_profile_evicted{0};      // incompatible free pooled backends evicted to create RFQ-LSN-capable replacements
 		std::atomic<unsigned long long> polardb_target_lsn_preferred{0};     // reader choice narrowed to fresh cached LSN >= target
 		std::atomic<unsigned long long> polardb_target_lsn_fallback_wait{0}; // no target-reached reader acquired; wrapper remains correctness check
-		std::atomic<unsigned long long> polardb_reader_node_limit{0};        // reader nodes skipped after the fixed candidate limit
 		std::atomic<unsigned long long> polardb_reader_pool_hit{0};          // reads that got a connection from the reader pool
 		std::atomic<unsigned long long> polardb_reader_pool_miss_empty{0};   // reader-pool lookups with no usable pooled reader
 		std::atomic<unsigned long long> polardb_reader_pool_return_to_core{0}; // reusable reader connections returned to the core FREE list
@@ -930,8 +953,6 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 		std::atomic<unsigned long long> polardb_reader_pool_p2c_second{0}; // P2C selected the second sampled reader
 		std::atomic<unsigned long long> polardb_reader_pool_p2c_active_load{0}; // P2C selected by lower global active load
 		std::atomic<unsigned long long> polardb_reader_pool_p2c_random{0}; // P2C selected by random tie-break
-		std::atomic<unsigned long long> polardb_pool_capacity_active_block{0}; // server rejected because active capacity reached max_connections
-		std::atomic<unsigned long long> polardb_pool_capacity_total_block{0}; // server rejected because total sockets reached max_connections
 		std::atomic<unsigned long long> polardb_reader_pool_drop_offline{0}; // reader-pool readers dropped because server is offline
 		std::atomic<unsigned long long> polardb_reader_pool_drop_unusable{0}; // reader-pool readers dropped because no longer reusable
 		std::atomic<unsigned long long> polardb_reader_pool_drop_client_identity{0}; // reader-pool readers closed because CLIENT startup identity cannot be shared
@@ -1226,6 +1247,8 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 		std::atomic<unsigned long long> polardb_reader_pool_shared_take_attempt{0};
 		std::atomic<unsigned long long> polardb_reader_pool_shared_take_hit{0};
 		std::atomic<unsigned long long> polardb_reader_pool_shared_take_miss{0};
+		std::atomic<unsigned long long> polardb_reader_pool_confirmed_saturated{0};
+		std::atomic<unsigned long long> polardb_reader_pool_hgm_create_lock_entry{0};
 		std::atomic<unsigned long long> polardb_reader_pool_shared_return_attempt{0};
 		std::atomic<unsigned long long> polardb_reader_pool_shared_return_accepted{0};
 		std::atomic<unsigned long long> polardb_reader_pool_shared_return_rejected{0};
@@ -1457,7 +1480,8 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 	PgSQL_PoolGetResult get_connection_from_selected_server(
 		PgSQL_SrvC* srv, unsigned int expected_hostgroup_id,
 		const PgSQL_PoolMatchKey& match_key,
-		PgSQL_Session* sess, PgSQL_PoolGetMode mode);
+		PgSQL_Session* sess, PgSQL_PoolGetMode mode,
+		unsigned int selected_max_connections = 0);
 #endif // POLARDB_PROXY
 
 	void drop_all_idle_connections();
@@ -1467,7 +1491,14 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 
 	void push_MyConn_to_pool(PgSQL_Connection *, bool _lock=true);
 	void push_MyConn_to_pool_array(PgSQL_Connection **, unsigned int);
-	bool return_connection_with_match_key(PgSQL_Connection* conn);
+	bool return_connection_with_match_key(PgSQL_Connection* conn,
+		const PgSQL_PoolMatchKey* known_match_key = nullptr,
+		PgSQL_Connection** detached_connection = nullptr);
+#if POLARDB_PROXY
+	void return_polardb_reader_connections(
+		const std::vector<PgSQL_Connection*>& connections,
+		std::vector<PgSQL_Connection*>& detached_connections);
+#endif // POLARDB_PROXY
 #if POLARDB_PROXY
 	PolarDB_ReaderLocalReturn polardb_reader_local_return_decision(
 		PgSQL_Connection* conn);
@@ -1555,9 +1586,16 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 		std::unordered_map<unsigned int, PolarDB_HG_Config> by_hostgroup;
 	};
 
+	struct PolarDB_ServerSnapshotEntry {
+		PgSQL_SrvC* srv{nullptr};
+		int64_t weight{0};
+		int64_t max_connections{0};
+		unsigned int max_latency_us{0};
+	};
+
 	struct PolarDB_ServerListEntry {
-		std::vector<PgSQL_SrvC*> servers;
-		std::shared_ptr<std::atomic<uint64_t>> selection_sequence;
+		std::vector<PolarDB_ServerSnapshotEntry> servers;
+		std::shared_ptr<std::atomic<uint64_t>> selection_start;
 	};
 
 	struct PolarDB_ServerListSnapshot {
@@ -1684,6 +1722,7 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 	 */
 	void warm_split_pools();
 	void refresh_split_warmup_variables();
+	void refresh_polardb_thread_snapshots();
 	void shutdown_split_warmup_thread();
 #endif // POLARDB_PROXY
 

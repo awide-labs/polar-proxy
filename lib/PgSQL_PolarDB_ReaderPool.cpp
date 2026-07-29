@@ -293,7 +293,7 @@ static void polardb_trace_split_warmup_target_declined(
 		mysrvc ? mysrvc->port : 0,
 		mysrvc ? static_cast<int>(mysrvc->status) : -1,
 		mysrvc ? mysrvc->weight : 0,
-		mysrvc ? mysrvc->current_latency_us : 0,
+		mysrvc ? mysrvc->current_latency_us_value() : 0,
 		mysrvc ? pgsql_srv_latency_limit_us(mysrvc) : 0,
 		(mysrvc && mysrvc->ConnectionsUsed)
 			? mysrvc->ConnectionsUsed->conns_length() : 0,
@@ -447,6 +447,7 @@ void PgSQL_PolarDB_ReaderPool::split_warmup_thread_run() {
 			break;
 		}
 		lk.unlock();
+		hgm_->refresh_polardb_thread_snapshots();
 		refresh_split_warmup_variables();
 		warm_split_pools();
 	}
@@ -1860,6 +1861,7 @@ struct PolarDB_ReaderNode {
 	PgSQL_SrvC* srv;
 	uint64_t lsn;
 	unsigned int weight;
+	unsigned int max_connections;
 	unsigned int active_count;
 	bool target_reached;
 };
@@ -1868,20 +1870,25 @@ static bool polardb_reader_pool_use_p2c(unsigned int num_nodes) {
 	return num_nodes > 1;
 }
 
-static bool polardb_reader_pool_server_ok(PgSQL_SrvC* srv) {
+static bool polardb_reader_pool_server_ok(
+		const PgSQL_HostGroups_Manager::PolarDB_ServerSnapshotEntry& entry) {
+	PgSQL_SrvC* srv = entry.srv;
 	return srv &&
 		srv->polardb_fast_status_value() == MYSQL_SERVER_STATUS_ONLINE &&
-		srv->weight > 0 &&
-		pgsql_srv_latency_allowed(srv) &&
-		srv->max_connections > 0;
+		entry.weight > 0 &&
+		pgsql_srv_latency_allowed(
+			srv->current_latency_us_value(), entry.max_latency_us) &&
+		entry.max_connections > 0;
 }
 
-static PgSQL_Connection* polardb_reader_pool_get_from_server(
+static PgSQL_PoolGetResult polardb_reader_pool_get_from_server(
 		PgSQL_HostGroups_Manager* hgm, PgSQL_Thread* thread,
 		PgSQL_SrvC* srv, PgSQL_Session* sess,
-		const PolarDB_PoolRequest& pool_request) {
+		const PolarDB_PoolRequest& pool_request,
+		unsigned int selected_max_connections) {
+	PgSQL_PoolGetResult result;
 	if (!hgm || !srv || !srv->myhgc) {
-		return nullptr;
+		return result;
 	}
 	const PolarDB_PoolRequest server_request =
 		polardb_pool_request_for_server(pool_request, srv);
@@ -1911,7 +1918,9 @@ static PgSQL_Connection* polardb_reader_pool_get_from_server(
 			PolarDB_ReaderPoolRejectReason::NONE;
 		if (polardb_reader_pool_conn_usable(
 				local_conn, sess, server_request, &reject_reason)) {
-			return local_conn;
+			result.conn = local_conn;
+			result.source = PgSQL_PoolGetSource::EXACT_MATCH;
+			return result;
 		}
 		polardb_count_reader_pool_reject(thread, reject_reason);
 		POLARDB_THREAD_COUNT_ONE(thread, reader_pool_drop_unusable);
@@ -1926,10 +1935,13 @@ static PgSQL_Connection* polardb_reader_pool_get_from_server(
 			attempt < POLARDB_READER_POOL_SERVER_POP_SCAN_LIMIT; attempt++) {
 		PgSQL_PoolGetResult got =
 			hgm->get_connection_from_selected_server(
-				srv, srv->myhgc->hid, match_key, sess, mode);
+				srv, srv->myhgc->hid, match_key, sess, mode,
+				pool_request.only_pooled ? 0 : selected_max_connections);
 		PgSQL_Connection* conn = got.conn;
 		if (!conn) {
-			break;
+			result.server_saturated = got.server_saturated;
+			POLARDB_THREAD_COUNT_ONE(thread, reader_pool_match_miss);
+			return result;
 		}
 		POLARDB_THREAD_COUNT_ONE(thread, reader_pool_conn_examined);
 		if (got.source == PgSQL_PoolGetSource::EXACT_MATCH) {
@@ -1944,7 +1956,7 @@ static PgSQL_Connection* polardb_reader_pool_get_from_server(
 					(void*)srv, srv->address ? srv->address : "(null)",
 					srv->port, (void*)conn);
 #endif // POLARDB_DEBUG
-				return conn;
+				return got;
 			}
 			polardb_count_reader_pool_reject(thread, reject_reason);
 			POLARDB_THREAD_COUNT_ONE(thread, reader_pool_drop_unusable);
@@ -1961,7 +1973,7 @@ static PgSQL_Connection* polardb_reader_pool_get_from_server(
 						PolarDB_PoolReuseState::NEEDS_VARIABLE_UPDATE;
 			}
 			if (acceptable) {
-				return conn;
+				return got;
 			}
 			polardb_count_reader_pool_reject(
 				thread,
@@ -1972,18 +1984,21 @@ static PgSQL_Connection* polardb_reader_pool_get_from_server(
 		delete conn;
 	}
 	POLARDB_THREAD_COUNT_ONE(thread, reader_pool_match_miss);
-	return nullptr;
+	return result;
 }
 
 static int polardb_reader_pool_pick_weighted_node(
 		PolarDB_ReaderNode* nodes, unsigned int num_nodes,
-		unsigned int weight_sum) {
+		uint64_t weight_sum) {
 	if (!nodes || num_nodes == 0 || weight_sum == 0) {
 		return -1;
 	}
-	unsigned int k = rand_fast() % weight_sum;
+	const uint64_t random_value =
+		(static_cast<uint64_t>(rand_fast()) << 32) |
+		static_cast<uint64_t>(rand_fast());
+	uint64_t k = random_value % weight_sum;
 	k++;
-	unsigned int running_sum = 0;
+	uint64_t running_sum = 0;
 	for (unsigned int j = 0; j < num_nodes; j++) {
 		running_sum += nodes[j].weight;
 		if (k <= running_sum) {
@@ -2013,25 +2028,30 @@ static bool polardb_reader_pool_node_better(
 static PolarDB_ReaderResult polardb_get_conn_from_reader_nodes(
 		PgSQL_HostGroups_Manager* hgm,
 		PolarDB_ReaderNode* nodes, unsigned int num_nodes,
-		unsigned int weight_sum, PgSQL_Session* sess,
-		const PolarDB_PoolRequest& pool_request) {
+		uint64_t weight_sum, PgSQL_Session* sess,
+		const PolarDB_PoolRequest& pool_request,
+		bool pair_preselected) {
 	PolarDB_ReaderResult result;
 	if (num_nodes == 0 || weight_sum == 0) {
 		return result;
 	}
 
 	PgSQL_Thread* thread = sess ? sess->thread : NULL;
-	int first_idx = polardb_reader_pool_pick_weighted_node(
-		nodes, num_nodes, weight_sum);
-	int second_idx = -1;
+	const bool compare_preselected_pair = pair_preselected && num_nodes == 2;
+	int first_idx = compare_preselected_pair ? 0 :
+		polardb_reader_pool_pick_weighted_node(nodes, num_nodes, weight_sum);
+	int second_idx = compare_preselected_pair ? 1 : -1;
 	int selected_idx = first_idx;
-	const bool use_p2c = polardb_reader_pool_use_p2c(num_nodes);
+	const bool use_p2c = compare_preselected_pair ||
+		polardb_reader_pool_use_p2c(num_nodes);
 	if (use_p2c && num_nodes > 1 && first_idx >= 0) {
-		second_idx = polardb_reader_pool_pick_weighted_node(
-			nodes, num_nodes, weight_sum);
-		if (second_idx == first_idx) {
-			second_idx = (first_idx + 1 +
-				(int)(rand_fast() % (num_nodes - 1))) % (int)num_nodes;
+		if (!compare_preselected_pair) {
+			second_idx = polardb_reader_pool_pick_weighted_node(
+				nodes, num_nodes, weight_sum);
+			if (second_idx == first_idx) {
+				second_idx = (first_idx + 1 +
+					(int)(rand_fast() % (num_nodes - 1))) % (int)num_nodes;
+			}
 		}
 		POLARDB_THREAD_COUNT_ONE(thread, reader_pool_p2c_select);
 		if (polardb_reader_pool_node_better(
@@ -2046,12 +2066,17 @@ static PolarDB_ReaderResult polardb_get_conn_from_reader_nodes(
 		// eligible server with an exact shared-pool match remains usable.
 		result.srv = nodes[selected_idx].srv;
 		auto try_node = [&](int idx) {
-			PgSQL_Connection* conn = polardb_reader_pool_get_from_server(
-				hgm, thread, nodes[idx].srv, sess, pool_request);
-			if (!conn) {
+			PgSQL_PoolGetResult acquired =
+				polardb_reader_pool_get_from_server(
+					hgm, thread, nodes[idx].srv, sess, pool_request,
+					nodes[idx].max_connections);
+			if (!acquired.conn) {
+				if (!pool_request.only_pooled) {
+					result.server_saturated = acquired.server_saturated;
+				}
 				return false;
 			}
-			result.conn = conn;
+			result.conn = acquired.conn;
 			result.srv = nodes[idx].srv;
 			result.status = PolarDB_ReaderStatus::ACQUIRED;
 			return true;
@@ -2156,8 +2181,9 @@ static PolarDB_ReaderResult polardb_try_reader_pool_fast(
 	};
 
 	/*
-	 * Selection reads the current topology plus global status, LSN, weight and
-	 * active count. Ordinary reads never let pool contents change that choice.
+	 * Selection reads the current topology plus global status, LSN and weight.
+	 * Multi-reader load comparison also reads the active count. Ordinary reads
+	 * never let pool contents change that choice.
 	 * A pooled-only read may try another otherwise eligible server after the
 	 * first server has no exact shared-pool match, because it cannot create or
 	 * reset a connection.
@@ -2181,24 +2207,35 @@ static PolarDB_ReaderResult polardb_try_reader_pool_fast(
 	PolarDB_ReaderNode* nodes = nodes_static;
 	unsigned int num_nodes = 0;
 	unsigned int num_ready_nodes = 0;
-	unsigned int weight_sum = 0;
-	unsigned int ready_weight_sum = 0;
-	const std::vector<PgSQL_SrvC*>& servers = hg_it->second.servers;
-	std::atomic<uint64_t>* selection_sequence =
-		hg_it->second.selection_sequence.get();
+	uint64_t weight_sum = 0;
+	uint64_t ready_weight_sum = 0;
+	const std::vector<
+		PgSQL_HostGroups_Manager::PolarDB_ServerSnapshotEntry>& servers =
+		hg_it->second.servers;
+	std::atomic<uint64_t>* selection_start =
+		hg_it->second.selection_start.get();
 	const unsigned int num_servers = servers.size();
+	static thread_local std::vector<PolarDB_ReaderNode> nodes_dynamic;
+	if (num_servers > POLARDB_READER_NODE_STACK_CAP) {
+		nodes_dynamic.resize(num_servers);
+		nodes = nodes_dynamic.data();
+	}
 
-	// The common two-replica topology uses global weighted alternation.
+	// Equal weights use worker-local alternation. Unequal weights keep one
+	// shared sequence so the configured ratio stays smooth across workers.
 	// A healthy match normally examines one server. The peer is examined only
 	// for LSN preference, an unusable first choice, or a pooled-only exact miss.
-	if (num_servers == 2 && selection_sequence) {
-		const uint64_t weight0 = servers[0] && servers[0]->weight > 0
-			? static_cast<uint64_t>(servers[0]->weight) : 0;
-		const uint64_t weight1 = servers[1] && servers[1]->weight > 0
-			? static_cast<uint64_t>(servers[1]->weight) : 0;
+	if (num_servers == 2 && selection_start) {
+		const uint64_t weight0 = servers[0].weight > 0
+			? static_cast<uint64_t>(servers[0].weight) : 0;
+		const uint64_t weight1 = servers[1].weight > 0
+			? static_cast<uint64_t>(servers[1].weight) : 0;
 		const uint64_t weight_sum64 = weight0 + weight1;
-		const uint64_t sequence = selection_sequence->fetch_add(
-			1, std::memory_order_relaxed);
+		const bool equal_weights = weight0 == weight1;
+		const uint64_t sequence = thread && equal_weights
+			? thread->next_polardb_reader_selection_sequence(
+				hostgroup_id, server_snapshot->generation, selection_start)
+			: selection_start->fetch_add(1, std::memory_order_relaxed);
 		unsigned int first_idx = sequence & 1U;
 		if (weight_sum64 != 0) {
 			const uint64_t slot = sequence % weight_sum64;
@@ -2210,9 +2247,12 @@ static PolarDB_ReaderResult polardb_try_reader_pool_fast(
 		}
 		const unsigned int second_idx = 1 - first_idx;
 
-		auto evaluate = [&](PgSQL_SrvC* srv, PolarDB_ReaderNode* node) {
+		auto evaluate = [&](const PgSQL_HostGroups_Manager::
+				PolarDB_ServerSnapshotEntry& entry,
+				PolarDB_ReaderNode* node) {
+			PgSQL_SrvC* srv = entry.srv;
 			POLARDB_THREAD_COUNT_ONE(thread, reader_pool_server_considered);
-			if (!polardb_reader_pool_server_ok(srv) ||
+			if (!polardb_reader_pool_server_ok(entry) ||
 					(exclude_address && exclude_address[0] && exclude_port >= 0 &&
 					 srv->address && strcmp(srv->address, exclude_address) == 0 &&
 					 (int)srv->port == exclude_port)) {
@@ -2220,7 +2260,6 @@ static PolarDB_ReaderResult polardb_try_reader_pool_fast(
 					reader_pool_server_skip_unusable);
 				return false;
 			}
-			const unsigned int active = srv->pool_used_count_value();
 			uint64_t reader_lsn = 0;
 			bool reader_lsn_fresh = false;
 			if (has_wait_target || lag_cap_enabled) {
@@ -2234,8 +2273,8 @@ static PolarDB_ReaderResult polardb_try_reader_pool_fast(
 				return false;
 			}
 			*node = PolarDB_ReaderNode{
-				srv, reader_lsn, static_cast<unsigned int>(srv->weight),
-				active,
+				srv, reader_lsn, static_cast<unsigned int>(entry.weight),
+				static_cast<unsigned int>(entry.max_connections), 0,
 				reader_lsn_fresh && has_wait_target &&
 					reader_lsn >= wait_spec.target};
 			return true;
@@ -2259,12 +2298,17 @@ static PolarDB_ReaderResult polardb_try_reader_pool_fast(
 			if (!node) {
 				return false;
 			}
-			PgSQL_Connection* conn = polardb_reader_pool_get_from_server(
-				hgm, thread, node->srv, sess, pool_request);
-			if (!conn) {
+			PgSQL_PoolGetResult acquired =
+				polardb_reader_pool_get_from_server(
+					hgm, thread, node->srv, sess, pool_request,
+					node->max_connections);
+			if (!acquired.conn) {
+				if (!only_pooled) {
+					result.server_saturated = acquired.server_saturated;
+				}
 				return false;
 			}
-			result.conn = conn;
+			result.conn = acquired.conn;
 			result.srv = node->srv;
 			result.status = PolarDB_ReaderStatus::ACQUIRED;
 			result.wait_bypass_allowed = node->target_reached;
@@ -2297,7 +2341,9 @@ static PolarDB_ReaderResult polardb_try_reader_pool_fast(
 		result.srv = preferred ? preferred->srv : nullptr;
 		result.status = result.srv
 			? (only_pooled ? PolarDB_ReaderStatus::RFQ_UNAVAILABLE
-				: PolarDB_ReaderStatus::READER_UNAVAILABLE)
+				: (result.server_saturated
+					? PolarDB_ReaderStatus::READER_BUSY
+					: PolarDB_ReaderStatus::READER_UNAVAILABLE))
 			: filter_status;
 		POLARDB_THREAD_COUNT_ONE(thread, reader_pool_miss_empty);
 		return result;
@@ -2306,42 +2352,50 @@ static PolarDB_ReaderResult polardb_try_reader_pool_fast(
 	bool sampled_pair = false;
 	// P2C compares two readers. Equal-weight ordinary reads can sample that
 	// pair directly; any unusable sample returns to the complete scan below.
-	if (num_servers > 2 && num_servers <= POLARDB_READER_NODE_STACK_CAP &&
+	if (num_servers > 2 &&
 			!has_wait_target && !lag_cap_enabled &&
 			!only_pooled &&
 			(!exclude_address || !exclude_address[0] || exclude_port < 0)) {
-		const unsigned int common_weight = servers[0]
-			? static_cast<unsigned int>(servers[0]->weight) : 0;
+		const unsigned int common_weight = servers[0].weight > 0
+			? static_cast<unsigned int>(servers[0].weight) : 0;
 		bool equal_positive_weights = common_weight > 0;
 		for (unsigned int n = 1; equal_positive_weights && n < num_servers; n++) {
-			equal_positive_weights = servers[n] &&
-				static_cast<unsigned int>(servers[n]->weight) == common_weight;
+			equal_positive_weights = servers[n].weight > 0 &&
+				static_cast<unsigned int>(servers[n].weight) == common_weight;
 		}
 		if (equal_positive_weights) {
 			const unsigned int first_idx = rand_fast() % num_servers;
 			const unsigned int second_idx =
 				(first_idx + 1 + rand_fast() % (num_servers - 1)) % num_servers;
-			PgSQL_SrvC* first = servers[first_idx];
-			PgSQL_SrvC* second = servers[second_idx];
-			if (polardb_reader_pool_server_ok(first) &&
-					polardb_reader_pool_server_ok(second)) {
+			const auto& first_entry = servers[first_idx];
+			const auto& second_entry = servers[second_idx];
+			PgSQL_SrvC* first = first_entry.srv;
+			PgSQL_SrvC* second = second_entry.srv;
+			if (polardb_reader_pool_server_ok(first_entry) &&
+					polardb_reader_pool_server_ok(second_entry)) {
 				POLARDB_THREAD_COUNT(thread, reader_pool_server_considered, 2);
 				nodes[0] = PolarDB_ReaderNode{
-					first, 0, common_weight, first->pool_used_count_value(), false};
+					first, 0, common_weight,
+					static_cast<unsigned int>(first_entry.max_connections),
+					first->pool_used_count_value(), false};
 				nodes[1] = PolarDB_ReaderNode{
-					second, 0, common_weight, second->pool_used_count_value(), false};
+					second, 0, common_weight,
+					static_cast<unsigned int>(second_entry.max_connections),
+					second->pool_used_count_value(), false};
 				num_nodes = 2;
-				weight_sum = common_weight * 2;
+				weight_sum = static_cast<uint64_t>(common_weight) * 2;
 				sampled_pair = true;
 			}
 		}
 	}
 
-	const unsigned int start = num_servers > 1 ? rand_fast() % num_servers : 0;
+	const unsigned int start = !sampled_pair && num_servers > 1
+		? rand_fast() % num_servers : 0;
 	for (unsigned int n = 0; !sampled_pair && n < num_servers; n++) {
-		PgSQL_SrvC* srv = servers[(start + n) % num_servers];
+		const auto& server_entry = servers[(start + n) % num_servers];
+		PgSQL_SrvC* srv = server_entry.srv;
 		POLARDB_THREAD_COUNT_ONE(thread, reader_pool_server_considered);
-		if (!polardb_reader_pool_server_ok(srv)) {
+		if (!polardb_reader_pool_server_ok(server_entry)) {
 			POLARDB_THREAD_COUNT_ONE(thread,
 				reader_pool_server_skip_unusable);
 			continue;
@@ -2371,29 +2425,27 @@ static PolarDB_ReaderResult polardb_try_reader_pool_fast(
 		const bool reader_lsn_reaches_target =
 			reader_lsn_fresh && has_wait_target &&
 			reader_lsn >= wait_spec.target;
-		if (num_nodes >= POLARDB_READER_NODE_STACK_CAP) {
-			POLARDB_THREAD_COUNT_ONE(thread, reader_node_limit);
-			continue;
-		}
-			nodes[num_nodes] = PolarDB_ReaderNode{
+		nodes[num_nodes] = PolarDB_ReaderNode{
 			srv,
 			reader_lsn,
-			static_cast<unsigned int>(srv->weight),
+			static_cast<unsigned int>(server_entry.weight),
+			static_cast<unsigned int>(server_entry.max_connections),
 			active,
 			reader_lsn_reaches_target};
 		num_nodes++;
-		weight_sum += static_cast<unsigned int>(srv->weight);
+		weight_sum += static_cast<unsigned int>(server_entry.weight);
 		if (reader_lsn_reaches_target) {
 			std::swap(nodes[num_ready_nodes], nodes[num_nodes - 1]);
 			num_ready_nodes++;
-			ready_weight_sum += static_cast<unsigned int>(srv->weight);
+			ready_weight_sum += static_cast<unsigned int>(server_entry.weight);
 		}
 	}
 	result.status = filter_status;
 	bool fallback_to_wait_set = false;
 	if (has_wait_target && num_ready_nodes > 0 && ready_weight_sum > 0) {
 		PolarDB_ReaderResult preferred_result = polardb_get_conn_from_reader_nodes(
-			hgm, nodes, num_ready_nodes, ready_weight_sum, sess, pool_request);
+			hgm, nodes, num_ready_nodes, ready_weight_sum, sess, pool_request,
+			false);
 		if (preferred_result.acquired()) {
 			result = preferred_result;
 			result.selected_server_snapshot = server_snapshot;
@@ -2401,6 +2453,7 @@ static PolarDB_ReaderResult polardb_try_reader_pool_fast(
 			POLARDB_THREAD_COUNT_ONE(thread, target_lsn_preferred);
 		} else if (!result.srv) {
 			result.srv = preferred_result.srv;
+			result.server_saturated = preferred_result.server_saturated;
 		}
 	}
 	if (!result.acquired()) {
@@ -2408,7 +2461,7 @@ static PolarDB_ReaderResult polardb_try_reader_pool_fast(
 			has_wait_target && num_ready_nodes > 0;
 		unsigned int fallback_nodes =
 			preferred_attempted ? num_nodes - num_ready_nodes : num_nodes;
-		unsigned int fallback_weight_sum =
+		uint64_t fallback_weight_sum =
 			preferred_attempted ? weight_sum - ready_weight_sum : weight_sum;
 		PolarDB_ReaderNode* fallback_set =
 			preferred_attempted ? nodes + num_ready_nodes : nodes;
@@ -2417,7 +2470,7 @@ static PolarDB_ReaderResult polardb_try_reader_pool_fast(
 		PolarDB_ReaderResult fallback_result =
 			polardb_get_conn_from_reader_nodes(
 				hgm, fallback_set, fallback_nodes, fallback_weight_sum, sess,
-				pool_request);
+				pool_request, sampled_pair);
 		if (fallback_result.acquired()) {
 			result = fallback_result;
 			result.selected_server_snapshot = server_snapshot;
@@ -2427,6 +2480,7 @@ static PolarDB_ReaderResult polardb_try_reader_pool_fast(
 			}
 		} else if (!result.srv) {
 			result.srv = fallback_result.srv;
+			result.server_saturated = fallback_result.server_saturated;
 		}
 	}
 
@@ -2440,7 +2494,9 @@ static PolarDB_ReaderResult polardb_try_reader_pool_fast(
 	if (num_nodes > 0) {
 		result.status = only_pooled
 			? PolarDB_ReaderStatus::RFQ_UNAVAILABLE
-			: PolarDB_ReaderStatus::READER_UNAVAILABLE;
+			: (result.server_saturated
+				? PolarDB_ReaderStatus::READER_BUSY
+				: PolarDB_ReaderStatus::READER_UNAVAILABLE);
 	}
 	POLARDB_THREAD_COUNT_ONE(thread, reader_pool_miss_empty);
 	return result;
@@ -2459,6 +2515,11 @@ PolarDB_ReaderResult PgSQL_PolarDB_ReaderPool::get_MyConn_polardb_reader(
 	if (result.acquired()) {
 		result.conn->polardb_selected_server_snapshot =
 			result.selected_server_snapshot;
+	}
+	if (result.status == PolarDB_ReaderStatus::READER_BUSY) {
+		pgsql_pool_status_count_get(sess ? sess->thread : nullptr,
+			&hgm_->status.pgconnpoll_get);
+		return result;
 	}
 	if (result.acquired() ||
 			result.status == PolarDB_ReaderStatus::RFQ_UNAVAILABLE ||

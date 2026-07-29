@@ -510,17 +510,6 @@ static inline bool polardb_reader_status_split_warmup_can_help(
 	}
 }
 
-/**
- * @brief Initial SESSION_LSN target source for a first read-only session.
- *
- * Values match the hot-path integer mapping for
- * pgsql-polardb_session_lsn_baseline.
- */
-enum class PolarDB_SessionLsnBaseline : uint8_t {
-    OBSERVED = 1,        // Use only positions observed by this client session
-    PRIMARY = 2          // Seed first read target from the writer mirror
-};
-
 /// @brief Map a configured int to PolarDB_RfqRoutePolicy; anything not
 /// BEST_EFFORT is treated as STRICT, the safe default that routes to
 /// the writer when no RFQ wait target can be enforced.
@@ -528,14 +517,6 @@ static inline PolarDB_RfqRoutePolicy polardb_rfq_route_policy_from_int(int v) {
     return v == static_cast<int>(PolarDB_RfqRoutePolicy::BEST_EFFORT)
         ? PolarDB_RfqRoutePolicy::BEST_EFFORT
         : PolarDB_RfqRoutePolicy::STRICT;
-}
-
-/// @brief Map a configured int to PolarDB_SessionLsnBaseline; anything not
-/// PRIMARY is treated as OBSERVED (the session-only default).
-static inline PolarDB_SessionLsnBaseline polardb_session_lsn_baseline_from_int(int v) {
-    return v == static_cast<int>(PolarDB_SessionLsnBaseline::PRIMARY)
-        ? PolarDB_SessionLsnBaseline::PRIMARY
-        : PolarDB_SessionLsnBaseline::OBSERVED;
 }
 
 // Bits that say which extra payloads ProxySQL asks the PolarDB backend to append
@@ -1418,24 +1399,6 @@ static inline int polardb_route_rfq_policy_from_string(
     return default_value;
 }
 
-/// @brief Map a config string ("primary"/"observed") to the baseline int.
-/// A null or unknown value returns @p default_value (OBSERVED, the
-/// session-only default).
-static inline int polardb_session_lsn_baseline_from_string(
-    const char* value,
-    int default_value = static_cast<int>(PolarDB_SessionLsnBaseline::OBSERVED)) {
-    if (!value) {
-        return default_value;
-    }
-    if (strcasecmp(value, "primary") == 0) {
-        return static_cast<int>(PolarDB_SessionLsnBaseline::PRIMARY);
-    }
-    if (strcasecmp(value, "observed") == 0) {
-        return static_cast<int>(PolarDB_SessionLsnBaseline::OBSERVED);
-    }
-    return default_value;
-}
-
 /**
  * @brief Consistency-policy routing suggestion for one query.
  *
@@ -1578,53 +1541,19 @@ struct PolarDB_SessionConsistency {
             observed_unknown;
     }
 
+    // A new session has no target. Its first reader RFQ establishes
+    // observed_lsn, after which every SESSION_LSN read is monotonic.
     uint64_t target() const {
         return write_lsn > observed_lsn ? write_lsn : observed_lsn;
     }
 
     /**
-     * @brief SESSION_LSN target after applying the first-read baseline.
-     *
-     * OBSERVED preserves the session-only target. PRIMARY only takes effect for
-     * a first read-only session with no known write or observed LSN. The caller
-     * supplies the current primary mirror; this method does not read or mutate
-     * external state.
-     */
-    uint64_t target_with_baseline(
-        int session_lsn_baseline,
-        uint64_t primary_lsn,
-        bool* primary_lsn_unknown) const {
-        if (primary_lsn_unknown) {
-            *primary_lsn_unknown = false;
-        }
-
-        uint64_t current = target();
-        if (current > 0) {
-            return current;
-        }
-
-        if (polardb_session_lsn_baseline_from_int(session_lsn_baseline) !=
-            PolarDB_SessionLsnBaseline::PRIMARY) {
-            return 0;
-        }
-
-        if (primary_lsn == 0) {
-            if (primary_lsn_unknown) {
-                *primary_lsn_unknown = true;
-            }
-            return 0;
-        }
-
-        return primary_lsn;
-    }
-
-    /**
      * @brief GLOBAL_LSN target for a committed-state read.
      *
-     * The caller must provide the current writer-scope primary LSN mirror. A
-     * missing mirror is unknown rather than "no wait": global consistency cannot
-     * be confirmed without a writer target. When present, wait on the max of this
-     * session's own monotonic target and the writer mirror.
+     * The caller must provide the current writer-scope group LSN observation. A
+     * missing observation is unknown rather than "no wait": global consistency
+     * cannot be confirmed without a shared target. When present, wait on the max
+     * of this session's own monotonic target and the group observation.
      */
     uint64_t target_with_global_lsn(
         uint64_t primary_lsn,
@@ -2444,7 +2373,6 @@ struct PolarDB_Query_RouteCtx {
     int effective_consistency_mode = 0;    // resolved once: session > HG > global
     int wait_timeout_mode = (int)PolarDB_WaitMode::BEST_EFFORT; // BEST_EFFORT / STRICT
     int route_rfq_policy = (int)PolarDB_RfqRoutePolicy::STRICT; // BEST_EFFORT / STRICT
-    int session_lsn_baseline = (int)PolarDB_SessionLsnBaseline::OBSERVED; // OBSERVED / PRIMARY
     int max_lag_bytes = -1;                // from HG policy, -1 = use thread default
 
     // --- bool fields (packed) ---
@@ -2572,6 +2500,7 @@ struct PolarDB_ReaderResult {
     PolarDB_ReaderStatus status =
         PolarDB_ReaderStatus::READER_UNAVAILABLE;
     bool wait_bypass_allowed = false;  // selected reader already reached consistency target
+    bool server_saturated = false;     // selected snapshot had no free or open capacity
 
     /// @brief True only when a usable reader connection was obtained.
     bool acquired() const {
@@ -2605,7 +2534,7 @@ struct PolarDB_Query_RoutePlan {
         HINT_PRIMARY,          // /* route=primary */ per-query hint
         WRITE_LSN_UNKNOWN,     // a prior write completed but RFQ carried no LSN
         OBSERVED_LSN_UNKNOWN,  // a prior tracked read completed but RFQ carried no LSN
-        PRIMARY_LSN_UNKNOWN,   // primary baseline/global LSN requested but writer mirror is unknown
+        PRIMARY_LSN_UNKNOWN,   // GLOBAL_LSN requested but the group LSN observation is unknown
         READER_FAILURE_FORCE_WRITER, // full retry: rest of txn stays on writer after reader failure
         WAL_PENDING,           // split: transaction WAL is not yet replay-safe
         SPLIT_BLOCKED,         // split: a prior split read failed in this transaction

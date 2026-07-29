@@ -273,7 +273,7 @@ public:
 	void detach_connection() {
 		assert(myconn);
 #if POLARDB_PROXY
-		myconn->polardb_flush_parent_bytes(PolarDB_ParentBytesFlushReason::Detach);
+		myconn->polardb_flush_parent_queries();
 #endif
 		myconn->statuses.pgconnpoll_put++;
 		statuses.pgconnpoll_put++;

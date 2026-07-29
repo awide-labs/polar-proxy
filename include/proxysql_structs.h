@@ -1126,6 +1126,7 @@ __thread int pgsql_thread___connect_timeout_client;
 __thread int pgsql_thread___connect_timeout_server;
 __thread int pgsql_thread___connect_timeout_server_max;
 __thread bool pgsql_thread___connection_warming;
+__thread int pgsql_thread___bounded_local_connection_cache;
 __thread bool pgsql_thread___log_unhealthy_connections;
 __thread int pgsql_thread___throttle_max_bytes_per_second_to_client;
 __thread int pgsql_thread___throttle_ratio_server_to_client;
@@ -1154,6 +1155,7 @@ __thread int pgsql_thread___polardb_lag_wait_ms;             // polar_xact_split
 __thread int pgsql_thread___polardb_lsn_freshness_ms;        // max age of a cached per-server LSN to trust
 __thread int pgsql_thread___polardb_lag_cap_freshness_ms;    // max LSN-cache age under byte-lag cap + finite wait; 0=wait-fraction only
 __thread int pgsql_thread___polardb_reader_lsn_lag_range_bytes; // 0=exact best-behind reader only
+__thread int pgsql_thread___polardb_reader_connection_retention; // 0=end-of-pass return, 1=retain active readers
 __thread int pgsql_thread___polardb_output_coalesce_bytes;   // 0=disabled; hold incomplete streaming output up to byte budget
 __thread int pgsql_thread___polardb_output_coalesce_packets; // 0=disabled; hold incomplete streaming output up to packet budget
 __thread bool pgsql_thread___polardb_monitor_lsn_updates;    // enable monitor LSN cache updates
@@ -1164,7 +1166,6 @@ __thread int pgsql_thread___polardb_split_warmup_max_connections_per_request; //
 __thread int pgsql_thread___polardb_wait_timeout_mode;       // best_effort=1, strict=2
 __thread int pgsql_thread___polardb_proxy_protocol;          // off=0, legacy=1, v15=2
 __thread int pgsql_thread___polardb_route_rfq_policy;        // best_effort=1, strict=2
-__thread int pgsql_thread___polardb_session_lsn_baseline;    // observed=1, primary=2
 __thread int pgsql_thread___polardb_reader_death_action;     // retry=0, forward=1, terminate=2
 __thread int pgsql_thread___polardb_reader_timeout_action;   // retry=0, forward=1, terminate=2
 __thread int pgsql_thread___polardb_reader_error_action;     // retry=0, forward=1, terminate=2
@@ -1500,6 +1501,7 @@ extern __thread int pgsql_thread___connect_timeout_client;
 extern __thread int pgsql_thread___connect_timeout_server;
 extern __thread int pgsql_thread___connect_timeout_server_max;
 extern __thread bool pgsql_thread___connection_warming;
+extern __thread int pgsql_thread___bounded_local_connection_cache;
 extern __thread bool pgsql_thread___log_unhealthy_connections;
 extern __thread int pgsql_thread___throttle_max_bytes_per_second_to_client;
 extern __thread int pgsql_thread___throttle_ratio_server_to_client;
@@ -1524,13 +1526,13 @@ extern __thread int pgsql_thread___polardb_lag_wait_ms;
 extern __thread int pgsql_thread___polardb_lsn_freshness_ms;
 extern __thread int pgsql_thread___polardb_lag_cap_freshness_ms;
 extern __thread int pgsql_thread___polardb_reader_lsn_lag_range_bytes;
+extern __thread int pgsql_thread___polardb_reader_connection_retention;
 extern __thread bool pgsql_thread___polardb_monitor_lsn_updates;
 extern __thread bool pgsql_thread___polardb_lazy_warmup_split;
 extern __thread int pgsql_thread___polardb_split_warmup_max_connections_per_request;
 extern __thread int pgsql_thread___polardb_wait_timeout_mode;
 extern __thread int pgsql_thread___polardb_proxy_protocol;
 extern __thread int pgsql_thread___polardb_route_rfq_policy;
-extern __thread int pgsql_thread___polardb_session_lsn_baseline;
 extern __thread int pgsql_thread___polardb_reader_death_action;
 extern __thread int pgsql_thread___polardb_reader_timeout_action;
 extern __thread int pgsql_thread___polardb_reader_error_action;

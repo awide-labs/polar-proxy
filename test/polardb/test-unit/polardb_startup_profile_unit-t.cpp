@@ -343,23 +343,10 @@ static void test_string_converters() {
 			static_cast<int>(PolarDB_RfqRoutePolicy::STRICT),
 		"RFQ policy converter default fallback is strict");
 
-	ok(polardb_session_lsn_baseline_from_string(nullptr, fallback) == fallback,
-		"session LSN baseline converter maps null to caller default");
-	ok(polardb_session_lsn_baseline_from_string("observed", fallback) ==
-			static_cast<int>(PolarDB_SessionLsnBaseline::OBSERVED),
-		"session LSN baseline converter maps observed");
-	ok(polardb_session_lsn_baseline_from_string("primary", fallback) ==
-			static_cast<int>(PolarDB_SessionLsnBaseline::PRIMARY),
-		"session LSN baseline converter maps primary");
-	ok(polardb_session_lsn_baseline_from_string("bad", fallback) == fallback,
-		"session LSN baseline converter maps unknown value to caller default");
-	ok(polardb_session_lsn_baseline_from_string("bad") ==
-			static_cast<int>(PolarDB_SessionLsnBaseline::OBSERVED),
-		"session LSN baseline converter default fallback is observed");
 }
 
 int main() {
-	plan(116);
+	plan(111);
 	test_protocol_request_bits();
 	test_profile_components_distinguish_protocol_and_bits();
 	test_startup_parameters_consumed_by_proxy();

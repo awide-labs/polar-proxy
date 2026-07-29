@@ -147,6 +147,12 @@
 	G(reader_pool_shared_take_miss, "PolarDB_Reader_Pool_Shared_Take_Miss", \
 		"proxysql_polardb_reader_pool_shared_take_miss_total", \
 		"Shared selected-server pool attempts that found no usable connection") \
+	G(reader_pool_confirmed_saturated, "PolarDB_Reader_Pool_Confirmed_Saturated", \
+		"proxysql_polardb_reader_pool_confirmed_saturated_total", \
+		"Selected-server pool misses with no free connection and snapshot capacity fully used") \
+	G(reader_pool_hgm_create_lock_entry, "PolarDB_Reader_Pool_HGM_Create_Lock_Entry", \
+		"proxysql_polardb_reader_pool_hgm_create_lock_entry_total", \
+		"Selected-server acquisition attempts that entered the HGM creation lock") \
 	G(reader_pool_shared_return_attempt, "PolarDB_Reader_Pool_Shared_Return_Attempt", \
 		"proxysql_polardb_reader_pool_shared_return_attempt_total", \
 		"Attempts to return a reader connection to its shared server pool") \
@@ -411,7 +417,7 @@
 		"Client ReadyForQuery LSN payloads raised because the query completed a successful LSN wait") \
 	T(primary_lsn_unknown, "PolarDB_Primary_LSN_Unknown", \
 		"proxysql_polardb_primary_lsn_unknown_total", \
-		"Primary-baseline reads that could not use a known primary LSN") \
+		"GLOBAL_LSN reads that could not use a known group LSN observation") \
 	T(rfq_best_effort_degraded_routes, "PolarDB_RFQ_Best_Effort_Degraded_Routes", \
 		"proxysql_polardb_rfq_best_effort_degraded_routes_total", \
 		"Best-effort RFQ-unavailable reads routed without an LSN wait") \
@@ -490,9 +496,6 @@
 	T(target_lsn_fallback_wait, "PolarDB_Target_LSN_Fallback_Wait", \
 		"proxysql_polardb_target_lsn_fallback_wait_total", \
 		"Reader choices that kept the backend wait as the correctness check") \
-	T(reader_node_limit, "PolarDB_Reader_Node_Limit", \
-		"proxysql_polardb_reader_node_limit_total", \
-		"Eligible reader nodes skipped after the stack-only acquisition cap") \
 	T(reader_pool_hit, "PolarDB_Reader_Pool_Hit", \
 		"proxysql_polardb_reader_pool_hit_total", \
 		"Reader acquisitions served by the PolarDB reader pool") \
@@ -514,12 +517,6 @@
 	T(reader_pool_p2c_random, "PolarDB_Reader_Pool_P2C_Decide_Random", \
 		"proxysql_polardb_reader_pool_p2c_random_total", \
 		"P2C where global load/free counts tied and random tie-break selected the reader") \
-	T(pool_capacity_active_block, "PolarDB_Pool_Capacity_Active_Block", \
-		"proxysql_polardb_pool_capacity_active_block_total", \
-		"Reader/backend choices rejected because active server capacity reached max_connections") \
-	T(pool_capacity_total_block, "PolarDB_Pool_Capacity_Total_Block", \
-		"proxysql_polardb_pool_capacity_total_block_total", \
-		"Backend socket creation rejected because total server sockets reached max_connections") \
 	T(reader_pool_drop_offline, "PolarDB_Reader_Pool_Drop_Offline", \
 		"proxysql_polardb_reader_pool_drop_offline_total", \
 		"Reader pool readers dropped because their server was no longer ONLINE") \

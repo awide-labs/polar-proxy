@@ -63,7 +63,7 @@ export POLARDB_DEBUG_FAIL_WRAP_FINALIZE_ONCE="${POLARDB_DEBUG_FAIL_WRAP_FINALIZE
 WRITER_HG="$POLARDB_WRITER_HG"
 READER_HG="$POLARDB_READER_HG"
 
-PLAN=70
+PLAN=67
 FAIL=0
 STARTED_PROXY=0
 TIMEOUT_EDGE_LAG_SET=0
@@ -102,10 +102,6 @@ pool_value() {
 
 set_route_rfq_policy() {
     set_global_var_runtime "pgsql-polardb_route_rfq_policy" "$1"
-}
-
-set_session_lsn_baseline() {
-    set_global_var_runtime "pgsql-polardb_session_lsn_baseline" "$1"
 }
 
 set_wait_mode() {
@@ -629,7 +625,6 @@ cleanup() {
     admin_sql "UPDATE global_variables SET variable_value='5000' WHERE variable_name='pgsql-polardb_lsn_freshness_ms';" >/dev/null 2>&1 || true
     admin_sql "UPDATE global_variables SET variable_value='best_effort' WHERE variable_name='pgsql-polardb_wait_timeout_mode';" >/dev/null 2>&1 || true
     admin_sql "UPDATE global_variables SET variable_value='strict' WHERE variable_name='pgsql-polardb_route_rfq_policy';" >/dev/null 2>&1 || true
-    admin_sql "UPDATE global_variables SET variable_value='observed' WHERE variable_name='pgsql-polardb_session_lsn_baseline';" >/dev/null 2>&1 || true
     admin_sql "UPDATE global_variables SET variable_value='v15' WHERE variable_name='pgsql-polardb_proxy_protocol';" >/dev/null 2>&1 || true
     admin_sql "UPDATE global_variables SET variable_value='' WHERE variable_name='pgsql-polardb_proxy_identity_host';" >/dev/null 2>&1 || true
     admin_sql "UPDATE global_variables SET variable_value='0' WHERE variable_name='pgsql-polardb_proxy_identity_port';" >/dev/null 2>&1 || true
@@ -786,7 +781,6 @@ case_route_wait_spec_reader_selection() {
     set_lsn_mode lsn
     set_global_var_runtime "pgsql-polardb_proxy_protocol" "v15"
     set_global_var_runtime "pgsql-polardb_route_rfq_policy" "strict"
-    set_global_var_runtime "pgsql-polardb_session_lsn_baseline" "observed"
     set_hg_policy lsn -1 5000
 
     snapshot_consistency_counters route_wait_before
@@ -1260,85 +1254,11 @@ case_startup_identity_configured() {
     fi
 }
 
-# RFQ availability policy: with proxy_protocol off so no RFQ LSN exists, strict
-# policy forces the primary while best_effort degrades to the replica and warns once.
-case_rfq_strict_and_best_effort() {
-    set_global_var_runtime "pgsql-polardb_proxy_protocol" "v15"
-    set_default_hostgroup "$WRITER_HG"
-    remove_extra_hg_pairs
-    set_select_rule_auto
-    set_lsn_mode lsn
-    set_pair_proxy_protocol 10 off
-    set_session_lsn_baseline primary
-    set_route_rfq_policy strict
-    fallback_before=$(counter PolarDB_Consistency_Writer_Fallback)
-    wait_before=$(counter PolarDB_Wait_LSN_Sent)
-    rfq_strict_out=$(proxy_sql "SELECT host(inet_server_addr()) || ':' || inet_server_port();" 2>&1)
-    fallback_after=$(counter PolarDB_Consistency_Writer_Fallback)
-    wait_after=$(counter PolarDB_Wait_LSN_Sent)
-    rfq_strict_endpoint=$(last_endpoint_from_output "$rfq_strict_out")
-    if [ "$rfq_strict_endpoint" = "$PRIMARY_SERVER_ENDPOINT" ] &&
-        [ $((fallback_after - fallback_before)) -eq 1 ] &&
-        [ $((wait_after - wait_before)) -eq 0 ]; then
-        ok 0 "RFQ unavailable strict: reader acquisition redirects consistency-target read to writer"
-    else
-        diag "rfq-strict output: $rfq_strict_out"
-        diag "endpoint=$rfq_strict_endpoint expected_writer=$PRIMARY_SERVER_ENDPOINT fallback_delta=$((fallback_after - fallback_before)) wait_delta=$((wait_after - wait_before))"
-        ok 1 "RFQ unavailable strict: reader acquisition redirects consistency-target read to writer"
-    fi
-
-    set_route_rfq_policy best_effort
-    degrade_before=$(counter PolarDB_RFQ_Best_Effort_Degraded_Routes)
-    wait_before=$(counter PolarDB_Wait_LSN_Sent)
-    rfq_best_out=$(proxy_sql "SELECT host(inet_server_addr()) || ':' || inet_server_port();" 2>&1)
-    degrade_after=$(counter PolarDB_RFQ_Best_Effort_Degraded_Routes)
-    wait_after=$(counter PolarDB_Wait_LSN_Sent)
-    rfq_best_endpoint=$(last_endpoint_from_output "$rfq_best_out")
-    rfq_best_warning_count=$(printf '%s\n' "$rfq_best_out" | grep -c "PolarDB best_effort RFQ route has no enforceable LSN wait target" || true)
-    if reader_endpoint_matches "$rfq_best_endpoint" &&
-        [ $((degrade_after - degrade_before)) -eq 1 ] &&
-        [ $((wait_after - wait_before)) -eq 0 ] &&
-        [ "$rfq_best_warning_count" -eq 1 ]; then
-        ok 0 "RFQ unavailable best_effort: degraded reader route is counted and warned once"
-    else
-        diag "rfq-best-effort output: $rfq_best_out"
-        diag "endpoint=$rfq_best_endpoint expected_reader=$REPLICA_SERVER_ENDPOINT degrade_delta=$((degrade_after - degrade_before)) wait_delta=$((wait_after - wait_before)) warning_count=$rfq_best_warning_count"
-        ok 1 "RFQ unavailable best_effort: degraded reader route is counted and warned once"
-    fi
-    set_pair_proxy_protocol 10 default
-    set_session_lsn_baseline observed
-    set_route_rfq_policy strict
-}
-
-# Primary baseline unknown: with no observable primary LSN, strict policy forces
-# the primary and increments the primary-unknown counter.
-case_primary_baseline_unknown() {
-    set_global_var_runtime "pgsql-polardb_monitor_lsn_updates" "0"
-    set_hg_pair_policy 27 28 off lsn -1 5000
-    set_default_hostgroup 27
-    set_session_lsn_baseline primary
-    set_route_rfq_policy strict
-    primary_unknown_before=$(counter PolarDB_Primary_LSN_Unknown)
-    wait_before=$(counter PolarDB_Wait_LSN_Sent)
-    primary_unknown_out=$(proxy_sql "SELECT host(inet_server_addr()) || ':' || inet_server_port();" 2>&1)
-    primary_unknown_after=$(counter PolarDB_Primary_LSN_Unknown)
-    wait_after=$(counter PolarDB_Wait_LSN_Sent)
-    primary_unknown_endpoint=$(last_endpoint_from_output "$primary_unknown_out")
-    if [ "$primary_unknown_endpoint" = "$PRIMARY_SERVER_ENDPOINT" ] &&
-        [ $((primary_unknown_after - primary_unknown_before)) -eq 1 ] &&
-        [ $((wait_after - wait_before)) -eq 0 ]; then
-        ok 0 "primary baseline unknown: strict policy forces writer and increments counter"
-    else
-        diag "primary-unknown output: $primary_unknown_out"
-        diag "endpoint=$primary_unknown_endpoint expected_writer=$PRIMARY_SERVER_ENDPOINT primary_unknown_delta=$((primary_unknown_after - primary_unknown_before)) wait_delta=$((wait_after - wait_before))"
-        ok 1 "primary baseline unknown: strict policy forces writer and increments counter"
-    fi
-}
-
 # Plan-stage best_effort RFQ degradation: a write whose LSN is unknown degrades
 # to the replica, warns exactly once, and records the reason.
 case_plan_stage_best_effort_degrade() {
-    set_session_lsn_baseline observed
+    set_hg_pair_policy 27 28 off lsn -1 5000
+    set_default_hostgroup 27
     set_route_rfq_policy best_effort
     write_missing_before=$(counter PolarDB_Write_Missing_LSN)
     degrade_before=$(counter PolarDB_RFQ_Best_Effort_Degraded_Routes)
@@ -1374,7 +1294,6 @@ SQL
 # automatic read stays on the primary.
 case_missing_writer_rfq_state() {
     set_global_var_runtime "pgsql-polardb_monitor_lsn_updates" "1"
-    set_session_lsn_baseline observed
     set_route_rfq_policy strict
 
     set_hg_pair_policy 23 24 off lsn -1 5000
@@ -1542,7 +1461,6 @@ case_query_cache_bypassed_after_session_write() {
     set_default_hostgroup "$WRITER_HG"
     remove_extra_hg_pairs
     set_lsn_mode lsn
-    set_session_lsn_baseline observed
 
     local row_id=9731
     local old_marker="cache_old_$$"
@@ -1899,7 +1817,6 @@ case_cf1_in_cap() {
     set_global_var_runtime "pgsql-polardb_lag_bytes" "0"
     set_global_var_runtime "pgsql-polardb_lsn_freshness_ms" "5000"
     set_global_var_runtime "pgsql-polardb_lag_cap_freshness_ms" "5000"
-    set_session_lsn_baseline observed
     set_route_rfq_policy strict
     set_hg_policy lsn 2147483647 5000
     cf1_monitor_before=$(counter PolarDB_LSN_Updates_From_Monitor)
@@ -2465,8 +2382,6 @@ case_startup_identity_listener
 case_startup_identity_configured
 
 # ==== RFQ availability policy ====
-case_rfq_strict_and_best_effort
-case_primary_baseline_unknown
 case_plan_stage_best_effort_degrade
 case_missing_writer_rfq_state
 case_missing_reader_rfq_state

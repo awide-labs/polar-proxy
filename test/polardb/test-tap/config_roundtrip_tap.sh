@@ -21,7 +21,7 @@ PROXYSQL_CONFIG_FILE="${PROXYSQL_CONFIG_FILE:-$PROXYSQL_DATA_DIR/proxysql.cnf}"
 PROXYSQL_START_LOG="${PROXYSQL_START_LOG:-${PROXYSQL_DATA_DIR}.start.log}"
 PROXYSQL_TXN_SPLIT_CHECK_LOG="${PROXYSQL_TXN_SPLIT_CHECK_LOG:-${PROXYSQL_DATA_DIR}.txn_split_check.log}"
 
-PLAN=15
+PLAN=17
 FAIL=0
 STARTED_PROXY=0
 
@@ -129,29 +129,43 @@ cluster_hg=$(mysql_admin_sql "PROXY_SELECT writer_hostgroup, reader_hostgroup, c
 [ "$cluster_hg" = "polardb|1|lsn|12345|0|legacy|polardb_hg_roundtrip;read_only|0|default|-1|-1|default|read_only_hg_roundtrip" ]
 ok $? "cluster replication-hostgroup surface includes PolarDB policy columns"
 
+[ "$(global_var pgsql-bounded_local_connection_cache)" = "0" ]
+ok $? "worker-local connection cache defaults to ProxySQL 3.0.7 behavior"
+
+set_global_var pgsql-bounded_local_connection_cache 1
+admin_sql "LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null
+[ "$(runtime_var pgsql-bounded_local_connection_cache)" = "1" ]
+bounded_cache_enabled=$?
+set_global_var pgsql-bounded_local_connection_cache 0
+admin_sql "LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null
+[ "$bounded_cache_enabled" -eq 0 ] &&
+	[ "$(runtime_var pgsql-bounded_local_connection_cache)" = "0" ]
+ok $? "worker-local connection cache switches between 3.0.9 and 3.0.7 behavior"
+
 	[ "$(global_var pgsql-polardb_proxy_protocol)" = "v15" ] &&
 	[ "$(global_var pgsql-polardb_route_rfq_policy)" = "strict" ] &&
-	[ "$(global_var pgsql-polardb_session_lsn_baseline)" = "observed" ] &&
+	[ "$(admin_sql "SELECT COUNT(*) FROM global_variables WHERE variable_name='pgsql-polardb_session_lsn_baseline';" | tr -d '[:space:]')" = "0" ] &&
 	[ "$(global_var pgsql-polardb_proxy_identity_mode)" = "proxy" ] &&
 	[ "$(global_var pgsql-polardb_proxy_identity_host)" = "" ] &&
 	[ "$(global_var pgsql-polardb_proxy_identity_port)" = "0" ] &&
 	[ "$(global_var pgsql-polardb_lag_cap_freshness_ms)" = "250" ] &&
 	[ "$(global_var pgsql-polardb_reader_lsn_lag_range_bytes)" = "0" ] &&
+	[ "$(global_var pgsql-polardb_reader_connection_retention)" = "0" ] &&
 	[ "$(global_var pgsql-polardb_output_coalesce_bytes)" = "0" ] &&
 	[ "$(global_var pgsql-polardb_output_coalesce_packets)" = "0" ] &&
 	[ "$(global_var pgsql-polardb_writev_direct)" = "true" ] &&
 	[ "$(global_var pgsql-polardb_result_fast_forward)" = "false" ] &&
 	[ "$(global_var pgsql-polardb_split_warmup_max_connections_per_request)" = "1" ]
-ok $? "PolarDB startup and reader-selection globals exist with expected defaults"
+ok $? "PolarDB globals have expected defaults and no first-read baseline setting"
 
 set_global_var pgsql-polardb_proxy_protocol legacy
 set_global_var pgsql-polardb_route_rfq_policy best_effort
-set_global_var pgsql-polardb_session_lsn_baseline primary
 set_global_var pgsql-polardb_proxy_identity_mode client
 set_global_var pgsql-polardb_proxy_identity_host 127.0.0.2
 set_global_var pgsql-polardb_proxy_identity_port 15432
 set_global_var pgsql-polardb_lag_cap_freshness_ms 125
 set_global_var pgsql-polardb_reader_lsn_lag_range_bytes 4096
+set_global_var pgsql-polardb_reader_connection_retention 1
 set_global_var pgsql-polardb_output_coalesce_bytes 262144
 set_global_var pgsql-polardb_output_coalesce_packets 64
 set_global_var pgsql-polardb_writev_direct 0
@@ -160,12 +174,12 @@ set_global_var pgsql-polardb_split_warmup_max_connections_per_request 4
 admin_sql "LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null
 	[ "$(runtime_var pgsql-polardb_proxy_protocol)" = "legacy" ] &&
 	[ "$(runtime_var pgsql-polardb_route_rfq_policy)" = "best_effort" ] &&
-	[ "$(runtime_var pgsql-polardb_session_lsn_baseline)" = "primary" ] &&
 	[ "$(runtime_var pgsql-polardb_proxy_identity_mode)" = "client" ] &&
 	[ "$(runtime_var pgsql-polardb_proxy_identity_host)" = "127.0.0.2" ] &&
 	[ "$(runtime_var pgsql-polardb_proxy_identity_port)" = "15432" ] &&
 	[ "$(runtime_var pgsql-polardb_lag_cap_freshness_ms)" = "125" ] &&
 	[ "$(runtime_var pgsql-polardb_reader_lsn_lag_range_bytes)" = "4096" ] &&
+	[ "$(runtime_var pgsql-polardb_reader_connection_retention)" = "1" ] &&
 	[ "$(runtime_var pgsql-polardb_output_coalesce_bytes)" = "262144" ] &&
 	[ "$(runtime_var pgsql-polardb_output_coalesce_packets)" = "64" ] &&
 	[ "$(runtime_var pgsql-polardb_writev_direct)" = "false" ] &&
@@ -175,7 +189,6 @@ ok $? "PolarDB startup and reader-selection globals load to runtime"
 
 set_global_var pgsql-polardb_proxy_protocol bogus
 set_global_var pgsql-polardb_route_rfq_policy bogus
-set_global_var pgsql-polardb_session_lsn_baseline bogus
 set_global_var pgsql-polardb_proxy_identity_mode proxy
 admin_sql "LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null
 [ "$(runtime_var pgsql-polardb_proxy_identity_mode)" = "proxy" ] &&
@@ -186,11 +199,9 @@ set_global_var pgsql-polardb_proxy_identity_mode bogus
 admin_sql "LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null
 [ "$(runtime_var pgsql-polardb_proxy_protocol)" = "legacy" ] &&
 	[ "$(runtime_var pgsql-polardb_route_rfq_policy)" = "best_effort" ] &&
-	[ "$(runtime_var pgsql-polardb_session_lsn_baseline)" = "primary" ] &&
 	[ "$(runtime_var pgsql-polardb_proxy_identity_mode)" = "proxy" ] &&
 	[ "$(global_var pgsql-polardb_proxy_protocol)" = "legacy" ] &&
 	[ "$(global_var pgsql-polardb_route_rfq_policy)" = "best_effort" ] &&
-	[ "$(global_var pgsql-polardb_session_lsn_baseline)" = "primary" ] &&
 	[ "$(global_var pgsql-polardb_proxy_identity_mode)" = "proxy" ]
 ok $? "RFQ startup word variables reject invalid runtime-load values"
 

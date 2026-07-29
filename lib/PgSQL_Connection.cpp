@@ -436,6 +436,7 @@ PgSQL_Connection::PgSQL_Connection(bool is_client_conn) {
 	polardb_parent_bytes_recv_pending = 0;
 	polardb_parent_bytes_sent_pending = 0;
 	polardb_parent_queries_sent_pending = 0;
+	polardb_parent_query_batch_count = 0;
 	polardb_startup_profile_generation = 0;
 	polardb_startup_identity_mode =
 		static_cast<int>(PolarDB_ProxyIdentityMode::PROXY);
@@ -3159,6 +3160,7 @@ void PgSQL_Connection::polardb_flush_parent_bytes(PolarDB_ParentBytesFlushReason
 		polardb_parent_bytes_recv_pending = 0;
 		polardb_parent_bytes_sent_pending = 0;
 		polardb_parent_queries_sent_pending = 0;
+		polardb_parent_query_batch_count = 0;
 		return;
 	}
 	if (recv_pending) {
@@ -3177,11 +3179,24 @@ void PgSQL_Connection::polardb_flush_parent_bytes(PolarDB_ParentBytesFlushReason
 		__sync_fetch_and_add(&parent->queries_sent, queries_pending);
 		polardb_parent_queries_sent_pending = 0;
 	}
+	polardb_parent_query_batch_count = 0;
+}
+
+void PgSQL_Connection::polardb_flush_parent_queries() {
+	const uint64_t queries_pending = polardb_parent_queries_sent_pending;
+	if (queries_pending == 0) {
+		return;
+	}
+	if (parent) {
+		__sync_fetch_and_add(&parent->queries_sent, queries_pending);
+	}
+	polardb_parent_queries_sent_pending = 0;
 }
 
 void PgSQL_Connection::update_queries_sent() {
 	polardb_parent_queries_sent_pending++;
-	if (polardb_parent_queries_sent_pending >=
+	polardb_parent_query_batch_count++;
+	if (polardb_parent_query_batch_count >=
 			POLARDB_PARENT_QUERIES_FLUSH_THRESHOLD) {
 		polardb_flush_parent_bytes(PolarDB_ParentBytesFlushReason::ThresholdQueries);
 	}

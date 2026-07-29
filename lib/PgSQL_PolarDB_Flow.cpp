@@ -162,18 +162,12 @@ bool PgSQL_Session::polardb_query_cache_disabled_for_current_rule() const {
 		return true;
 	}
 
-	// In LSN mode, cache is safe until the session has an LSN target or a missing
-	// LSN sticky flag. PRIMARY baseline can create a first-read target from the writer
-	// mirror, so it also bypasses cache before the planner runs.
-	if (polardb_session_consistency.target() > 0 ||
+	// In SESSION_LSN mode, cache is safe until the session has an LSN target or a
+	// missing-LSN sticky flag. A new session has no target; its first reader RFQ
+	// establishes the observed LSN for later reads.
+	return polardb_session_consistency.target() > 0 ||
 			polardb_session_consistency.write_unknown ||
-			polardb_session_consistency.observed_unknown) {
-		return true;
-	}
-
-	return polardb_session_lsn_baseline_from_int(
-		pgsql_thread___polardb_session_lsn_baseline) ==
-			PolarDB_SessionLsnBaseline::PRIMARY;
+			polardb_session_consistency.observed_unknown;
 }
 
 static std::string polardb_normalize_query_words(
@@ -505,7 +499,6 @@ void PgSQL_Session::polardb_collect(PolarDB_Query_RouteCtx& route_ctx,
 	route_ctx.wait_timeout_ms = polardb_resolve_wait_timeout_ms(policy.lsn_wait_timeout_ms);
 	route_ctx.wait_timeout_mode = pgsql_thread___polardb_wait_timeout_mode;
 	route_ctx.route_rfq_policy = pgsql_thread___polardb_route_rfq_policy;
-	route_ctx.session_lsn_baseline = pgsql_thread___polardb_session_lsn_baseline;
 	route_ctx.max_lag_bytes = policy.max_lag_bytes;
 
 	// Session LSN positions. SESSION_LSN waits on max(write_lsn, observed_lsn).
@@ -590,7 +583,7 @@ void PgSQL_Session::polardb_collect(PolarDB_Query_RouteCtx& route_ctx,
 			"replica_eligible=%d multi_stmt=%d extended=%d in_txn=%d "
 			"write_lsn=%lu observed_lsn=%lu write_lsn_unknown=%d "
 			"observed_lsn_unknown=%d timeout_ms=%u timeout_mode=%d "
-			"rfq_policy=%d lsn_baseline=%d txn_split_enabled=%d "
+			"rfq_policy=%d txn_split_enabled=%d "
 			"txn_safe_read=%d txn_locking_read=%d txn_stage=%d "
 			"txn_lsn=%lu txn_xids_len=%zu txn_wal_pending=%d "
 			"txn_wait_rc=%d txn_wait_local_clean=%d "
@@ -603,7 +596,7 @@ void PgSQL_Session::polardb_collect(PolarDB_Query_RouteCtx& route_ctx,
 			route_ctx.session.write_unknown ? 1 : 0,
 			route_ctx.session.observed_unknown ? 1 : 0,
 			route_ctx.wait_timeout_ms, route_ctx.wait_timeout_mode,
-			route_ctx.route_rfq_policy, route_ctx.session_lsn_baseline,
+			route_ctx.route_rfq_policy,
 			route_ctx.txn_split_enabled ? 1 : 0,
 			route_ctx.is_txn_split_safe_read ? 1 : 0,
 			route_ctx.is_txn_split_locking_read ? 1 : 0,
@@ -681,14 +674,13 @@ void PgSQL_Session::polardb_reader_lag_plan(
  *      route still belongs to this function.
  *   5. Unknown-LSN rules: missing write or observed RFQ sticky flags are handled
  *      before building a wait target, according to the RFQ route policy.
- *   6. Session target rule: protected reads wait on the session consistency
- *      target, with the configured baseline providing an initial
- *      observed/primary target for first reads. If there is no target, the
- *      reader is trivially consistent: passthrough, no wait.
+ *   6. Session target rule: protected reads wait on max(write_lsn,
+ *      observed_lsn). A new session has no target, so its first read can use a
+ *      reader without waiting; that reader's RFQ establishes observed_lsn.
  *   7. Lag-cap rule: set reader metadata; backend acquisition picks a reader
  *      within the cap or redirects this query to the writer.
  *
- * No mutations. Reads HGM only for primary-baseline and lag-cap snapshots.
+ * No mutations. Reads HGM only for GLOBAL_LSN and lag-cap snapshots.
  *
  * @param route_ctx Immutable routing context from polardb_collect().
  * @return Routing plan consumed by polardb_execute().
@@ -979,42 +971,30 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(const PolarDB_Query_RouteCtx
 			route_ctx.route_rfq_policy, (int)plan.action, plan.target_hg);
 		return plan;
 	}
-	// Consistency subdecision. SESSION_LSN uses max(write, observed),
-	// optionally seeded from the configured baseline. GLOBAL_LSN uses
-	// max(session target, writer mirror LSN), and fails closed when the writer
-	// mirror is unknown.
+	// Consistency subdecision. SESSION_LSN uses max(write, observed). GLOBAL_LSN
+	// also includes the latest trusted group LSN observation and fails closed
+	// when that observation is unknown.
 	const bool global_lsn_mode = mode == PolarDB_ConsistencyMode::GLOBAL_LSN;
 	bool primary_lsn_unknown = false;
 	uint64_t primary_lsn = 0;
-	if (global_lsn_mode ||
-			(polardb_session_lsn_baseline_from_int(route_ctx.session_lsn_baseline) ==
-				PolarDB_SessionLsnBaseline::PRIMARY &&
-				route_ctx.session.target() == 0)) {
+	if (global_lsn_mode) {
 		primary_lsn = PgHGM->get_polardb_primary_lsn(route_ctx.writer_scope.hg);
 	}
 	uint64_t session_lsn = global_lsn_mode
 		? route_ctx.session.target_with_global_lsn(
 			primary_lsn,
 			&primary_lsn_unknown)
-		: route_ctx.session.target_with_baseline(
-			route_ctx.session_lsn_baseline,
-			primary_lsn,
-			&primary_lsn_unknown);
+		: route_ctx.session.target();
 	if (primary_lsn_unknown) {
 		plan = PolarDB_Query_RoutePlan::rfq_unavailable(
 				PolarDB_Query_RoutePlan::RouteActionReason::PRIMARY_LSN_UNKNOWN,
 				route_ctx.route_rfq_policy,
 				route_ctx.writer_scope.hg,
 				route_ctx.reader_hg,
-				!global_lsn_mode && !route_ctx.is_extended_protocol);
-		if (allow_transaction_wait_read &&
-				plan.action == PolarDB_Query_RoutePlan::RouteAction::PASSTHROUGH &&
-				plan.target_hg == route_ctx.reader_hg) {
-			plan.txn_wait_read = true;
-		}
+				false);
 		POLARDB_TRACE(
-			"PolarDB PLAN: primary LSN unknown mode=%d policy=%d -> action=%d target=%d\n",
-			(int)mode, route_ctx.route_rfq_policy, (int)plan.action, plan.target_hg);
+			"PolarDB PLAN: GLOBAL_LSN group observation unknown policy=%d -> action=%d target=%d\n",
+			route_ctx.route_rfq_policy, (int)plan.action, plan.target_hg);
 		return plan;
 	}
 	PolarDB_Query_WaitPlan wait_plan = PolarDB_Query_WaitPlan::build_consistency(
@@ -1034,8 +1014,8 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(const PolarDB_Query_RouteCtx
 	// byte-lag, and cached-LSN freshness checks before choosing PASSTHROUGH reader
 	// or REPLICA_WITH_WAIT.
 
-	// If max(write, observed) plus any first-read baseline yields no target, no
-	// wait is needed. The write LSN alone is not the full session target.
+	// If max(write, observed) yields no target, this session has no consistency
+	// obligation yet and the first reader RFQ will establish one.
 	if (!wait_plan.has_wait()) {
 		// No session target -> reader is trivially consistent, no wait. This is
 		// also safe for extended protocol: no wrapper is needed.

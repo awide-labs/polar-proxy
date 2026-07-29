@@ -149,19 +149,31 @@ PgSQL_Connection* pgsql_create_backend_connection_locked(PgSQL_SrvC* mysrvc) {
 	return conn;
 }
 
-unsigned int pgsql_srv_latency_limit_us(const PgSQL_SrvC* mysrvc) {
-	return mysrvc->max_latency_us
-		? mysrvc->max_latency_us
+unsigned int pgsql_srv_latency_limit_us(unsigned int configured_max_latency_us) {
+	return configured_max_latency_us
+		? configured_max_latency_us
 		: pgsql_thread___default_max_latency_ms * 1000;
 }
 
-bool pgsql_srv_latency_allowed(const PgSQL_SrvC* mysrvc) {
-	unsigned int max_latency_us = pgsql_srv_latency_limit_us(mysrvc);
+unsigned int pgsql_srv_latency_limit_us(const PgSQL_SrvC* mysrvc) {
+	return pgsql_srv_latency_limit_us(mysrvc->max_latency_us);
+}
+
+bool pgsql_srv_latency_allowed(
+		unsigned int current_latency_us,
+		unsigned int configured_max_latency_us) {
+	unsigned int max_latency_us =
+		pgsql_srv_latency_limit_us(configured_max_latency_us);
 	// ProxySQL uses 0 for max_latency_ms/default_max_latency_ms as no limit.
 	if (max_latency_us == 0) {
 		return true;
 	}
-	return mysrvc->current_latency_us < max_latency_us;
+	return current_latency_us < max_latency_us;
+}
+
+bool pgsql_srv_latency_allowed(const PgSQL_SrvC* mysrvc) {
+	return pgsql_srv_latency_allowed(
+		mysrvc->current_latency_us_value(), mysrvc->max_latency_us);
 }
 
 /**
@@ -328,18 +340,20 @@ PgSQL_Connection *PgSQL_SrvConnList::index(unsigned int _k) {
 }
 
 #if POLARDB_PROXY
-static void pgsql_polardb_drop_classic_free_locked(
-		PgSQL_SrvC* mysrvc, unsigned int count) {
+static void pgsql_polardb_detach_classic_free_locked(
+		PgSQL_SrvC* mysrvc, unsigned int count,
+		std::vector<PgSQL_Connection*>& connections_to_delete) {
 	while (mysrvc && count > 0 && mysrvc->ConnectionsFree &&
 			mysrvc->ConnectionsFree->conns_length() > 0) {
-		PgSQL_Connection* conn = mysrvc->ConnectionsFree->remove(0);
-		delete conn;
+		connections_to_delete.push_back(
+			mysrvc->ConnectionsFree->remove(0));
 		count--;
 	}
 }
 
 static bool pgsql_polardb_prepare_classic_create_locked(
-		PgSQL_SrvC* mysrvc, unsigned int preferred_classic_evict) {
+		PgSQL_SrvC* mysrvc, unsigned int preferred_classic_evict,
+		std::vector<PgSQL_Connection*>& connections_to_delete) {
 	if (!mysrvc || mysrvc->max_connections <= 0 || !mysrvc->ConnectionsFree) {
 		return false;
 	}
@@ -362,7 +376,8 @@ static bool pgsql_polardb_prepare_classic_create_locked(
 		mysrvc->ConnectionsFree->conns_length();
 	const unsigned int drop_classic =
 		classic_to_evict < classic_free ? classic_to_evict : classic_free;
-	pgsql_polardb_drop_classic_free_locked(mysrvc, drop_classic);
+	pgsql_polardb_detach_classic_free_locked(
+		mysrvc, drop_classic, connections_to_delete);
 
 	capacity = mysrvc->polardb_pool_conn_stats();
 
@@ -526,6 +541,14 @@ PgSQL_Connection* PgSQL_SrvConnList::remove_matching_unlocked(
 }
 #endif // POLARDB_PROXY
 
+void PgSQL_SrvConnList::detach_all_unlocked(
+		std::vector<PgSQL_Connection*>& connections) {
+	connections.reserve(connections.size() + conns->len);
+	while (conns->len) {
+		connections.push_back(remove_unlocked(0));
+	}
+}
+
 PgSQL_Connection * PgSQL_SrvConnList::remove(int _k) {
 #if POLARDB_PROXY
 	std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
@@ -572,24 +595,35 @@ unsigned int PgSQL_SrvConnList::conns_length() {
 }
 
 PgSQL_SrvConnList::~PgSQL_SrvConnList() {
+	std::vector<PgSQL_Connection*> connections_to_delete;
 #if POLARDB_PROXY
-	std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
+	{
+		std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
 #endif // POLARDB_PROXY
-	while (conns_length()) {
-		PgSQL_Connection *conn=remove_unlocked(0);
+		detach_all_unlocked(connections_to_delete);
+		delete conns;
+		conns = nullptr;
+#if POLARDB_PROXY
+	}
+#endif // POLARDB_PROXY
+	for (PgSQL_Connection* conn : connections_to_delete) {
 		delete conn;
 	}
-	delete conns;
 	mysrvc=NULL;
 }
 
 void PgSQL_SrvConnList::drop_all_connections() {
+	std::vector<PgSQL_Connection*> connections_to_delete;
 #if POLARDB_PROXY
-	std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
+	{
+		std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
 #endif // POLARDB_PROXY
-	proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Dropping all connections (%u total) on PgSQL_SrvConnList %p for server %s:%d , hostgroup=%d , status=%d\n", conns_length(), this, mysrvc->address, mysrvc->port, mysrvc->myhgc->hid, mysrvc->status);
-	while (conns_length()) {
-		PgSQL_Connection *conn=remove_unlocked(0);
+		proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Dropping all connections (%u total) on PgSQL_SrvConnList %p for server %s:%d , hostgroup=%d , status=%d\n", conns_length(), this, mysrvc->address, mysrvc->port, mysrvc->myhgc->hid, mysrvc->status);
+		detach_all_unlocked(connections_to_delete);
+#if POLARDB_PROXY
+	}
+#endif // POLARDB_PROXY
+	for (PgSQL_Connection* conn : connections_to_delete) {
 		delete conn;
 	}
 }
@@ -610,7 +644,7 @@ PgSQL_SrvC::PgSQL_SrvC(
 	use_ssl=_use_ssl;
 	cur_replication_lag_count=0;
 	max_latency_us=_max_latency_ms*1000;
-	current_latency_us=0;
+	set_current_latency_us_value(0);
 	aws_aurora_current_lag_us = 0;
 	connect_OK=0;
 	connect_ERR=0;
@@ -651,7 +685,8 @@ PgSQL_Connection* PgSQL_SrvC::take_matching_connection(
 
 PgSQL_PoolGetResult PgSQL_SrvC::take_existing_connection(
 		PgSQL_Session* sess, const PgSQL_PoolMatchKey& key,
-		PgSQL_PoolGetMode mode, unsigned long long* lock_wait_us,
+		PgSQL_PoolGetMode mode, unsigned int selected_max_connections,
+		unsigned long long* lock_wait_us,
 		unsigned long long* lock_hold_us) {
 	PgSQL_PoolGetResult result;
 	if (lock_wait_us) {
@@ -692,6 +727,12 @@ PgSQL_PoolGetResult PgSQL_SrvC::take_existing_connection(
 				ConnectionsUsed->add_unlocked(result.conn);
 				result.source = PgSQL_PoolGetSource::RESET;
 			}
+		}
+		if (!result.conn && selected_max_connections > 0) {
+			const unsigned int used = pool_used_count_value();
+			const unsigned int free = pool_free_count_value();
+			result.server_saturated =
+				free == 0 && used >= selected_max_connections;
 		}
 	}
 
@@ -781,6 +822,9 @@ bool PgSQL_SrvC::return_matching_connection(
 #if POLARDB_PROXY && POLARDB_PROFILE
 	const unsigned long long wait_started_at = monotonic_time();
 #endif // POLARDB_PROXY && POLARDB_PROFILE
+#if POLARDB_PROXY
+	std::shared_ptr<const void> selected_server_snapshot;
+#endif // POLARDB_PROXY
 	std::unique_lock<std::recursive_mutex> pool_lock(pool_mutex);
 #if POLARDB_PROXY && POLARDB_PROFILE
 	const unsigned long long lock_acquired_at = monotonic_time();
@@ -809,6 +853,11 @@ bool PgSQL_SrvC::return_matching_connection(
 #endif // POLARDB_PROXY && POLARDB_PROFILE
 		return false;
 	}
+#if POLARDB_PROXY
+	selected_server_snapshot =
+		std::move(conn->polardb_selected_server_snapshot);
+	(void)selected_server_snapshot;
+#endif // POLARDB_PROXY
 	ConnectionsFree->add_unlocked(conn, &key);
 #if POLARDB_PROXY && POLARDB_PROFILE
 	if (lock_hold_us) {
@@ -865,11 +914,21 @@ bool PgSQL_SrvC::remove_free_connection(PgSQL_Connection* conn) {
 
 #if POLARDB_PROXY
 void PgSQL_SrvC::set_status(enum MySerStatus new_status) {
-	std::lock_guard<std::recursive_mutex> pool_lock(pool_mutex);
-	status = new_status;
-	polardb_fast_status.store((int)new_status, std::memory_order_release);
-	if (new_status == MYSQL_SERVER_STATUS_OFFLINE_HARD) {
-		ConnectionsFree->drop_all_connections();
+	std::shared_ptr<const PgSQL_HostGroups_Manager::PolarDB_ServerListSnapshot>
+		server_list = new_status == MYSQL_SERVER_STATUS_OFFLINE_HARD && PgHGM
+			? PgHGM->get_polardb_server_list_snapshot() : nullptr;
+	(void)server_list;
+	std::vector<PgSQL_Connection*> connections_to_delete;
+	{
+		std::lock_guard<std::recursive_mutex> pool_lock(pool_mutex);
+		status = new_status;
+		polardb_fast_status.store((int)new_status, std::memory_order_release);
+		if (new_status == MYSQL_SERVER_STATUS_OFFLINE_HARD && ConnectionsFree) {
+			ConnectionsFree->detach_all_unlocked(connections_to_delete);
+		}
+	}
+	for (PgSQL_Connection* conn : connections_to_delete) {
+		delete conn;
 	}
 }
 
@@ -988,8 +1047,24 @@ static void pgsql_pool_trim_idle_connections_to_max(PgSQL_SrvC* mysrvc) {
 		return;
 	}
 #if POLARDB_PROXY
-	std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
-#endif // POLARDB_PROXY
+	std::vector<PgSQL_Connection*> connections_to_delete;
+	{
+		std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
+		const unsigned int max_connections =
+			mysrvc->max_connections > 0
+				? static_cast<unsigned int>(mysrvc->max_connections)
+				: 0;
+		while (mysrvc->ConnectionsFree->conns_length() &&
+				mysrvc->ConnectionsUsed->conns_length() +
+					mysrvc->ConnectionsFree->conns_length() > max_connections) {
+			connections_to_delete.push_back(
+				mysrvc->ConnectionsFree->remove(0));
+		}
+	}
+	for (PgSQL_Connection* conn : connections_to_delete) {
+		delete conn;
+	}
+#else
 	const unsigned int max_connections =
 		mysrvc->max_connections > 0
 			? static_cast<unsigned int>(mysrvc->max_connections)
@@ -997,9 +1072,9 @@ static void pgsql_pool_trim_idle_connections_to_max(PgSQL_SrvC* mysrvc) {
 	while (mysrvc->ConnectionsFree->conns_length() &&
 			mysrvc->ConnectionsUsed->conns_length() +
 				mysrvc->ConnectionsFree->conns_length() > max_connections) {
-		PgSQL_Connection* conn = mysrvc->ConnectionsFree->remove(0);
-		delete conn;
+		delete mysrvc->ConnectionsFree->remove(0);
 	}
+#endif // POLARDB_PROXY
 }
 
 void PgSQL_SrvC::connect_error(int err_num, bool get_mutex) {
@@ -1671,6 +1746,11 @@ void PgSQL_HostGroups_Manager::shutdown_split_warmup_thread() {
 	}
 }
 
+void PgSQL_HostGroups_Manager::refresh_polardb_thread_snapshots() {
+	(void)get_polardb_server_list_snapshot();
+	(void)get_polardb_topology_snapshot_cached();
+}
+
 std::shared_ptr<const PgSQL_HostGroups_Manager::PolarDB_ServerListSnapshot>
 PgSQL_HostGroups_Manager::get_polardb_server_list_snapshot() const {
 	const uint64_t generation =
@@ -1747,14 +1827,15 @@ void PgSQL_HostGroups_Manager::polardb_update_server_list_snapshot_locked() {
 			continue;
 		}
 		PolarDB_ServerListEntry& entry = next->by_hostgroup[myhgc->hid];
-		entry.selection_sequence = myhgc->polardb_reader_selection_sequence;
-		std::vector<PgSQL_SrvC*>& servers = entry.servers;
+		entry.selection_start = myhgc->polardb_reader_selection_start;
+		std::vector<PolarDB_ServerSnapshotEntry>& servers = entry.servers;
 		const unsigned int count = myhgc->mysrvs->cnt();
 		servers.reserve(count);
 		for (unsigned int j = 0; j < count; j++) {
 			PgSQL_SrvC* srv = myhgc->mysrvs->idx(j);
 			if (srv) {
-				servers.push_back(srv);
+				servers.push_back(PolarDB_ServerSnapshotEntry{
+					srv, srv->weight, srv->max_connections, srv->max_latency_us});
 			}
 		}
 	}
@@ -2444,6 +2525,9 @@ bool PgSQL_HostGroups_Manager::commit(
 	if (pgsql_servers_mutated) {
 #if POLARDB_PROXY
 		polardb_refresh_all_writer_epochs_locked("pgsql_servers reload");
+		polardb_fast_topology_wrlock();
+		polardb_update_server_list_snapshot_locked();
+		polardb_fast_topology_unlock();
 #endif // POLARDB_PROXY
 	}
 
@@ -2997,13 +3081,19 @@ void PgSQL_HostGroups_Manager::increase_reset_counter() {
 	wrunlock();
 }
 bool PgSQL_HostGroups_Manager::return_connection_with_match_key(
-		PgSQL_Connection* conn) {
+		PgSQL_Connection* conn, const PgSQL_PoolMatchKey* known_match_key,
+		PgSQL_Connection** detached_connection) {
 #if !POLARDB_PROXY
 	(void)conn;
+	(void)known_match_key;
+	(void)detached_connection;
 	return false;
 #else
 	if (!conn || !conn->parent) {
 		return false;
+	}
+	if (detached_connection) {
+		*detached_connection = nullptr;
 	}
 #if POLARDB_PROXY
 	std::shared_ptr<const void> selected_server_snapshot =
@@ -3079,7 +3169,11 @@ bool PgSQL_HostGroups_Manager::return_connection_with_match_key(
 #endif // POLARDB_PROFILE
 		if (!returned) {
 			(void)srv->remove_used_connection(conn);
-			delete conn;
+			if (detached_connection) {
+				*detached_connection = conn;
+			} else {
+				delete conn;
+			}
 			return true;
 		}
 #if POLARDB_PROXY
@@ -3089,12 +3183,121 @@ bool PgSQL_HostGroups_Manager::return_connection_with_match_key(
 		return true;
 	}
 	(void)srv->remove_used_connection(conn);
-	delete conn;
+	if (detached_connection) {
+		*detached_connection = conn;
+	} else {
+		delete conn;
+	}
 	return true;
 #endif // !POLARDB_PROXY
 }
 
 #if POLARDB_PROXY
+void PgSQL_HostGroups_Manager::return_polardb_reader_connections(
+		const std::vector<PgSQL_Connection*>& connections,
+		std::vector<PgSQL_Connection*>& detached_connections) {
+	if (connections.empty()) {
+		return;
+	}
+	PgSQL_SrvC* server = connections.front() && connections.front()->parent
+		? static_cast<PgSQL_SrvC*>(connections.front()->parent) : nullptr;
+	if (!server) {
+		detached_connections.insert(detached_connections.end(),
+			connections.begin(), connections.end());
+		return;
+	}
+
+	struct PreparedReturn {
+		PgSQL_Connection* connection;
+		PgSQL_PoolMatchKey match_key;
+		bool reusable;
+	};
+	std::vector<PreparedReturn> prepared;
+	prepared.reserve(connections.size());
+	std::vector<std::shared_ptr<const void>> returned_server_snapshots;
+	returned_server_snapshots.reserve(connections.size());
+	unsigned int return_attempts = 0;
+	for (PgSQL_Connection* connection : connections) {
+		if (!connection || connection->parent != server) {
+			if (connection) {
+				detached_connections.push_back(connection);
+			}
+			continue;
+		}
+		connection->auto_increment_delay_token = 0;
+		const bool pool_state_allows_return = GloPTH != nullptr &&
+			connection->async_state_machine == ASYNC_IDLE &&
+			connection->largest_query_length <= static_cast<unsigned int>(
+				GloPTH->variables.threshold_query_length) &&
+			connection->local_stmts->get_num_backend_stmts() <=
+				static_cast<unsigned int>(
+					GloPTH->variables.max_stmts_per_connection);
+		PgSQL_PoolMatchKey match_key;
+		const bool reusable = pool_state_allows_return &&
+			polardb_reader_pool_ &&
+			polardb_reader_pool_->connection_match_key_for_return(
+				connection, &match_key);
+		if (reusable) {
+			return_attempts++;
+		}
+		pgsql_pool_status_count(&status.pgconnpoll_push);
+		prepared.push_back(PreparedReturn{connection, match_key, reusable});
+	}
+
+#if POLARDB_PROFILE
+	const unsigned long long wait_started_at = monotonic_time();
+#endif // POLARDB_PROFILE
+	unsigned int returned = 0;
+	{
+		std::unique_lock<std::recursive_mutex> pool_lock(server->pool_mutex);
+#if POLARDB_PROFILE
+		const unsigned long long lock_acquired_at = monotonic_time();
+		POLARDB_PROFILE_STATUS_COUNT(
+			reader_pool_shared_return_lock_wait_sum_us,
+			lock_acquired_at - wait_started_at);
+#endif // POLARDB_PROFILE
+		for (PreparedReturn& entry : prepared) {
+			const int used_index = server->ConnectionsUsed
+				? server->ConnectionsUsed->find_idx(entry.connection) : -1;
+			if (used_index < 0) {
+				proxy_error(
+					"PostgreSQL core could not return matching USED connection %p on %s:%u\n",
+					(void*)entry.connection,
+					server->address ? server->address : "(null)", server->port);
+				detached_connections.push_back(entry.connection);
+				continue;
+			}
+			(void)server->ConnectionsUsed->remove_unlocked(
+				static_cast<unsigned int>(used_index));
+			if (!entry.reusable ||
+					server->status != MYSQL_SERVER_STATUS_ONLINE) {
+				detached_connections.push_back(entry.connection);
+				continue;
+			}
+			returned_server_snapshots.push_back(std::move(
+				entry.connection->polardb_selected_server_snapshot));
+			server->ConnectionsFree->add_unlocked(
+				entry.connection, &entry.match_key);
+			returned++;
+		}
+#if POLARDB_PROFILE
+		POLARDB_PROFILE_STATUS_COUNT(
+			reader_pool_shared_return_lock_hold_sum_us,
+			monotonic_time() - lock_acquired_at);
+#endif // POLARDB_PROFILE
+	}
+#if POLARDB_PROFILE
+	POLARDB_PROFILE_STATUS_COUNT(
+		reader_pool_shared_return_attempt, return_attempts);
+	POLARDB_PROFILE_STATUS_COUNT(
+		reader_pool_shared_return_accepted, returned);
+	POLARDB_PROFILE_STATUS_COUNT(
+		reader_pool_shared_return_rejected, return_attempts - returned);
+#endif // POLARDB_PROFILE
+	status.polardb_reader_pool_return_to_core.fetch_add(
+		returned, std::memory_order_relaxed);
+}
+
 PolarDB_ReaderLocalReturn
 PgSQL_HostGroups_Manager::polardb_reader_local_return_decision(
 		PgSQL_Connection* conn) {
@@ -3120,40 +3323,40 @@ void PgSQL_HostGroups_Manager::push_MyConn_to_pool(PgSQL_Connection *c, bool _lo
 		wrlock();
 	c->auto_increment_delay_token = 0;
 	status.pgconnpoll_push++;
+	PgSQL_Connection* connection_to_delete = nullptr;
 	// The global HGM lock protects topology/status and the pool status
 	// counters.  The selected-server lock makes the USED -> FREE transfer
 	// indivisible while a matching connection is being taken.
 #if POLARDB_PROXY
-	std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
+	{
+		std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
 #endif // POLARDB_PROXY
-	proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Returning PgSQL_Connection %p, server %s:%d with status %d\n", c, mysrvc->address, mysrvc->port, mysrvc->status);
-	mysrvc->ConnectionsUsed->remove(c);
-	if (GloPTH == NULL) { goto __exit_push_MyConn_to_pool; }
-	if (c->largest_query_length > (unsigned int)GloPTH->variables.threshold_query_length) {
-		proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Destroying PgSQL_Connection %p, server %s:%d with status %d . largest_query_length = %lu\n", c, mysrvc->address, mysrvc->port, mysrvc->status, c->largest_query_length);
-		delete c;
-		goto __exit_push_MyConn_to_pool;
-	}
-	if (mysrvc->status==MYSQL_SERVER_STATUS_ONLINE) {
-		if (c->async_state_machine==ASYNC_IDLE) {
-			if (GloPTH == NULL) { goto __exit_push_MyConn_to_pool; }
-			if (c->local_stmts->get_num_backend_stmts() > (unsigned int)GloPTH->variables.max_stmts_per_connection) {  // Check if the connection has too many prepared statements
-				// Log debug information about destroying the connection due to too many prepared statements
-				proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Destroying PgSQL_Connection %p, server %s:%d with status %d because has too many prepared statements\n", c, mysrvc->address, mysrvc->port, (int)mysrvc->status);
-				mysrvc->ConnectionsUsed->add(c); // Add the connection back to the list of used connections
-				destroy_MyConn_from_pool(c, false); // Destroy the connection from the pool
+		proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Returning PgSQL_Connection %p, server %s:%d with status %d\n", c, mysrvc->address, mysrvc->port, mysrvc->status);
+		mysrvc->ConnectionsUsed->remove(c);
+		if (GloPTH != NULL) {
+			if (c->largest_query_length >
+					(unsigned int)GloPTH->variables.threshold_query_length) {
+				proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Destroying PgSQL_Connection %p, server %s:%d with status %d . largest_query_length = %lu\n", c, mysrvc->address, mysrvc->port, mysrvc->status, c->largest_query_length);
+				connection_to_delete = c;
+			} else if (mysrvc->status == MYSQL_SERVER_STATUS_ONLINE &&
+					c->async_state_machine == ASYNC_IDLE) {
+				if (c->local_stmts->get_num_backend_stmts() >
+						(unsigned int)GloPTH->variables.max_stmts_per_connection) {
+					proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Destroying PgSQL_Connection %p, server %s:%d with status %d because has too many prepared statements\n", c, mysrvc->address, mysrvc->port, (int)mysrvc->status);
+					status.pgconnpoll_destroy++;
+					connection_to_delete = c;
+				} else {
+					mysrvc->ConnectionsFree->add(c);
+				}
 			} else {
-				mysrvc->ConnectionsFree->add(c); // Add the connection to the list of free connections
+				proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Destroying PgSQL_Connection %p, server %s:%d with status %d\n", c, mysrvc->address, mysrvc->port, mysrvc->status);
+				connection_to_delete = c;
 			}
-		} else {
-			proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Destroying PgSQL_Connection %p, server %s:%d with status %d\n", c, mysrvc->address, mysrvc->port, mysrvc->status);
-			delete c;
 		}
-	} else {
-		proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Destroying PgSQL_Connection %p, server %s:%d with status %d\n", c, mysrvc->address, mysrvc->port, mysrvc->status);
-		delete c;
+#if POLARDB_PROXY
 	}
-__exit_push_MyConn_to_pool:
+#endif // POLARDB_PROXY
+	delete connection_to_delete;
 	if (_lock)
 		wrunlock();
 }
@@ -3221,7 +3424,7 @@ PgSQL_SrvC *PgSQL_HGC::get_random_MySrvC(char * gtid_uuid, uint64_t gtid_trxid, 
 			mysrvc=mysrvs->idx(j);
 			if (mysrvc->status==MYSQL_SERVER_STATUS_ONLINE) { // consider this server only if ONLINE
 				if (server_can_run_active(mysrvc)) { // consider this server only if active capacity remains
-					if ( mysrvc->current_latency_us < ( mysrvc->max_latency_us ? mysrvc->max_latency_us : pgsql_thread___default_max_latency_ms *1000 ) ) { // consider the host only if not too far
+					if ( mysrvc->current_latency_us_value() < ( mysrvc->max_latency_us ? mysrvc->max_latency_us : pgsql_thread___default_max_latency_ms *1000 ) ) { // consider the host only if not too far
 						if (gtid_trxid) {
 #if 0
 							if (PgHGM->gtid_exists(mysrvc, gtid_uuid, gtid_trxid)) {
@@ -3291,7 +3494,7 @@ PgSQL_SrvC *PgSQL_HGC::get_random_MySrvC(char * gtid_uuid, uint64_t gtid_trxid, 
 									PgHGM->unshun_server_all_hostgroups(mysrvc->address, mysrvc->port, t, max_wait_sec, &mysrvc->myhgc->hid);
 								}
 								// if a server is taken back online, consider it immediately
-								if ( mysrvc->current_latency_us < ( mysrvc->max_latency_us ? mysrvc->max_latency_us : pgsql_thread___default_max_latency_ms *1000 ) ) { // consider the host only if not too far
+								if ( mysrvc->current_latency_us_value() < ( mysrvc->max_latency_us ? mysrvc->max_latency_us : pgsql_thread___default_max_latency_ms *1000 ) ) { // consider the host only if not too far
 									if (gtid_trxid) {
 #if 0
 										if (PgHGM->gtid_exists(mysrvc, gtid_uuid, gtid_trxid)) {
@@ -3378,7 +3581,7 @@ PgSQL_SrvC *PgSQL_HGC::get_random_MySrvC(char * gtid_uuid, uint64_t gtid_trxid, 
 						mysrvc->connect_ERR_at_time_last_detected_error=0;
 						mysrvc->time_last_detected_error=0;
 						// if a server is taken back online, consider it immediately
-						if ( mysrvc->current_latency_us < ( mysrvc->max_latency_us ? mysrvc->max_latency_us : pgsql_thread___default_max_latency_ms *1000 ) ) { // consider the host only if not too far
+						if ( mysrvc->current_latency_us_value() < ( mysrvc->max_latency_us ? mysrvc->max_latency_us : pgsql_thread___default_max_latency_ms *1000 ) ) { // consider the host only if not too far
 							if (gtid_trxid) {
 #if 0
 								if (PgHGM->gtid_exists(mysrvc, gtid_uuid, gtid_trxid)) {
@@ -3462,9 +3665,11 @@ PgSQL_SrvC *PgSQL_HGC::get_random_MySrvC(char * gtid_uuid, uint64_t gtid_trxid, 
 				// scan and verify that all servers have some latency
 				for (j=0; j<num_candidates; j++) {
 					mysrvc = mysrvcCandidates[j];
-					if (mysrvc->current_latency_us) {
+					const unsigned int current_latency_us =
+						mysrvc->current_latency_us_value();
+					if (current_latency_us) {
 						servers_with_latency++;
-						total_latency_us += mysrvc->current_latency_us;
+						total_latency_us += current_latency_us;
 					}
 				}
 				if (servers_with_latency == num_candidates) {
@@ -3476,7 +3681,7 @@ PgSQL_SrvC *PgSQL_HGC::get_random_MySrvC(char * gtid_uuid, uint64_t gtid_trxid, 
 					avg_latency_us = total_latency_us/num_candidates;
 					for (j=0; j<num_candidates; j++) {
 						mysrvc = mysrvcCandidates[j];
-						if (mysrvc->current_latency_us > avg_latency_us) {
+						if (mysrvc->current_latency_us_value() > avg_latency_us) {
 							// remove the candidate
 							if (j+1 < num_candidates) {
 								mysrvcCandidates[j] = mysrvcCandidates[num_candidates-1];
@@ -3603,7 +3808,9 @@ void PgSQL_SrvConnList::get_random_MyConn_inner_search(unsigned int start, unsig
 	}
 }
 
-PgSQL_Connection * PgSQL_SrvConnList::get_random_MyConn(PgSQL_Session *sess, bool ff, bool only_pooled) {
+PgSQL_Connection * PgSQL_SrvConnList::get_random_MyConn(
+		PgSQL_Session *sess, bool ff, bool only_pooled,
+		std::vector<PgSQL_Connection*>* connections_to_delete) {
 #if POLARDB_PROXY
 	std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
 #endif // POLARDB_PROXY
@@ -3673,8 +3880,10 @@ PgSQL_Connection * PgSQL_SrvConnList::get_random_MyConn(PgSQL_Session *sess, boo
 						bool can_create = true;
 						if (decision.evict_connections) {
 #if POLARDB_PROXY
+							assert(connections_to_delete);
 							can_create = pgsql_polardb_prepare_classic_create_locked(
-								mysrvc, decision.num_to_evict);
+								mysrvc, decision.num_to_evict,
+								*connections_to_delete);
 #else
 							unsigned int cur_free = conns_free;
 							unsigned int connections_to_free = decision.num_to_evict;
@@ -3688,8 +3897,9 @@ PgSQL_Connection * PgSQL_SrvConnList::get_random_MyConn(PgSQL_Session *sess, boo
 #endif // POLARDB_PROXY
 						} else {
 #if POLARDB_PROXY
+							assert(connections_to_delete);
 							can_create = pgsql_polardb_prepare_classic_create_locked(
-								mysrvc, 0);
+								mysrvc, 0, *connections_to_delete);
 #endif // POLARDB_PROXY
 						}
 
@@ -3709,8 +3919,9 @@ PgSQL_Connection * PgSQL_SrvConnList::get_random_MyConn(PgSQL_Session *sess, boo
 						}
 						if (decision.create_new_connection) {
 #if POLARDB_PROXY
+							assert(connections_to_delete);
 							if (!pgsql_polardb_prepare_classic_create_locked(
-									mysrvc, 0)) {
+									mysrvc, 0, *connections_to_delete)) {
 								return NULL;
 							}
 #endif // POLARDB_PROXY
@@ -3747,7 +3958,9 @@ PgSQL_Connection * PgSQL_SrvConnList::get_random_MyConn(PgSQL_Session *sess, boo
 			return NULL;
 		} else {
 #if POLARDB_PROXY
-			if (!pgsql_polardb_prepare_classic_create_locked(mysrvc, 0)) {
+			assert(connections_to_delete);
+			if (!pgsql_polardb_prepare_classic_create_locked(
+					mysrvc, 0, *connections_to_delete)) {
 				return NULL;
 			}
 #endif // POLARDB_PROXY
@@ -3813,6 +4026,7 @@ void PgSQL_HostGroups_Manager::unshun_server_all_hostgroups(const char * address
 
 PgSQL_Connection * PgSQL_HostGroups_Manager::get_MyConn_from_pool(unsigned int _hid, PgSQL_Session *sess, bool ff, char * gtid_uuid, uint64_t gtid_trxid, int max_lag_ms, bool only_pooled) {
 	PgSQL_Connection * conn=NULL;
+	std::vector<PgSQL_Connection*> connections_to_delete;
 	wrlock();
 	pgsql_pool_status_count_get(sess ? sess->thread : NULL,
 		&status.pgconnpoll_get);
@@ -3828,13 +4042,17 @@ PgSQL_Connection * PgSQL_HostGroups_Manager::get_MyConn_from_pool(unsigned int _
 #if POLARDB_PROXY
 		std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
 #endif // POLARDB_PROXY
-		conn=mysrvc->ConnectionsFree->get_random_MyConn(sess, ff, only_pooled);
+		conn=mysrvc->ConnectionsFree->get_random_MyConn(
+			sess, ff, only_pooled, &connections_to_delete);
 		if (conn) {
 			mysrvc->ConnectionsUsed->add(conn);
 			pgsql_pool_status_count_get_ok(sess ? sess->thread : NULL,
 				&status.pgconnpoll_get_ok);
 			mysrvc->update_max_connections_used();
 		}
+	}
+	for (PgSQL_Connection* connection : connections_to_delete) {
+		delete connection;
 	}
 	wrunlock();
 	proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Returning MySQL Connection %p, server %s:%d\n", conn, (conn ? conn->parent->address : "") , (conn ? conn->parent->port : 0 ));
@@ -3846,7 +4064,8 @@ PgSQL_PoolGetResult
 PgSQL_HostGroups_Manager::get_connection_from_selected_server(
 		PgSQL_SrvC* srv, unsigned int expected_hostgroup_id,
 		const PgSQL_PoolMatchKey& match_key,
-		PgSQL_Session* sess, PgSQL_PoolGetMode mode) {
+		PgSQL_Session* sess, PgSQL_PoolGetMode mode,
+		unsigned int selected_max_connections) {
 	PgSQL_PoolGetResult result;
 	if (!srv) {
 		return result;
@@ -3859,7 +4078,8 @@ PgSQL_HostGroups_Manager::get_connection_from_selected_server(
 		unsigned long long lock_hold_us = 0;
 		POLARDB_PROFILE_STATUS_COUNT_ONE(reader_pool_shared_take_attempt);
 		result = srv->take_existing_connection(
-			sess, match_key, mode, &lock_wait_us, &lock_hold_us);
+			sess, match_key, mode, selected_max_connections,
+			&lock_wait_us, &lock_hold_us);
 		if (result.conn) {
 			POLARDB_PROFILE_STATUS_COUNT_ONE(
 				reader_pool_shared_take_hit);
@@ -3884,6 +4104,10 @@ PgSQL_HostGroups_Manager::get_connection_from_selected_server(
 		if (result.conn) {
 			return result;
 		}
+		if (result.server_saturated) {
+			POLARDB_PROFILE_STATUS_COUNT_ONE(reader_pool_confirmed_saturated);
+			return result;
+		}
 	}
 	if (!pgsql_pool_get_mode_has(
 			mode, PgSQL_PoolGetMode::ALLOW_CREATE)) {
@@ -3892,6 +4116,7 @@ PgSQL_HostGroups_Manager::get_connection_from_selected_server(
 
 	// Creating changes global limits, so check the selected server again while
 	// holding HGM. This function must not choose a different server.
+	POLARDB_PROFILE_STATUS_COUNT_ONE(reader_pool_hgm_create_lock_entry);
 	wrlock();
 	if (srv->status != MYSQL_SERVER_STATUS_ONLINE || !srv->myhgc ||
 			srv->myhgc->hid != expected_hostgroup_id ||
@@ -3901,6 +4126,7 @@ PgSQL_HostGroups_Manager::get_connection_from_selected_server(
 		wrunlock();
 		return result;
 	}
+	std::vector<PgSQL_Connection*> connections_to_delete;
 	{
 		std::lock_guard<std::recursive_mutex> pool_lock(srv->pool_mutex);
 		const unsigned int max_connections =
@@ -3913,7 +4139,8 @@ PgSQL_HostGroups_Manager::get_connection_from_selected_server(
 				? total - max_connections + 1 : 0;
 			if (evict_count <= free) {
 				for (unsigned int i = 0; i < evict_count; i++) {
-					delete srv->ConnectionsFree->remove(0);
+					connections_to_delete.push_back(
+						srv->ConnectionsFree->remove_unlocked(0));
 				}
 				result.conn = pgsql_create_backend_connection_locked(srv);
 				if (result.conn) {
@@ -3921,12 +4148,15 @@ PgSQL_HostGroups_Manager::get_connection_from_selected_server(
 							result.conn, match_key)) {
 						result.source = PgSQL_PoolGetSource::CREATED;
 					} else {
-						delete result.conn;
+						connections_to_delete.push_back(result.conn);
 						result.conn = nullptr;
 					}
 				}
 			}
 		}
+	}
+	for (PgSQL_Connection* conn : connections_to_delete) {
+		delete conn;
 	}
 	wrunlock();
 	return result;
@@ -3975,14 +4205,18 @@ void PgSQL_HostGroups_Manager::destroy_MyConn_from_pool(PgSQL_Connection *c, boo
 		proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Destroying PgSQL_Connection %p, server %s:%d Error %s\n", c, mysrvc->address, mysrvc->port,
 			c->get_error_code_with_message().c_str());
 #if POLARDB_PROXY
-		std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
+		{
+			std::lock_guard<std::recursive_mutex> pool_lock(mysrvc->pool_mutex);
 #endif // POLARDB_PROXY
-		mysrvc->ConnectionsUsed->remove(c);
+			mysrvc->ConnectionsUsed->remove(c);
+#if POLARDB_PROXY
+		}
+#endif // POLARDB_PROXY
 		status.pgconnpoll_destroy++;
-        if (_lock) {
+		delete c;
+		if (_lock) {
 			wrunlock();
 		}
-		delete c;
 	}
 }
 
@@ -4157,45 +4391,94 @@ void PgSQL_HostGroups_Manager::drop_all_idle_connections() {
 		for (j=0; j<(int)myhgc->mysrvs->cnt(); j++) {
 			PgSQL_SrvC *mysrvc=(PgSQL_SrvC *)myhgc->mysrvs->servers->index(j);
 #if POLARDB_PROXY
-			std::lock_guard<std::recursive_mutex> pool_lock(
-				mysrvc->pool_mutex);
-#endif // POLARDB_PROXY
+			std::vector<PgSQL_Connection*> connections_to_delete;
+			{
+				std::lock_guard<std::recursive_mutex> pool_lock(
+					mysrvc->pool_mutex);
+				PgSQL_SrvConnList *free_connections = mysrvc->ConnectionsFree;
+				if (mysrvc->status != MYSQL_SERVER_STATUS_ONLINE) {
+					proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5, "Server %s:%d is not online\n", mysrvc->address, mysrvc->port);
+					free_connections->detach_all_unlocked(connections_to_delete);
+				}
+
+				const unsigned int max_connections =
+					mysrvc->max_connections > 0
+						? static_cast<unsigned int>(mysrvc->max_connections)
+						: 0;
+				while (free_connections->conns->len &&
+						mysrvc->ConnectionsUsed->conns->len +
+							free_connections->conns->len > max_connections) {
+					connections_to_delete.push_back(
+						free_connections->remove_unlocked(0));
+				}
+
+				int free_connections_pct = pgsql_thread___free_connections_pct;
+				if (mysrvc->myhgc->attributes.configured == true) {
+					free_connections_pct =
+						mysrvc->myhgc->attributes.free_connections_pct;
+				}
+				while (free_connections->conns->len >
+						free_connections_pct * mysrvc->max_connections / 100) {
+					connections_to_delete.push_back(
+						free_connections->remove_unlocked(0));
+				}
+
+				if (pgsql_thread___connection_max_age_ms) {
+					const unsigned long long curtime = monotonic_time();
+					const unsigned long long max_age_us =
+						static_cast<unsigned long long>(
+							pgsql_thread___connection_max_age_ms) * 1000ULL;
+					unsigned int index = 0;
+					while (index < free_connections->conns->len) {
+						PgSQL_Connection *connection =
+							static_cast<PgSQL_Connection*>(
+								free_connections->conns->index(index));
+						if (curtime > connection->creation_time + max_age_us) {
+							connections_to_delete.push_back(
+								free_connections->remove_unlocked(index));
+						} else {
+							index++;
+						}
+					}
+				}
+			}
+			for (PgSQL_Connection* connection : connections_to_delete) {
+				delete connection;
+			}
+#else
 			if (mysrvc->status!=MYSQL_SERVER_STATUS_ONLINE) {
 				proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5, "Server %s:%d is not online\n", mysrvc->address, mysrvc->port);
-				//__sync_fetch_and_sub(&status.server_connections_connected, mysrvc->ConnectionsFree->conns->len);
 				mysrvc->ConnectionsFree->drop_all_connections();
 			}
 
 			pgsql_pool_trim_idle_connections_to_max(mysrvc);
-
-			//PtrArray *pa=mysrvc->ConnectionsFree->conns;
-			PgSQL_SrvConnList *mscl=mysrvc->ConnectionsFree;
+			PgSQL_SrvConnList *free_connections = mysrvc->ConnectionsFree;
 			int free_connections_pct = pgsql_thread___free_connections_pct;
 			if (mysrvc->myhgc->attributes.configured == true) {
-				// pgsql_hostgroup_attributes takes priority
-				free_connections_pct = mysrvc->myhgc->attributes.free_connections_pct;
+				free_connections_pct =
+					mysrvc->myhgc->attributes.free_connections_pct;
 			}
-			while (mscl->conns_length() > free_connections_pct*mysrvc->max_connections/100) {
-				PgSQL_Connection *mc=mscl->remove(0);
-				delete mc;
+			while (free_connections->conns_length() >
+					free_connections_pct * mysrvc->max_connections / 100) {
+				delete free_connections->remove(0);
 			}
 
-			// drop all connections with life exceeding pgsql-connection_max_age
 			if (pgsql_thread___connection_max_age_ms) {
-				unsigned long long curtime=monotonic_time();
-				int i=0;
-				for (i=0; i<(int)mscl->conns_length() ; i++) {
-					PgSQL_Connection *mc=mscl->index(i);
-					unsigned long long intv = pgsql_thread___connection_max_age_ms;
-					intv *= 1000;
-					if (curtime > mc->creation_time + intv) {
-						mc=mscl->remove(i);
-						delete mc;
-						i--;
+				const unsigned long long curtime = monotonic_time();
+				const unsigned long long max_age_us =
+					static_cast<unsigned long long>(
+						pgsql_thread___connection_max_age_ms) * 1000ULL;
+				unsigned int index = 0;
+				while (index < free_connections->conns_length()) {
+					PgSQL_Connection* connection = free_connections->index(index);
+					if (curtime > connection->creation_time + max_age_us) {
+						delete free_connections->remove(index);
+					} else {
+						index++;
 					}
 				}
 			}
-
+#endif // POLARDB_PROXY
 		}
 	}
 }
@@ -4378,15 +4661,15 @@ SQLite3_result * PgSQL_HostGroups_Manager::SQL3_Free_Connections() {
 		PgSQL_HGC *myhgc=(PgSQL_HGC *)MyHostGroups->index(i);
 		for (j=0; j<(int)myhgc->mysrvs->cnt(); j++) {
 			PgSQL_SrvC *mysrvc=(PgSQL_SrvC *)myhgc->mysrvs->servers->index(j);
-#if POLARDB_PROXY
-			std::lock_guard<std::recursive_mutex> pool_lock(
-				mysrvc->pool_mutex);
-#endif // POLARDB_PROXY
 			if (mysrvc->status!=MYSQL_SERVER_STATUS_ONLINE) {
 				proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 5, "Server %s:%d is not online\n", mysrvc->address, mysrvc->port);
 				mysrvc->ConnectionsFree->drop_all_connections();
 			}
 			pgsql_pool_trim_idle_connections_to_max(mysrvc);
+#if POLARDB_PROXY
+			std::lock_guard<std::recursive_mutex> pool_lock(
+				mysrvc->pool_mutex);
+#endif // POLARDB_PROXY
 			char buf[1024];
 			for (l=0; l < (int) mysrvc->ConnectionsFree->conns_length(); l++) {
 				char **pta=(char **)malloc(sizeof(char *)*colnum);
@@ -4561,7 +4844,7 @@ void PgSQL_HostGroups_Manager::p_update_connection_pool() {
 
 			// proxysql_connection_pool_latency_us metric
 			p_update_connection_pool_update_gauge(endpoint_id, common_labels,
-				status.p_connection_pool_latency_us_map, mysrvc->current_latency_us, PgSQL_p_hg_dyn_gauge::connection_pool_latency_us);
+				status.p_connection_pool_latency_us_map, mysrvc->current_latency_us_value(), PgSQL_p_hg_dyn_gauge::connection_pool_latency_us);
 
 			// proxysql_connection_pool_queries metric
 			p_update_connection_pool_update_counter(endpoint_id, common_labels,
@@ -4701,7 +4984,7 @@ SQLite3_result * PgSQL_HostGroups_Manager::SQL3_Connection_Pool(bool _reset, int
 			if (_reset) {
 				mysrvc->bytes_recv=0;
 			}
-			sprintf(buf,"%u", mysrvc->current_latency_us);
+			sprintf(buf,"%u", mysrvc->current_latency_us_value());
 			pta[12]=strdup(buf);
 			result->add_row(pta);
 			for (k=0; k<colnum; k++) {
@@ -4944,7 +5227,7 @@ void PgSQL_HostGroups_Manager::set_server_current_latency_us(char *hostname, int
 			for (j=0; j<l; j++) {
 				mysrvc=myhgc->mysrvs->idx(j);
 				if (mysrvc->port==port && strcmp(mysrvc->address,hostname)==0) {
-					mysrvc->current_latency_us=_current_latency_us;
+					mysrvc->set_current_latency_us_value(_current_latency_us);
 				}
 			}
 		}
@@ -5477,6 +5760,11 @@ int PgSQL_HostGroups_Manager::create_new_server_in_hg(
 		if (mysrvc && mysrvc->status == MYSQL_SERVER_STATUS_OFFLINE_HARD) {
 			reset_hg_attrs_server_defaults(mysrvc);
 			update_hg_attrs_server_defaults(mysrvc, mysrvc->myhgc);
+#if POLARDB_PROXY
+			polardb_fast_topology_wrlock();
+			polardb_update_server_list_snapshot_locked();
+			polardb_fast_topology_unlock();
+#endif // POLARDB_PROXY
 			mysrvc->set_status(MYSQL_SERVER_STATUS_ONLINE);
 
 			proxy_info(
@@ -5662,6 +5950,11 @@ PgSQL_SrvC* PgSQL_HostGroups_Manager::HostGroup_Server_Mapping::insert_HGM(unsig
 				mysrvc->use_ssl = srv->use_ssl;
 				mysrvc->max_latency_us = srv->max_latency_us;
 				mysrvc->comment = strdup(srv->comment);
+#if POLARDB_PROXY
+				myHGM->polardb_fast_topology_wrlock();
+				myHGM->polardb_update_server_list_snapshot_locked();
+				myHGM->polardb_fast_topology_unlock();
+#endif // POLARDB_PROXY
 				mysrvc->set_status(MYSQL_SERVER_STATUS_ONLINE);
 
 				if (GloPTH->variables.hostgroup_manager_verbose) {

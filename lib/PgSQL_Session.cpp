@@ -6157,7 +6157,7 @@ void PgSQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 #if POLARDB_PROXY
 	const PgSQL_HostGroups_Manager::PolarDB_HG_Config* polardb_hg_config =
 		PgHGM ? PgHGM->find_polardb_hg_config(mybe->hostgroup_id) : nullptr;
-	const bool polardb_reader_v2_eligible =
+	const bool polardb_reader_pool_eligible =
 		polardb_hg_config && polardb_hg_config->is_polardb_hostgroup &&
 		polardb_hg_config->reader_hostgroup == (int)mybe->hostgroup_id &&
 		session_fast_forward == SESSION_FORWARD_TYPE_NONE &&
@@ -6167,7 +6167,7 @@ void PgSQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 	if (session_fast_forward == SESSION_FORWARD_TYPE_NONE && qpo->create_new_conn == false) {
 #ifndef STRESSTEST_POOL
 #if POLARDB_PROXY
-	if (!polardb_reader_v2_eligible) {
+	if (!polardb_reader_pool_eligible) {
 			mc = thread->get_MyConn_local(
 				mybe->hostgroup_id, this, NULL, 0, (int)qpo->max_lag_ms);
 		}
@@ -6206,7 +6206,7 @@ void PgSQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 #if POLARDB_PROXY
 		bool polardb_reader_acquisition_handled = false;
 		const PolarDB_WaitSpec& polardb_wait_spec = polardb_query.wait.spec;
-		if (polardb_reader_v2_eligible) {
+		if (polardb_reader_pool_eligible) {
 			PolarDB_ReaderResult reader_result =
 				PgHGM->get_MyConn_polardb_reader(mybe->hostgroup_id, this,
 					polardb_query.reader_plan, polardb_wait_spec, false);

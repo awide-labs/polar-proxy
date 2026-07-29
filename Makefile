@@ -693,17 +693,15 @@ polardb-opt-report:
 	@$(CURDIR)/test/polardb/tools/opt_remarks_report.py --root "$(CURDIR)" --remarks-dir "$(POLARDB_OPT_REMARKS_DIR)" --pgo-dir "$(POLARDB_OPT_PGO_DIR)" --cs-dir "$(POLARDB_OPT_PGO_CS_DIR)" --bolt-dir "$(POLARDB_OPT_BOLT_DIR)" --output "$(POLARDB_OPT_REMARKS_DIR)/summary.md"
 	@echo "=== Wrote optimization remarks report: $(POLARDB_OPT_REMARKS_DIR)/summary.md ==="
 
-# Verify BOTH tiers with explicit clean builds. Leaves the tree at POLARDB_PROXY=1.
+# Verify both tiers with explicit clean builds: feature off first, then on.
+# The final build is the PolarDB binary used by development and live tests.
 # Usage: make polardb-check
 .PHONY: polardb-check
 polardb-check:
-	@echo "=== polardb-check [1/3]: POLARDB_PROXY=1 ==="
-	+$(MAKE) clean
-	+$(MAKE) POLARDB_PROXY=1 build_src
-	@echo "=== polardb-check [2/3]: POLARDB_PROXY=0 (stubs) ==="
+	@echo "=== polardb-check [1/2]: POLARDB_PROXY=0 (stubs) ==="
 	+$(MAKE) clean
 	+$(MAKE) POLARDB_PROXY=0 build_src
-	@echo "=== polardb-check [3/3]: restore POLARDB_PROXY=1 ==="
+	@echo "=== polardb-check [2/2]: POLARDB_PROXY=1 ==="
 	+$(MAKE) clean
 	+$(MAKE) POLARDB_PROXY=1 build_src
 	@echo "=== polardb-check OK: both tiers build; tree left at POLARDB_PROXY=1 ==="

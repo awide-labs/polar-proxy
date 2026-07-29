@@ -498,6 +498,7 @@ public:
 	bool set_single_row_mode();
 #if POLARDB_PROXY
 	void update_queries_sent();
+	void polardb_flush_parent_queries();
 	void polardb_flush_parent_bytes(PolarDB_ParentBytesFlushReason reason = PolarDB_ParentBytesFlushReason::Manual);
 #endif
 	void update_bytes_recv(uint64_t bytes_recv);
@@ -674,6 +675,7 @@ public:
 	uint64_t polardb_parent_bytes_recv_pending;
 	uint64_t polardb_parent_bytes_sent_pending;
 	uint64_t polardb_parent_queries_sent_pending;
+	uint32_t polardb_parent_query_batch_count;
 	uint32_t polardb_row_run_last_bytes = 0;
 	// ---- PolarDB wrapped-wait result filtering ----
 	// A wrapped LSN-wait read prepends N SET statements ahead of the user query
@@ -884,6 +886,7 @@ public:
 
 	PolarDB_PoolKey polardb_pool_key;
 	uint32_t polardb_core_pool_position{UINT32_MAX};
+	uint64_t polardb_worker_cache_epoch{0};
 
 	/**
 	 * Keeps the selected server alive while this backend is in use. Server-list

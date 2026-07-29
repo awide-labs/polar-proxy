@@ -439,6 +439,7 @@ static char* pgsql_thread_variables_names[] = {
 	(char*)"handle_unknown_charset",
 	(char*)"free_connections_pct",
 	(char*)"connection_warming",
+	(char*)"bounded_local_connection_cache",
 #ifdef IDLE_THREADS
 	(char*)"session_idle_ms",
 #endif // IDLE_THREADS
@@ -505,6 +506,7 @@ static char* pgsql_thread_variables_names[] = {
 	(char*)"polardb_lsn_freshness_ms",
 	(char*)"polardb_lag_cap_freshness_ms",
 	(char*)"polardb_reader_lsn_lag_range_bytes",
+	(char*)"polardb_reader_connection_retention",
 	(char*)"polardb_output_coalesce_bytes",
 	(char*)"polardb_output_coalesce_packets",
 	(char*)"polardb_monitor_lsn_updates",
@@ -515,7 +517,6 @@ static char* pgsql_thread_variables_names[] = {
 	(char*)"polardb_wait_timeout_mode",
 	(char*)"polardb_proxy_protocol",
 	(char*)"polardb_route_rfq_policy",
-	(char*)"polardb_session_lsn_baseline",
 	(char*)"polardb_reader_death_action",
 	(char*)"polardb_reader_timeout_action",
 	(char*)"polardb_reader_error_action",
@@ -1270,6 +1271,7 @@ PgSQL_Threads_Handler::PgSQL_Threads_Handler() {
 	variables.polardb_lsn_freshness_ms = 5000;                   // 5s max age for a trusted cached LSN
 	variables.polardb_lag_cap_freshness_ms = 250;                // cap trusted LSN age under byte-lag + finite wait
 	variables.polardb_reader_lsn_lag_range_bytes = 0;            // 0 = exact best-behind reader only
+	variables.polardb_reader_connection_retention = 0;           // return readers to shared storage after every worker pass
 	variables.polardb_output_coalesce_bytes = 0;                 // 0 = disabled; hold incomplete streaming output up to this byte budget
 	variables.polardb_output_coalesce_packets = 0;               // 0 = disabled; hold incomplete streaming output up to this packet budget
 	variables.polardb_monitor_lsn_updates = true;                // monitor LSN cache updates enabled
@@ -1280,7 +1282,6 @@ PgSQL_Threads_Handler::PgSQL_Threads_Handler() {
 	variables.polardb_wait_timeout_mode = strdup((char*)"best_effort");
 	variables.polardb_proxy_protocol = strdup((char*)"v15");
 	variables.polardb_route_rfq_policy = strdup((char*)"strict");
-	variables.polardb_session_lsn_baseline = strdup((char*)"observed");
 	variables.polardb_reader_death_action = strdup((char*)"retry");
 	variables.polardb_reader_timeout_action = strdup((char*)"retry");
 	variables.polardb_reader_error_action = strdup((char*)"forward");
@@ -1307,6 +1308,7 @@ PgSQL_Threads_Handler::PgSQL_Threads_Handler() {
 	variables.throttle_max_bytes_per_second_to_client = 0;
 	variables.throttle_ratio_server_to_client = 0;
 	variables.connection_warming = false;
+	variables.bounded_local_connection_cache = 0;
 	variables.max_connections = 10 * 1000;
 	variables.max_stmts_per_connection = 20;
 	variables.max_stmts_cache = 10000;
@@ -1514,7 +1516,6 @@ char* PgSQL_Threads_Handler::get_variable_string(char* name) {
 	if (!strcmp(name, "polardb_wait_timeout_mode")) return strdup(variables.polardb_wait_timeout_mode);
 	if (!strcmp(name, "polardb_proxy_protocol")) return strdup(variables.polardb_proxy_protocol);
 	if (!strcmp(name, "polardb_route_rfq_policy")) return strdup(variables.polardb_route_rfq_policy);
-	if (!strcmp(name, "polardb_session_lsn_baseline")) return strdup(variables.polardb_session_lsn_baseline);
 	if (!strcmp(name, "polardb_reader_death_action")) return strdup(variables.polardb_reader_death_action);
 	if (!strcmp(name, "polardb_reader_timeout_action")) return strdup(variables.polardb_reader_timeout_action);
 	if (!strcmp(name, "polardb_reader_error_action")) return strdup(variables.polardb_reader_error_action);
@@ -1822,7 +1823,6 @@ char* PgSQL_Threads_Handler::get_variable(char* name) {	// this is the public fu
 	if (!strcasecmp(name, "polardb_wait_timeout_mode")) return strdup(variables.polardb_wait_timeout_mode);
 	if (!strcasecmp(name, "polardb_proxy_protocol")) return strdup(variables.polardb_proxy_protocol);
 	if (!strcasecmp(name, "polardb_route_rfq_policy")) return strdup(variables.polardb_route_rfq_policy);
-	if (!strcasecmp(name, "polardb_session_lsn_baseline")) return strdup(variables.polardb_session_lsn_baseline);
 	if (!strcasecmp(name, "polardb_reader_death_action")) return strdup(variables.polardb_reader_death_action);
 	if (!strcasecmp(name, "polardb_reader_timeout_action")) return strdup(variables.polardb_reader_timeout_action);
 	if (!strcasecmp(name, "polardb_reader_error_action")) return strdup(variables.polardb_reader_error_action);
@@ -1975,15 +1975,6 @@ bool PgSQL_Threads_Handler::set_variable(char* name, const char* value) {	// thi
 			return true;
 		}
 		proxy_error("Invalid value '%s' for pgsql-polardb_route_rfq_policy (allowed: strict, best_effort)\n", value);
-		return false;
-	}
-	if (!strcasecmp(name, "polardb_session_lsn_baseline")) {
-		if (polardb_session_lsn_baseline_from_string(value, -1) >= 0) {
-			free(variables.polardb_session_lsn_baseline);
-			variables.polardb_session_lsn_baseline = strdup(value);
-			return true;
-		}
-		proxy_error("Invalid value '%s' for pgsql-polardb_session_lsn_baseline (allowed: observed, primary)\n", value);
 		return false;
 	}
 	if (!strcasecmp(name, "polardb_reader_death_action")) {
@@ -2565,6 +2556,8 @@ char** PgSQL_Threads_Handler::get_variables_list() {
 	// it is safe to do it here because get_variables_list() is the first function called during start time
 	if (VariablesPointers_int.size() == 0) {
 		VariablesPointers_int["authentication_method"] = make_tuple(&variables.authentication_method, 1, 3, false);
+		VariablesPointers_int["bounded_local_connection_cache"] =
+			make_tuple(&variables.bounded_local_connection_cache, 0, 1, false);
 		// Monitor variables
 		VariablesPointers_int["monitor_history"] = make_tuple(&variables.monitor_history, 1000, 7 * 24 * 3600 * 1000, false);
 
@@ -2693,6 +2686,7 @@ char** PgSQL_Threads_Handler::get_variables_list() {
 		VariablesPointers_int["polardb_lsn_freshness_ms"] = make_tuple(&variables.polardb_lsn_freshness_ms, 100, 60000, false); // 100ms-60s
 		VariablesPointers_int["polardb_lag_cap_freshness_ms"] = make_tuple(&variables.polardb_lag_cap_freshness_ms, 0, 60000, false); // 0 = wait-fraction only
 		VariablesPointers_int["polardb_reader_lsn_lag_range_bytes"] = make_tuple(&variables.polardb_reader_lsn_lag_range_bytes, 0, INT_MAX, false); // 0 = exact
+		VariablesPointers_int["polardb_reader_connection_retention"] = make_tuple(&variables.polardb_reader_connection_retention, 0, 1, false);
 		VariablesPointers_int["polardb_output_coalesce_bytes"] = make_tuple(&variables.polardb_output_coalesce_bytes, 0, 16 * 1024 * 1024, false);
 		VariablesPointers_int["polardb_output_coalesce_packets"] = make_tuple(&variables.polardb_output_coalesce_packets, 0, 1024, false);
 		VariablesPointers_int["polardb_proxy_identity_port"] = make_tuple(&variables.polardb_proxy_identity_port, 0, 65535, false); // 0 = unset
@@ -3097,7 +3091,6 @@ PgSQL_Threads_Handler::~PgSQL_Threads_Handler() {
 	if (variables.polardb_wait_timeout_mode) { free(variables.polardb_wait_timeout_mode); variables.polardb_wait_timeout_mode = NULL; }
 	if (variables.polardb_proxy_protocol) { free(variables.polardb_proxy_protocol); variables.polardb_proxy_protocol = NULL; }
 	if (variables.polardb_route_rfq_policy) { free(variables.polardb_route_rfq_policy); variables.polardb_route_rfq_policy = NULL; }
-	if (variables.polardb_session_lsn_baseline) { free(variables.polardb_session_lsn_baseline); variables.polardb_session_lsn_baseline = NULL; }
 	if (variables.polardb_reader_death_action) { free(variables.polardb_reader_death_action); variables.polardb_reader_death_action = NULL; }
 	if (variables.polardb_reader_timeout_action) { free(variables.polardb_reader_timeout_action); variables.polardb_reader_timeout_action = NULL; }
 	if (variables.polardb_reader_error_action) { free(variables.polardb_reader_error_action); variables.polardb_reader_error_action = NULL; }
@@ -3240,7 +3233,7 @@ PgSQL_Thread::~PgSQL_Thread() {
 #endif // IDLE_THREADS
 
 	if (cached_connections) {
-		return_local_connections();
+		return_local_connections(true);
 		delete cached_connections;
 	}
 
@@ -4399,6 +4392,8 @@ void PgSQL_Thread::refresh_variables() {
 	pgsql_thread___connect_timeout_server = GloPTH->get_variable_int((char*)"connect_timeout_server");
 	pgsql_thread___connect_timeout_server_max = GloPTH->get_variable_int((char*)"connect_timeout_server_max");
 	pgsql_thread___connection_warming = (bool)GloPTH->get_variable_int((char*)"connection_warming");
+	pgsql_thread___bounded_local_connection_cache =
+		GloPTH->get_variable_int((char*)"bounded_local_connection_cache");
 	pgsql_thread___log_unhealthy_connections = (bool)GloPTH->get_variable_int((char*)"log_unhealthy_connections");
 	pgsql_thread___throttle_max_bytes_per_second_to_client = GloPTH->get_variable_int((char*)"throttle_max_bytes_per_second_to_client");
 	pgsql_thread___throttle_ratio_server_to_client = GloPTH->get_variable_int((char*)"throttle_ratio_server_to_client");
@@ -4425,6 +4420,8 @@ void PgSQL_Thread::refresh_variables() {
 		GloPTH->get_variable_int((char*)"polardb_lag_cap_freshness_ms");
 	pgsql_thread___polardb_reader_lsn_lag_range_bytes =
 		GloPTH->get_variable_int((char*)"polardb_reader_lsn_lag_range_bytes");
+	pgsql_thread___polardb_reader_connection_retention =
+		GloPTH->get_variable_int((char*)"polardb_reader_connection_retention");
 	pgsql_thread___polardb_output_coalesce_bytes =
 		GloPTH->get_variable_int((char*)"polardb_output_coalesce_bytes");
 	pgsql_thread___polardb_output_coalesce_packets =
@@ -4458,11 +4455,6 @@ void PgSQL_Thread::refresh_variables() {
 		char* policy = GloPTH->get_variable_string((char*)"polardb_route_rfq_policy");
 		pgsql_thread___polardb_route_rfq_policy = polardb_route_rfq_policy_from_string(policy);
 		if (policy) free(policy);
-	}
-	{
-		char* baseline = GloPTH->get_variable_string((char*)"polardb_session_lsn_baseline");
-		pgsql_thread___polardb_session_lsn_baseline = polardb_session_lsn_baseline_from_string(baseline);
-		if (baseline) free(baseline);
 	}
 	{
 		char* action = GloPTH->get_variable_string((char*)"polardb_reader_death_action");
@@ -6422,6 +6414,28 @@ PgSQL_Connection* PgSQL_Thread::get_MyConn_local(unsigned int _hid, PgSQL_Sessio
 }
 
 #if POLARDB_PROXY
+uint64_t PgSQL_Thread::next_polardb_reader_selection_sequence(
+		unsigned int hostgroup_id, uint64_t server_list_generation,
+		std::atomic<uint64_t>* selection_start) {
+	if (!polardb_reader_selection_generation_initialized ||
+			polardb_reader_selection_generation != server_list_generation) {
+		polardb_reader_selection_sequences.clear();
+		polardb_reader_selection_generation = server_list_generation;
+		polardb_reader_selection_generation_initialized = true;
+	}
+	for (PolarDB_ReaderSelectionState& state :
+			polardb_reader_selection_sequences) {
+		if (state.hostgroup_id == hostgroup_id) {
+			return state.next_sequence++;
+		}
+	}
+	const uint64_t first_sequence = selection_start
+		? selection_start->fetch_add(1, std::memory_order_relaxed) : 0;
+	polardb_reader_selection_sequences.push_back(
+		PolarDB_ReaderSelectionState{hostgroup_id, first_sequence + 1});
+	return first_sequence;
+}
+
 static bool polardb_local_reader_connection_matches(
 		const PgSQL_Connection* conn, const PgSQL_SrvC* server,
 		uint32_t profile_generation, const PolarDB_PoolKey& pool_key) {
@@ -6465,32 +6479,10 @@ void PgSQL_Thread::push_MyConn_local(PgSQL_Connection * c) {
 		if (!cached_connections) {
 			cached_connections = new PtrArray();
 		}
-		PgSQL_SrvC* server = static_cast<PgSQL_SrvC*>(c->parent);
-		bool already_local = false;
-		for (unsigned int index = 0;
-				index < cached_connections->len; index++) {
-			PgSQL_Connection* existing = static_cast<PgSQL_Connection*>(
-				cached_connections->index(index));
-			if (polardb_local_reader_connection_matches(
-					existing, server,
-					c->polardb_startup_profile_generation,
-					c->polardb_pool_key)) {
-				already_local = true;
-				break;
-			}
-		}
-		if (!already_local) {
-			POLARDB_HGM_PROFILE_STATUS_COUNT_ONE(
-				PgHGM->status, reader_pool_local_store_accepted);
-			cached_connections->add(c);
-			return;
-		}
+		c->polardb_worker_cache_epoch = polardb_reader_cache_epoch;
 		POLARDB_HGM_PROFILE_STATUS_COUNT_ONE(
-			PgHGM->status, reader_pool_local_store_rejected);
-		if (PgHGM && PgHGM->return_connection_with_match_key(c)) {
-			return;
-		}
-		PgHGM->destroy_MyConn_from_pool(c);
+			PgHGM->status, reader_pool_local_store_accepted);
+		cached_connections->add(c);
 		return;
 	}
 	if (local_return == PolarDB_ReaderLocalReturn::REMOVE_CONNECTION) {
@@ -6509,94 +6501,124 @@ void PgSQL_Thread::push_MyConn_local(PgSQL_Connection * c) {
 		cached_connections = new PtrArray();
 	}
 
-	// Bounded local cache: cache 1-in-N releases (N = pgsql_threads), push the
-	// rest to the shared HGM pool so peer workers can pick them up.
-	// At N=1 always cache (no sibling to share with).
-	// Rationale: avoids the connection-hoarding behavior that starved sibling
-	// workers at high client count, while preserving most of the lock-amortization
-	// benefit at lower client counts.
 	PgSQL_SrvC* mysrvc = (PgSQL_SrvC*)c->parent;
 	if (mysrvc->status == MYSQL_SERVER_STATUS_ONLINE) {
 		if (c->async_state_machine == ASYNC_IDLE) {
-			unsigned int n = (GloPTH && GloPTH->num_threads > 0) ? GloPTH->num_threads : 1;
-			if ((push_local_counter++ % n) == 0) {
-				cached_connections->add(c);
-				return;
+			if (pgsql_thread___bounded_local_connection_cache != 0) {
+				const unsigned int thread_count =
+					(GloPTH && GloPTH->num_threads > 0)
+						? GloPTH->num_threads : 1;
+				if ((push_local_counter++ % thread_count) != 0) {
+					PgHGM->push_MyConn_to_pool(c);
+					return;
+				}
 			}
+			cached_connections->add(c);
+			return;
 		}
 	}
 	PgHGM->push_MyConn_to_pool(c);
 }
 
-void PgSQL_Thread::return_local_connections() {
+void PgSQL_Thread::return_local_connections(bool return_polardb_connections) {
 	if (cached_connections->len == 0) {
+#if POLARDB_PROXY
+		if (!return_polardb_connections) {
+			polardb_reader_cache_epoch++;
+		}
+#endif // POLARDB_PROXY
 		return;
 	}
 	const unsigned int cached_count = cached_connections->len;
-	unsigned int generic_count = 0;
-#if POLARDB_PROXY && POLARDB_PROFILE
-	unsigned int polardb_reader_connections = 0;
+
+#if POLARDB_PROXY
+	struct ReaderReturnGroup {
+		PgSQL_SrvC* server;
+		std::vector<unsigned int> indexes;
+		std::vector<PgSQL_Connection*> connections;
+	};
+	std::vector<ReaderReturnGroup> reader_groups;
 	for (unsigned int index = 0; index < cached_count; index++) {
-		PgSQL_Connection* conn = static_cast<PgSQL_Connection*>(
+		PgSQL_Connection* connection = static_cast<PgSQL_Connection*>(
 			cached_connections->index(index));
-		if (conn && !conn->polardb_pool_key.empty()) {
-			polardb_reader_connections++;
+		if (!connection || connection->polardb_pool_key.empty() ||
+				!connection->parent) {
+			continue;
+		}
+		if (!return_polardb_connections &&
+				pgsql_thread___polardb_reader_connection_retention != 0 &&
+				connection->polardb_worker_cache_epoch ==
+					polardb_reader_cache_epoch) {
+			continue;
+		}
+		PgSQL_SrvC* server = static_cast<PgSQL_SrvC*>(connection->parent);
+		auto group = std::find_if(reader_groups.begin(), reader_groups.end(),
+			[server](const ReaderReturnGroup& candidate) {
+				return candidate.server == server;
+			});
+		if (group == reader_groups.end()) {
+			reader_groups.push_back(ReaderReturnGroup{server, {}, {}});
+			group = reader_groups.end() - 1;
+		}
+		group->indexes.push_back(index);
+		group->connections.push_back(connection);
+	}
+	unsigned int polardb_reader_connections = 0;
+	for (ReaderReturnGroup& group : reader_groups) {
+		polardb_reader_connections += group.connections.size();
+		std::vector<PgSQL_Connection*> connections_to_delete;
+		connections_to_delete.reserve(group.connections.size());
+		PgHGM->return_polardb_reader_connections(
+			group.connections, connections_to_delete);
+		for (unsigned int index : group.indexes) {
+			cached_connections->pdata[index] = nullptr;
+		}
+		for (PgSQL_Connection* connection : connections_to_delete) {
+			delete connection;
 		}
 	}
 	POLARDB_HGM_PROFILE_STATUS_COUNT(PgHGM->status,
 		reader_pool_local_return_to_shared, polardb_reader_connections);
-#endif // POLARDB_PROXY && POLARDB_PROFILE
-
-#if POLARDB_PROXY
-	for (unsigned int index = 0; index < cached_count; index++) {
-		PgSQL_Connection* first = static_cast<PgSQL_Connection*>(
-			cached_connections->index(index));
-		if (!first || first->polardb_pool_key.empty()) {
-			continue;
-		}
-		PgSQL_SrvC* server = static_cast<PgSQL_SrvC*>(first->parent);
-		if (!server) {
-			continue;
-		}
-		std::shared_ptr<const void> server_snapshot =
-			first->polardb_selected_server_snapshot;
-		(void)server_snapshot;
-		// Calls below may re-enter this server mutex, but must not acquire the
-		// HostGroups_Manager lock while it is held.
-		std::lock_guard<std::recursive_mutex> pool_lock(server->pool_mutex);
-		for (unsigned int candidate_index = index;
-				candidate_index < cached_count; candidate_index++) {
-			PgSQL_Connection* candidate = static_cast<PgSQL_Connection*>(
-				cached_connections->index(candidate_index));
-			if (candidate && candidate->parent == server &&
-					!candidate->polardb_pool_key.empty() &&
-					PgHGM->return_connection_with_match_key(candidate)) {
-				cached_connections->pdata[candidate_index] = nullptr;
-			}
-		}
-	}
 #endif // POLARDB_PROXY
 
+	unsigned int generic_count = 0;
 	for (unsigned int index = 0; index < cached_count; index++) {
 		PgSQL_Connection* conn = static_cast<PgSQL_Connection*>(
 			cached_connections->index(index));
-		if (conn) {
-			cached_connections->pdata[generic_count++] = conn;
+		if (!conn) {
+			continue;
 		}
+#if POLARDB_PROXY
+		if (!conn->polardb_pool_key.empty()) {
+			continue;
+		}
+#endif // POLARDB_PROXY
+		std::swap(cached_connections->pdata[generic_count],
+			cached_connections->pdata[index]);
+		generic_count++;
 	}
-	/*
-		PgSQL_Connection **ca=(PgSQL_Connection **)malloc(sizeof(PgSQL_Connection *)*(cached_connections->len+1));
-		unsigned int i=0;
-	*/
-	//	ca[i]=NULL;
 	if (generic_count != 0) {
 		PgHGM->push_MyConn_to_pool_array(
-			(PgSQL_Connection**)cached_connections->pdata, generic_count);
+			reinterpret_cast<PgSQL_Connection**>(cached_connections->pdata),
+			generic_count);
+		for (unsigned int index = 0; index < generic_count; index++) {
+			cached_connections->pdata[index] = nullptr;
+		}
 	}
-	//	free(ca);
-	while (cached_connections->len) {
-		cached_connections->remove_index_fast(0);
+	unsigned int retained_count = 0;
+	for (unsigned int index = generic_count; index < cached_count; index++) {
+		PgSQL_Connection* conn = static_cast<PgSQL_Connection*>(
+			cached_connections->index(index));
+		if (conn) {
+			cached_connections->pdata[retained_count++] = conn;
+		}
 	}
+	cached_connections->len = retained_count;
+#if POLARDB_PROXY
+	if (!return_polardb_connections) {
+		polardb_reader_cache_epoch++;
+	}
+#endif // POLARDB_PROXY
 }
 
 void PgSQL_Thread::Scan_Sessions_to_Kill_All() {

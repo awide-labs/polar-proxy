@@ -13,9 +13,34 @@ export POLARDB_PARALLEL_RUN=1
 # shellcheck source=../common/env.sh
 source "$POLARDB_TEST_DIR/common/env.sh"
 
-MODE="${1:-all}"
-case "$MODE" in
-all | safe | exclusive | list) ;;
+REQUESTED_MODE="${1:-all}"
+INTERNAL_SCHEDULER=0
+INTERNAL_JOB=""
+INTERNAL_SHARD=""
+case "$REQUESTED_MODE" in
+all | safe | exclusive | list)
+	MODE="$REQUESTED_MODE"
+	;;
+__schedule)
+	MODE="${2:-}"
+	INTERNAL_SCHEDULER=1
+	case "$MODE" in
+	all | safe | exclusive) ;;
+	*)
+		echo "invalid internal scheduler mode: $MODE" >&2
+		exit 2
+		;;
+	esac
+	;;
+__run-job)
+	MODE="$REQUESTED_MODE"
+	INTERNAL_JOB="${2:-}"
+	INTERNAL_SHARD="${3:-}"
+	if [ -z "$INTERNAL_JOB" ] || [ -z "$INTERNAL_SHARD" ]; then
+		echo "internal TAP job requires a name and shard" >&2
+		exit 2
+	fi
+	;;
 *)
 	echo "usage: $0 [all|safe|exclusive|list]" >&2
 	exit 2
@@ -140,7 +165,7 @@ list_manifest() {
 case_id | group | tag | plan_count | function
 config | config | parallel | 16 | config_roundtrip_tap.sh
 rfq-lifecycle | rfq-lifecycle | parallel | 8 | rfq_lsn_lifecycle_tap.sh
-lsn-session | lsn-session | parallel | 70 | lsn_session_consistency_tap.sh
+lsn-session | lsn-session | parallel | 67 | lsn_session_consistency_tap.sh
 global:1-5 | global-core | parallel | 11 total | GLOBAL_LSN selected cases
 global:7-9 | global-split | parallel | 10 total | GLOBAL_LSN selected cases
 global:6 | global-timeout | backend_exclusive | 7 total | GLOBAL_LSN timeout case
@@ -217,6 +242,11 @@ run_job_body() {
 	job_command "$job"
 }
 
+if [ "$MODE" = "__run-job" ]; then
+	run_job_body "$INTERNAL_JOB" "$INTERNAL_SHARD"
+	exit 2
+fi
+
 run_job_capture() {
 	local job="$1"
 	local shard="$2"
@@ -224,13 +254,10 @@ run_job_capture() {
 	local log="$4"
 
 	if [ "$tag" = "backend_exclusive" ] && command -v flock >/dev/null 2>&1; then
-		(
-			exec 7>"$BACKEND_EXCLUSIVE_LOCK"
+		{
 			printf '# waiting for backend-exclusive lock: %s\n' "$BACKEND_EXCLUSIVE_LOCK"
-			flock 7
-			printf '# acquired backend-exclusive lock: %s\n' "$BACKEND_EXCLUSIVE_LOCK"
-			run_job_body "$job" "$shard"
-		) >"$log" 2>&1
+			flock --close "$BACKEND_EXCLUSIVE_LOCK" "$0" __run-job "$job" "$shard"
+		} >"$log" 2>&1
 	else
 		run_job_body "$job" "$shard" >"$log" 2>&1
 	fi
@@ -330,12 +357,15 @@ if [ "$MODE" = "list" ]; then
 fi
 
 mkdir -p "$LOCK_DIR" "$LOG_DIR"
-if command -v flock >/dev/null 2>&1; then
-	exec 8>"$RUN_LOCK"
-	if ! flock -n 8; then
+if [ "$INTERNAL_SCHEDULER" -eq 0 ] && command -v flock >/dev/null 2>&1; then
+	flock --nonblock --close --conflict-exit-code 75 \
+		"$RUN_LOCK" "$0" __schedule "$MODE"
+	status=$?
+	if [ "$status" -eq 75 ]; then
 		echo "[tap] another PolarDB TAP scheduler holds $RUN_LOCK" >&2
 		exit 1
 	fi
+	exit "$status"
 fi
 
 if ! check_selected_ports; then

@@ -278,8 +278,9 @@ A focused test for timeout and notice behavior. It checks:
 The PolarDB unit tests live under `test/polardb/test-unit/` and are built by the
 PolarDB-owned Makefile target:
 
-- `polardb_routing_lsn_unit-t` — monotonic session-target, wait-plan, baseline,
-  RFQ-unavailable route policy, query-shape checks, writer-scope matrix
+- `polardb_routing_lsn_unit-t` — zero-target first reads, monotonic session and
+  GLOBAL_LSN targets, wait plans, RFQ-unavailable route policy, query-shape
+  checks, and the writer-scope matrix
 - `polardb_protocol_parse_unit-t` — node-type name mapping, monitor-health parsers,
   multi-statement detection
 - `polardb_status_policy_unit-t` — route-action / reader-status names,
