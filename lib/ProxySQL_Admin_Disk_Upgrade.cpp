@@ -781,3 +781,37 @@ void ProxySQL_Admin::disk_upgrade_pgsql_replication_hostgroups() {
 
 	configdb->execute("PRAGMA foreign_keys = ON");
 }
+
+void ProxySQL_Admin::normalize_legacy_pgsql_global_variables(SQLite3DB* db) {
+#if POLARDB_PROXY
+	if (!db || db->return_one_int(
+			"SELECT COUNT(*) FROM global_variables"
+			" WHERE variable_name='pgsql-polardb_consistency_mode'"
+			" AND LOWER(variable_value) IN"
+			" ('lsn','global','lsn_global','primary')") == 0) {
+		return;
+	}
+
+	proxy_warning(
+		"Migrating legacy pgsql-polardb_consistency_mode to the current policy names\n");
+
+	// The legacy 'primary' mode controlled both consistency and placement.
+	// Preserve that behavior before canonicalizing it to consistency 'off'.
+	db->execute(
+		"INSERT OR REPLACE INTO global_variables(variable_name,variable_value)"
+		" SELECT 'pgsql-polardb_read_target','primary'"
+		" FROM global_variables"
+		" WHERE variable_name='pgsql-polardb_consistency_mode'"
+		" AND LOWER(variable_value)='primary'");
+	db->execute(
+		"UPDATE global_variables SET variable_value=CASE LOWER(variable_value)"
+		" WHEN 'lsn' THEN 'session_lsn'"
+		" WHEN 'global' THEN 'global_lsn'"
+		" WHEN 'lsn_global' THEN 'global_lsn'"
+		" WHEN 'primary' THEN 'off'"
+		" ELSE variable_value END"
+		" WHERE variable_name='pgsql-polardb_consistency_mode'");
+#else
+	(void)db;
+#endif
+}

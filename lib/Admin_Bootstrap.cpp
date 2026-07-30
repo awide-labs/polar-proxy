@@ -1027,6 +1027,7 @@ bool ProxySQL_Admin::init(const bootstrap_info_t& bootstrap_info) {
 
 	flush_pgsql_variables___runtime_to_database(configdb, false, false, false);
 	flush_pgsql_variables___runtime_to_database(admindb, false, true, false);
+	normalize_legacy_pgsql_global_variables(configdb);
 
 	load_or_update_global_settings(configdb);
 
@@ -1064,6 +1065,7 @@ bool ProxySQL_Admin::init(const bootstrap_info_t& bootstrap_info) {
 			proxysql_config().Read_PgSQL_Users_from_configfile(e);
 			proxysql_config().Read_PgSQL_Query_Rules_from_configfile();
 			proxysql_config().Read_Global_Variables_from_configfile("pgsql");
+			normalize_legacy_pgsql_global_variables(admindb);
 
 			proxysql_config().Read_Scheduler_from_configfile();
 			proxysql_config().Read_Restapi_from_configfile();

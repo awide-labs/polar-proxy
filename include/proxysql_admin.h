@@ -542,6 +542,7 @@ class ProxySQL_Admin {
 	void disk_upgrade_scheduler();
 	void disk_upgrade_rest_api_routes();
 	void disk_upgrade_pgsql_replication_hostgroups();
+	void normalize_legacy_pgsql_global_variables(SQLite3DB* db);
 
 #ifdef DEBUG
 	template<enum SERVER_TYPE>

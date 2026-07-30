@@ -80,6 +80,9 @@ public:
 	void upgrade_rest_api_routes() { admin->disk_upgrade_rest_api_routes(); }
 	void upgrade_mysql_query_rules() { admin->disk_upgrade_mysql_query_rules(); }
 	void upgrade_pgsql_replication_hostgroups() { admin->disk_upgrade_pgsql_replication_hostgroups(); }
+	void normalize_legacy_pgsql_global_variables() {
+		admin->normalize_legacy_pgsql_global_variables(admin->configdb);
+	}
 };
 
 // ---------------------------------------------------------------------------
@@ -486,6 +489,66 @@ static void test_pgsql_repl_hg_upgrade_from_v3_0_5() {
 		"pgsql_replication_hostgroups: v3.0.5 source table is retained after migration");
 }
 
+static void test_pgsql_global_variable_legacy_values() {
+	TestDiskUpgrade t;
+	SQLite3DB *db = t.db();
+
+	db->execute(ADMIN_SQLITE_TABLE_GLOBAL_VARIABLES);
+	db->execute("INSERT INTO global_variables VALUES"
+		" ('pgsql-polardb_consistency_mode','lsn'),"
+		" ('pgsql-polardb_read_target','replica'),"
+		" ('pgsql-unrelated','unchanged')");
+
+	t.normalize_legacy_pgsql_global_variables();
+	ok(query_string(db,
+			"SELECT variable_value FROM global_variables"
+			" WHERE variable_name='pgsql-polardb_consistency_mode'") ==
+			"session_lsn",
+		"pgsql global variables: legacy lsn becomes session_lsn");
+
+	db->execute("UPDATE global_variables SET variable_value='global'"
+		" WHERE variable_name='pgsql-polardb_consistency_mode'");
+	t.normalize_legacy_pgsql_global_variables();
+	ok(query_string(db,
+			"SELECT variable_value FROM global_variables"
+			" WHERE variable_name='pgsql-polardb_consistency_mode'") ==
+			"global_lsn",
+		"pgsql global variables: legacy global becomes global_lsn");
+
+	db->execute("UPDATE global_variables SET variable_value='lsn_global'"
+		" WHERE variable_name='pgsql-polardb_consistency_mode'");
+	t.normalize_legacy_pgsql_global_variables();
+	ok(query_string(db,
+			"SELECT variable_value FROM global_variables"
+			" WHERE variable_name='pgsql-polardb_consistency_mode'") ==
+			"global_lsn",
+		"pgsql global variables: legacy lsn_global becomes global_lsn");
+
+	db->execute("UPDATE global_variables SET variable_value='primary'"
+		" WHERE variable_name='pgsql-polardb_consistency_mode'");
+	t.normalize_legacy_pgsql_global_variables();
+	ok(query_string(db,
+			"SELECT variable_value FROM global_variables"
+			" WHERE variable_name='pgsql-polardb_consistency_mode'") == "off",
+		"pgsql global variables: legacy primary consistency becomes off");
+	ok(query_string(db,
+			"SELECT variable_value FROM global_variables"
+			" WHERE variable_name='pgsql-polardb_read_target'") == "primary",
+		"pgsql global variables: legacy primary preserves primary placement");
+
+	db->execute("UPDATE global_variables SET variable_value='invalid'"
+		" WHERE variable_name='pgsql-polardb_consistency_mode'");
+	t.normalize_legacy_pgsql_global_variables();
+	ok(query_string(db,
+			"SELECT variable_value FROM global_variables"
+			" WHERE variable_name='pgsql-polardb_consistency_mode'") == "invalid",
+		"pgsql global variables: unknown values remain invalid");
+	ok(query_string(db,
+			"SELECT variable_value FROM global_variables"
+			" WHERE variable_name='pgsql-unrelated'") == "unchanged",
+		"pgsql global variables: unrelated settings remain unchanged");
+}
+
 // ============================================================================
 // disk_upgrade_mysql_query_rules() tests
 // ============================================================================
@@ -603,7 +666,7 @@ static void test_mysql_servers_upgrade_multiple_rows_with_fixes() {
 // ============================================================================
 
 int main() {
-	plan(67);
+	plan(74);
 	test_init_minimal();
 
 	// scheduler tests
@@ -630,6 +693,7 @@ int main() {
 	test_pgsql_repl_hg_upgrade_from_v3_0_1();
 	test_pgsql_repl_hg_upgrade_from_v3_0_5();
 	test_pgsql_repl_hg_no_upgrade_needed();
+	test_pgsql_global_variable_legacy_values();
 
 	// mysql_query_rules tests
 	test_mysql_query_rules_upgrade_from_v1_2_2();
