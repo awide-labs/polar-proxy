@@ -10,13 +10,14 @@
  *
  * The read-your-writes path works like this. For an autocommit, single-statement,
  * replica-eligible read, polardb_plan() returns REPLICA_WITH_WAIT. polardb_execute()
- * then records the wait intent and a copy of the original query, but does not yet
- * build any SQL. The read is sent to a reader hostgroup, and the actual wrapped
- * query is built exactly once, later (at ASYNC_IDLE, by the finalize step), after
- * the backend connection exists. The
- * wrapper is three SET statements in front of the user query: a consistency mode,
- * a wait timeout, and the wait step itself ("SET polar_xact_split_wait_lsn =
- * '<lsn>'"). On that last statement the backend blocks until its replay position
+ * records the reader-selection policy and wait target, but does not activate a
+ * wait or copy the query. After a concrete reader is acquired, a current cached
+ * LSN at or beyond the target permits direct dispatch. Otherwise the wait becomes
+ * active, and the wrapped query is built exactly once at ASYNC_IDLE after the
+ * backend connection exists. The wrapper is three SET statements in front of the
+ * user query: a consistency mode, a wait timeout, and the wait step itself
+ * ("SET polar_xact_split_wait_lsn = '<lsn>'"). On that last statement the backend
+ * blocks until its replay position
  * reaches the target LSN, which is what makes the replica read return the
  * session's own earlier writes.
  *
@@ -1088,6 +1089,12 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(
 	// a replica backend for one read and then restores the primary backend.
 	bool allow_transaction_wait_read = false;
 	if (route_ctx.in_transaction) {
+		const uint64_t max_replica_replay_lsn =
+			route_ctx.transaction_split.wal_pending &&
+					route_ctx.transaction_split.primary_lsn != 0
+			? PgHGM->get_polardb_max_replica_replay_lsn(
+				route_ctx.writer_scope)
+			: 0;
 		PolarDB_Query_RoutePlan::RouteActionReason split_reason =
 			polardb_txn_split_rejection_reason(
 				route_ctx.txn_split_enabled,
@@ -1097,9 +1104,21 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(
 				route_ctx.is_multi_statement,
 				route_ctx.is_extended_protocol,
 				route_ctx.is_txn_split_safe_read,
-				route_ctx.is_txn_split_locking_read);
+				route_ctx.is_txn_split_locking_read,
+				max_replica_replay_lsn);
 		plan.split_checked = true;
 		plan.split_reason = split_reason;
+		if (route_ctx.transaction_split.wal_pending &&
+				split_reason ==
+					PolarDB_Query_RoutePlan::RouteActionReason::NONE) {
+			POLARDB_TRACE(
+				"PolarDB PLAN: replica replay supersedes RFQ WAL pending "
+				"primary_lsn=%lu max_replica_replay_lsn=%lu reader_hg=%d "
+				"primary_hg=%d\n",
+				(unsigned long)route_ctx.transaction_split.primary_lsn,
+				(unsigned long)max_replica_replay_lsn,
+				route_ctx.reader_hg, route_ctx.writer_scope.hg);
+		}
 		if (split_reason == PolarDB_Query_RoutePlan::RouteActionReason::IN_TRANSACTION &&
 				route_ctx.txn_split_enabled &&
 				route_ctx.transaction_split.stage ==
@@ -1431,6 +1450,10 @@ void PgSQL_Session::polardb_report_route_result(
 		if (plan.action ==
 				PolarDB_Query_RoutePlan::RouteAction::REPLICA_TXN_SPLIT) {
 			POLARDB_THREAD_COUNT_ONE(thread, queries_split_eligible);
+			if (route_ctx.transaction_split.wal_pending) {
+				POLARDB_THREAD_COUNT_ONE(
+					thread, split_wal_pending_replica_confirmed);
+			}
 		}
 		switch (plan.split_reason) {
 		case PolarDB_Query_RoutePlan::RouteActionReason::MULTI_STATEMENT:
@@ -1975,7 +1998,7 @@ static bool polardb_query_command_can_preserve_session_lsn(
  * @brief Apply an RFQ that carried a usable LSN to the server cache and the session.
  *
  * The epoch-aware per-server cache check runs first. An actual shared-cache
- * publication is serialized with writer reset and rejects an old group/epoch.
+ * update is serialized with writer reset and rejects an old group/epoch.
  * Repeated equal/lower observations may be coalesced without a shared write; the
  * accepted session observation remains tagged with the request writer scope, so
  * a concurrent writer change clears it during the next request collection before

@@ -230,6 +230,7 @@ static void test_transaction_split_state_reset_contract() {
 	state.primary_lsn = 500;
 	state.splittable = true;
 	state.wal_pending = true;
+	state.failed = true;
 	state.blocked = true;
 
 	ok(state.active(),
@@ -250,6 +251,8 @@ static void test_transaction_split_state_reset_contract() {
 		"transaction split state: reset clears splittable flag");
 	ok(!state.wal_pending,
 		"transaction split state: reset clears WAL-pending flag");
+	ok(!state.failed,
+		"transaction split state: reset clears failed-transaction flag");
 	ok(!state.blocked,
 		"transaction split state: reset clears split-blocked flag");
 	ok(!state.has_backend_evidence(),
@@ -274,6 +277,8 @@ static void test_transaction_split_state_rfq_observation() {
 		"transaction split observation: absent XIDs are not invented");
 	ok(!state.splittable,
 		"transaction split observation: absent splittable marker stays false");
+	ok(!state.failed,
+		"transaction split observation: active transaction is not marked failed");
 
 	state.observe_primary_rfq('T', "", true, false, 150, true);
 	ok(state.stage == PolarDB_TransactionSplitStage::TXN_ON_PRIMARY,
@@ -333,15 +338,21 @@ static void test_transaction_split_state_rfq_observation() {
 		"transaction split observation: blocked marker is preserved");
 
 	state.blocked = false;
-	state.observe_primary_rfq('E', "", true, false, 270, true);
+	state.observe_primary_rfq('E', "13", true, true, 270, true);
 	ok(state.stage == PolarDB_TransactionSplitStage::TXN_ON_PRIMARY,
 		"transaction split observation: failed transaction stays primary-only");
 	ok(state.primary_lsn == 270,
 		"transaction split observation: failed transaction still records primary LSN");
-	ok(state.xids.empty(),
-		"transaction split observation: failed empty-XID RFQ clears older XIDs");
+	ok(state.xids == "13",
+		"transaction split observation: failed RFQ retains its XIDs for primary handling");
 	ok(!state.splittable,
 		"transaction split observation: failed RFQ cannot authorize reader routing");
+	ok(state.failed,
+		"transaction split observation: failed RFQ is retained as an eligibility fact");
+
+	state.observe_primary_rfq('T', "13", false, true, 275, true);
+	ok(!state.failed,
+		"transaction split observation: recovered transaction clears failed status");
 
 	state.observe_primary_rfq('I', nullptr, false, false, 0, true);
 	ok(!state.active(),
@@ -367,9 +378,9 @@ static void test_no_write_xids_marker() {
 
 int main() {
 #if POLARDB_PROFILE
-	plan(101);
+	plan(105);
 #else
-	plan(99);
+	plan(103);
 #endif // POLARDB_PROFILE
 	test_query_state_named_reset_subsets();
 	test_query_state_extended_message_reset();

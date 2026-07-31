@@ -466,6 +466,34 @@ static void test_txn_split_rejection_reason() {
 	ok(polardb_txn_split_rejection_reason(true, snapshot(), false, false, false, false, true, false) ==
 			PolarDB_Query_RoutePlan::RouteActionReason::WAL_PENDING,
 		"transaction split planning rejects WAL-pending transaction with XIDs and LSN");
+	ok(polardb_txn_split_rejection_reason(
+			true, snapshot(), false, false, false, false, true, false, 899) ==
+			PolarDB_Query_RoutePlan::RouteActionReason::WAL_PENDING,
+		"transaction split planning keeps WAL-pending transaction on primary when replica replay is behind");
+	ok(polardb_txn_split_rejection_reason(
+			true, snapshot(), false, false, false, false, true, false, 900) ==
+			PolarDB_Query_RoutePlan::RouteActionReason::NONE,
+		"transaction split planning accepts WAL-pending evidence once a replica replay reaches the transaction LSN");
+
+	state.failed = true;
+	ok(polardb_txn_split_rejection_reason(
+			true, snapshot(), false, false, false, false, true, false, 900) ==
+			PolarDB_Query_RoutePlan::RouteActionReason::IN_TRANSACTION,
+		"transaction split planning never applies replica replay proof to a failed transaction");
+	state.failed = false;
+	state.stage = PolarDB_TransactionSplitStage::TXN_SPLITTABLE;
+	ok(polardb_txn_split_rejection_reason(
+			true, snapshot(), false, false, false, false, true, false, 900) ==
+			PolarDB_Query_RoutePlan::RouteActionReason::NONE,
+		"transaction split planning preserves replay confirmation for a consecutive split read");
+	state.stage = PolarDB_TransactionSplitStage::TXN_ON_PRIMARY;
+
+	state.xids.clear();
+	ok(polardb_txn_split_rejection_reason(
+			true, snapshot(), false, false, false, false, true, false, 900) ==
+			PolarDB_Query_RoutePlan::RouteActionReason::WAL_PENDING,
+		"transaction split planning requires XIDs before replica replay can supersede WAL pending");
+	state.xids = "10,11";
 
 	state.wal_pending = false;
 	ok(polardb_txn_split_rejection_reason(true, snapshot(), false, false, false, false, true, false) ==
@@ -552,7 +580,7 @@ static void test_session_lsn_scope_check() {
 }
 
 int main() {
-	plan(164);
+	plan(169);
 	test_route_action_values_are_append_only();
 	test_session_lsn_target_uses_max_position();
 	test_wait_plan_uses_monotonic_session_lsn();

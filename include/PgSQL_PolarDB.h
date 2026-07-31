@@ -2961,7 +2961,8 @@ struct PolarDB_TransactionSplitState {
     std::string xids;          // RFQ transaction ID list for future replica import
     uint64_t primary_lsn = 0;  // LSN observed for this transaction's primary side
     bool splittable = false;   // RFQ reports the transaction is eligible for split reads
-    bool wal_pending = false;  // RFQ reports WAL is pending; do not split
+    bool wal_pending = false;  // RFQ reports WAL pending; replica proof is required
+    bool failed = false;       // latest primary RFQ reports failed transaction status 'E'
     bool blocked = false;      // A prior split fault blocks further split attempts
     bool was_splittable = false; // Transaction was split-readable at least once
     bool did_split = false;      // At least one split read completed in this transaction
@@ -2990,9 +2991,8 @@ struct PolarDB_TransactionSplitState {
      *   - any status other than 'T' or 'E': nothing is touched, so an
      *     unrecognised status byte never corrupts the state;
      *   - `primary_lsn` only moves forward — a lower reported LSN is ignored;
-     *   - 'E' force-clears `splittable`, because a failed transaction cannot
-     *     authorize reads on another backend even when its RFQ still carries the
-     *     split marker;
+     *   - `failed` records status 'E' until a later 'T' RFQ recovers the
+     *     transaction or 'I' resets it; 'E' also force-clears `splittable`;
      *   - a `blocked` transaction, and any 'E' status, pins the stage to
      *     TXN_ON_PRIMARY;
      *   - otherwise the stage becomes TXN_SPLITTABLE only when `splittable` is
@@ -3038,6 +3038,7 @@ struct PolarDB_TransactionSplitState {
         }
         splittable = rfq_splittable;
         wal_pending = rfq_wal_pending;
+        failed = transaction_status == 'E';
 
         // A failed transaction cannot authorize reads on another backend,
         // even if its RFQ still carries an otherwise valid split marker.
@@ -3062,6 +3063,7 @@ struct PolarDB_TransactionSplitState {
         primary_lsn = 0;
         splittable = false;
         wal_pending = false;
+        failed = false;
         blocked = false;
         was_splittable = false;
         did_split = false;
@@ -3082,6 +3084,7 @@ struct PolarDB_TransactionSplitSnapshot {
     PolarDB_TransactionSplitStage stage = PolarDB_TransactionSplitStage::NONE;
     bool splittable = false;
     bool wal_pending = false;
+    bool failed = false;
     bool blocked = false;
     bool was_splittable = false;
     bool did_split = false;
@@ -3113,6 +3116,7 @@ polardb_transaction_split_snapshot(const PolarDB_TransactionSplitState& state) {
     snapshot.stage = state.stage;
     snapshot.splittable = state.splittable;
     snapshot.wal_pending = state.wal_pending;
+    snapshot.failed = state.failed;
     snapshot.blocked = state.blocked;
     snapshot.was_splittable = state.was_splittable;
     snapshot.did_split = state.did_split;
@@ -4476,6 +4480,10 @@ struct PolarDB_Query_RoutePlan {
  * @param is_extended_protocol     The query arrived over the extended protocol.
  * @param is_txn_split_safe_read   The query shape is eligible for a split read.
  * @param is_txn_split_locking_read The query is a locking SELECT.
+ * @param max_replica_replay_lsn   Highest replay LSN confirmed by a physical
+ *                                 replica in the current writer epoch. It can
+ *                                 supersede a prior `w` marker only when it has
+ *                                 reached that transaction's primary LSN.
  * @return NONE when a split read may be planned, otherwise the first rejection
  *         reason in precedence order.
  */
@@ -4487,8 +4495,20 @@ static inline PolarDB_Query_RoutePlan::RouteActionReason polardb_txn_split_rejec
     bool is_multi_statement,
     bool is_extended_protocol,
     bool is_txn_split_safe_read,
-    bool is_txn_split_locking_read) {
+    bool is_txn_split_locking_read,
+    uint64_t max_replica_replay_lsn = 0) {
     using RAR = PolarDB_Query_RoutePlan::RouteActionReason;
+    const bool replay_confirmable_stage =
+        transaction_split.stage == PolarDB_TransactionSplitStage::TXN_ON_PRIMARY ||
+        transaction_split.stage == PolarDB_TransactionSplitStage::TXN_SPLITTABLE;
+    const bool wal_pending_replica_confirmed =
+        transaction_split.wal_pending &&
+        replay_confirmable_stage &&
+        !transaction_split.failed &&
+        !transaction_split.blocked &&
+        !transaction_split.xids.empty() &&
+        transaction_split.primary_lsn != 0 &&
+        max_replica_replay_lsn >= transaction_split.primary_lsn;
 
     if (!txn_split_enabled) return RAR::HG_SPLIT_DISABLED;
     if (is_multi_statement) return RAR::MULTI_STATEMENT;
@@ -4498,8 +4518,12 @@ static inline PolarDB_Query_RoutePlan::RouteActionReason polardb_txn_split_rejec
     if (write_lsn_unknown) return RAR::SPLIT_WRITE_LSN_UNKNOWN;
     if (observed_lsn_unknown) return RAR::SPLIT_OBSERVED_LSN_UNKNOWN;
     if (transaction_split.blocked) return RAR::SPLIT_BLOCKED;
-    if (transaction_split.wal_pending) return RAR::WAL_PENDING;
-    if (transaction_split.stage != PolarDB_TransactionSplitStage::TXN_SPLITTABLE) {
+    if (transaction_split.failed) return RAR::IN_TRANSACTION;
+    if (transaction_split.wal_pending && !wal_pending_replica_confirmed) {
+        return RAR::WAL_PENDING;
+    }
+    if (transaction_split.stage != PolarDB_TransactionSplitStage::TXN_SPLITTABLE &&
+            !wal_pending_replica_confirmed) {
         return RAR::IN_TRANSACTION;
     }
     if (transaction_split.xids.empty()) return RAR::INVARIANT_VIOLATION;

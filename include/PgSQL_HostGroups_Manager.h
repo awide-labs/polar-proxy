@@ -1086,9 +1086,9 @@ class PgSQL_HGC: public BaseHGC<PgSQL_HGC> {
 	 * pointer to this container.
 	 *
 	 * Writer-epoch rule: when the set of live (non-OFFLINE_HARD) writer
-	 * servers changes, the epoch is increased and the group LSN plus the
-	 * affected per-server LSN caches are reset, so stale positions from the old
-	 * writer set are never carried forward.
+	 * servers changes, the group and replica-only LSN maxima plus the affected
+	 * per-server LSN caches are reset before the epoch is increased, so stale
+	 * positions from the old writer set are never carried forward.
 	 *
 	 * Rationale and full field semantics: see
 	 * doc/polardb-arch/05-MONITOR-AND-HGM-LSN-STATE.md.
@@ -1110,6 +1110,9 @@ class PgSQL_HGC: public BaseHGC<PgSQL_HGC> {
 		std::shared_ptr<std::atomic<uint64_t>> polardb_group_lsn{
 			std::make_shared<std::atomic<uint64_t>>(0)
 		};                                  // highest LSN reported during the current writer epoch
+		std::shared_ptr<std::atomic<uint64_t>> polardb_max_replica_replay_lsn{
+			std::make_shared<std::atomic<uint64_t>>(0)
+		};                                  // highest physical-replica replay LSN in this epoch
 		std::shared_ptr<std::atomic<uint64_t>> polardb_writer_epoch{
 			std::make_shared<std::atomic<uint64_t>>(0)
 		};                                  // bumps when the writer identity set changes
@@ -1627,6 +1630,7 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 		// Do not replace these declarations with POLARDB_ALL_COUNTER_LIST(X).
 		std::atomic<unsigned long long> polardb_server_lsn_updates_from_rfq{0}; // accepted current-group/current-epoch per-server LSN cache updates from query RFQ
 		std::atomic<unsigned long long> polardb_lsn_updates_from_monitor{0}; // LSN advances observed by the monitor
+		std::atomic<unsigned long long> polardb_replica_replay_lsn_advanced{0}; // current-epoch monitor observations that advanced the physical-replica replay maximum
 		std::atomic<unsigned long long> polardb_monitor_health_invalid_role{0}; // monitor role is not routable, including PolarDB "unknown" for POLAR_UNKNOWN/POLAR_STANDALONE_DATAMAX
 		std::atomic<unsigned long long> polardb_monitor_health_invalid_values{0}; // PolarDB monitor health row has invalid availability or LSN text
 		std::atomic<unsigned long long> polardb_lsn_stale_count{0};          // stale-LSN skips while selecting a reader
@@ -1972,6 +1976,7 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 		std::atomic<unsigned long long> polardb_split_rejected_observed_lsn_unknown{0}; // split candidates blocked by missing observed LSN
 		std::atomic<unsigned long long> polardb_split_rejected_no_marker{0}; // transaction RFQ has no usable split or pre-write marker
 		std::atomic<unsigned long long> polardb_split_wal_pending{0};         // primary RFQ still has pending WAL
+		std::atomic<unsigned long long> polardb_split_wal_pending_replica_confirmed{0}; // WAL-pending read admitted after current-epoch replica replay confirmation
 		std::atomic<unsigned long long> polardb_split_invariant_violations{0}; // unexpected transaction-split state
 		std::atomic<unsigned long long> polardb_split_blocked_reads{0};       // transaction already blocked from further split reads
 		std::atomic<unsigned long long> polardb_split_no_backend{0};          // no split replica backend available
@@ -2601,6 +2606,7 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 	struct PolarDB_HG_SnapshotEntry {
 		PolarDB_HG_Config config;
 		std::shared_ptr<std::atomic<uint64_t>> group_lsn;
+		std::shared_ptr<std::atomic<uint64_t>> max_replica_replay_lsn;
 		std::shared_ptr<std::atomic<uint64_t>> writer_epoch;
 	};
 
@@ -2708,16 +2714,20 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 	 * hostgroup and server, so the caller must not already hold it. Every
 	 * hostgroup that carries the address and port is updated; servers that are
 	 * not MYSQL_SERVER_STATUS_ONLINE are skipped. Besides the per-server cache
-	 * it also advances the replication group's shared group LSN.
+	 * it also advances the replication group's shared group LSN. A physical
+	 * replica observation may additionally advance the current-epoch
+	 * replica-only replay maximum; primary observations never do.
 	 *
 	 * @param address Server address.
 	 * @param port Server port.
 	 * @param lsn Observed LSN value.
+	 * @param node_type Physical role reported with the monitor observation.
 	 * @return true if a matching ONLINE server was found and this call advanced
 	 *         its cached LSN.
 	 */
 	bool polardb_update_server_lsn_from_monitor(
-		const char* address, uint16_t port, uint64_t lsn);
+		const char* address, uint16_t port, uint64_t lsn,
+		PolarDB_NodeType node_type);
 	/**
 	 * @brief Process an RFQ LSN through a direct server pointer.
 	 *
@@ -2725,7 +2735,8 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 	 * backend hostgroup is resolved through the thread-local topology snapshot,
 	 * without taking the global HGM lock or copying reference-counted state.
 	 * When the observation is stored, the group's shared LSN is advanced with the
-	 * per-server cache.
+	 * per-server cache. Direct RFQ carries no authoritative physical role and
+	 * therefore never advances the replica-only replay maximum.
 	 *
 	 * @param srv Server the RFQ came from. Must not be null.
 	 * @param backend_hostgroup_id Hostgroup the backend belongs to.
@@ -2760,6 +2771,18 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 	 *         has no group LSN, or nothing has ever been observed for it.
 	 */
 	uint64_t get_polardb_group_lsn(unsigned int writer_hostgroup_id);
+
+	/**
+	 * @brief Read the highest replay LSN confirmed by a physical replica.
+	 *
+	 * Primary observations, including a primary copied into the reader hostgroup,
+	 * never update this value. It is reset before the writer epoch advances.
+	 *
+	 * @param writer_scope Writer hostgroup and epoch that produced the `w` marker.
+	 * @return Replica replay maximum for the current epoch, or 0 when unavailable.
+	 */
+	uint64_t get_polardb_max_replica_replay_lsn(
+		const PolarDB_WriterScope& writer_scope);
 
 	/**
 	 * @brief Select a reader connection from a reader hostgroup.

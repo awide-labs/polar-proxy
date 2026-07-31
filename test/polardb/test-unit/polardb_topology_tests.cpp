@@ -41,6 +41,7 @@ static void test_writer_epoch_change_resets_lsn_caches() {
 
 	// Pre-epoch-change LSN cache seed values (arbitrary distinct nonzero LSNs).
 	const uint64_t SEED_GROUP_LSN = 0x5000;
+	const uint64_t SEED_REPLICA_REPLAY_LSN = 0x4F00;
 	const uint64_t SEED_OLD_WRITER_LSN = 0x5100;
 	const uint64_t SEED_READER_LSN = 0x5200;
 	const unsigned long long SEED_OLD_WRITER_LSN_TS = 101;
@@ -82,6 +83,8 @@ static void test_writer_epoch_change_resets_lsn_caches() {
 
 	writer_hgc->repl_config.polardb_group_lsn->store(
 		SEED_GROUP_LSN, std::memory_order_relaxed);
+	writer_hgc->repl_config.polardb_max_replica_replay_lsn->store(
+		SEED_REPLICA_REPLAY_LSN, std::memory_order_relaxed);
 	old_writer->polardb_current_lsn.store(SEED_OLD_WRITER_LSN, std::memory_order_relaxed);
 	old_writer->lsn_updated_at.store(SEED_OLD_WRITER_LSN_TS, std::memory_order_relaxed);
 	reader->polardb_current_lsn.store(SEED_READER_LSN, std::memory_order_relaxed);
@@ -104,6 +107,9 @@ static void test_writer_epoch_change_resets_lsn_caches() {
 
 	ok(writer_hgc->repl_config.polardb_group_lsn->load(std::memory_order_relaxed) == 0,
 		"PolarDB HGM: writer change clears the group LSN");
+	ok(writer_hgc->repl_config.polardb_max_replica_replay_lsn->load(
+			std::memory_order_relaxed) == 0,
+		"PolarDB HGM: writer change clears the replica replay maximum");
 	ok(writer_hgc->repl_config.polardb_writer_epoch->load(std::memory_order_relaxed) == 1,
 		"PolarDB HGM: writer epoch increments after writer identity changes");
 	// Old writer + paired reader LSN caches are cleared: assert the cached LSN and
@@ -126,6 +132,28 @@ static void test_writer_epoch_change_resets_lsn_caches() {
 	ok(writer_hgc->repl_config.polardb_group_lsn->load(
 			std::memory_order_relaxed) == 0,
 		"PolarDB HGM: rejected RFQ update leaves the group LSN empty");
+	ok(writer_hgc->repl_config.polardb_max_replica_replay_lsn->load(
+			std::memory_order_relaxed) == 0,
+		"PolarDB HGM: rejected old-epoch RFQ leaves the replica replay maximum empty");
+
+	const auto new_config = PgHGM->get_polardb_hg_config(reader_hg);
+	const PolarDB_WriterScope new_scope{
+		new_config.writer_hostgroup, new_config.writer_epoch};
+	ok(PgHGM->polardb_accept_rfq_server_lsn(
+			reader, reader_hg, 0x5400, new_scope, nullptr),
+		"PolarDB HGM: current-epoch reader RFQ is accepted before role refresh");
+	ok(writer_hgc->repl_config.polardb_max_replica_replay_lsn->load(
+			std::memory_order_relaxed) == 0,
+		"PolarDB HGM: direct RFQ cannot advance the replica replay maximum");
+	ok(PgHGM->polardb_update_server_lsn_from_monitor(
+			"polardb-reader", 15433, 0x5500, PolarDB_NodeType::REPLICA),
+		"PolarDB HGM: current-epoch replica monitor observation is accepted");
+	ok(writer_hgc->repl_config.polardb_max_replica_replay_lsn->load(
+			std::memory_order_relaxed) == 0x5500,
+		"PolarDB HGM: current-epoch monitor observation restores replica replay evidence");
+	ok(PgHGM->get_polardb_max_replica_replay_lsn(new_scope) == 0x5500 &&
+			PgHGM->get_polardb_max_replica_replay_lsn(old_scope) == 0,
+		"PolarDB HGM: replica replay lookup is bound to the marker's writer epoch");
 }
 
 static void test_writer_epoch_change_serializes_rfq_publication() {
@@ -264,6 +292,9 @@ static void test_monitor_lsn_update_skips_non_online_servers() {
 	const uint64_t BLOCKED_LSN = 0x9100;
 	const uint64_t ACCEPTED_LSN = 0x9200;
 	const uint64_t READER_LSN = 0x9300;
+	const uint64_t DIRECT_READER_LSN = 0x9400;
+	const uint64_t WRITER_AS_READER_LSN = 0x9500;
+	const uint64_t WRITER_AS_READER_RFQ_LSN = 0x9600;
 
 	stage_polardb_topology(PgHGM, "PolarDB monitor LSN check",
 		writer_hg, "polardb-monitor-writer", 17432,
@@ -284,7 +315,8 @@ static void test_monitor_lsn_update_skips_non_online_servers() {
 
 	writer->status = MYSQL_SERVER_STATUS_SHUNNED;
 	ok(!PgHGM->polardb_update_server_lsn_from_monitor(
-			"polardb-monitor-writer", 17432, BLOCKED_LSN),
+			"polardb-monitor-writer", 17432, BLOCKED_LSN,
+			PolarDB_NodeType::PRIMARY),
 		"PolarDB monitor LSN check: non-ONLINE server update is rejected");
 	ok(writer->polardb_current_lsn.load(std::memory_order_relaxed) == 0,
 		"PolarDB monitor LSN check: non-ONLINE server LSN cache stays empty");
@@ -294,22 +326,54 @@ static void test_monitor_lsn_update_skips_non_online_servers() {
 
 	writer->status = MYSQL_SERVER_STATUS_ONLINE;
 	ok(PgHGM->polardb_update_server_lsn_from_monitor(
-			"polardb-monitor-writer", 17432, ACCEPTED_LSN),
+			"polardb-monitor-writer", 17432, ACCEPTED_LSN,
+			PolarDB_NodeType::PRIMARY),
 		"PolarDB monitor LSN check: ONLINE server update is accepted");
 	ok(writer->polardb_current_lsn.load(std::memory_order_relaxed) == ACCEPTED_LSN,
 		"PolarDB monitor LSN check: ONLINE server updates its LSN cache");
 	ok(writer_hgc->repl_config.polardb_group_lsn->load(
 			std::memory_order_relaxed) == ACCEPTED_LSN,
 		"PolarDB monitor LSN check: ONLINE writer updates group LSN");
+	ok(writer_hgc->repl_config.polardb_max_replica_replay_lsn->load(
+			std::memory_order_relaxed) == 0,
+		"PolarDB monitor LSN check: physical writer does not update replica replay maximum");
 
 	ok(PgHGM->polardb_update_server_lsn_from_monitor(
-			"polardb-monitor-reader", 17433, READER_LSN),
+			"polardb-monitor-reader", 17433, READER_LSN,
+			PolarDB_NodeType::REPLICA),
 		"PolarDB monitor LSN check: ONLINE reader update is accepted");
 	ok(reader->polardb_current_lsn.load(std::memory_order_relaxed) == READER_LSN,
 		"PolarDB monitor LSN check: ONLINE reader updates its LSN cache");
 	ok(writer_hgc->repl_config.polardb_group_lsn->load(
 			std::memory_order_relaxed) == READER_LSN,
 		"PolarDB monitor LSN check: ONLINE reader updates shared group LSN");
+	ok(writer_hgc->repl_config.polardb_max_replica_replay_lsn->load(
+			std::memory_order_relaxed) == READER_LSN,
+		"PolarDB monitor LSN check: physical replica updates replica replay maximum");
+
+	const auto reader_config = PgHGM->get_polardb_hg_config(reader_hg);
+	const PolarDB_WriterScope reader_scope{
+		reader_config.writer_hostgroup, reader_config.writer_epoch};
+	ok(PgHGM->polardb_accept_rfq_server_lsn(
+			reader, reader_hg, DIRECT_READER_LSN, reader_scope, nullptr),
+		"PolarDB monitor LSN check: replica RFQ remains a valid group observation");
+	ok(writer_hgc->repl_config.polardb_max_replica_replay_lsn->load(
+			std::memory_order_relaxed) == READER_LSN,
+		"PolarDB monitor LSN check: direct RFQ cannot reuse historical monitor role as replay proof");
+
+	ok(PgHGM->polardb_update_server_lsn_from_monitor(
+			"polardb-monitor-reader", 17433, WRITER_AS_READER_LSN,
+			PolarDB_NodeType::PRIMARY),
+		"PolarDB monitor LSN check: primary role on a reader-hostgroup endpoint is accepted");
+	ok(writer_hgc->repl_config.polardb_max_replica_replay_lsn->load(
+			std::memory_order_relaxed) == READER_LSN,
+		"PolarDB monitor LSN check: writer-as-reader observation cannot advance replica replay maximum");
+	ok(PgHGM->polardb_accept_rfq_server_lsn(
+			reader, reader_hg, WRITER_AS_READER_RFQ_LSN, reader_scope, nullptr),
+		"PolarDB monitor LSN check: writer-as-reader RFQ remains a valid group observation");
+	ok(writer_hgc->repl_config.polardb_max_replica_replay_lsn->load(
+			std::memory_order_relaxed) == READER_LSN,
+		"PolarDB monitor LSN check: writer-as-reader RFQ cannot advance replica replay maximum");
 }
 
 static void test_lsn_observation_refreshes_freshness_timestamp() {

@@ -542,13 +542,12 @@ PgSQL_Session::polardb_fail_wrap_and_disable_session_waits(
  *
  * This is the single place the wrapper is applied. It runs once per query at the
  * ASYNC_IDLE state, after a backend connection and data stream exist. It returns
- * CONTINUE immediately unless the plan/execute stage already staged a wait
- * (wait_stage == WAITING), so an un-staged query is a safe no-op here. When a
- * wait is staged, the plan stage already saved the prepared wait spec. This
- * method copies the original SQL only when a wrapper is really needed, assembles
- * the wrapped multi-statement string exactly once, and swaps it into the outgoing
- * simple-query ('Q') packet. It then records how many leading SET results the
- * connection must drop.
+ * CONTINUE immediately unless reader acquisition activated a wait
+ * (`wait_stage == WAITING`), so a direct-dispatch query is a safe no-op here.
+ * The method copies the original SQL only when a wrapper is really needed,
+ * assembles the wrapped multi-statement string exactly once, and swaps it into
+ * the outgoing simple-query (`'Q'`) packet. It then records how many leading SET
+ * results the connection must drop.
  *
  * Idempotent: a second call after success is a no-op (protected by
  * wrapper_finalized), so re-entering ASYNC_IDLE is safe.

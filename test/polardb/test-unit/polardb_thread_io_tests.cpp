@@ -495,6 +495,8 @@ static int polardb_ordered_counter_index(const char *needle) {
 static void test_polardb_counter_order_metadata() {
 	const int monitor_lsn =
 		polardb_ordered_counter_index("PolarDB_LSN_Updates_From_Monitor");
+	const int replica_replay_lsn =
+		polardb_ordered_counter_index("PolarDB_Replica_Replay_LSN_Advanced");
 	const int monitor_role =
 		polardb_ordered_counter_index("PolarDB_Monitor_Health_Invalid_Role");
 	const int monitor_values =
@@ -516,9 +518,10 @@ static void test_polardb_counter_order_metadata() {
 	const int split_wal_pending =
 		polardb_ordered_counter_index("PolarDB_Split_WAL_Pending");
 
-	ok(monitor_lsn >= 0 && monitor_lsn < monitor_role &&
+	ok(monitor_lsn >= 0 && monitor_lsn < replica_replay_lsn &&
+			replica_replay_lsn < monitor_role &&
 			monitor_role < monitor_values && monitor_values < stale,
-		"PolarDB counters: ordered metadata keeps monitor counters with monitor LSN");
+		"PolarDB counters: ordered metadata keeps replica replay and monitor counters with monitor LSN");
 	ok(writer_retry >= 0 && rfq_skipped >= 0 && writer_retry < rfq_skipped,
 		"PolarDB counters: ordered metadata keeps retry before RFQ profile counters");
 	ok(split_for_update >= 0 && split_for_update < split_write_unknown &&

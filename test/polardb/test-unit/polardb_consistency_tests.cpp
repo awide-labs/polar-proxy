@@ -721,6 +721,14 @@ static void test_collect_is_const_stable_snapshot() {
 			writer_cfg.writer_hostgroup != writer_hg) {
 		return;
 	}
+	PgSQL_HGC* writer_hgc = PgHGM->MyHGC_lookup(writer_hg);
+	ok(writer_hgc != nullptr &&
+			writer_hgc->repl_config.polardb_max_replica_replay_lsn != nullptr,
+		"PolarDB collect snapshot: replica replay state is available");
+	if (!writer_hgc ||
+			!writer_hgc->repl_config.polardb_max_replica_replay_lsn) {
+		return;
+	}
 
 	std::unique_ptr<PgSQL_Thread> worker(new PgSQL_Thread());
 	PgSQL_Session sess;
@@ -1074,6 +1082,65 @@ static void test_collect_is_const_stable_snapshot() {
 	ok(txn_plan.action == PolarDB_Query_RoutePlan::RouteAction::REPLICA_TXN_SPLIT &&
 			no_marker_rejection.delta() == 1,
 		"PolarDB transaction wait safety: complete backend split metadata permits later replica reads without a rejection count");
+
+	const uint64_t wal_pending_lsn = 0x2330;
+	txn_ctx.transaction_split.stage =
+		PolarDB_TransactionSplitStage::TXN_ON_PRIMARY;
+	txn_ctx.transaction_split.primary_lsn = wal_pending_lsn;
+	txn_ctx.transaction_split.splittable = false;
+	txn_ctx.transaction_split.wal_pending = true;
+	writer_hgc->repl_config.polardb_max_replica_replay_lsn->store(
+		wal_pending_lsn - 1, std::memory_order_relaxed);
+	const PolarDB_ThreadCounterSnapshot wal_pending_rejection(
+		worker.get(), polardb_st_var_split_wal_pending);
+	const PolarDB_ThreadCounterSnapshot wal_pending_confirmed(
+		worker.get(), polardb_st_var_split_wal_pending_replica_confirmed);
+	txn_plan = sess.polardb_plan(txn_ctx);
+	sess.polardb_report_route_result(txn_plan, txn_ctx);
+	ok(txn_plan.action == PolarDB_Query_RoutePlan::RouteAction::FORCE_PRIMARY &&
+			txn_plan.action_reason ==
+				PolarDB_Query_RoutePlan::RouteActionReason::WAL_PENDING &&
+			wal_pending_rejection.delta() == 1 &&
+			wal_pending_confirmed.delta() == 0,
+		"PolarDB WAL-pending route: replay below the transaction LSN stays on primary");
+
+	writer_hgc->repl_config.polardb_max_replica_replay_lsn->store(
+		wal_pending_lsn, std::memory_order_relaxed);
+	txn_plan = sess.polardb_plan(txn_ctx);
+	sess.polardb_report_route_result(txn_plan, txn_ctx);
+	ok(txn_plan.action ==
+			PolarDB_Query_RoutePlan::RouteAction::REPLICA_TXN_SPLIT &&
+			txn_plan.wait_spec.type == PolarDB_WaitType::LSN &&
+			txn_plan.wait_spec.target == wal_pending_lsn &&
+			txn_plan.txn_xids == txn_ctx.transaction_split.xids &&
+			txn_plan.reader.require_replica &&
+			wal_pending_rejection.delta() == 1 &&
+			wal_pending_confirmed.delta() == 1,
+		"PolarDB WAL-pending route: replica replay confirmation keeps XIDs and the strict selected-replica LSN target");
+	txn_ctx.transaction_split.stage =
+		PolarDB_TransactionSplitStage::TXN_SPLITTABLE;
+	txn_plan = sess.polardb_plan(txn_ctx);
+	sess.polardb_report_route_result(txn_plan, txn_ctx);
+	ok(txn_plan.action ==
+			PolarDB_Query_RoutePlan::RouteAction::REPLICA_TXN_SPLIT &&
+			wal_pending_rejection.delta() == 1 &&
+			wal_pending_confirmed.delta() == 2,
+		"PolarDB WAL-pending route: replica replay confirmation permits consecutive split reads");
+
+	txn_ctx.transaction_split.stage =
+		PolarDB_TransactionSplitStage::TXN_ON_PRIMARY;
+	txn_ctx.transaction_split.failed = true;
+	txn_plan = sess.polardb_plan(txn_ctx);
+	sess.polardb_report_route_result(txn_plan, txn_ctx);
+	ok(txn_plan.action == PolarDB_Query_RoutePlan::RouteAction::FORCE_PRIMARY &&
+			txn_plan.action_reason ==
+				PolarDB_Query_RoutePlan::RouteActionReason::IN_TRANSACTION &&
+			wal_pending_confirmed.delta() == 2,
+		"PolarDB WAL-pending route: failed transaction cannot use replica replay confirmation");
+	writer_hgc->repl_config.polardb_max_replica_replay_lsn->store(
+		0, std::memory_order_relaxed);
+	txn_ctx.transaction_split.failed = false;
+	txn_ctx.transaction_split.wal_pending = false;
 
 	sess.polardb_observe_route_inputs(writer_hg);
 	ok(sess.polardb_query.profile_enabled &&

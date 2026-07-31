@@ -409,6 +409,7 @@ struct readonly_res_t {
 #if POLARDB_PROXY
 	uint64_t lsn;           // PolarDB: current WAL LSN from the health check
 	bool is_available;      // PolarDB: polar_is_available(); true for standard PG
+	PolarDB_NodeType node_type; // Physical role associated with this LSN sample
 #endif // POLARDB_PROXY
 };
 
@@ -785,6 +786,7 @@ short handle_async_check_cont(state_t& st, short _) {
 					int32_t read_only_val = 0;
 					uint64_t lsn = 0;
 					bool is_available = true;
+					PolarDB_NodeType node_type = PolarDB_NodeType::UNKNOWN;
 
 					if (col_count >= 3) {
 						// PolarDB query result: node_type, is_available, current_lsn.
@@ -848,6 +850,7 @@ short handle_async_check_cont(state_t& st, short _) {
 						read_only_val = PolarDB_Protocol::node_type_to_read_only(health.node_type);
 						is_available = health.is_available;
 						lsn = health.current_lsn;
+						node_type = health.node_type;
 					} else {
 						// Standard PostgreSQL: pg_is_in_recovery() = 't' or 'f'.
 						const char* value_str { PQgetvalue(res, 0, 0) };
@@ -856,7 +859,8 @@ short handle_async_check_cont(state_t& st, short _) {
 
 					set_finish_st(st, ASYNC_QUERY_END,
 						op_result_t {
-							new readonly_res_t { read_only_val, lsn, is_available },
+							new readonly_res_t {
+								read_only_val, lsn, is_available, node_type },
 							[] (void* v) { delete static_cast<readonly_res_t*>(v); }
 						}
 					);
@@ -2072,7 +2076,8 @@ void perf_readonly_actions(SQLite3DB* db, state_t& state) {
 					polardb_should_update_monitor_lsn(
 						pgsql_thread___polardb_monitor_lsn_updates, op_result->lsn)) {
 				if (PgHGM->polardb_update_server_lsn_from_monitor(
-						srv.addr.c_str(), srv.port, op_result->lsn)) {
+						srv.addr.c_str(), srv.port, op_result->lsn,
+						op_result->node_type)) {
 					PgHGM->status.polardb_lsn_updates_from_monitor.fetch_add(1, std::memory_order_relaxed);
 				}
 			}

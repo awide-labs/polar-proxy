@@ -644,6 +644,10 @@ void PgSQL_HostGroups_Manager::polardb_refresh_writer_epoch_under_hgm_write_lock
 	if (writer_hgc->repl_config.polardb_group_lsn) {
 		writer_hgc->repl_config.polardb_group_lsn->store(0, std::memory_order_relaxed);
 	}
+	if (writer_hgc->repl_config.polardb_max_replica_replay_lsn) {
+		writer_hgc->repl_config.polardb_max_replica_replay_lsn->store(
+			0, std::memory_order_relaxed);
+	}
 
 	polardb_reset_lsn_cache_for_hostgroup_under_hgm_write_lock(writer_hostgroup_id);
 	if (writer_hgc->repl_config.reader_hostgroup != writer_hostgroup_id) {
@@ -664,7 +668,7 @@ void PgSQL_HostGroups_Manager::polardb_refresh_writer_epoch_under_hgm_write_lock
 
 	proxy_info(
 		"PolarDB writer epoch advanced for writer HG %u to %lu after %s; "
-		"cleared group and per-server LSN cache for the replication group\n",
+		"cleared group, replica-replay, and per-server LSN caches for the replication group\n",
 		writer_hostgroup_id, (unsigned long)new_epoch,
 		reason ? reason : "writer identity change");
 }

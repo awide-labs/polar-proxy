@@ -3915,6 +3915,8 @@ void PgSQL_HostGroups_Manager::generate_pgsql_replication_hostgroups_table() {
 			if (writer_hgc) {
 				snapshot_entry.group_lsn =
 					writer_hgc->repl_config.polardb_group_lsn;
+				snapshot_entry.max_replica_replay_lsn =
+					writer_hgc->repl_config.polardb_max_replica_replay_lsn;
 				snapshot_entry.writer_epoch =
 					writer_hgc->repl_config.polardb_writer_epoch;
 			}
@@ -7546,7 +7548,8 @@ bool PgSQL_HostGroups_Manager::polardb_has_effective_global_lsn(
 }
 
 bool PgSQL_HostGroups_Manager::polardb_update_server_lsn_from_monitor(
-		const char* hostname, uint16_t port, uint64_t lsn) {
+		const char* hostname, uint16_t port, uint64_t lsn,
+		PolarDB_NodeType node_type) {
 	if (!status.polardb_active.load(std::memory_order_relaxed)) return false;
 	if (hostname == nullptr) return false;
 	const uint64_t now_us = monotonic_time();
@@ -7562,15 +7565,20 @@ bool PgSQL_HostGroups_Manager::polardb_update_server_lsn_from_monitor(
 		if (!hgc) continue;
 
 		std::shared_ptr<std::atomic<uint64_t>> group_lsn;
+		std::shared_ptr<std::atomic<uint64_t>> max_replica_replay_lsn;
 		auto reader_it = polardb_reader_to_writer_.find(hgc->hid);
 		if (reader_it != polardb_reader_to_writer_.end()) {
 			PgSQL_HGC* writer_hgc = MyHGC_find(reader_it->second);
 			if (writer_hgc) {
 				group_lsn = writer_hgc->repl_config.polardb_group_lsn;
+				max_replica_replay_lsn =
+					writer_hgc->repl_config.polardb_max_replica_replay_lsn;
 			}
 		} else if (polardb_writer_to_reader_.find(hgc->hid) !=
 				polardb_writer_to_reader_.end()) {
 			group_lsn = hgc->repl_config.polardb_group_lsn;
+			max_replica_replay_lsn =
+				hgc->repl_config.polardb_max_replica_replay_lsn;
 		}
 
 		for (unsigned int j = 0; j < hgc->mysrvs->cnt(); j++) {
@@ -7585,13 +7593,23 @@ bool PgSQL_HostGroups_Manager::polardb_update_server_lsn_from_monitor(
 					continue;
 				}
 
+				// The HGM write lock serializes this monitor observation with writer
+				// epoch reset. Role and replay LSN come from this same health result.
+				srv->polardb_lock_lsn_cache();
 				bool advanced = srv->polardb_advance_lsn(lsn, now_us);
 
-				// Keep the highest accepted LSN for GLOBAL_LSN and lag checks.
-				// This is not the writer's current WAL position.
+				// group_lsn intentionally accepts primary and replica observations.
+				// The replica-only maximum proves that a physical replica replayed a
+				// target and therefore never accepts a writer-as-reader observation.
 				if (group_lsn) {
 					polardb_atomic_max_u64(group_lsn, lsn);
 				}
+				if (PolarDB_Protocol::is_reader(node_type) &&
+						polardb_atomic_max_u64(max_replica_replay_lsn, lsn)) {
+					POLARDB_HGM_STATUS_COUNT_ONE(
+						status, replica_replay_lsn_advanced);
+				}
+				srv->polardb_unlock_lsn_cache();
 
 				POLARDB_TRACE("PolarDB LSN CACHE: monitor update matched host=%s port=%u lsn=%lu advanced=%d\n",
 					hostname, port, (unsigned long)lsn, advanced ? 1 : 0);
@@ -7674,10 +7692,9 @@ bool PgSQL_HostGroups_Manager::polardb_accept_rfq_server_lsn(
 	// writer change from clearing the caches between the final epoch check and
 	// this update.
 	//
-	// Direct RFQ payloads are scoped differently by server role: primary RFQ is a
-	// backend-session LSN, while replica RFQ is replay progress. Both are still
-	// valid group observations for this writer epoch. Keep the shared value
-	// moving forward; it is not the writer's current WAL position.
+	// Direct RFQ carries no authoritative physical role. It remains a valid
+	// server/group observation for this writer epoch, but only a monitor result
+	// containing role and replay LSN together may advance replica replay proof.
 	const uint64_t now_us = monotonic_time();
 	const bool update_cache = !worker ||
 		worker->polardb_track_server_lsn_update(
@@ -7749,6 +7766,31 @@ uint64_t PgSQL_HostGroups_Manager::get_polardb_group_lsn(
 		return 0;
 	}
 	return it->second.group_lsn->load(std::memory_order_relaxed);
+}
+
+uint64_t PgSQL_HostGroups_Manager::get_polardb_max_replica_replay_lsn(
+		const PolarDB_WriterScope& writer_scope) {
+	if (!status.polardb_active.load(std::memory_order_relaxed) ||
+			!writer_scope.valid()) {
+		return 0;
+	}
+
+	const auto snapshot = get_polardb_topology_snapshot_cached();
+	if (!snapshot) return 0;
+	const auto it = snapshot->by_hostgroup.find(
+		static_cast<unsigned int>(writer_scope.hg));
+	if (it == snapshot->by_hostgroup.end() ||
+			!it->second.max_replica_replay_lsn || !it->second.writer_epoch) {
+		return 0;
+	}
+	if (it->second.writer_epoch->load(std::memory_order_acquire) !=
+			writer_scope.epoch) {
+		return 0;
+	}
+	const uint64_t replica_lsn =
+		it->second.max_replica_replay_lsn->load(std::memory_order_relaxed);
+	return it->second.writer_epoch->load(std::memory_order_acquire) ==
+		writer_scope.epoch ? replica_lsn : 0;
 }
 
 #if POLARDB_PROXY

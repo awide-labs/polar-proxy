@@ -162,7 +162,7 @@
 		"Released reader connections not kept by the current worker") \
 	T(reader_pool_local_return_to_shared, "PolarDB_Reader_Pool_Local_Return_To_Shared", \
 		"proxysql_polardb_reader_pool_local_return_to_shared_total", \
-		"Worker-local reader connections returned to shared server pools") \
+		"Worker-local reader connections released at pass end through shared return or remote reservation") \
 	T(reader_pool_shared_return_attempt, "PolarDB_Reader_Pool_Shared_Return_Attempt", \
 		"proxysql_polardb_reader_pool_shared_return_attempt_total", \
 		"Attempts to return a reader connection to its shared server pool") \
@@ -754,6 +754,9 @@
 	G(lsn_updates_from_monitor, "PolarDB_LSN_Updates_From_Monitor", \
 		"proxysql_polardb_lsn_updates_from_monitor_total", \
 		"LSN advances observed by the monitor") \
+	G(replica_replay_lsn_advanced, "PolarDB_Replica_Replay_LSN_Advanced", \
+		"proxysql_polardb_replica_replay_lsn_advanced_total", \
+		"Monitor physical-replica observations that advanced the current writer epoch's replica replay maximum") \
 	G(monitor_health_invalid_role, "PolarDB_Monitor_Health_Invalid_Role", \
 		"proxysql_polardb_monitor_health_invalid_role_total", \
 		"Monitor health rows reporting a role ProxySQL cannot route to, including POLAR_UNKNOWN/POLAR_STANDALONE_DATAMAX") \
@@ -762,7 +765,7 @@
 		"Monitor health rows with invalid availability or LSN text") \
 	T(lsn_stale_count, "PolarDB_LSN_Stale_Count", \
 		"proxysql_polardb_lsn_stale_count_total", \
-		"Reader candidates skipped because their cached LSN is below the session target") \
+		"Reader candidates skipped because a byte-lag check found their cached LSN missing or stale") \
 	T(write_missing_lsn, "PolarDB_Write_Missing_LSN", \
 		"proxysql_polardb_write_missing_lsn_total", \
 		"Writer queries whose RFQ did not include an LSN") \
@@ -1002,7 +1005,7 @@
 		"Capacity requests avoided because the worker had compatible reusable active capacity") \
 	T(reader_pool_capacity_ownership_reservation, "PolarDB_ReaderPool_Capacity_Ownership_Reservation", \
 		"proxysql_polardb_reader_pool_capacity_ownership_reservation_total", \
-		"Capacity requests avoided because the worker already had a compatible reservation") \
+		"Reserved diagnostic; current registration exits before checking ownership when a reservation is active") \
 	T(reader_pool_capacity_ownership_zero, "PolarDB_ReaderPool_Capacity_Ownership_Zero", \
 		"proxysql_polardb_reader_pool_capacity_ownership_zero_total", \
 		"Complete reader-group busy results for workers with no compatible owned capacity") \
@@ -1476,7 +1479,10 @@
 		"Transaction reads kept on the primary because RFQ state had no usable split or pre-write marker") \
 	T(split_wal_pending, "PolarDB_Split_WAL_Pending", \
 		"proxysql_polardb_split_wal_pending_total", \
-		"Transaction-split candidates rejected because primary RFQ reported WAL pending") \
+		"WAL-pending transaction reads kept on primary because no replica replay observation reached the transaction LSN") \
+	T(split_wal_pending_replica_confirmed, "PolarDB_Split_WAL_Pending_Replica_Confirmed", \
+		"proxysql_polardb_split_wal_pending_replica_confirmed_total", \
+		"WAL-pending transaction reads admitted to split planning after a replica replay observation reached the transaction LSN") \
 	T(split_invariant_violations, "PolarDB_Split_Invariant_Violations", \
 		"proxysql_polardb_split_invariant_violations_total", \
 		"Unexpected transaction-split state-machine violations") \
