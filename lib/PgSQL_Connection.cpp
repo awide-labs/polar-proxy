@@ -30,6 +30,8 @@ static_assert(POLARDB_PROXY_PROTOCOL_LEGACY == static_cast<int>(PolarDB_ProxyPro
 	"PolarDB proxy protocol LEGACY constant mismatch");
 static_assert(POLARDB_PROXY_PROTOCOL_V15 == static_cast<int>(PolarDB_ProxyProtocol::V15),
 	"PolarDB proxy protocol V15 constant mismatch");
+static_assert(POLARDB_PROXY_PROTOCOL_V15_WAIT == static_cast<int>(PolarDB_ProxyProtocol::V15_WAIT),
+	"PolarDB proxy protocol V15_WAIT constant mismatch");
 
 // Defined in PgSQL_PolarDB_Notices.cpp. Counts the backend's LSN wait-timeout
 // notice and queues it for the client. It must run even when this connection has
@@ -40,6 +42,8 @@ void polardb_handle_lsn_wait_timeout_notice(PgSQL_Connection* conn, const PGresu
 /// @brief Human-readable name of a proxy protocol value, for log and trace lines.
 static const char* polardb_proxy_protocol_name(PolarDB_ProxyProtocol protocol) {
 	switch (protocol) {
+	case PolarDB_ProxyProtocol::V15_WAIT:
+		return "v15_wait";
 	case PolarDB_ProxyProtocol::V15:
 		return "v15";
 	case PolarDB_ProxyProtocol::LEGACY:
@@ -1687,7 +1691,7 @@ void PgSQL_Connection::connect_start() {
 #if POLARDB_PROXY
 		// Append the PolarDB startup parameters now that the options block above
 		// is closed: they must be top-level conninfo keys, not options entries.
-		// The profile selects whether v15, legacy, or no parameters are emitted.
+		// The profile selects v15_wait, v15, legacy, or no startup parameters.
 		if (use_polardb_startup_settings) {
 			POLARDB_TRACE("PolarDB CONNINFO: client-backed sess=%p is_polardb_enabled=%d session_consistency_mode=%d\n",
 				myds->sess,
@@ -2008,7 +2012,8 @@ bool PgSQL_Connection::polardb_append_startup_params(std::ostringstream& conninf
 	// negotiated on every non-OFF PolarDB connection because the startup profile
 	// is fixed for as long as a pooled backend lives; txn_split_enabled determines
 	// later whether routing uses it.
-	if (profile.protocol == PolarDB_ProxyProtocol::V15) {
+	if (profile.protocol == PolarDB_ProxyProtocol::V15 ||
+			profile.protocol == PolarDB_ProxyProtocol::V15_WAIT) {
 		conninfo << " _polar_proxy_client_host=" << identity.host;
 		conninfo << " _polar_proxy_client_port=" << identity.port;
 		if (profile.requests_rfq_lsn()) {
@@ -2016,6 +2021,9 @@ bool PgSQL_Connection::polardb_append_startup_params(std::ostringstream& conninf
 		}
 		if (profile.requests_rfq_xid()) {
 			conninfo << " _polar_proxy_send_xact=true";
+		}
+		if (profile.requests_extended_wait()) {
+			conninfo << " _pq_.polar_proxy_wait_v1=1";
 		}
 		return true;
 	}

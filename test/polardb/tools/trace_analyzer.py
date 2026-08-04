@@ -87,7 +87,7 @@ TRACE = {
     # Session-LSN mode.
     "conninfo_reader_params_re": (
         rf"PolarDB CONNINFO: adding startup params to HG {READER_HG} "
-        r"protocol=(v15|legacy)"),
+        r"protocol=(v15_wait|v15|legacy)"),
     "plan_replica_with_wait": f"PolarDB PLAN: REPLICA_WITH_WAIT reader={READER_HG}",
     "execute_replica_prepared": "PolarDB EXECUTE: REPLICA_WITH_WAIT prepared",
     "wait_wrap_built": "PolarDB WAIT WRAP: built wrapped_query_len",

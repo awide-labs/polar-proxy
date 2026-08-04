@@ -59,6 +59,7 @@ struct PolarDB_WaitProfileState;
 constexpr int POLARDB_PROXY_PROTOCOL_OFF    = 0;
 constexpr int POLARDB_PROXY_PROTOCOL_LEGACY = 1;
 constexpr int POLARDB_PROXY_PROTOCOL_V15    = 2;
+constexpr int POLARDB_PROXY_PROTOCOL_V15_WAIT = 3;
 
 enum PolarDB_ThreadStatusVariable {
 #define X(name, display_name, prom_name, help) polardb_st_var_##name,
@@ -1847,7 +1848,7 @@ public:
 		bool polardb_result_fast_forward;     // batch contiguous backend DataRow frames into one result packet
 		int polardb_split_warmup_max_connections_per_request; // max backend connections per warmup request
 		char* polardb_action_lsn_timeout;      // warning | primary | error | disconnect
-		char* polardb_proxy_protocol;         // v15 | legacy | off
+		char* polardb_proxy_protocol;         // v15_wait | v15 | legacy | off
 		char* polardb_action_missing_lsn;      // primary | warning | error
 		char* polardb_action_replica_loss;     // replica_then_primary | replica_then_error | primary | error | disconnect
 		char* polardb_action_replica_error;    // primary | error | disconnect

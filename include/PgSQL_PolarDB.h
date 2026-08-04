@@ -886,6 +886,7 @@ polardb_replica_error_action_from_int(int v) {
 constexpr uint32_t REQUEST_RFQ_LSN = 1u << 0;
 constexpr uint32_t REQUEST_RFQ_CSN = 1u << 1;
 constexpr uint32_t REQUEST_RFQ_XID = 1u << 2;
+constexpr uint32_t REQUEST_EXTENDED_WAIT = 1u << 3;
 
 /**
  * @brief PolarDB proxy startup-parameter dialect for a backend connection.
@@ -897,12 +898,15 @@ constexpr uint32_t REQUEST_RFQ_XID = 1u << 2;
 enum class PolarDB_ProxyProtocol : uint8_t {
     OFF = 0,        // Send no PolarDB proxy startup keys
     LEGACY = 1,     // Older key names (_polar_origin_client_ip/port, _polar_send_lsn)
-    V15 = 2         // Newer key names (_polar_proxy_client_host/port, _polar_proxy_send_lsn)
+    V15 = 2,        // Newer key names (_polar_proxy_client_host/port, _polar_proxy_send_lsn)
+    V15_WAIT = 3    // V15 plus negotiated wait+extended-protocol support
 };
 
 /// @brief Map a configured int to PolarDB_ProxyProtocol; unknown values map to OFF.
 static inline PolarDB_ProxyProtocol polardb_proxy_protocol_from_int(int protocol) {
     switch (protocol) {
+    case static_cast<int>(PolarDB_ProxyProtocol::V15_WAIT):
+        return PolarDB_ProxyProtocol::V15_WAIT;
     case static_cast<int>(PolarDB_ProxyProtocol::V15):
         return PolarDB_ProxyProtocol::V15;
     case static_cast<int>(PolarDB_ProxyProtocol::LEGACY):
@@ -922,6 +926,8 @@ static inline const char* polardb_proxy_protocol_config_name(
         return "legacy";
     case PolarDB_ProxyProtocol::V15:
         return "v15";
+    case PolarDB_ProxyProtocol::V15_WAIT:
+        return "v15_wait";
     }
     return "off";
 }
@@ -964,8 +970,12 @@ struct PolarDB_StartupProfile {
         PolarDB_StartupProfile profile;
         profile.protocol = protocol;
         if (protocol == PolarDB_ProxyProtocol::LEGACY ||
-            protocol == PolarDB_ProxyProtocol::V15) {
+            protocol == PolarDB_ProxyProtocol::V15 ||
+            protocol == PolarDB_ProxyProtocol::V15_WAIT) {
             profile.request_bits = REQUEST_RFQ_LSN | REQUEST_RFQ_XID;
+        }
+        if (protocol == PolarDB_ProxyProtocol::V15_WAIT) {
+            profile.request_bits |= REQUEST_EXTENDED_WAIT;
         }
         return profile;
     }
@@ -990,6 +1000,10 @@ struct PolarDB_StartupProfile {
     /// @brief True if this profile asked the backend to append transaction XIDs.
 	bool requests_rfq_xid() const {
         return requests(REQUEST_RFQ_XID);
+    }
+
+    bool requests_extended_wait() const {
+        return requests(REQUEST_EXTENDED_WAIT);
     }
 
     /// @brief True if this profile causes any PolarDB startup keys to be sent.
@@ -1675,7 +1689,7 @@ static inline const char* polardb_hostgroup_lsn_source_error(
         PolarDB_ProxyProtocol protocol) {
     if (mode == PolarDB_ConsistencyMode::SESSION_LSN &&
             protocol == PolarDB_ProxyProtocol::OFF) {
-        return "session_lsn requires proxy_protocol v15 or legacy";
+        return "session_lsn requires proxy_protocol v15_wait, v15, or legacy";
     }
     return nullptr;
 }
@@ -2216,7 +2230,7 @@ polardb_profile_settings() {
         {K::REPLICA_LOSS, "polardb_action_replica_loss",
             "replica_then_primary, replica_then_error, primary, "
             "error, disconnect"},
-        {K::PROXY_PROTOCOL, "polardb_proxy_protocol", "v15, legacy, off"},
+        {K::PROXY_PROTOCOL, "polardb_proxy_protocol", "v15_wait, v15, legacy, off"},
         {K::MONITOR_LSN_UPDATES, "polardb_monitor_lsn_updates",
             "true, false"},
         {K::SPLIT_WARMUP, "polardb_lazy_warmup_split", "true, false"}
@@ -2521,7 +2535,7 @@ static inline const char* polardb_txn_split_warmup_mode_name(int mode) {
     }
 }
 
-/// @brief Map a config string ("off"/"legacy"/"v15") to the proxy-protocol int.
+/// @brief Map a config string to the proxy-protocol int.
 /// Null, empty, "default", or any unknown value returns @p default_value.
 static inline int polardb_proxy_protocol_from_string(
     const char* value,
@@ -2537,6 +2551,9 @@ static inline int polardb_proxy_protocol_from_string(
     }
     if (strcasecmp(value, "v15") == 0) {
         return static_cast<int>(PolarDB_ProxyProtocol::V15);
+    }
+    if (strcasecmp(value, "v15_wait") == 0) {
+        return static_cast<int>(PolarDB_ProxyProtocol::V15_WAIT);
     }
     return default_value;
 }

@@ -1884,9 +1884,12 @@ int ProxySQL_Config::Read_PgSQL_Servers_from_configfile(std::string& error) {
 			line.lookupValue("lsn_wait_timeout_ms", lsn_wait_timeout_ms);
 			line.lookupValue("proxy_protocol", proxy_protocol);
 			if (strcasecmp(proxy_protocol.c_str(), (char*)"default") &&
-				strcasecmp(proxy_protocol.c_str(), (char*)"v15") &&
-				strcasecmp(proxy_protocol.c_str(), (char*)"legacy") &&
-				strcasecmp(proxy_protocol.c_str(), (char*)"off")) {
+					polardb_proxy_protocol_from_string(
+						proxy_protocol.c_str(), -1) < 0) {
+				proxy_error(
+					"Admin: invalid PolarDB proxy_protocol '%s' in "
+					"pgsql_replication_hostgroups; using default\n",
+					proxy_protocol.c_str());
 				proxy_protocol = "default";
 			}
 #else

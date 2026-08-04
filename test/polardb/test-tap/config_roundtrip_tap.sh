@@ -106,14 +106,14 @@ cluster_qr=$(mysql_admin_sql "PROXY_SELECT rule_id, username, database, flagIN, 
 ok $? "cluster query-rule surface includes replica_eligible without shifting fields"
 
 admin_sql "DELETE FROM pgsql_replication_hostgroups;" >/dev/null
-admin_sql "INSERT INTO pgsql_replication_hostgroups (writer_hostgroup, reader_hostgroup, check_type, txn_split_enabled, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment) VALUES (101, 102, 'polardb', 1, 'global_lsn', 12345, 0, 'legacy', 'polardb_hg_roundtrip');" >/dev/null
+admin_sql "INSERT INTO pgsql_replication_hostgroups (writer_hostgroup, reader_hostgroup, check_type, txn_split_enabled, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment) VALUES (101, 102, 'polardb', 1, 'global_lsn', 12345, 0, 'v15_wait', 'polardb_hg_roundtrip');" >/dev/null
 admin_sql "SAVE CONFIG TO FILE $PROXYSQL_CONFIG_FILE;" >/dev/null
 admin_sql "DELETE FROM pgsql_replication_hostgroups;" >/dev/null
 admin_sql "LOAD PGSQL SERVERS FROM CONFIG;" >/dev/null
 
 hg_policy=$(admin_sql "SELECT check_type || '|' || txn_split_enabled || '|' || consistency_mode || '|' || max_lag_bytes || '|' || lsn_wait_timeout_ms || '|' || proxy_protocol || '|' || comment FROM pgsql_replication_hostgroups WHERE writer_hostgroup=101 AND reader_hostgroup=102;" | tr -d '\r')
-[ "$hg_policy" = "polardb|1|global_lsn|12345|0|legacy|polardb_hg_roundtrip" ]
-ok $? "PolarDB replication-hostgroup policy and proxy_protocol survive config round-trip"
+[ "$hg_policy" = "polardb|1|global_lsn|12345|0|v15_wait|polardb_hg_roundtrip" ]
+ok $? "PolarDB replication-hostgroup policy and v15_wait survive config round-trip"
 
 admin_sql "INSERT INTO pgsql_replication_hostgroups (writer_hostgroup, reader_hostgroup, check_type, txn_split_enabled, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment) VALUES (103, 104, 'read_only', 0, 'default', -1, -1, 'default', 'read_only_hg_roundtrip');" >/dev/null
 admin_sql "SAVE CONFIG TO FILE $PROXYSQL_CONFIG_FILE;" >/dev/null
@@ -151,7 +151,7 @@ admin_sql "LOAD PGSQL SERVERS TO RUNTIME;" >/dev/null
 cluster_hg=$(mysql_admin_sql "PROXY_SELECT writer_hostgroup, reader_hostgroup, check_type, txn_split_enabled, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment FROM runtime_pgsql_replication_hostgroups ORDER BY writer_hostgroup" |
 	awk -F'\t' '$1 == 101 || $1 == 103 { if (out != "") out = out ";"; out = out $3 "|" $4 "|" $5 "|" $6 "|" $7 "|" $8 "|" $9 } END { print out }' |
 	tr -d '\r')
-[ "$cluster_hg" = "polardb|1|session_lsn|12345|0|legacy|polardb_hg_roundtrip;read_only|0|default|-1|-1|default|read_only_hg_roundtrip" ]
+[ "$cluster_hg" = "polardb|1|session_lsn|12345|0|v15_wait|polardb_hg_roundtrip;read_only|0|default|-1|-1|default|read_only_hg_roundtrip" ]
 ok $? "cluster replication-hostgroup surface includes PolarDB policy columns"
 
 [ "$(global_var pgsql-bounded_local_connection_cache)" = "0" ]

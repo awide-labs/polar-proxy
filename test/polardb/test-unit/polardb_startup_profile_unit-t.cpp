@@ -32,6 +32,7 @@ static void test_protocol_request_bits() {
 	PolarDB_StartupProfile off =
 		PolarDB_StartupProfile::from_protocol(PolarDB_ProxyProtocol::OFF);
 	ok(!off.requests_rfq_lsn(), "off profile does not request RFQ LSN");
+	ok(!off.requests_extended_wait(), "off profile does not request extended wait");
 	ok(!off.emits_startup_params(), "off profile emits no startup params");
 	ok(off.protocol == PolarDB_ProxyProtocol::OFF, "off profile records OFF protocol");
 	off.request_rfq_xid();
@@ -43,15 +44,27 @@ static void test_protocol_request_bits() {
 	ok(legacy.requests_rfq_xid(), "legacy profile requests RFQ XID");
 	ok(legacy.emits_startup_params(), "legacy profile emits startup params");
 	ok(!legacy.requests(REQUEST_RFQ_CSN), "legacy profile does not request RFQ CSN");
+	ok(!legacy.requests_extended_wait(), "legacy profile does not request extended wait");
 
 	PolarDB_StartupProfile v15 = make_v15_profile();
 	ok(v15.requests_rfq_lsn(), "v15 profile requests RFQ LSN");
 	ok(v15.requests_rfq_xid(), "v15 profile requests RFQ XID");
 	ok(v15.emits_startup_params(), "v15 profile emits startup params");
 	ok(!v15.requests(REQUEST_RFQ_CSN), "v15 profile does not request RFQ CSN");
+	ok(!v15.requests_extended_wait(), "v15 profile does not request extended wait");
 	v15.request_rfq_xid();
 	ok(v15.requests_rfq_lsn(), "v15 profile keeps RFQ LSN when RFQ XID is requested again");
 	ok(v15.requests_rfq_xid(), "v15 profile keeps RFQ XID when requested again");
+
+	PolarDB_StartupProfile v15_wait =
+		PolarDB_StartupProfile::from_protocol(PolarDB_ProxyProtocol::V15_WAIT);
+	ok(v15_wait.requests_rfq_lsn() && v15_wait.requests_rfq_xid(),
+		"v15_wait profile retains RFQ LSN and XID requests");
+	ok(v15_wait.requests_extended_wait(),
+		"v15_wait profile requests the extended wait capability");
+	ok(v15_wait.generation(static_cast<int>(PolarDB_ProxyIdentityMode::PROXY)) !=
+			v15.generation(static_cast<int>(PolarDB_ProxyIdentityMode::PROXY)),
+		"v15_wait has a distinct pool generation from v15");
 
 	PolarDB_StartupProfile csn_only = make_v15_profile();
 	csn_only.request_bits = REQUEST_RFQ_CSN;
@@ -329,6 +342,7 @@ static void test_string_converters() {
 		{"off", static_cast<int>(PolarDB_ProxyProtocol::OFF)},
 		{"legacy", static_cast<int>(PolarDB_ProxyProtocol::LEGACY)},
 		{"v15", static_cast<int>(PolarDB_ProxyProtocol::V15)},
+		{"v15_wait", static_cast<int>(PolarDB_ProxyProtocol::V15_WAIT)},
 		{"bad", fallback},
 	};
 	check_string_conversions(
@@ -444,8 +458,11 @@ static void test_string_converters() {
 			PolarDB_ProxyProtocol::V15) == nullptr &&
 			polardb_hostgroup_lsn_source_error(
 				PolarDB_ConsistencyMode::SESSION_LSN,
+				PolarDB_ProxyProtocol::V15_WAIT) == nullptr &&
+			polardb_hostgroup_lsn_source_error(
+				PolarDB_ConsistencyMode::SESSION_LSN,
 				PolarDB_ProxyProtocol::LEGACY) == nullptr,
-		"session_lsn accepts both RFQ-capable startup protocols");
+		"session_lsn accepts every RFQ-capable startup protocol");
 	ok(polardb_hostgroup_lsn_source_error(
 			PolarDB_ConsistencyMode::GLOBAL_LSN,
 			PolarDB_ProxyProtocol::OFF) == nullptr,

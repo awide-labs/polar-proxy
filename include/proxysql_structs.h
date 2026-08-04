@@ -1168,7 +1168,7 @@ __thread bool pgsql_thread___polardb_writev_direct;           // enable plaintex
 __thread bool pgsql_thread___polardb_result_fast_forward;     // batch contiguous backend DataRow frames into one result copy
 __thread int pgsql_thread___polardb_split_warmup_max_connections_per_request; // max backend connections per warmup request
 __thread int pgsql_thread___polardb_action_lsn_timeout;      // PolarDB_LsnWaitTimeoutAction
-__thread int pgsql_thread___polardb_proxy_protocol;          // off=0, legacy=1, v15=2
+__thread int pgsql_thread___polardb_proxy_protocol;          // off=0, legacy=1, v15=2, v15_wait=3
 __thread int pgsql_thread___polardb_action_missing_lsn;      // PolarDB_MissingLsnAction
 __thread int pgsql_thread___polardb_action_replica_loss;     // PolarDB_ReplicaLossAction
 __thread int pgsql_thread___polardb_action_replica_error;    // PolarDB_ReplicaErrorAction
