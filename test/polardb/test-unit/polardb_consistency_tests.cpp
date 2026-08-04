@@ -25,11 +25,17 @@ extern "C" {
 #include "polardb_unit_domains.h"
 
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <vector>
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 extern PgSQL_HostGroups_Manager* PgHGM;
 extern PgSQL_Threads_Handler* GloPTH;
@@ -56,6 +62,305 @@ static void test_wait_timeout_fields() {
 	ok(polardb_is_lsn_wait_timeout_result(result),
 		"PolarDB timeout fields: exact DETAIL and source function are accepted");
 	PQclear(result);
+}
+
+struct PolarDB_WireCapture {
+	bool fixture_ready{false};
+	int send_rc{0};
+	int flush_rc{-1};
+	std::vector<unsigned char> bytes;
+	std::string trace;
+};
+
+template <typename Sender>
+static PolarDB_WireCapture capture_libpq_wire(Sender sender) {
+	PolarDB_WireCapture capture;
+	int sockets[2] = {-1, -1};
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
+		return capture;
+	}
+	for (int socket_fd : sockets) {
+		const int flags = fcntl(socket_fd, F_GETFL, 0);
+		if (flags < 0 ||
+				fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+			close(sockets[0]);
+			close(sockets[1]);
+			return capture;
+		}
+	}
+
+	PGconn* conn = PQconnectStart("polardb_unit_invalid_conninfo=1");
+	if (!conn) {
+		close(sockets[0]);
+		close(sockets[1]);
+		return capture;
+	}
+	pqDropConnection(conn, true);
+	conn->sock = sockets[0];
+	conn->status = CONNECTION_OK;
+	conn->asyncStatus = PGASYNC_IDLE;
+	conn->pipelineStatus = PQ_PIPELINE_OFF;
+	if (PQsetnonblocking(conn, 1) != 0) {
+		PQfinish(conn);
+		close(sockets[1]);
+		return capture;
+	}
+	FILE* trace_file = tmpfile();
+	if (trace_file) {
+		PQtrace(conn, trace_file);
+		PQsetTraceFlags(conn, PQTRACE_SUPPRESS_TIMESTAMPS);
+	}
+	capture.fixture_ready = true;
+	if constexpr (std::is_invocable_v<Sender, PGconn*, int>) {
+		capture.send_rc = sender(conn, sockets[1]);
+	} else {
+		capture.send_rc = sender(conn);
+	}
+	if (capture.send_rc == 1) {
+		capture.flush_rc = PQflush(conn);
+	}
+	if (capture.flush_rc == 0) {
+		struct pollfd peer = {sockets[1], POLLIN, 0};
+		int poll_rc;
+		do {
+			poll_rc = poll(&peer, 1, 1000);
+		} while (poll_rc < 0 && errno == EINTR);
+	}
+
+	unsigned char buf[512];
+	for (;;) {
+		const ssize_t received = recv(
+			sockets[1], buf, sizeof(buf), MSG_DONTWAIT);
+		if (received > 0) {
+			capture.bytes.insert(
+				capture.bytes.end(), buf, buf + received);
+			continue;
+		}
+		if (received < 0 && errno == EINTR) {
+			continue;
+		}
+		break;
+	}
+	if (trace_file) {
+		fflush(trace_file);
+		rewind(trace_file);
+		char trace_buf[512];
+		while (fgets(trace_buf, sizeof(trace_buf), trace_file)) {
+			capture.trace.append(trace_buf);
+		}
+		PQuntrace(conn);
+		fclose(trace_file);
+	}
+
+	PQfinish(conn);
+	close(sockets[1]);
+	return capture;
+}
+
+static uint32_t polardb_wire_u32(
+		const std::vector<unsigned char>& wire, size_t offset) {
+	return (static_cast<uint32_t>(wire[offset]) << 24) |
+		(static_cast<uint32_t>(wire[offset + 1]) << 16) |
+		(static_cast<uint32_t>(wire[offset + 2]) << 8) |
+		static_cast<uint32_t>(wire[offset + 3]);
+}
+
+static uint64_t polardb_wire_u64(
+		const std::vector<unsigned char>& wire, size_t offset) {
+	return (static_cast<uint64_t>(polardb_wire_u32(wire, offset)) << 32) |
+		polardb_wire_u32(wire, offset + 4);
+}
+
+static std::string polardb_wire_message_types(
+		const std::vector<unsigned char>& wire) {
+	std::string types;
+	size_t offset = 0;
+	while (offset + 5 <= wire.size()) {
+		const uint32_t length = polardb_wire_u32(wire, offset + 1);
+		if (length < 4 || offset + 1 + length > wire.size()) {
+			return "invalid";
+		}
+		types.push_back(static_cast<char>(wire[offset]));
+		offset += 1 + length;
+	}
+	return offset == wire.size() ? types : "invalid";
+}
+
+static bool polardb_wait_frame_matches(
+		const std::vector<unsigned char>& wire,
+		uint64_t target_lsn, uint32_t timeout_ms, int mode) {
+	return wire.size() >= 21 && wire[0] == 'W' &&
+		polardb_wire_u32(wire, 1) == 20 &&
+		wire[5] == 1 && wire[6] == static_cast<unsigned char>(mode) &&
+		wire[7] == 0 && wire[8] == 0 &&
+		polardb_wire_u32(wire, 9) == timeout_ms &&
+		polardb_wire_u64(wire, 13) == target_lsn;
+}
+
+static bool polardb_wait_wire_matches(
+		const char* label, const PolarDB_WireCapture& capture,
+		const char* expected_types, uint64_t target_lsn,
+		uint32_t timeout_ms, int mode) {
+	const std::string types = polardb_wire_message_types(capture.bytes);
+	const bool matches = polardb_wait_frame_matches(
+		capture.bytes, target_lsn, timeout_ms, mode) &&
+		types == expected_types;
+	if (!matches) {
+		if (capture.bytes.size() >= 21) {
+			diag("%s: bytes=%zu types=%s first=%u length=%u version=%u "
+				"mode=%u flags=%u/%u timeout=%u target=%llu",
+				label, capture.bytes.size(), types.c_str(), capture.bytes[0],
+				polardb_wire_u32(capture.bytes, 1), capture.bytes[5],
+				capture.bytes[6], capture.bytes[7], capture.bytes[8],
+				polardb_wire_u32(capture.bytes, 9),
+				(unsigned long long)polardb_wire_u64(capture.bytes, 13));
+		} else {
+			diag("%s: bytes=%zu types=%s send_rc=%d flush_rc=%d",
+				label, capture.bytes.size(), types.c_str(),
+				capture.send_rc, capture.flush_rc);
+		}
+	}
+	return matches;
+}
+
+static void test_extended_wait_libpq_wire_order() {
+	const uint64_t target_lsn = UINT64_C(0x0102030405060708);
+	const uint32_t timeout_ms = 0x00010203;
+	const int mode = PQ_POLAR_CONSISTENCY_STRICT;
+
+	const PolarDB_WireCapture prepare = capture_libpq_wire(
+		[&](PGconn* conn) {
+			return PQsendPreparePolarWait(
+				conn, "stmt", "SELECT $1", 0, nullptr,
+				target_lsn, timeout_ms, mode);
+		});
+	ok(prepare.fixture_ready && prepare.send_rc == 1 &&
+			prepare.flush_rc == 0,
+		"v15_wait libpq wire: prepare fixture sends successfully");
+	ok(polardb_wait_wire_matches(
+			"prepare", prepare, "WPS", target_lsn, timeout_ms, mode),
+		"v15_wait libpq wire: W precedes Parse and carries exact fields");
+	ok(prepare.trace.find("PolarWait") != std::string::npos &&
+			prepare.trace.find("CopyBothResponse") == std::string::npos,
+		"v15_wait libpq trace: frontend W is decoded as PolarWait");
+
+	const PolarDB_WireCapture execute = capture_libpq_wire(
+		[&](PGconn* conn) {
+			return PQsendQueryPreparedPolarWait(
+				conn, "stmt", 0, nullptr, nullptr, nullptr, 0,
+				target_lsn, timeout_ms, mode);
+		});
+	ok(execute.fixture_ready && execute.send_rc == 1 &&
+			execute.flush_rc == 0,
+		"v15_wait libpq wire: prepared Execute fixture sends successfully");
+	ok(polardb_wait_wire_matches(
+			"execute", execute, "WBDES", target_lsn, timeout_ms, mode),
+		"v15_wait libpq wire: W precedes Bind/Describe/Execute in one flush");
+
+	const PolarDB_WireCapture params = capture_libpq_wire(
+		[&](PGconn* conn) {
+			return PQsendQueryParamsPolarWait(
+				conn, "SELECT 1", 0, nullptr, nullptr, nullptr, nullptr, 0,
+				target_lsn, timeout_ms, mode);
+		});
+	ok(params.fixture_ready && params.send_rc == 1 &&
+			params.flush_rc == 0,
+		"v15_wait libpq wire: parameterized query fixture sends successfully");
+	ok(polardb_wait_wire_matches(
+			"params", params, "WPBDES", target_lsn, timeout_ms, mode),
+		"v15_wait libpq wire: W precedes Parse for a one-shot extended query");
+
+	const PolarDB_WireCapture max_timeout = capture_libpq_wire(
+		[&](PGconn* conn) {
+			return PQsendQueryPreparedPolarWait(
+				conn, "stmt", 0, nullptr, nullptr, nullptr, 0,
+				target_lsn, UINT32_MAX, mode);
+		});
+	ok(max_timeout.fixture_ready && max_timeout.send_rc == 1 &&
+			max_timeout.flush_rc == 0,
+		"v15_wait libpq wire: full uint32 timeout sends successfully");
+	ok(polardb_wait_wire_matches(
+			"max_timeout", max_timeout, "WBDES", target_lsn,
+			UINT32_MAX, mode),
+		"v15_wait libpq wire: full uint32 timeout preserves all wire bits");
+}
+
+static void test_extended_wait_libpq_send_rollback() {
+	const uint64_t failed_target = UINT64_C(0x1111111122222222);
+	const uint64_t valid_target = UINT64_C(0x3333333344444444);
+	const char* values[] = {"value"};
+	const int binary_formats[] = {1};
+	const int binary_lengths[] = {5};
+	int failed_send_rc = -1;
+
+	const PolarDB_WireCapture recovered = capture_libpq_wire(
+		[&](PGconn* conn) {
+			failed_send_rc = PQsendQueryPreparedPolarWait(
+				conn, "stmt", 1, values, nullptr, binary_formats, 0,
+				failed_target, 1000, PQ_POLAR_CONSISTENCY_STRICT);
+			if (failed_send_rc != 0) {
+				return 0;
+			}
+			return PQsendQueryPreparedPolarWait(
+				conn, "stmt", 1, values, binary_lengths, binary_formats, 0,
+				valid_target, 1000, PQ_POLAR_CONSISTENCY_STRICT);
+		});
+	ok(recovered.fixture_ready && failed_send_rc == 0 &&
+			recovered.send_rc == 1 && recovered.flush_rc == 0,
+		"v15_wait libpq rollback: failed Bind leaves connection reusable");
+	ok(polardb_wait_wire_matches(
+			"rollback", recovered, "WBDES", valid_target, 1000,
+			PQ_POLAR_CONSISTENCY_STRICT),
+		"v15_wait libpq rollback: next send contains only its own W and Execute");
+
+	constexpr int prefix_size = 8192 - 21;
+	ssize_t premature_bytes = -1;
+	bool checkpoint_restored = false;
+	failed_send_rc = -1;
+	const PolarDB_WireCapture threshold = capture_libpq_wire(
+		[&](PGconn* conn, int peer_fd) {
+			if (pqCheckOutBufferSpace(prefix_size, conn) != 0) {
+				return 0;
+			}
+			memset(conn->outBuffer, 'x', prefix_size);
+			conn->outCount = prefix_size;
+			const int saved_msg_start = conn->outMsgStart;
+			const int saved_msg_end = conn->outMsgEnd;
+
+			failed_send_rc = PQsendQueryPreparedPolarWait(
+				conn, "stmt", 1, values, nullptr, binary_formats, 0,
+				failed_target, 1000, PQ_POLAR_CONSISTENCY_STRICT);
+			unsigned char probe[64];
+			premature_bytes = recv(
+				peer_fd, probe, sizeof(probe), MSG_DONTWAIT);
+			if (premature_bytes < 0 &&
+					(errno == EAGAIN || errno == EWOULDBLOCK)) {
+				premature_bytes = 0;
+			}
+			checkpoint_restored = conn->outCount == prefix_size &&
+				conn->outMsgStart == saved_msg_start &&
+				conn->outMsgEnd == saved_msg_end;
+
+			// The synthetic prefix exists only to exercise the threshold. Remove it
+			// before proving that the same connection accepts a clean valid send.
+			conn->outCount = 0;
+			conn->outMsgStart = 0;
+			conn->outMsgEnd = 0;
+			if (failed_send_rc != 0) {
+				return 0;
+			}
+			return PQsendQueryPreparedPolarWait(
+				conn, "stmt", 1, values, binary_lengths, binary_formats, 0,
+				valid_target, 1000, PQ_POLAR_CONSISTENCY_STRICT);
+		});
+	ok(threshold.fixture_ready && failed_send_rc == 0 &&
+			premature_bytes == 0 && checkpoint_restored,
+		"v15_wait libpq rollback: failed compound send cannot auto-flush W at 8K");
+	ok(threshold.send_rc == 1 && threshold.flush_rc == 0 &&
+		polardb_wait_wire_matches(
+			"rollback-threshold", threshold, "WBDES", valid_target, 1000,
+			PQ_POLAR_CONSISTENCY_STRICT),
+		"v15_wait libpq rollback: threshold failure is followed by a clean valid send");
 }
 
 static void test_reader_target_selection_counter_contract() {
@@ -1350,6 +1655,8 @@ void run_polardb_consistency_target_tests() {
 }
 
 void run_polardb_consistency_wait_cache_tests() {
+	test_extended_wait_libpq_wire_order();
+	test_extended_wait_libpq_send_rollback();
 	test_successful_wait_cache_advance_requires_active_wait();
 	test_wait_wrapper_failure_preserves_prefix();
 	test_wait_wrapper_keeps_original_query_alive();

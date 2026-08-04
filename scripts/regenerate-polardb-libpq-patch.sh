@@ -36,7 +36,9 @@ POLARDB_LIBPQ_FILES=(
 	src/interfaces/libpq/exports.txt
 	src/interfaces/libpq/fe-connect.c
 	src/interfaces/libpq/fe-exec.c
+	src/interfaces/libpq/fe-misc.c
 	src/interfaces/libpq/fe-protocol3.c
+	src/interfaces/libpq/fe-trace.c
 	src/interfaces/libpq/libpq-fe.h
 	src/interfaces/libpq/libpq-int.h
 )
