@@ -777,6 +777,30 @@ void ProxySQL_Admin::disk_upgrade_pgsql_replication_hostgroups() {
 				" FROM pgsql_replication_hostgroups_v305"
 		);
 	}
+
+	// Extended-wait protocol upgrade: preserve an existing 3.0.9 table while
+	// widening only the proxy_protocol CHECK constraint to accept v15_wait.
+	rci = configdb->check_table_structure(
+		const_cast<char*>("pgsql_replication_hostgroups"),
+		const_cast<char*>(ADMIN_SQLITE_TABLE_PGSQL_REPLICATION_HOSTGROUPS_V3_0_9)
+	);
+
+	if (rci) {
+		proxy_warning("Detected version 3.0.9 of table 'pgsql_replication_hostgroups'\n");
+		proxy_warning("ONLINE UPGRADE of table 'pgsql_replication_hostgroups' in progress\n");
+		configdb->execute("DROP TABLE IF EXISTS pgsql_replication_hostgroups_v309");
+		configdb->execute("ALTER TABLE pgsql_replication_hostgroups RENAME TO pgsql_replication_hostgroups_v309");
+		configdb->build_table(
+			const_cast<char*>("pgsql_replication_hostgroups"),
+			const_cast<char*>(ADMIN_SQLITE_TABLE_PGSQL_REPLICATION_HOSTGROUPS),
+			false
+		);
+		configdb->execute(
+			"INSERT INTO pgsql_replication_hostgroups(writer_hostgroup, reader_hostgroup, check_type, txn_split_enabled, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment)"
+				" SELECT writer_hostgroup, reader_hostgroup, check_type, txn_split_enabled, consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment"
+				" FROM pgsql_replication_hostgroups_v309"
+		);
+	}
 #endif // POLARDB_PROXY
 
 	configdb->execute("PRAGMA foreign_keys = ON");

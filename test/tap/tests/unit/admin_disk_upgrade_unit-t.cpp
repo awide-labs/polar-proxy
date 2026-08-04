@@ -489,6 +489,73 @@ static void test_pgsql_repl_hg_upgrade_from_v3_0_5() {
 		"pgsql_replication_hostgroups: v3.0.5 source table is retained after migration");
 }
 
+static void test_pgsql_repl_hg_upgrade_from_v3_0_9() {
+	TestDiskUpgrade t;
+	SQLite3DB *db = t.db();
+
+	db->execute(ADMIN_SQLITE_TABLE_PGSQL_REPLICATION_HOSTGROUPS_V3_0_9);
+	db->execute(
+		"INSERT INTO pgsql_replication_hostgroups"
+		" (writer_hostgroup, reader_hostgroup, check_type, txn_split_enabled,"
+		" consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment)"
+		" VALUES (310, 320, 'polardb', 1, 'session_lsn', 12345, 6789, 'v15', 'existing-3.0.9')");
+
+	t.upgrade_pgsql_replication_hostgroups();
+
+	ok(table_matches_current(
+			db, "pgsql_replication_hostgroups",
+			ADMIN_SQLITE_TABLE_PGSQL_REPLICATION_HOSTGROUPS),
+		"pgsql_replication_hostgroups: upgrade from v3.0.9 produces the v15_wait schema");
+	ok(query_int(db, "SELECT COUNT(*) FROM pgsql_replication_hostgroups") == 1,
+		"pgsql_replication_hostgroups: v3.0.9 upgrade preserves every row");
+	ok(query_int(db,
+			"SELECT COUNT(*) FROM pgsql_replication_hostgroups"
+			" WHERE writer_hostgroup=310 AND reader_hostgroup=320"
+			" AND check_type='polardb' AND txn_split_enabled=1"
+			" AND consistency_mode='session_lsn' AND max_lag_bytes=12345"
+			" AND lsn_wait_timeout_ms=6789 AND proxy_protocol='v15'"
+			" AND comment='existing-3.0.9'") == 1,
+		"pgsql_replication_hostgroups: v3.0.9 policy columns survive migration");
+	ok(query_int(db,
+			"SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+			" AND name='pgsql_replication_hostgroups_v309'") == 1,
+		"pgsql_replication_hostgroups: v3.0.9 source table is retained after migration");
+	db->execute(
+		"INSERT INTO pgsql_replication_hostgroups"
+		" (writer_hostgroup, reader_hostgroup, check_type, proxy_protocol)"
+		" VALUES (311, 321, 'polardb', 'v15_wait')");
+	ok(query_int(db,
+			"SELECT COUNT(*) FROM pgsql_replication_hostgroups"
+			" WHERE writer_hostgroup=311 AND proxy_protocol='v15_wait'") == 1,
+		"pgsql_replication_hostgroups: upgraded schema accepts v15_wait");
+}
+
+static void test_pgsql_repl_hg_runtime_schema_preserves_primary_v15_wait() {
+	TestDiskUpgrade t;
+	SQLite3DB *db = t.db();
+
+	db->build_table("pgsql_replication_hostgroups",
+		ADMIN_SQLITE_TABLE_PGSQL_REPLICATION_HOSTGROUPS, false);
+	db->build_table("runtime_pgsql_replication_hostgroups",
+		ADMIN_SQLITE_TABLE_RUNTIME_PGSQL_REPLICATION_HOSTGROUPS, false);
+	db->execute(
+		"INSERT INTO pgsql_replication_hostgroups"
+		" (writer_hostgroup, reader_hostgroup, check_type, txn_split_enabled,"
+		" consistency_mode, max_lag_bytes, lsn_wait_timeout_ms, proxy_protocol, comment)"
+		" VALUES (410, 420, 'polardb', 1, 'primary', 12345, 6789, 'v15_wait', 'runtime-copy')");
+	db->execute(
+		"INSERT INTO runtime_pgsql_replication_hostgroups"
+		" SELECT * FROM pgsql_replication_hostgroups");
+
+	ok(query_int(db, "SELECT COUNT(*) FROM runtime_pgsql_replication_hostgroups") == 1,
+		"runtime pgsql_replication_hostgroups accepts current rows");
+	ok(query_int(db,
+			"SELECT COUNT(*) FROM runtime_pgsql_replication_hostgroups"
+			" WHERE writer_hostgroup=410 AND consistency_mode='primary'"
+			" AND proxy_protocol='v15_wait'") == 1,
+		"runtime pgsql_replication_hostgroups preserves primary with v15_wait");
+}
+
 static void test_pgsql_global_variable_legacy_values() {
 	TestDiskUpgrade t;
 	SQLite3DB *db = t.db();
@@ -666,7 +733,7 @@ static void test_mysql_servers_upgrade_multiple_rows_with_fixes() {
 // ============================================================================
 
 int main() {
-	plan(74);
+	plan(81);
 	test_init_minimal();
 
 	// scheduler tests
@@ -692,7 +759,9 @@ int main() {
 	// pgsql_replication_hostgroups tests
 	test_pgsql_repl_hg_upgrade_from_v3_0_1();
 	test_pgsql_repl_hg_upgrade_from_v3_0_5();
+	test_pgsql_repl_hg_upgrade_from_v3_0_9();
 	test_pgsql_repl_hg_no_upgrade_needed();
+	test_pgsql_repl_hg_runtime_schema_preserves_primary_v15_wait();
 	test_pgsql_global_variable_legacy_values();
 
 	// mysql_query_rules tests
