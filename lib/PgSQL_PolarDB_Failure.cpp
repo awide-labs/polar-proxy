@@ -1694,7 +1694,7 @@ bool PgSQL_Session::polardb_try_redispatch_reader_read_to_other_reader(
 			failure.reader_hg < 0 || failure.reader_address.empty() ||
 			failure.reader_port < 0 ||
 			(failure.is_wait() &&
-				(failure.retry_query.empty() ||
+				((!failure.extended_query && failure.retry_query.empty()) ||
 				 !failure.wait_spec.has_wait()))) {
 		return false;
 	}
@@ -1760,7 +1760,7 @@ bool PgSQL_Session::polardb_try_redispatch_reader_read_to_other_reader(
 				failure.wait_spec,
 				reader_result.wait_bypass_allowed,
 				failure.fallback_writer_hg);
-		if (wait_activated &&
+		if (wait_activated && !failure.extended_query &&
 				polardb_query.original_query.empty()) {
 			polardb_query.original_query = failure.retry_query;
 		}
@@ -1790,12 +1790,13 @@ bool PgSQL_Session::polardb_try_redispatch_reader_read_to_other_reader(
 /**
  * @brief Add wait-request state to a captured backend failure.
  *
- * WAIT requires an active consistency wrapper, a finalized wrapper, and the
- * saved original query. Query dispatch stores the wrapper type on the connection.
+ * A simple query is a WAIT only after the connection owns a finalized
+ * consistency wrapper and the original SQL was saved. An extended Execute can
+ * also be a WAIT after reader selection but before libpq accepts W. Preserve its
+ * packet and wait specification so a retry cannot omit the consistency target.
  *
- * This function never marks the request as SPLIT and never takes its packet. A
- * caller that recovers a transaction wait reader still adds its request-specific
- * retry text and fallback state.
+ * This function never marks the request as SPLIT. It takes only an extended
+ * wait packet; transaction-split packet transfer remains with split capture.
  *
  * @param failure  Backend fields captured before cleanup starts.
  * @return The captured backend fields plus the request's wait and retry state.
@@ -1803,6 +1804,7 @@ bool PgSQL_Session::polardb_try_redispatch_reader_read_to_other_reader(
 PgSQL_Session::PolarDB_ReaderFailure
 PgSQL_Session::polardb_capture_wait_read_failure(
 		PolarDB_ReaderFailure failure) {
+	failure.extended_query = status != PROCESSING_QUERY;
 	failure.fallback_writer_hg = polardb_query.wait.fallback_writer_hg;
 	failure.reader_plan = polardb_query.reader_plan;
 	failure.wait_spec = polardb_query.wait.spec;
@@ -1818,11 +1820,24 @@ PgSQL_Session::polardb_capture_wait_read_failure(
 			"POLARDB_DEBUG_WAIT_RETRY_RESULT_STARTED_ONCE")) {
 		failure.result_started = true;
 	}
-	// The wrapper kind belongs to the backend after query dispatch.
-	if (polardb_wait_active() &&
-			failure.wrapper_is_consistency_wait &&
-			polardb_query.wait.wrapper_finalized &&
-			!failure.retry_query.empty()) {
+	const bool extended_wait_packet_ready =
+		polardb_extended_wait_retry_packet_ready(
+			failure.extended_query,
+			polardb_wait_active(),
+			failure.wait_spec.has_wait(),
+			failure.failed_myds &&
+			failure.failed_myds->pgsql_real_query.pkt.ptr);
+	if (extended_wait_packet_ready) {
+		failure.retry_pkt =
+			failure.failed_myds->pgsql_real_query.release_packet();
+	}
+	const bool finalized_simple_wait =
+		!failure.extended_query && polardb_wait_active() &&
+		failure.wrapper_is_consistency_wait &&
+		polardb_query.wait.wrapper_finalized &&
+		!failure.retry_query.empty();
+	if ((extended_wait_packet_ready && failure.retry_pkt.ptr) ||
+			finalized_simple_wait) {
 		failure.request_kind = PolarDB_ReaderRequestKind::WAIT;
 	}
 

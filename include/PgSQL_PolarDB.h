@@ -3783,6 +3783,23 @@ static inline bool polardb_should_handle_wait_timeout_result(
 }
 
 /**
+ * @brief Whether a failed extended dispatch still owns a retryable wait request.
+ *
+ * A connection can fail after reader selection but before libpq accepts the W
+ * frame. In that window the session wait is active while the connection wrapper
+ * state is still empty. Treating the request as an ordinary reader query would
+ * drop its wait specification on a reader retry and violate read-your-writes.
+ */
+static inline bool polardb_extended_wait_retry_packet_ready(
+		bool extended_query,
+		bool wait_active,
+		bool wait_spec_present,
+		bool retry_packet_present) {
+	return extended_query && wait_active && wait_spec_present &&
+		retry_packet_present;
+}
+
+/**
  * @brief Whether a reader is close enough behind the best candidate to be treated
  *        as equivalent to it.
  *

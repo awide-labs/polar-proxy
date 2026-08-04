@@ -286,6 +286,24 @@ static void test_wait_timeout_result_policy() {
 		"wait-timeout result policy requires active wait state");
 }
 
+static void test_extended_wait_retry_packet_policy() {
+	ok(polardb_extended_wait_retry_packet_ready(
+			true, true, true, true),
+		"extended wait retry packet is captured before libpq accepts W");
+	ok(!polardb_extended_wait_retry_packet_ready(
+			false, true, true, true),
+		"extended wait retry packet requires an extended request");
+	ok(!polardb_extended_wait_retry_packet_ready(
+			true, false, true, true),
+		"extended wait retry packet requires active wait state");
+	ok(!polardb_extended_wait_retry_packet_ready(
+			true, true, false, true),
+		"extended wait retry packet requires a complete wait specification");
+	ok(!polardb_extended_wait_retry_packet_ready(
+			true, true, true, false),
+		"extended wait retry packet requires ownership of the Execute packet");
+}
+
 static void test_effective_lsn_freshness_policy() {
 	bool clamped = true;
 	ok(polardb_effective_lsn_freshness_ms(5000, 1000, 0, 250, &clamped) == 5000 &&
@@ -328,13 +346,14 @@ static void test_server_lsn_cache_reset_policy() {
 }
 
 int main() {
-	plan(107);
+	plan(112);
 	test_degraded_rfq_notice_packet_helpers();
 	test_failure_action_names();
 	test_reader_action_policy_mapping();
 	test_reader_status_names();
 	test_wrapper_error_accounting_policy();
 	test_wait_timeout_result_policy();
+	test_extended_wait_retry_packet_policy();
 	test_effective_lsn_freshness_policy();
 	test_server_lsn_cache_reset_policy();
 	return exit_status();
