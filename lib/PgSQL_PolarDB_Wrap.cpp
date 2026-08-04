@@ -911,10 +911,19 @@ void PgSQL_Session::polardb_clear_request_state_for_query_end(
 		!extended_query_frame.empty() &&
 		(extended_query_phase &
 			(EXTQ_PHASE_PROCESSING_PARSE |
-			 EXTQ_PHASE_PROCESSING_DESCRIBE));
+				EXTQ_PHASE_PROCESSING_DESCRIBE));
 	if (continue_extended_request) {
 		polardb_query.reset_between_extended_messages();
 	} else {
+		// Extended-wait bookkeeping spans an implicit backend Parse and its
+		// following Execute. Clear it only at the final request boundary, after
+		// polardb_finish_wait() has consumed the success evidence. Ordinary
+		// prepared traffic only reads this inactive-state branch and performs no
+		// connection-state writes.
+		if (myds && myds->myconn &&
+				myds->myconn->polardb_query_wrap_state.is_extended_wait()) {
+			myds->myconn->polardb_query_wrap_state.clear();
+		}
 		polardb_query.reset_for_new_query();
 	}
 	discard_pending_notices();

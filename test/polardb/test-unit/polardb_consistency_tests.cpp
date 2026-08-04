@@ -1587,7 +1587,8 @@ static void test_collect_is_const_stable_snapshot() {
 	const unsigned long long planner_before =
 		worker->polardb_status_variables.stvar[
 			polardb_st_var_route_planner_total];
-	const bool extended_handled = sess.polardb_apply_extended_route();
+	const bool extended_handled = sess.polardb_apply_extended_route(
+		PGSQL_EXTENDED_QUERY_TYPE_EXECUTE);
 	ok(!extended_handled &&
 			sess.current_hostgroup == writer_hg &&
 			sess.polardb_query.reader_plan.read_target ==
@@ -1637,6 +1638,136 @@ static void test_collect_is_const_stable_snapshot() {
 	}
 }
 
+static void test_extended_wait_routes_only_execute_to_reader() {
+	const int writer_hg = 982;
+	const int reader_hg = 983;
+	const uint64_t target_lsn = 0x4510;
+
+	ok(PgHGM->servers_add(make_pgsql_servers_result(
+			writer_hg, "polardb-v15-wait-writer", 26432,
+			reader_hg, "polardb-v15-wait-reader", 26433)) == 0,
+		"PolarDB v15_wait route: writer and reader staged for commit");
+	PgHGM->save_incoming_pgsql_table(
+		make_polardb_replication_row_with_protocol(
+			writer_hg, reader_hg, "v15_wait"),
+		"pgsql_replication_hostgroups");
+	ok(PgHGM->commit({}, {}, false, false),
+		"PolarDB v15_wait route: topology commit succeeds");
+
+	const auto writer_cfg = PgHGM->get_polardb_hg_config(writer_hg);
+	ok(writer_cfg.is_polardb_hostgroup &&
+			writer_cfg.writer_hostgroup == writer_hg &&
+			writer_cfg.reader_hostgroup == reader_hg,
+		"PolarDB v15_wait route: writer scope and reader hostgroup are available");
+	if (!writer_cfg.is_polardb_hostgroup ||
+			writer_cfg.writer_hostgroup != writer_hg ||
+			writer_cfg.reader_hostgroup != reader_hg) {
+		return;
+	}
+
+	std::unique_ptr<PgSQL_Thread> worker(new PgSQL_Thread());
+	PgSQL_Session sess;
+	attach_test_frontend(sess, worker.get());
+	PolarDB_SessionUnitAccess::set_extended_route_state(
+		&sess, 1, false, EXTQ_PHASE_IDLE);
+	sess.polardb_config.session_consistency_mode =
+		static_cast<int>(PolarDB_ConsistencyMode::SESSION_LSN);
+	sess.polardb_session_consistency.writer_scope = PolarDB_WriterScope{
+		writer_cfg.writer_hostgroup, writer_cfg.writer_epoch};
+	sess.polardb_session_consistency.write_lsn = target_lsn;
+	const char select_query[] = "SELECT $1";
+	sess.CurrentQuery.begin(
+		(unsigned char*)const_cast<char*>(select_query),
+		strlen(select_query) + 1, false);
+	sess.CurrentQuery.PgQueryCmd = PGSQL_QUERY_SELECT;
+
+	const int saved_read_target = pgsql_thread___polardb_read_target;
+	const bool saved_profile_off = pgsql_thread___polardb_profile_off;
+	pgsql_thread___polardb_read_target =
+		static_cast<int>(PolarDB_ReadTarget::REPLICA);
+	pgsql_thread___polardb_profile_off = false;
+
+	struct PhaseCase {
+		PgSQL_Extended_Query_Type type;
+		uint8_t phase;
+		const char* name;
+	};
+	const PhaseCase metadata_phases[] = {
+		{PGSQL_EXTENDED_QUERY_TYPE_PARSE,
+			EXTQ_PHASE_PROCESSING_PARSE, "Parse"},
+		{PGSQL_EXTENDED_QUERY_TYPE_BIND,
+			EXTQ_PHASE_PROCESSING_BIND, "Bind"},
+		{PGSQL_EXTENDED_QUERY_TYPE_DESCRIBE,
+			EXTQ_PHASE_PROCESSING_DESCRIBE, "Describe"},
+	};
+	for (const PhaseCase& phase : metadata_phases) {
+		PolarDB_SessionUnitAccess::reset_extended_route_state(&sess);
+		sess.current_hostgroup = writer_hg;
+		PolarDB_SessionUnitAccess::set_extended_route_state(
+			&sess, 1, false, phase.phase);
+		const bool handled = sess.polardb_apply_extended_route(phase.type);
+		ok(!handled && sess.current_hostgroup == writer_hg &&
+				!sess.polardb_query.reader_wait_spec.has_wait() &&
+				PolarDB_SessionUnitAccess::extended_execute_route_pending(
+					&sess),
+			"PolarDB v15_wait route: %s stays on writer and arms Execute routing",
+			phase.name);
+	}
+
+	/* Normal prepared execution reaches Execute through a preceding Bind. */
+	PolarDB_SessionUnitAccess::reset_extended_route_state(&sess);
+	sess.current_hostgroup = writer_hg;
+	PolarDB_SessionUnitAccess::set_extended_route_state(
+		&sess, 1, false, EXTQ_PHASE_PROCESSING_BIND);
+	const bool bind_handled = sess.polardb_apply_extended_route(
+		PGSQL_EXTENDED_QUERY_TYPE_BIND);
+	ok(!bind_handled && sess.current_hostgroup == writer_hg &&
+			PolarDB_SessionUnitAccess::extended_execute_route_pending(&sess),
+		"PolarDB v15_wait route: Bind hands routing to Execute");
+
+	sess.current_hostgroup = writer_hg;
+	PolarDB_SessionUnitAccess::set_extended_route_state(
+		&sess, 1, false, EXTQ_PHASE_PROCESSING_EXECUTE);
+	const bool execute_handled = sess.polardb_apply_extended_route(
+		PGSQL_EXTENDED_QUERY_TYPE_EXECUTE);
+	ok(!execute_handled && sess.current_hostgroup == reader_hg &&
+			sess.polardb_query.reader_wait_spec.has_wait() &&
+			sess.polardb_query.reader_wait_spec.target == target_lsn &&
+			!PolarDB_SessionUnitAccess::extended_execute_route_pending(&sess),
+		"PolarDB v15_wait route: Execute consumes Bind handoff and selects reader with the session LSN target");
+
+	const int v15_writer_hg = 984;
+	const int v15_reader_hg = 985;
+	ok(PgHGM->servers_add(make_pgsql_servers_result(
+			v15_writer_hg, "polardb-v15-writer", 26434,
+			v15_reader_hg, "polardb-v15-reader", 26435)) == 0,
+		"PolarDB v15 route: writer and reader staged for commit");
+	PgHGM->save_incoming_pgsql_table(
+		make_polardb_replication_row_with_protocol(
+			v15_writer_hg, v15_reader_hg, "v15"),
+		"pgsql_replication_hostgroups");
+	ok(PgHGM->commit({}, {}, false, false),
+		"PolarDB v15 route: topology commit succeeds");
+	const auto v15_writer_cfg = PgHGM->get_polardb_hg_config(v15_writer_hg);
+	sess.polardb_session_consistency.writer_scope = PolarDB_WriterScope{
+		v15_writer_cfg.writer_hostgroup, v15_writer_cfg.writer_epoch};
+	sess.polardb_session_consistency.write_lsn = target_lsn;
+	sess.current_hostgroup = v15_writer_hg;
+	PolarDB_SessionUnitAccess::set_extended_route_state(
+		&sess, 1, false, EXTQ_PHASE_PROCESSING_EXECUTE);
+	const bool v15_execute_handled = sess.polardb_apply_extended_route(
+		PGSQL_EXTENDED_QUERY_TYPE_EXECUTE);
+	ok(!v15_execute_handled && sess.current_hostgroup == v15_writer_hg &&
+			!sess.polardb_query.reader_wait_spec.has_wait(),
+		"PolarDB v15 route: Execute with a target falls back to writer");
+
+	PolarDB_SessionUnitAccess::set_extended_route_state(
+		&sess, 1, false, EXTQ_PHASE_IDLE);
+	PolarDB_SessionUnitAccess::reset_extended_route_state(&sess);
+	pgsql_thread___polardb_read_target = saved_read_target;
+	pgsql_thread___polardb_profile_off = saved_profile_off;
+}
+
 void run_polardb_consistency_counter_tests() {
 	test_wait_timeout_fields();
 	test_reader_target_selection_counter_contract();
@@ -1667,6 +1798,7 @@ void run_polardb_session_state_tests() {
 	test_notice_queue_state_contract();
 	test_user_attributes_are_reapplied_after_reset();
 	test_collect_is_const_stable_snapshot();
+	test_extended_wait_routes_only_execute_to_reader();
 }
 
 #endif // POLARDB_PROXY

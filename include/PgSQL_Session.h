@@ -230,6 +230,15 @@ private:
 	uint8_t extended_query_phase { EXTQ_PHASE_IDLE };
 	std::queue<PktType> extended_query_frame;
 	std::unique_ptr<const PgSQL_Bind_Message> bind_waiting_for_execute;
+#if POLARDB_PROXY
+	struct PolarDB_ExtendedRouteState {
+		bool execute_pending{false};
+
+		void reset() {
+			execute_pending = false;
+		}
+	} polardb_extended_route;
+#endif // POLARDB_PROXY
 
 	//int handler_ret;
 	void handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(PtrSize_t*, bool*);
@@ -1079,15 +1088,13 @@ public:
 	 */
 	bool polardb_capture_request_writer_scope(int scope_hg);
 	/**
-	 * @brief Apply automatic routing for an extended-protocol (Parse/Bind/Execute)
-	 *        query, without a wait wrapper.
+	 * @brief Apply automatic routing for an extended-protocol request.
 	 *
-	 * The wait is injected as SQL text, which cannot be safely spliced into an
-	 * extended-protocol stream, so this is routing only. Manual destination rules
-	 * are left untouched. An automatic replica-eligible read may use a reader only
-	 * when the session has no wait target; otherwise it stays on the writer.
+	 * Manual destination rules are left untouched. Parse, Bind, and Describe stay
+	 * on the writer. Execute may select a reader directly when it is target-ready,
+	 * or carry a protocol-level wait to a v15_wait reader when it is behind.
 	 */
-	bool polardb_apply_extended_route();
+	bool polardb_apply_extended_route(PgSQL_Extended_Query_Type stmt_type);
 	/**
 	 * @brief Attach lag-cap inputs (group LSN and byte cap) to the reader plan.
 	 *
@@ -1774,6 +1781,7 @@ private:
 #else
 	friend class Base_Session<PgSQL_Session, PgSQL_Data_Stream, PgSQL_Backend, PgSQL_Thread>;
 #endif
+	friend struct PolarDB_SessionUnitAccess;
 };
 
 

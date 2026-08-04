@@ -486,7 +486,6 @@ void PgSQL_Session::polardb_leave_reader_capacity_wait(
 }
 #endif // POLARDB_PROXY
 
-
 PgSQL_Session::PgSQL_Session() {
 	thread = nullptr;
 	user_max_connections = 0;
@@ -3142,6 +3141,9 @@ __implicit_sync:
 							pkt = { 0, nullptr };
 							bind_waiting_for_execute.reset(nullptr);
 							extended_query_exec_qp = true;
+#if POLARDB_PROXY
+							polardb_extended_route.reset();
+#endif // POLARDB_PROXY
 
 						__run_sync_again:
 							int rc = handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_SYNC();
@@ -4173,7 +4175,7 @@ handler_again:
 #if POLARDB_PROXY
 				// A target-ready reader leaves wait inactive and dispatches the
 				// original query without entering wrapper finalization.
-				if (polardb_wait_active() &&
+				if (status == PROCESSING_QUERY && polardb_wait_active() &&
 					polardb_install_wait_wrapper(myconn, myds) ==
 					PolarDB_WrapFinalizeResult::FAILED) {
 					const bool txn_wait_reader =
@@ -4271,7 +4273,8 @@ handler_again:
 						};
 					bool polardb_result_failure_checked = false;
 					if (polardb_should_handle_wait_timeout_result(
-							status == PROCESSING_QUERY,
+							status == PROCESSING_QUERY ||
+								status == PROCESSING_STMT_EXECUTE,
 							polardb_wait_active(),
 							polardb_query.wait.timeout_error,
 							polardb_query.wait.wrapper_finalized,
@@ -6344,15 +6347,14 @@ __exit_set_destination_hostgroup:
 	}
 
 #if POLARDB_PROXY
-	// Extended-protocol (Parse/Bind/Execute) requests pick their hostgroup here.
-	// Simple queries are routed by the collect/plan/execute pipeline at the
-	// dispatch entry instead. The extended path is routing-only: it never injects
-	// an LSN wait into the message stream, so a read that needs a wait is pinned
-	// to the writer rather than sent to a replica.
+	// Extended-protocol requests pick their hostgroup here. Simple queries use the
+	// collect/plan/execute pipeline at dispatch entry. With v15_wait, a target-
+	// bearing Execute may use a replica and carry a protocol wait; metadata phases
+	// stay on the writer unless an implicit Parse is required on that reader.
 	polardb_reconcile_txn_wait_read_request_entry(
 		"query_processor_request_entry_stale");
 	if (stmt_type != PGSQL_EXTENDED_QUERY_TYPE_NOT_SET) {
-		if (polardb_apply_extended_route()) {
+		if (polardb_apply_extended_route(stmt_type)) {
 			l_free(pkt->size, pkt->ptr);
 			*pkt = {0, nullptr};
 			return true;
@@ -8722,6 +8724,16 @@ int PgSQL_Session::handle_post_sync_execute_message(PgSQL_Execute_Message* execu
 		current_hostgroup = previous_hostgroup; // reset current hostgroup to previous hostgroup
 		proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Session=%p client_myds=%p. Using previous hostgroup '%d'\n",
 			this, client_myds, previous_hostgroup);
+
+#if POLARDB_PROXY
+		if (polardb_extended_route.execute_pending &&
+				polardb_apply_extended_route(
+					PGSQL_EXTENDED_QUERY_TYPE_EXECUTE)) {
+			auto execute_pkt = execute_msg->detach();
+			l_free(execute_pkt.size, execute_pkt.ptr);
+			return 0;
+		}
+#endif // POLARDB_PROXY
 	}
 
 	if (pgsql_thread___set_query_lock_on_hostgroup == 1) {
@@ -8778,6 +8790,9 @@ void PgSQL_Session::reset_extended_query_frame() {
 	}
 	bind_waiting_for_execute.reset(nullptr);
 	extended_query_phase = EXTQ_PHASE_IDLE;
+#if POLARDB_PROXY
+	polardb_extended_route.reset();
+#endif // POLARDB_PROXY
 }
 
 int  PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_SYNC() {
@@ -8803,6 +8818,9 @@ int  PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_S
 		client_myds->DSS = STATE_SLEEP;
 		status = WAITING_CLIENT_DATA;
 		extended_query_phase = EXTQ_PHASE_IDLE;
+#if POLARDB_PROXY
+		polardb_extended_route.reset();
+#endif // POLARDB_PROXY
 		return 0;
 	}
 

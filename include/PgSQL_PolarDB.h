@@ -1575,7 +1575,8 @@ enum class PolarDB_Query_WrapperKind : uint8_t {
     NONE = 0,             // No PolarDB wrapper SET results to consume
     CONSISTENCY_WAIT = 1, // Mode + timeout + wait-target SETs before the user query
     TXN_SPLIT_WAIT = 2,   // XID SET plus mode + timeout + wait-target SETs
-    TXN_SPLIT_XIDS_RESET = 3 // Empty XID SET used to clean a reused reader
+    TXN_SPLIT_XIDS_RESET = 3, // Empty XID SET used to clean a reused reader
+    EXTENDED_WAIT = 4     // W message before Parse or Bind/Execute; no wrapper SET result
 };
 
 /**
@@ -3753,7 +3754,8 @@ static inline uint32_t polardb_effective_lsn_freshness_ms(
  * result transfer has started the client has already seen part of the answer and
  * the statement can no longer be replayed, so this returns false.
  *
- * @param simple_query_result Whether the result belongs to a simple-protocol query.
+ * @param query_result        Whether the result belongs to a simple query or
+ *                            prepared Execute result eligible for handling.
  * @param wait_active         Whether the PolarDB wait state is still active.
  * @param timeout_error       Whether the backend reported the structured strict
  *                            wait-timeout error.
@@ -3766,13 +3768,13 @@ static inline uint32_t polardb_effective_lsn_freshness_ms(
  *         @p result_started is false.
  */
 static inline bool polardb_should_handle_wait_timeout_result(
-		bool simple_query_result,
+		bool query_result,
 		bool wait_active,
 		bool timeout_error,
 		bool wrapper_finalized,
 		bool consistency_wait,
 		bool result_started) {
-	return simple_query_result &&
+	return query_result &&
 		wait_active &&
 		timeout_error &&
 		wrapper_finalized &&
@@ -4094,26 +4096,26 @@ public:
  * Protocol scope:
  *
  * ProxySQL PostgreSQL query-rule routing supports both simple-query protocol and
- * extended protocol (Parse/Bind/Execute). The PolarDB LSN consistency feature
- * supports read-your-writes only for simple-query protocol, because the wait step
- * is injected as wrapper SQL text:
+ * extended protocol (Parse/Bind/Execute). Simple-query consistency waits use SQL
+ * wrapper text:
  *
  *   SET polar_xact_split_wait_lsn = ...; <user query>
  *
- * That wrapper cannot be safely inserted into a backend extended-protocol stream
- * without a separate Parse/Bind/Execute wrapper and result-consumption model.
+ * A v15_wait backend instead accepts a negotiated W message before the first
+ * snapshot-bearing message. ProxySQL keeps explicit Parse/Bind/Describe on the
+ * writer; Execute may select a reader, where an implicit prepare emits W before P
+ * or an existing prepared statement emits W before B/E. W has no success reply,
+ * so this remains one wire flush and adds no round trip.
  *
  * Therefore:
  *   - simple-query + replica_eligible=1 may route to a reader with a wait wrapper;
  *   - manual destination_hostgroup rules remain authoritative, including manual
  *     extended-protocol routing to a reader; ProxySQL does not add a wait wrapper
  *     to that manually selected backend;
- *   - automatic replica_eligible=1 extended-protocol reads with no session LSN
- *     target may route to a reader without a wrapper;
- *   - automatic replica_eligible=1 extended-protocol reads after the session has
- *     a wait target, or when write/observed LSN state is unknown, force the
- *     writer. Sending those reads to a replica without an extended-protocol wait
- *     wrapper could serve stale data.
+ *   - automatic replica_eligible=1 extended Execute reads may route to a reader;
+ *   - a target-ready reader needs no W message;
+ *   - a behind reader needs v15_wait and receives W before Parse or Execute;
+ *   - profiles without negotiated extended wait fall back to the writer.
  */
 
 /// All inputs needed for the routing decision. Filled once per query by

@@ -168,6 +168,7 @@ POLARDB_COMPONENT_TESTS := \
 POLARDB_HGM_TEST_SOURCES := \
 	polardb_hgm_lsn_unit-t.cpp \
 	polardb_unit_support.cpp \
+	polardb_session_unit_access.cpp \
 	polardb_reader_selection_tests.cpp \
 	polardb_reader_pool_tests.cpp \
 	polardb_reader_capacity_tests.cpp \

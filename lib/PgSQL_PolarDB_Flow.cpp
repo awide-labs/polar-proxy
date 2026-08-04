@@ -1277,11 +1277,11 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(
 	// apply the missing-LSN action only after primary-required query shapes had a
 	// chance to force the writer.
 	//
-	// Extended protocol is different: it carries no wait wrapper, and local
-	// Parse/Bind completions can bypass the normal result-wire notice flush.
-	// Therefore warning degradation is disabled there; an unknown-target
-	// extended read forces the writer rather than risk a silent stale result,
-	// until a dedicated extended-protocol wait model exists.
+	// Extended protocol can carry a known target through v15_wait, but an
+	// unknown target still cannot be enforced. Local Parse/Bind completions can
+	// bypass the normal result-wire notice flush, so warning degradation remains
+	// disabled: route the request to the writer instead of silently serving a
+	// stale result.
 	if (route_ctx.session.write_unknown) {
 		plan = PolarDB_Query_RoutePlan::missing_lsn(
 				PolarDB_Query_RoutePlan::RouteActionReason::WRITE_LSN_UNKNOWN,
@@ -1369,21 +1369,6 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(
 			"reader=%d txn_wait_read=%d\n",
 			(int)mode, (unsigned long)session_lsn, (unsigned long)group_lsn, route_ctx.reader_hg,
 			allow_transaction_wait_read ? 1 : 0);
-		return plan;
-	}
-
-	if (route_ctx.is_extended_protocol) {
-		// Extended protocol cannot be wait-wrapped. If the session already has a
-		// write LSN, sending the read to a replica without a wait could serve
-		// stale data, so automatic replica-eligible extended reads stay on the
-		// writer. Manual destination_hostgroup rules bypass this planner earlier
-		// and remain authoritative.
-		plan = PolarDB_Query_RoutePlan::force_primary(
-			route_ctx.writer_scope.hg,
-			PolarDB_Query_RoutePlan::RouteActionReason::EXTENDED_PROTOCOL);
-		POLARDB_TRACE(
-			"PolarDB PLAN: extended protocol with session_lsn=%lu cannot wait-wrap -> FORCE_PRIMARY writer=%d\n",
-			(unsigned long)session_lsn, route_ctx.writer_scope.hg);
 		return plan;
 	}
 
@@ -1863,10 +1848,11 @@ PolarDB_Query_ExecuteResult PgSQL_Session::polardb_execute(
 /**
  * @brief Apply PolarDB automatic routing for PostgreSQL extended protocol.
  *
- * This is intentionally routing-only: no PolarDB wait SQL is injected into
- * Parse/Bind/Execute streams. The per-request writer scope is reset on entry, and
- * for automatic routes the reader target and wait state are reset too, so nothing
- * from an earlier simple-query request leaks into this one.
+ * This path never rewrites the user's SQL. A v15_wait backend can receive one
+ * protocol-level wait immediately before an implicit Parse or a prepared Execute.
+ * The per-request writer scope is reset on entry, and for automatic routes the
+ * reader target and wait state are reset too, so nothing from an earlier request
+ * leaks into this one.
  *
  * A session hostgroup lock short-circuits everything: the route stays on the
  * locked hostgroup and this returns. Manual destination_hostgroup rules keep their
@@ -1875,16 +1861,24 @@ PolarDB_Query_ExecuteResult PgSQL_Session::polardb_execute(
  * with that failure writer hostgroup so the transaction stays where it must, and
  * the manual destination is not honored for that request.
  *
- * Automatic replica_eligible=1 reads may use a reader only when the session has no
- * wait target. If the session has a write/observed target, or a missing-LSN sticky
- * flag is set, the planner returns FORCE_PRIMARY and this helper keeps the
- * extended read on the writer.
+ * Automatic replica_eligible=1 Execute reads may use a reader. A target-ready
+ * reader needs no protocol wait; a behind reader requires v15_wait and carries
+ * the wait state into connection dispatch. Explicit Parse, Bind, and Describe
+ * remain on the writer because they may consult catalogs before Execute.
  */
-bool PgSQL_Session::polardb_apply_extended_route()
+bool PgSQL_Session::polardb_apply_extended_route(
+		PgSQL_Extended_Query_Type stmt_type)
 {
+	const bool active_known =
+		stmt_type == PGSQL_EXTENDED_QUERY_TYPE_EXECUTE &&
+		polardb_extended_route.execute_pending;
+	if (stmt_type == PGSQL_EXTENDED_QUERY_TYPE_EXECUTE) {
+		polardb_extended_route.execute_pending = false;
+	}
 	polardb_query.request_writer_scope.reset();
 
-	if (!PgHGM->status.polardb_active.load(std::memory_order_relaxed) || !qpo) {
+	if (!qpo || (!active_known &&
+			!PgHGM->status.polardb_active.load(std::memory_order_relaxed))) {
 		return false;
 	}
 	if (polardb_handle_locked_hostgroup_route(
@@ -1905,8 +1899,8 @@ bool PgSQL_Session::polardb_apply_extended_route()
 		return false;
 	}
 
-	// Extended protocol does not use wait wrappers. Clear request-local wait
-	// state before planning.
+	// Clear request-local reader routing state before planning so an earlier
+	// message cannot affect this one. Execute below may record a new wait.
 	polardb_query.clear_reader_route();
 
 	polardb_observe_route_inputs(current_hostgroup);
@@ -1915,6 +1909,24 @@ bool PgSQL_Session::polardb_apply_extended_route()
 		POLARDB_TRACE(
 			"PolarDB EXTENDED: named profile off after request cleanup; "
 			"routing left unchanged\n");
+		return false;
+	}
+
+	/*
+	 * Parse, Bind, and Describe establish metadata on the writer. Remember that
+	 * this frame still needs its actual read-placement decision at Execute.
+	 * request_writer_scope was populated by observe(), so Execute can consume
+	 * this handoff without another global polardb_active load.
+	 */
+	if (stmt_type != PGSQL_EXTENDED_QUERY_TYPE_EXECUTE) {
+		if (polardb_query.request_writer_scope.valid()) {
+			current_hostgroup = polardb_query.request_writer_scope.hg;
+			polardb_extended_route.execute_pending = true;
+			POLARDB_TRACE(
+				"PolarDB EXTENDED: metadata phase=%u stays on writer=%d; "
+				"Execute routing pending\n",
+				static_cast<unsigned int>(stmt_type), current_hostgroup);
+		}
 		return false;
 	}
 	PolarDB_Query_RouteCtx polardb_route_ctx = polardb_collect(
@@ -1936,12 +1948,37 @@ bool PgSQL_Session::polardb_apply_extended_route()
 		return true;
 	}
 	if (plan.action == PolarDB_Query_RoutePlan::RouteAction::REPLICA_WITH_WAIT) {
-		// Defensive only: polardb_plan() should return FORCE_PRIMARY for extended
-		// protocol once a wait target exists. Never try to wrap extended protocol.
-		current_hostgroup = polardb_route_ctx.writer_scope.hg;
+		const PolarDB_StartupProfile profile =
+			PgHGM->polardb_startup_profile_for_hostgroup(
+				polardb_route_ctx.reader_hg,
+				pgsql_thread___polardb_proxy_protocol);
+		if (!profile.requests_extended_wait()) {
+			current_hostgroup = polardb_route_ctx.writer_scope.hg;
+			POLARDB_TRACE(
+				"PolarDB EXTENDED: wait target requires v15_wait; "
+				"force writer=%d protocol=%s\n",
+				polardb_route_ctx.writer_scope.hg,
+				polardb_proxy_protocol_config_name(profile.protocol));
+			return false;
+		}
+
+		// Parse, Bind, and Describe can consult catalogs before Execute. Do not
+		// send those metadata phases to a behind replica without a wait. Execute
+		// may select the reader; if its statement is absent there, the normal
+		// implicit-prepare path sends W immediately before that Parse.
+		const bool execute = stmt_type == PGSQL_EXTENDED_QUERY_TYPE_EXECUTE;
+		current_hostgroup = execute
+			? plan.target_hg
+			: polardb_route_ctx.writer_scope.hg;
+		if (execute) {
+			polardb_query.reader_wait_spec = plan.wait_spec;
+		}
 		POLARDB_TRACE(
-			"PolarDB EXTENDED: planner requested wait wrapper; force writer=%d\n",
-			polardb_route_ctx.writer_scope.hg);
+			"PolarDB EXTENDED: REPLICA_WITH_WAIT target_hg=%d reader=%d "
+			"target=%lu dispatch_wait=%d phase=%u\n",
+			current_hostgroup,
+			plan.target_hg, (unsigned long)plan.wait_spec.target,
+			execute ? 1 : 0, static_cast<unsigned int>(stmt_type));
 		return false;
 	}
 

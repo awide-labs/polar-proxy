@@ -848,6 +848,15 @@ handler_again:
 				const ExecStatusType exec_status_type = PQresultStatus(result.get());
 
 #if POLARDB_PROXY
+				if (polardb_query_wrap_state.is_extended_wait()) {
+					if (exec_status_type != PGRES_BAD_RESPONSE &&
+							exec_status_type != PGRES_NONFATAL_ERROR &&
+							exec_status_type != PGRES_FATAL_ERROR &&
+							exec_status_type != PGRES_PIPELINE_ABORTED) {
+						polardb_query_wrap_state.mark_extended_wait_succeeded();
+					}
+				}
+
 				// Consume the wrapper SET results inline. A wrapped LSN-wait read
 				// prepends N SET statements; each completes as PGRES_COMMAND_OK or
 				// PGRES_EMPTY_QUERY. We silently discard those results (do NOT buffer
@@ -1251,11 +1260,10 @@ handler_again:
 		 *    ReadyForQuery is emitted after Sync, not after every
 		 *    Parse/Bind/Execute message, so LSN availability follows Sync
 		 *    boundaries. RFQ-LSN forwarding is supported for this backend-backed
-		 *    extended path, but PolarDB wait/split support is routing-only for the
-		 *    extended protocol: it does not inject LSN-wait or split-XID SQL
-		 *    wrappers into Parse/Bind/Execute streams. If an extended-protocol read
-		 *    needs a wait, the PolarDB extended route helper forces the writer
-		 *    instead of trying to wrap the extended message flow.
+		 *    path. A v15_wait reader receives a negotiated protocol-level wait
+		 *    immediately before the implicit Parse or prepared Execute; no wait SQL
+		 *    is inserted into the client's Parse/Bind/Execute stream. Transaction
+		 *    split remains simple-query-only.
 		 *
 		 *  - Proxy-local responses:
 		 *    If ProxySQL generates a response locally without a backend RFQ, it
@@ -2531,10 +2539,9 @@ int PgSQL_Connection::async_query(short event, const char* stmt, unsigned long l
 	case ASYNC_IDLE:
 	{
 #if POLARDB_PROXY
-		// Snapshot the wrapper-statement count from session state at dispatch time
-		// so query_start() consumes dispatch_state and does not re-read the session.
-		// Only simple queries can be wrapped; extended queries never are. Clearing
-		// the session fields here stops a later query from re-skipping these results.
+		// Snapshot the SQL-wrapper statement count from session state at dispatch
+		// time so query_start() does not re-read the session. Only simple queries use
+		// SQL wrappers; extended waits use connection-local protocol state instead.
 		dispatch_state.reset();
 		if (!extended_query_info && myds && myds->sess &&
 			myds->sess->polardb_query.dispatch_wrapper_stmts > 0) {
@@ -2870,7 +2877,55 @@ void PgSQL_Connection::stmt_prepare_start() {
 	const PgSQL_Extended_Query_Info* extended_query_info = query.extended_query_info;
 	const Parse_Param_Types& parse_param_types = extended_query_info->parse_param_types;
 
-	if (PQsendPrepare(pgsql_conn, query.backend_stmt_name, query.ptr, parse_param_types.size(), parse_param_types.data()) == 0) {
+	int send_rc = 0;
+#if POLARDB_PROXY
+	PgSQL_Session* polardb_sess = myds ? myds->sess : nullptr;
+	const bool implicit_prepare =
+		(extended_query_info->flags & PGSQL_EXTENDED_QUERY_FLAG_IMPLICIT_PREPARE) != 0;
+	// Cold path only: an ordinary Parse takes the else branch without touching
+	// connection-local wait state. An implicit backend Parse starts W once and
+	// retains its state for the Execute that follows.
+	if (unlikely(implicit_prepare && polardb_sess &&
+			polardb_sess->polardb_wait_active())) {
+		PolarDB_Query_WaitState& wait_state = polardb_sess->polardb_query.wait;
+		if (wait_state.wrapper_finalized) {
+			if (!polardb_query_wrap_state.is_extended_wait()) {
+				set_error(PGSQL_ERROR_CODES::ERRCODE_PROTOCOL_VIOLATION,
+					"PolarDB extended wait dispatch state was lost", true);
+				return;
+			}
+			send_rc = PQsendPrepare(pgsql_conn, query.backend_stmt_name,
+				query.ptr, parse_param_types.size(), parse_param_types.data());
+		} else {
+			if (!polardb_startup_profile.requests_extended_wait()) {
+				set_error(PGSQL_ERROR_CODES::ERRCODE_PROTOCOL_VIOLATION,
+					"PolarDB extended wait was not negotiated on this backend", true);
+				return;
+			}
+			const int wait_mode =
+				wait_state.spec.mode == PolarDB_WaitMode::BEST_EFFORT
+					? PQ_POLAR_CONSISTENCY_BEST_EFFORT
+					: PQ_POLAR_CONSISTENCY_STRICT;
+			send_rc = PQsendPreparePolarWait(pgsql_conn, query.backend_stmt_name,
+				query.ptr, parse_param_types.size(), parse_param_types.data(),
+				wait_state.spec.target, wait_state.spec.timeout_ms, wait_mode);
+			if (send_rc != 0) {
+				polardb_query_wrap_state.begin_extended_wait();
+				wait_state.wrapper_finalized = true;
+				POLARDB_THREAD_COUNT_ONE(polardb_sess->thread, wait_lsn_sent);
+				POLARDB_TRACE("PolarDB EXTENDED WAIT: dispatched before implicit Parse "
+					"target=%lu timeout_ms=%u mode=%d\n",
+					(unsigned long)wait_state.spec.target,
+					wait_state.spec.timeout_ms, wait_mode);
+			}
+		}
+	} else
+#endif // POLARDB_PROXY
+	{
+		send_rc = PQsendPrepare(pgsql_conn, query.backend_stmt_name, query.ptr,
+			parse_param_types.size(), parse_param_types.data());
+	}
+	if (send_rc == 0) {
 		set_error_from_PQerrorMessage();
 		proxy_error("Failed to send prepare. %s\n", get_error_code_with_message().c_str());
 		return;
@@ -3098,9 +3153,58 @@ void PgSQL_Connection::stmt_execute_start() {
 	// libpq represents this case by passing paramFormats = nullptr.
 	const int* param_formats_data = (param_formats.empty() == false ? param_formats.data() : nullptr);
 
-	if (PQsendQueryPrepared(pgsql_conn, query.backend_stmt_name, param_values.size(),
-		param_values.data(), param_lengths.data(), param_formats_data,
-		(result_formats.size() > 0) ? result_formats[0] : 0) == 0) {
+	int send_rc = 0;
+#if POLARDB_PROXY
+	PgSQL_Session* polardb_sess = myds ? myds->sess : nullptr;
+	// Cold path only: ordinary prepared Execute goes straight to libpq. An
+	// active wait either sends W here or reuses the W state retained by the
+	// preceding implicit backend Parse.
+	if (unlikely(polardb_sess && polardb_sess->polardb_wait_active())) {
+		PolarDB_Query_WaitState& wait_state = polardb_sess->polardb_query.wait;
+		if (wait_state.wrapper_finalized) {
+			if (!polardb_query_wrap_state.is_extended_wait()) {
+				set_error(PGSQL_ERROR_CODES::ERRCODE_PROTOCOL_VIOLATION,
+					"PolarDB extended wait dispatch state was lost", true);
+				return;
+			}
+			send_rc = PQsendQueryPrepared(pgsql_conn, query.backend_stmt_name,
+				param_values.size(), param_values.data(), param_lengths.data(),
+				param_formats_data,
+				(result_formats.size() > 0) ? result_formats[0] : 0);
+		} else {
+			if (!polardb_startup_profile.requests_extended_wait()) {
+				set_error(PGSQL_ERROR_CODES::ERRCODE_PROTOCOL_VIOLATION,
+					"PolarDB extended wait was not negotiated on this backend", true);
+				return;
+			}
+			const int wait_mode =
+				wait_state.spec.mode == PolarDB_WaitMode::BEST_EFFORT
+					? PQ_POLAR_CONSISTENCY_BEST_EFFORT
+					: PQ_POLAR_CONSISTENCY_STRICT;
+			send_rc = PQsendQueryPreparedPolarWait(pgsql_conn,
+				query.backend_stmt_name, param_values.size(), param_values.data(),
+				param_lengths.data(), param_formats_data,
+				(result_formats.size() > 0) ? result_formats[0] : 0,
+				wait_state.spec.target, wait_state.spec.timeout_ms, wait_mode);
+			if (send_rc != 0) {
+				polardb_query_wrap_state.begin_extended_wait();
+				wait_state.wrapper_finalized = true;
+				POLARDB_THREAD_COUNT_ONE(polardb_sess->thread, wait_lsn_sent);
+				POLARDB_TRACE("PolarDB EXTENDED WAIT: dispatched before Bind/Execute "
+					"target=%lu timeout_ms=%u mode=%d\n",
+					(unsigned long)wait_state.spec.target,
+					wait_state.spec.timeout_ms, wait_mode);
+			}
+		}
+	} else
+#endif // POLARDB_PROXY
+	{
+		send_rc = PQsendQueryPrepared(pgsql_conn, query.backend_stmt_name,
+			param_values.size(), param_values.data(), param_lengths.data(),
+			param_formats_data,
+			(result_formats.size() > 0) ? result_formats[0] : 0);
+	}
+	if (send_rc == 0) {
 		set_error_from_PQerrorMessage();
 		proxy_error("Failed to send execute prepared statement. %s\n", get_error_code_with_message().c_str());
 		return;

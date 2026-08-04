@@ -92,6 +92,14 @@ struct PolarDB_WorkerLifecycleUnitAccess {
 		PgSQL_Threads_Handler* handler, bool shutdown_started);
 };
 
+struct PolarDB_SessionUnitAccess {
+	static void set_extended_route_state(
+		PgSQL_Session* session, int replica_eligible,
+		bool force_primary_hint, uint8_t phase);
+	static bool extended_execute_route_pending(const PgSQL_Session* session);
+	static void reset_extended_route_state(PgSQL_Session* session);
+};
+
 struct PolarDB_WarmupUnitAccess {
 	static std::string queued_key(
 		const PgSQL_PolarDB_ReaderPool& pool);

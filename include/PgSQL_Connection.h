@@ -869,7 +869,11 @@ public:
 		bool wrapper_set_failed() const { return stmt_failed; }
 		bool wrapper_set_succeeded() const { return stmt_succeeded; }
 		bool is_consistency_wait() const {
-			return wrapper_kind == PolarDB_Query_WrapperKind::CONSISTENCY_WAIT;
+			return wrapper_kind == PolarDB_Query_WrapperKind::CONSISTENCY_WAIT ||
+				wrapper_kind == PolarDB_Query_WrapperKind::EXTENDED_WAIT;
+		}
+		bool is_extended_wait() const {
+			return wrapper_kind == PolarDB_Query_WrapperKind::EXTENDED_WAIT;
 		}
 		bool is_txn_split_wait() const {
 			return wrapper_kind == PolarDB_Query_WrapperKind::TXN_SPLIT_WAIT;
@@ -890,6 +894,20 @@ public:
 			stmt_pending = n;
 			wrapper_kind = (n > 0) ? kind : PolarDB_Query_WrapperKind::NONE;
 			txn_split_xids_reset_pending = (n > 0) && txn_xids_reset;
+		}
+		void begin_extended_wait() {
+			was_wrapped = true;
+			stmt_failed = false;
+			stmt_succeeded = false;
+			stmt_total = 0;
+			stmt_pending = 0;
+			wrapper_kind = PolarDB_Query_WrapperKind::EXTENDED_WAIT;
+			txn_split_xids_reset_pending = false;
+		}
+		void mark_extended_wait_succeeded() {
+			if (is_extended_wait()) {
+				stmt_succeeded = true;
+			}
 		}
 		void mark_wrapper_set_failed() {
 			stmt_failed = true;
