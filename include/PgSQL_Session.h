@@ -238,6 +238,16 @@ private:
 			execute_pending = false;
 		}
 	} polardb_extended_route;
+
+	inline bool polardb_extended_request_continues(
+			bool called_on_failure, bool result_has_error) const {
+		return !called_on_failure &&
+			!result_has_error &&
+			!extended_query_frame.empty() &&
+			(extended_query_phase &
+				(EXTQ_PHASE_PROCESSING_PARSE |
+				 EXTQ_PHASE_PROCESSING_DESCRIBE));
+	}
 #endif // POLARDB_PROXY
 
 	//int handler_ret;

@@ -9,6 +9,7 @@
 
 #include "tap.h"
 #include "PgSQL_PolarDB.h"
+#include "PgSQL_Protocol.h"
 #include "polardb_unit_common.h"
 
 #include <cstring>
@@ -286,6 +287,16 @@ static void test_wait_timeout_result_policy() {
 		"wait-timeout result policy requires active wait state");
 }
 
+static void test_query_result_error_policy() {
+	ok(!pgsql_query_result_has_error(PGSQL_QUERY_RESULT_COMMAND),
+		"successful Parse result permits prepared-statement registration");
+	ok(pgsql_query_result_has_error(PGSQL_QUERY_RESULT_ERROR),
+		"Parse ErrorResponse blocks prepared-statement registration");
+	ok(pgsql_query_result_has_error(
+			PGSQL_QUERY_RESULT_ERROR | PGSQL_QUERY_RESULT_READY),
+		"Parse ErrorResponse remains an error when other result flags are set");
+}
+
 static void test_extended_wait_retry_packet_policy() {
 	ok(polardb_extended_wait_retry_packet_ready(
 			true, true, true, true),
@@ -346,13 +357,14 @@ static void test_server_lsn_cache_reset_policy() {
 }
 
 int main() {
-	plan(112);
+	plan(115);
 	test_degraded_rfq_notice_packet_helpers();
 	test_failure_action_names();
 	test_reader_action_policy_mapping();
 	test_reader_status_names();
 	test_wrapper_error_accounting_policy();
 	test_wait_timeout_result_policy();
+	test_query_result_error_policy();
 	test_extended_wait_retry_packet_policy();
 	test_effective_lsn_freshness_policy();
 	test_server_lsn_cache_reset_policy();

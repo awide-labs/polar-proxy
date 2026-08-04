@@ -4238,7 +4238,12 @@ handler_again:
 				switch (status) {
 				case PROCESSING_STMT_PREPARE: {
 					enum session_status st;
-					if (handler___rc0_PROCESSING_STMT_PREPARE(st, myds)) {
+					const bool prepare_has_error =
+						myconn->query_result &&
+						pgsql_query_result_has_error(
+							myconn->query_result->get_result_packet_type());
+					if (!prepare_has_error &&
+							handler___rc0_PROCESSING_STMT_PREPARE(st, myds)) {
 						// No need to send a response: the prepared statement
 						// was created implicitly. Execute the original query next.
 						if (myconn->query_result) {

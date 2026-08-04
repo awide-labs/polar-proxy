@@ -906,12 +906,16 @@ void PgSQL_Session::polardb_clear_request_state_for_query_end(
 		polardb_reconcile_txn_wait_read_end("request_end_stale", false);
 	}
 	polardb_finish_wait(called_on_failure ? nullptr : myds);
+	// PostgreSQL ErrorResponse is delivered with rc == 0, so called_on_failure
+	// alone cannot distinguish a successful intermediate Parse from a Parse that
+	// has entered skip-to-Sync. The latter is a final cleanup boundary.
+	const bool result_has_error =
+		myds && myds->myconn && myds->myconn->query_result &&
+		pgsql_query_result_has_error(
+			myds->myconn->query_result->get_result_packet_type());
 	const bool continue_extended_request =
-		!called_on_failure &&
-		!extended_query_frame.empty() &&
-		(extended_query_phase &
-			(EXTQ_PHASE_PROCESSING_PARSE |
-				EXTQ_PHASE_PROCESSING_DESCRIBE));
+		polardb_extended_request_continues(
+			called_on_failure, result_has_error);
 	if (continue_extended_request) {
 		polardb_query.reset_between_extended_messages();
 	} else {

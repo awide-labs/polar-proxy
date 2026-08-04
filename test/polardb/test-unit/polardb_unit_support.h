@@ -96,6 +96,14 @@ struct PolarDB_SessionUnitAccess {
 	static void set_extended_route_state(
 		PgSQL_Session* session, int replica_eligible,
 		bool force_primary_hint, uint8_t phase);
+	static void set_extended_request_boundary(
+		PgSQL_Session* session, uint8_t phase, bool pending_message);
+	static bool extended_request_continues(
+		const PgSQL_Session* session,
+		bool called_on_failure, bool result_has_error);
+	static void clear_request_state_for_query_end(
+		PgSQL_Session* session, PgSQL_Data_Stream* backend_myds,
+		bool called_on_failure);
 	static bool extended_execute_route_pending(const PgSQL_Session* session);
 	static void reset_extended_route_state(PgSQL_Session* session);
 };

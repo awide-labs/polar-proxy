@@ -387,6 +387,48 @@ static void test_extended_wait_notice_owner_contract() {
 		"PolarDB notice owner: clear restores normal query-result ownership");
 }
 
+static void test_extended_wait_cleanup_boundaries() {
+	std::unique_ptr<PgSQL_Thread> worker(new PgSQL_Thread());
+	PgSQL_Session sess;
+	attach_test_frontend(sess, worker.get());
+	PgSQL_Data_Stream backend_myds;
+	backend_myds.init(MYDS_BACKEND, &sess, 0);
+	PgSQL_Connection backend_conn(false);
+	backend_myds.attach_connection(&backend_conn);
+
+	backend_conn.polardb_query_wrap_state.begin_extended_wait(
+		PolarDB_ExtendedWaitNoticeOwner::SESSION_QUEUE);
+	PolarDB_SessionUnitAccess::set_extended_request_boundary(
+		&sess, EXTQ_PHASE_PROCESSING_PARSE, true);
+	PolarDB_SessionUnitAccess::clear_request_state_for_query_end(
+		&sess, &backend_myds, false);
+	ok(backend_conn.polardb_query_wrap_state.is_extended_wait(),
+		"v15_wait cleanup: successful intermediate Parse retains state for Execute");
+
+	PolarDB_SessionUnitAccess::set_extended_request_boundary(
+		&sess, EXTQ_PHASE_IDLE, false);
+	PolarDB_SessionUnitAccess::clear_request_state_for_query_end(
+		&sess, &backend_myds, false);
+	ok(!backend_conn.polardb_query_wrap_state.is_extended_wait(),
+		"v15_wait cleanup: final Execute boundary clears connection state");
+
+	backend_conn.polardb_query_wrap_state.begin_extended_wait(
+		PolarDB_ExtendedWaitNoticeOwner::SESSION_QUEUE);
+	PolarDB_SessionUnitAccess::set_extended_request_boundary(
+		&sess, EXTQ_PHASE_PROCESSING_PARSE, true);
+	ok(!PolarDB_SessionUnitAccess::extended_request_continues(
+			&sess, false, true),
+		"v15_wait cleanup: Parse ErrorResponse is final despite pending messages");
+	PolarDB_SessionUnitAccess::clear_request_state_for_query_end(
+		&sess, &backend_myds, true);
+	ok(!backend_conn.polardb_query_wrap_state.is_extended_wait(),
+		"v15_wait cleanup: failure boundary clears connection state");
+
+	PolarDB_SessionUnitAccess::set_extended_request_boundary(
+		&sess, EXTQ_PHASE_IDLE, false);
+	backend_myds.detach_connection();
+}
+
 static void test_reader_target_selection_counter_contract() {
 	std::unique_ptr<PgSQL_Thread> worker(new PgSQL_Thread());
 	const uint64_t TARGET = 0x20000;
@@ -1819,6 +1861,7 @@ void run_polardb_consistency_wait_cache_tests() {
 
 void run_polardb_session_state_tests() {
 	test_extended_wait_notice_owner_contract();
+	test_extended_wait_cleanup_boundaries();
 	test_session_route_state_clear_tiers();
 	test_notice_queue_state_contract();
 	test_user_attributes_are_reapplied_after_reset();

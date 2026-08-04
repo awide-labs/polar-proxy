@@ -244,9 +244,12 @@ $(LIBPROXYSQLAR): FORCE
 
 # Focused test object (compiled into BUILDDIR so its .gcno/.gcda intermediates
 # stay out of the source tree) and its link step (binary into BINDIR).
+$(ODIR)/polardb_status_policy_unit-t.o: FOCUSED_EXTRA_IDIRS := $(IDIRS)
+
 $(ODIR)/%.o: %.cpp polardb_unit_common.h | $(ODIR)
 	$(CXX) -c $(abspath $<) -I$(TAP_IDIR) -I$(PROXYSQL_PATH)/include \
-		-DPOLARDB_PROXY=1 $(POLARDB_UNIT_PROFILE_FLAG) $(POLARDB_UNIT_PERF_DEBUG_FLAG) $(STDCPP) -O0 -ggdb $(WGCOV) $(WASAN) -o $@
+		$(FOCUSED_EXTRA_IDIRS) -DPOLARDB_PROXY=1 $(POLARDB_UNIT_PROFILE_FLAG) \
+		$(POLARDB_UNIT_PERF_DEBUG_FLAG) $(STDCPP) -O0 -ggdb $(WGCOV) $(WASAN) -o $@
 
 $(ODIR)/pgsql_status_variables_unit-t.o: pgsql_status_variables_unit-t.cpp $(PROXYSQL_TEST_HEADERS) | $(ODIR)
 	$(CXX) -c $(abspath $<) $(IDIRS) \

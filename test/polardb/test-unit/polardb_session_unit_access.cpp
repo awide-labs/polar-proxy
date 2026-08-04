@@ -21,6 +21,30 @@ void PolarDB_SessionUnitAccess::set_extended_route_state(
 	session->extended_query_phase = phase;
 }
 
+void PolarDB_SessionUnitAccess::set_extended_request_boundary(
+		PgSQL_Session* session, uint8_t phase, bool pending_message) {
+	session->reset_extended_query_frame();
+	session->extended_query_phase = phase;
+	if (pending_message) {
+		session->extended_query_frame.emplace(
+			std::unique_ptr<PgSQL_Parse_Message>{});
+	}
+}
+
+bool PolarDB_SessionUnitAccess::extended_request_continues(
+		const PgSQL_Session* session,
+		bool called_on_failure, bool result_has_error) {
+	return session->polardb_extended_request_continues(
+		called_on_failure, result_has_error);
+}
+
+void PolarDB_SessionUnitAccess::clear_request_state_for_query_end(
+		PgSQL_Session* session, PgSQL_Data_Stream* backend_myds,
+		bool called_on_failure) {
+	session->polardb_clear_request_state_for_query_end(
+		backend_myds, called_on_failure);
+}
+
 bool PolarDB_SessionUnitAccess::extended_execute_route_pending(
 		const PgSQL_Session* session) {
 	return session->polardb_extended_route.execute_pending;

@@ -310,6 +310,10 @@ struct ColumnMetadata {
 #define PGSQL_QUERY_RESULT_COPY_OUT	0x20
 #define PGSQL_QUERY_RESULT_NOTICE	0x40
 
+static inline bool pgsql_query_result_has_error(uint8_t result_packet_type) {
+	return (result_packet_type & PGSQL_QUERY_RESULT_ERROR) != 0;
+}
+
 class PgSQL_Query_Result {
 public:
 	PgSQL_Query_Result();
