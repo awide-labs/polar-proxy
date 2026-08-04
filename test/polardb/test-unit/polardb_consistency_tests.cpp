@@ -363,6 +363,30 @@ static void test_extended_wait_libpq_send_rollback() {
 		"v15_wait libpq rollback: threshold failure is followed by a clean valid send");
 }
 
+static void test_extended_wait_notice_owner_contract() {
+	PgSQL_Connection::PolarDB_Query_WrapState state;
+
+	state.begin_extended_wait(
+		PolarDB_ExtendedWaitNoticeOwner::SESSION_QUEUE);
+	ok(state.wait_notice_uses_session_queue(),
+		"v15_wait notice owner: implicit backend Parse keeps W notices in session queue");
+	state.mark_extended_wait_result_received();
+	ok(!state.wait_notice_uses_session_queue(),
+		"v15_wait notice owner: owner returns to query result after Parse result arrives");
+
+	state.begin_extended_wait(
+		PolarDB_ExtendedWaitNoticeOwner::QUERY_RESULT);
+	ok(!state.wait_notice_uses_session_queue(),
+		"v15_wait notice owner: prepared Execute keeps W notices in client result");
+
+	state.begin(1, PolarDB_Query_WrapperKind::CONSISTENCY_WAIT);
+	ok(state.wait_notice_uses_session_queue(),
+		"PolarDB notice owner: discarded SQL-wrapper results still use session queue");
+	state.clear();
+	ok(!state.wait_notice_uses_session_queue(),
+		"PolarDB notice owner: clear restores normal query-result ownership");
+}
+
 static void test_reader_target_selection_counter_contract() {
 	std::unique_ptr<PgSQL_Thread> worker(new PgSQL_Thread());
 	const uint64_t TARGET = 0x20000;
@@ -1794,6 +1818,7 @@ void run_polardb_consistency_wait_cache_tests() {
 }
 
 void run_polardb_session_state_tests() {
+	test_extended_wait_notice_owner_contract();
 	test_session_route_state_clear_tiers();
 	test_notice_queue_state_contract();
 	test_user_attributes_are_reapplied_after_reset();

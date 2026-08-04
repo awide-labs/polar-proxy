@@ -1373,8 +1373,8 @@ public:
 	 * never hits a wait timeout never allocates it. @p pkt becomes session-owned.
 	 */
 	void enqueue_pending_notice(unsigned char* pkt, unsigned int size);
-	/** @brief Build and enqueue a NoticeResponse packet. */
-	bool polardb_enqueue_notice_packet(const char* severity, const char* sqlstate,
+	/** @brief Build and enqueue a NoticeResponse packet; return its wire size. */
+	unsigned int polardb_enqueue_notice_packet(const char* severity, const char* sqlstate,
 		const char* primary, const char* detail = nullptr,
 		const char* severity_nonlocalized = nullptr);
 	/** @brief Queue a synthetic client-visible warning for a degraded RFQ route. */

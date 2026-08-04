@@ -155,9 +155,9 @@ void PgSQL_Session::enqueue_pending_notice(unsigned char* pkt, unsigned int size
  * ownership. On a serialization failure the packet is freed here and nothing is
  * queued.
  *
- * @return true if the packet was built and queued; false on failure.
+ * @return Serialized wire size when queued; zero on failure.
  */
-bool PgSQL_Session::polardb_enqueue_notice_packet(
+unsigned int PgSQL_Session::polardb_enqueue_notice_packet(
 		const char* severity,
 		const char* sqlstate,
 		const char* primary,
@@ -174,11 +174,11 @@ bool PgSQL_Session::polardb_enqueue_notice_packet(
 		// null/short buffer. Free the packet so it is not leaked, since enqueue
 		// never took ownership.
 		l_free(size, pkt);
-		return false;
+		return 0;
 	}
 	// On success enqueue_pending_notice() owns pkt; the session frees it later.
 	enqueue_pending_notice(pkt, written);
-	return true;
+	return written;
 }
 
 /**
@@ -245,10 +245,9 @@ void PgSQL_Session::polardb_enqueue_degraded_rfq_notice(
  * stable proxy wait-timeout detail marker plus wrapper state. It then performs
  * timeout accounting and applies the forwarding ownership rule below: generic
  * forwarding owns user-result notices; the PolarDB pending path only rescues
- * notices attached to hidden wrapper SET results. Other notices, including
+ * notices attached to discarded wrapper SET results. Other notices, including
  * user-generated text that looks like an LSN timeout, are ignored here; the
- * generic store in notice_handler_cb() already ran for them (or had no result
- * to store into).
+ * generic store in notice_handler_cb() handles them after this returns false.
  *
  * @note Runs in the libpq NoticeReceiver callback on the backend thread; keep it
  *       cheap and non-blocking. conn->myds and the session reached through it may
@@ -256,15 +255,17 @@ void PgSQL_Session::polardb_enqueue_degraded_rfq_notice(
  *
  * @param conn   Active backend connection supplied by the libpq notice receiver.
  * @param result libpq PGresult containing the notice fields.
+ * @return true when the session queue owns forwarding and the generic callback
+ *         must not store a duplicate in the active result.
  */
-void polardb_handle_lsn_wait_timeout_notice(PgSQL_Connection* conn, const PGresult* result) {
+bool polardb_handle_lsn_wait_timeout_notice(PgSQL_Connection* conn, const PGresult* result) {
 	if (!conn || !result) {
 		// libpq should never pass NULL, but check against it.
-		return;
+		return false;
 	}
 
 	if (!polardb_is_lsn_wait_timeout_result(result)) {
-		return;
+		return false;
 	}
 
 	POLARDB_TRACE("PolarDB WAIT: LSN timeout detected in notice: %s\n",
@@ -274,11 +275,11 @@ void polardb_handle_lsn_wait_timeout_notice(PgSQL_Connection* conn, const PGresu
 	// The best_effort timeout WARNING is emitted while the user's SELECT obtains
 	// its snapshot, after the leading SET results may already be consumed. Do not
 	// require stmt_pending > 0 here; an active PolarDB wait plus wrapper_kind is
-	// the signal that the notice belongs to the current hidden wrapper. Transaction
+	// the signal that the notice belongs to the current wait operation. Transaction
 	// split has its own wrapper kind but uses the same wait-timeout backend marker.
 	PgSQL_Session* sess = (conn->myds ? conn->myds->sess : nullptr);
 	if (!sess) {
-		return;
+		return false;
 	}
 
 	const bool wait_active =
@@ -294,9 +295,9 @@ void polardb_handle_lsn_wait_timeout_notice(PgSQL_Connection* conn, const PGresu
 		(void*)sess, (void*)conn);
 	if (!wait_active || !polar_wait_wrapper) {
 		// Timeout-looking notice outside the current PolarDB wait wrapper: do NOT
-		// count it and do NOT forward it ourselves. notice_handler_cb() already
-		// ran its generic store before calling us (or had no result to store into).
-		return;
+		// count it and do NOT forward it ourselves. notice_handler_cb() will
+		// continue through the generic result path after this returns false.
+		return false;
 	}
 
 	// Current PolarDB wait confirmed. A best_effort wait surfaces a timeout as
@@ -311,29 +312,28 @@ void polardb_handle_lsn_wait_timeout_notice(PgSQL_Connection* conn, const PGresu
 	/*
 	 * Notice forwarding ownership:
 	 *
-	 *  - Generic path owns notices attached to the user query result.
-	 *    notice_handler_cb() first stores backend notices in conn->query_result.
-	 *    When that result is the user SELECT result, ProxySQL forwards the notice
-	 *    normally with the user result.
+	 *  - Generic path owns notices attached to the user query result. Returning
+	 *    false lets notice_handler_cb() store the notice there normally.
 	 *
-	 *  - PolarDB pending path owns only notices attached to hidden wrapper results.
+	 *  - PolarDB pending path owns notices attached to discarded wrapper results.
 	 *    A wrapped consistency read starts with prepended SET statements. ProxySQL
 	 *    consumes those SET results and does not forward them to the client. If the
-	 *    LSN timeout WARNING is attached to one of those hidden SET results, the
+	 *    LSN timeout WARNING is attached to one of those discarded SET results, the
 	 *    generic path would hide the WARNING too. In that case this helper copies
 	 *    the notice into the session notice queue so it is forwarded once with the
 	 *    user result.
 	 *
-	 *  - Do not enqueue when conn->query_result is already the user result.
-	 *    Generic forwarding is already correct there; enqueueing again would turn
-	 *    one backend WARNING into two client-visible WARNINGs.
+	 *  - An extended W before implicit backend Parse also uses the session queue:
+	 *    ProxySQL discards ParseComplete before executing the client statement.
+	 *    W before Bind/Execute uses the normal client-visible query result.
 	 */
-	const bool consuming_wrapper_set =
-		conn->polardb_query_wrap_state.consuming_wrapper_set();
-	if (conn->query_result && !consuming_wrapper_set) {
+	const bool session_queue_owns =
+		conn->polardb_query_wrap_state.wait_notice_uses_session_queue() ||
+		!conn->query_result;
+	if (!session_queue_owns) {
 		POLARDB_TRACE(
 			"PolarDB WAIT: timeout notice accounted; generic user-result path owns forwarding\n");
-		return;
+		return false;
 	}
 
 	POLARDB_TRACE("PolarDB WAIT: saving timeout notice to session notice queue\n");
@@ -345,13 +345,16 @@ void polardb_handle_lsn_wait_timeout_notice(PgSQL_Connection* conn, const PGresu
 	const char* primary = PQresultErrorField(result, PG_DIAG_MESSAGE_PRIMARY);
 	const char* detail = PQresultErrorField(result, PG_DIAG_MESSAGE_DETAIL);
 
-	if (!sess->polardb_enqueue_notice_packet(
-			severity, sqlstate, primary, detail, severity_nonlocalized)) {
-		return;
+	const unsigned int bytes_recv = sess->polardb_enqueue_notice_packet(
+		severity, sqlstate, primary, detail, severity_nonlocalized);
+	if (bytes_recv == 0) {
+		return true;
 	}
+	conn->update_bytes_recv(bytes_recv);
 
 	POLARDB_TRACE("PolarDB WAIT: saved notice packet pending_len=%u\n",
 		sess->polardb_notices.len());
+	return true;
 }
 
 #endif // POLARDB_PROXY

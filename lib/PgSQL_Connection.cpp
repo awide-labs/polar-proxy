@@ -37,7 +37,7 @@ static_assert(POLARDB_PROXY_PROTOCOL_V15_WAIT == static_cast<int>(PolarDB_ProxyP
 // notice and queues it for the client. It must run even when this connection has
 // no active result object, because the wrapped wait recycles that object while
 // consuming the prepended SET results (see notice_handler_cb below).
-void polardb_handle_lsn_wait_timeout_notice(PgSQL_Connection* conn, const PGresult* result);
+bool polardb_handle_lsn_wait_timeout_notice(PgSQL_Connection* conn, const PGresult* result);
 
 /// @brief Human-readable name of a proxy protocol value, for log and trace lines.
 static const char* polardb_proxy_protocol_name(PolarDB_ProxyProtocol protocol) {
@@ -855,6 +855,10 @@ handler_again:
 							exec_status_type != PGRES_PIPELINE_ABORTED) {
 						polardb_query_wrap_state.mark_extended_wait_succeeded();
 					}
+					// Notice callbacks for W have completed once its following
+					// Parse/Execute result is available. Later user-result notices
+					// belong to the normal query result.
+					polardb_query_wrap_state.mark_extended_wait_result_received();
 				}
 
 				// Consume the wrapper SET results inline. A wrapped LSN-wait read
@@ -2910,7 +2914,8 @@ void PgSQL_Connection::stmt_prepare_start() {
 				query.ptr, parse_param_types.size(), parse_param_types.data(),
 				wait_state.spec.target, wait_state.spec.timeout_ms, wait_mode);
 			if (send_rc != 0) {
-				polardb_query_wrap_state.begin_extended_wait();
+				polardb_query_wrap_state.begin_extended_wait(
+					PolarDB_ExtendedWaitNoticeOwner::SESSION_QUEUE);
 				wait_state.wrapper_finalized = true;
 				POLARDB_THREAD_COUNT_ONE(polardb_sess->thread, wait_lsn_sent);
 				POLARDB_TRACE("PolarDB EXTENDED WAIT: dispatched before implicit Parse "
@@ -3187,7 +3192,8 @@ void PgSQL_Connection::stmt_execute_start() {
 				(result_formats.size() > 0) ? result_formats[0] : 0,
 				wait_state.spec.target, wait_state.spec.timeout_ms, wait_mode);
 			if (send_rc != 0) {
-				polardb_query_wrap_state.begin_extended_wait();
+				polardb_query_wrap_state.begin_extended_wait(
+					PolarDB_ExtendedWaitNoticeOwner::QUERY_RESULT);
 				wait_state.wrapper_finalized = true;
 				POLARDB_THREAD_COUNT_ONE(polardb_sess->thread, wait_lsn_sent);
 				POLARDB_TRACE("PolarDB EXTENDED WAIT: dispatched before Bind/Execute "
@@ -3638,6 +3644,15 @@ void PgSQL_Connection::notice_handler_cb(void* arg, const PGresult* result) {
 	PgSQL_Connection* conn = (PgSQL_Connection*)arg;
 	if (!result) return;
 
+#if POLARDB_PROXY
+	// The W warning before an implicit backend Parse cannot live in that
+	// ParseComplete result: ProxySQL discards it before executing the client
+	// statement. Let the PolarDB handler queue and account that notice instead.
+	if (polardb_handle_lsn_wait_timeout_notice(conn, result)) {
+		return;
+	}
+#endif
+
 	if (conn->query_result != nullptr) {
 		// Generic upstream path: record the notice in the active result so its
 		// NoticeResponse is forwarded inline and its bytes are accounted.
@@ -3652,15 +3667,6 @@ void PgSQL_Connection::notice_handler_cb(void* arg, const PGresult* result) {
 			conn->get_pg_socket_fd(),
 			PQresultErrorMessage(result));
 	}
-
-#if POLARDB_PROXY
-	// Do not return before this block: a wrapped LSN wait can receive its timeout
-	// notice while hidden wrapper SET results are being consumed and query_result
-	// is not available for normal notice forwarding. polardb_handle_lsn_wait_timeout_notice()
-	// ignores anything that is not an LSN wait-timeout notice during an active
-	// PolarDB wait.
-	polardb_handle_lsn_wait_timeout_notice(conn, result);
-#endif
 }
 
 void PgSQL_Connection::unhandled_notice_cb(void* arg, const PGresult* result) {

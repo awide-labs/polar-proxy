@@ -1580,6 +1580,18 @@ enum class PolarDB_Query_WrapperKind : uint8_t {
 };
 
 /**
+ * @brief Owner that must retain notices emitted by an extended-protocol wait.
+ *
+ * SESSION_QUEUE is used when W precedes an implicit backend Parse. ProxySQL
+ * discards that ParseComplete result before executing the client statement, so
+ * storing the wait warning in the temporary Parse result would lose it.
+ */
+enum class PolarDB_ExtendedWaitNoticeOwner : uint8_t {
+    QUERY_RESULT = 0,
+    SESSION_QUEUE = 1
+};
+
+/**
  * @brief Consistency routing mode for a PolarDB session.
  *
  * Resolved from the three-level config hierarchy: session override > hostgroup >

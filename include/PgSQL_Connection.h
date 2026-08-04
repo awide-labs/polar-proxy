@@ -861,6 +861,8 @@ public:
 		uint32_t stmt_pending{0};  // wrapper statements whose result set is still to consume
 		PolarDB_Query_WrapperKind wrapper_kind{PolarDB_Query_WrapperKind::NONE};
 		bool txn_split_xids_reset_pending{false}; // true only for the first wrapper SET
+		PolarDB_ExtendedWaitNoticeOwner extended_wait_notice_owner{
+			PolarDB_ExtendedWaitNoticeOwner::QUERY_RESULT};
 
 		bool consuming_wrapper_set() const { return stmt_pending > 0; }
 		bool consuming_txn_split_xids_reset() const {
@@ -884,6 +886,11 @@ public:
 		bool is_polar_wait_wrapper() const {
 			return is_consistency_wait() || is_txn_split_wait();
 		}
+		bool wait_notice_uses_session_queue() const {
+			return consuming_wrapper_set() ||
+				(is_extended_wait() && extended_wait_notice_owner ==
+					PolarDB_ExtendedWaitNoticeOwner::SESSION_QUEUE);
+		}
 
 		void begin(uint32_t n, PolarDB_Query_WrapperKind kind,
 				bool txn_xids_reset = false) {
@@ -894,8 +901,10 @@ public:
 			stmt_pending = n;
 			wrapper_kind = (n > 0) ? kind : PolarDB_Query_WrapperKind::NONE;
 			txn_split_xids_reset_pending = (n > 0) && txn_xids_reset;
+			extended_wait_notice_owner =
+				PolarDB_ExtendedWaitNoticeOwner::QUERY_RESULT;
 		}
-		void begin_extended_wait() {
+		void begin_extended_wait(PolarDB_ExtendedWaitNoticeOwner notice_owner) {
 			was_wrapped = true;
 			stmt_failed = false;
 			stmt_succeeded = false;
@@ -903,6 +912,13 @@ public:
 			stmt_pending = 0;
 			wrapper_kind = PolarDB_Query_WrapperKind::EXTENDED_WAIT;
 			txn_split_xids_reset_pending = false;
+			extended_wait_notice_owner = notice_owner;
+		}
+		void mark_extended_wait_result_received() {
+			if (is_extended_wait()) {
+				extended_wait_notice_owner =
+					PolarDB_ExtendedWaitNoticeOwner::QUERY_RESULT;
+			}
 		}
 		void mark_extended_wait_succeeded() {
 			if (is_extended_wait()) {
@@ -930,6 +946,8 @@ public:
 			stmt_pending = 0;
 			wrapper_kind = PolarDB_Query_WrapperKind::NONE;
 			txn_split_xids_reset_pending = false;
+			extended_wait_notice_owner =
+				PolarDB_ExtendedWaitNoticeOwner::QUERY_RESULT;
 		}
 	};
 	PolarDB_Query_WrapState polardb_query_wrap_state;
