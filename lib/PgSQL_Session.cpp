@@ -44,6 +44,27 @@ using json = nlohmann::json;
 
 const char* PROXYSQL_PS_PREFIX = "proxysql_ps_";
 
+void PgSQL_Session::ExtendedBoundPortal::capture(
+		const PgSQL_Bind_Message* bind_message,
+		const PgSQL_STMT_Global_info* stmt) {
+	message.reset(bind_message);
+	statement = stmt;
+	retained_statement.reset();
+}
+
+void PgSQL_Session::ExtendedBoundPortal::retain_statement_owner(
+		std::shared_ptr<const PgSQL_STMT_Global_info>& stmt) {
+	if (message && statement == stmt.get() && !retained_statement) {
+		retained_statement = std::move(stmt);
+	}
+}
+
+void PgSQL_Session::ExtendedBoundPortal::reset() {
+	message.reset();
+	statement = nullptr;
+	retained_statement.reset();
+}
+
 using std::function;
 using std::vector;
 
@@ -1450,8 +1471,22 @@ int PgSQL_Session::handler_again___status_RESYNCHRONIZING_CONNECTION() {
 	if (rc == 0) {
 		myconn->async_state_machine = ASYNC_IDLE;
 		myds->DSS = STATE_MARIADB_GENERIC;
+#if POLARDB_PROXY
+		if (extended_query_frame_state.waiting_for_client_sync_after_error &&
+				polardb_extended_rfq.publication_pending) {
+			// The semantic ErrorResponse retained its publication policy before
+			// RequestEnd cleared request state. Internal Sync now supplies the exact
+			// RFQ values that the later client Sync may need after backend release.
+			polardb_retain_extended_rfq_evidence(myds);
+		}
+#endif // POLARDB_PROXY
+		extended_query_frame_state.mark_backend_sync_sent(true);
+		if (emit_extended_ready_for_query(myconn)) {
+			writeout();
+		}
 		RequestEnd(myds, false); // we close the session gracefully
 		finishQuery(myds, myds->myconn, false);
+		complete_extended_query_frame();
 		return 0;
 	} else {
 		if (rc == -1) {
@@ -1470,6 +1505,7 @@ int PgSQL_Session::handler_again___status_RESYNCHRONIZING_CONNECTION() {
 			myds->destroy_MySQL_Connection_From_Pool(false);
 			myds->fd = 0;
 			RequestEnd(myds, true);
+			complete_extended_query_frame();
 			return -1;
 		} 
 			
@@ -1863,7 +1899,7 @@ bool PgSQL_Session::handler_again___status_CONNECTING_SERVER(int* _rc) {
 
 					client_myds->setDSS_STATE_QUERY_SENT_NET();
 					client_myds->myprot.generate_error_packet(
-						true, is_extended_query_ready_for_query(),
+						true, extended_local_result_sends_ready(true),
 						"PolarDB could not acquire a replica before the "
 						"connection deadline",
 						PGSQL_ERROR_CODES::
@@ -2536,7 +2572,7 @@ int PgSQL_Session::get_pkts_from_client(bool& wrong_pass, PtrSize_t& pkt) {
 			// active at a time, with no client-side changes required.
 			switch (status) {
 			case WAITING_CLIENT_DATA:
-				if (extended_query_frame.empty() == false) {
+				if (needs_implicit_sync_before_simple_query()) {
 					// peeking message type of the next packet
 					if (const PtrSize_t* nxt_pkt = client_myds->PSarrayIN->index(0); nxt_pkt->size > 0) {
 						char msg_type = *static_cast<char*>(nxt_pkt->ptr);
@@ -2704,7 +2740,7 @@ __implicit_sync:
 						} else if (c == 'P' || c == 'B' || c == 'C' || c == 'D' || c == 'E') {
 							l_free(pkt.size, pkt.ptr);
 							continue;
-						} else {
+					} else {
 							proxy_error("Not implemented yet. Message type:'0x%02X'\n", c);
 							client_myds->setDSS_STATE_QUERY_SENT_NET();
 							client_myds->myprot.generate_error_packet(true, true, "Feature not supported", PGSQL_ERROR_CODES::ERRCODE_FEATURE_NOT_SUPPORTED,
@@ -2716,6 +2752,17 @@ __implicit_sync:
 						}
 					} else {
 						char command = c = *((unsigned char*)pkt.ptr);
+						// After an extended-protocol error PostgreSQL ignores every
+						// frontend message except Sync and Terminate. Flush still makes
+						// the already-generated ErrorResponse visible to the client.
+						if (extended_query_frame_state.discards_until_sync(command)) {
+							l_free(pkt.size, pkt.ptr);
+							pkt = {0, nullptr};
+							if (command == 'H') {
+								writeout();
+							}
+							continue;
+						}
 						// Poisoned-session gate for Extended Query messages.
 						// Simple Query ('Q') falls through to handler_special_queries,
 						// which dispatches to handler_poisoned_simple_query. Extended
@@ -2723,7 +2770,9 @@ __implicit_sync:
 						// swallowed silently, and S emits ErrorResponse(25P02) +
 						// ReadyForQuery('E'). Client must issue a Simple-Query ROLLBACK
 						// to recover. QUIT ('X') is always honored.
-						if (tx_poisoned && command != 'Q' && command != 'X') {
+						if (tx_poisoned &&
+								!extended_query_frame_state.waiting_for_client_sync_after_error &&
+								command != 'Q' && command != 'X') {
 							if (command == 'P' || command == 'B' || command == 'D' ||
 							    command == 'C' || command == 'E') {
 								// Silent swallow — Parse/Bind/Describe/Close/Execute
@@ -2825,7 +2874,9 @@ __implicit_sync:
 								if (qpo->max_lag_ms >= 0) {
 									thread->status_variables.stvar[st_var_queries_with_max_lag_ms]++;
 								}
-								rc_break = handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY_qpo(&pkt, &lock_hostgroup);
+								rc_break =
+									handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY_qpo(
+										&pkt, &lock_hostgroup) != QpoHandlerResult::CONTINUE;
 								if (mirror == false && rc_break == false) {
 									if (pgsql_thread___automatic_detect_sqli) {
 										if (handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY_detect_SQLi()) {
@@ -2933,111 +2984,14 @@ __implicit_sync:
 									}
 								}
 #if POLARDB_PROXY
-								// PolarDB LSN routing pipeline.
-								// Reset the reader target and request scope at dispatch entry so a
-								// stale LSN can never leak into a PASSTHROUGH read. Wait/wrapper
-								// runtime state is owned by the query cleanup path.
-								polardb_query.reset_reader_plan();
-								polardb_query.request_writer_scope.reset();
-								polardb_reconcile_txn_wait_read_request_entry(
-									"simple_request_entry_stale");
-
-								// collect -> plan -> execute.
-								//
-								// Manual mode: when replica_eligible is unset (-1) and a
-								// destination_hostgroup is explicitly set by a query rule, the user
-								// is doing manual routing — the pipeline does NOT override the
-								// destination (e.g. analytics/standby readers chosen by rule).
-								//   replica_eligible:  1 = auto (pipeline routes), 0 = force primary,
-								//                     -1 = unset (manual if destination_hostgroup set,
-								//                          else default routing).
-								if (PgHGM->status.polardb_active.load(std::memory_order_relaxed)) {
-									bool manual_mode =
-										polardb_handle_locked_hostgroup_route("PIPELINE");
-									PolarDB_ManualRoute manual_route;
-									if (!manual_mode) {
-										manual_route = polardb_manual_route();
-										manual_mode = manual_route.is_manual();
-									}
-
-									if (manual_mode && locked_on_hostgroup < 0) {
-										const bool forced_writer =
-											polardb_apply_reader_failure_writer_route("PIPELINE");
-										polardb_capture_request_writer_scope(
-											manual_route.scope_hg);
-										polardb_account_manual_route(current_hostgroup, forced_writer);
-										POLARDB_TRACE(
-											"PolarDB PIPELINE: MANUAL mode (replica_eligible=%d "
-											"dest_hg=%d scope_hg=%d) -- PolarDB routing skipped\n",
-											manual_route.replica_eligible,
-											manual_route.destination_hg,
-											manual_route.scope_hg);
-									}
-									if (!manual_mode) {
-										polardb_observe_route_inputs(current_hostgroup);
-										if (pgsql_thread___polardb_profile_off) {
-											// observe() performed the required writer-scope and
-											// transaction-reader cleanup. Clear every request-local
-											// reader artifact, then leave routing entirely to ordinary
-											// ProxySQL without collect/plan/account/execute.
-											polardb_query.clear_reader_route();
-											POLARDB_TRACE(
-												"PolarDB PIPELINE: named profile off after "
-												"request cleanup; routing left unchanged\n");
-										} else {
-											PolarDB_Query_RouteCtx polardb_route_ctx = polardb_collect(
-												current_hostgroup,
-												manual_route.replica_eligible,
-												qpo ? qpo->force_primary_hint : false);
-											if (polardb_route_ctx.is_polar_hg) {
-												const int warmup_mode =
-													polardb_effective_txn_split_warmup_mode();
-												const bool begin_warmup =
-													warmup_mode == static_cast<int>(
-														PolarDB_TxnSplitWarmupMode::BEGIN) ||
-													warmup_mode == static_cast<int>(
-														PolarDB_TxnSplitWarmupMode::BOTH);
-												const PolarDB_ConsistencyMode begin_consistency =
-													polardb_consistency_from_int(
-														polardb_route_ctx.effective_consistency_mode);
-												// BEGIN-time warmup only prepares a reader backend; the
-												// later split planner still requires RFQ XIDs and LSN
-												// evidence before it sends a transaction read to a replica.
-												if (begin_warmup &&
-														CurrentQuery.PgQueryCmd == PGSQL_QUERY_BEGIN &&
-														polardb_route_ctx.txn_split_enabled &&
-														polardb_route_ctx.reader_hg >= 0 &&
-														polardb_route_ctx.effective_consistency_mode >= 0 &&
-														(begin_consistency ==
-															PolarDB_ConsistencyMode::SESSION_LSN ||
-														begin_consistency ==
-															PolarDB_ConsistencyMode::GLOBAL_LSN)) {
-													polardb_request_txn_split_warmup(
-														polardb_route_ctx.reader_hg, "begin");
-												}
-												PolarDB_Query_RoutePlan plan =
-													polardb_plan(polardb_route_ctx);
-												polardb_report_route_result(
-													plan, polardb_route_ctx);
-												// Execute every active-profile plan. PASSTHROUGH
-												// retains reader policy for acquisition and failure
-												// handling; an explicit target selects its hostgroup.
-												PolarDB_Query_ExecuteResult result =
-													polardb_execute(plan, polardb_route_ctx, pkt);
-												if (result.return_error) {
-													if (pkt.ptr) {
-														l_free(pkt.size, pkt.ptr);
-														pkt = {0, nullptr};
-													}
-													break;
-												}
-												if (result.final_target_hg >= 0) {
-													current_hostgroup = result.final_target_hg;
-												}
-											}
+									if (thread->polardb_is_active() &&
+											polardb_route_query(pkt)) {
+										if (pkt.ptr) {
+											l_free(pkt.size, pkt.ptr);
+											pkt = {0, nullptr};
 										}
+										break;
 									}
-								}
 #endif // POLARDB_PROXY
 #if POLARDB_PROXY
 								if (!polardb_txn_reader_read_active()) {
@@ -3139,11 +3093,8 @@ __implicit_sync:
 							// we do not need sync packet anymore
 							l_free(pkt.size, pkt.ptr);
 							pkt = { 0, nullptr };
-							bind_waiting_for_execute.reset(nullptr);
 							extended_query_exec_qp = true;
-#if POLARDB_PROXY
-							polardb_extended_route.reset();
-#endif // POLARDB_PROXY
+							begin_extended_query_frame(true);
 
 						__run_sync_again:
 							int rc = handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_SYNC();
@@ -3157,6 +3108,35 @@ __implicit_sync:
 							// and there are more messages in the queue, sync needs to be executed again
 							if (rc == 0 && extended_query_frame.empty() == false) {
 								goto __run_sync_again;
+							}
+						}
+							break;
+						case 'H':
+						{
+							// Flush is a visibility boundary, not the end of the
+							// extended cycle. Process queued operations without
+							// sending backend Sync or frontend ReadyForQuery.
+							l_free(pkt.size, pkt.ptr);
+							pkt = {0, nullptr};
+							if (extended_query_frame.empty()) {
+								writeout();
+								break;
+							}
+							extended_query_exec_qp = true;
+							begin_extended_query_frame(false);
+
+						__run_flush_again:
+							int rc = handler___status_PROCESSING_EXTENDED_QUERY_SYNC();
+							if (rc == -1) {
+								handler_ret = -1;
+								return handler_ret;
+							}
+							if (rc == 0 && !extended_query_frame.empty()) {
+								goto __run_flush_again;
+							}
+							if (rc == 0) {
+								extended_query_phase = EXTQ_PHASE_BUILDING;
+								writeout();
 							}
 						}
 							break;
@@ -3182,7 +3162,7 @@ __implicit_sync:
 							proxy_error("Not implemented yet. Message type:'0x%02X'\n", c);
 							client_myds->setDSS_STATE_QUERY_SENT_NET();
 
-							bool send_ready_packet = is_extended_query_ready_for_query() && c != 'H';
+							bool send_ready_packet = extended_local_result_sends_ready(true);
 							//unsigned int nTrx = NumActiveTransactions();
 							//const char txn_state = (nTrx ? 'T' : 'I');
 							client_myds->myprot.generate_error_packet(true, send_ready_packet, "Feature not supported", PGSQL_ERROR_CODES::ERRCODE_FEATURE_NOT_SUPPORTED,
@@ -3312,18 +3292,58 @@ void PgSQL_Session::SetQueryTimeout() {
 	}
 }
 
-// Synthesize an aborted-transaction ErrorResponse + NoticeResponse +
-// ReadyForQuery('E') to the client so the application can react with ROLLBACK
-// without having to reconnect. Called only from handler_minus1_ClientLibraryError
+// Synthesize an aborted-transaction ErrorResponse + NoticeResponse so the
+// application can react with ROLLBACK without having to reconnect. Simple
+// protocol owns ReadyForQuery here; an extended cycle retains that ownership
+// until its real client Sync boundary.
+void PgSQL_Session::emit_tx_poisoned_response(const char* backend_warning) {
+	const bool extended_owner = extended_query_frame_state.active() ||
+		extended_query_phase != EXTQ_PHASE_IDLE;
+	const bool client_sync_received = extended_owner &&
+		(extended_query_phase & EXTQ_PHASE_EXECUTING_SYNC_CLIENT) != 0;
+
+	PG_pkt pgpkt{};
+	pgpkt.set_multi_pkt_mode(true);
+	write_tx_poisoned_error(pgpkt);
+	if (backend_warning && backend_warning[0] != '\0') {
+		write_tx_poisoned_warning_notice(
+			pgpkt, PGSQL_ERROR_CODES::ERRCODE_WARNING, backend_warning);
+	}
+	if (!extended_owner) {
+		pgpkt.write_ReadyForQuery('E');
+	}
+	pgpkt.set_multi_pkt_mode(false);
+	auto buff = pgpkt.detach();
+	client_myds->PSarrayOUT->add((void*)buff.first, buff.second);
+	client_myds->DSS = STATE_SLEEP;
+
+	if (!extended_owner) {
+		return;
+	}
+
+	// ErrorResponse starts the protocol discard boundary. A Flush-owned error
+	// waits for the later client Sync; when Sync is already present, the failed
+	// backend has no remaining pipeline to synchronize and Z(E) completes now.
+	note_extended_error_response();
+	if (client_sync_received) {
+		extended_query_frame_state.mark_backend_sync_sent(true);
+		if (emit_extended_ready_for_query(nullptr, 'E')) {
+			complete_extended_query_frame();
+		}
+	}
+}
+
+// Called only from handler_minus1_ClientLibraryError
 // when we are certain: (a) admin variable is on, (b) the session was in an
 // explicit transaction, (c) the result-set transfer has not already started to
 // the client (synthesizing 25P02 mid-stream would corrupt the protocol), and
 // (d) the client data stream is valid.
 //
-// On success: the three messages are queued on client_myds->PSarrayOUT,
-// tx_poisoned is set to true, and the pgsql_tx_poisoned_total counter is
-// incremented. Returns true. The backend connection is NOT destroyed here —
-// that stays the caller's job.
+// On success, ErrorResponse and NoticeResponse are queued immediately. Simple
+// protocol also queues ReadyForQuery('E'); extended protocol leaves that packet
+// to the real client Sync boundary. tx_poisoned is set and the
+// pgsql_tx_poisoned_total counter is incremented. Returns true. The backend
+// connection is NOT destroyed here — that stays the caller's job.
 //
 // On failure (preflight not satisfied): returns false, no side effects.
 bool PgSQL_Session::handler_minus1_PoisonTransaction(PgSQL_Data_Stream* myds) {
@@ -3350,29 +3370,8 @@ bool PgSQL_Session::handler_minus1_PoisonTransaction(PgSQL_Data_Stream* myds) {
 	// See sanitize_backend_err_msg() comment for NUL / length rationale.
 	const std::string backend_err_msg = sanitize_backend_err_msg(myconn->get_error_message());
 
-	PG_pkt pgpkt{};
-	pgpkt.set_multi_pkt_mode(true);
-	// ErrorResponse severity=ERROR SQLSTATE=25P02. Not FATAL — libpq treats
-	// FATAL as connection-loss and drops the socket.
-	write_tx_poisoned_error(pgpkt);
-	// NoticeResponse carries the backend's original message text as context at
-	// SQLSTATE 01000 (ERRCODE_WARNING). Per design, the backend's original
-	// SQLSTATE (e.g. 57P01 terminating connection due to administrator command)
-	// is NOT propagated — the only SQLSTATE surfaced to the client is the
-	// synthesized 25P02 on the ErrorResponse above.
-	if (!backend_err_msg.empty()) {
-		write_tx_poisoned_warning_notice(pgpkt, PGSQL_ERROR_CODES::ERRCODE_WARNING, backend_err_msg.c_str());
-	}
-	// ReadyForQuery with txn_state='E' signals the client it is in an aborted
-	// transaction — libpq will report PQTRANS_INERROR and accept only
-	// ROLLBACK/COMMIT/ABORT.
-	pgpkt.write_ReadyForQuery('E');
-	pgpkt.set_multi_pkt_mode(false);
-	auto buff = pgpkt.detach();
-	client_myds->PSarrayOUT->add((void*)buff.first, buff.second);
-	client_myds->DSS = STATE_SLEEP;
-
 	tx_poisoned = true;
+	emit_tx_poisoned_response(backend_err_msg.c_str());
 	thread->status_variables.tx_poisoned_total++;
 	// Rich log context for debugging a deployed proxy: hostgroup, backend addr:port,
 	// backend PID, client addr, frontend user, dbname, digest text, original
@@ -3504,8 +3503,9 @@ bool PgSQL_Session::handler_minus1_HandleErrorCodes(PgSQL_Data_Stream* myds, int
 		// This is the most common real-world mid-transaction backend-death
 		// scenario. Before falling through to session teardown, offer the
 		// poison path: if the client is in an explicit transaction, synthesize
-		// ERROR 25P02 + ReadyForQuery('E') and keep the session alive so the
-		// client can issue ROLLBACK. Gated internally on is_in_transaction()
+		// ERROR 25P02 and keep the session alive so the client can issue ROLLBACK.
+		// Simple protocol emits RFQ('E') here; extended protocol leaves RFQ to Sync.
+		// Gated internally on is_in_transaction()
 		// and the preserve_client_on_broken_backend_in_tx admin variable.
 		if (retry_conn == false) {
 			handler_minus1_PoisonTransaction(myds);
@@ -3557,7 +3557,10 @@ void PgSQL_Session::handler_minus1_GenerateErrorMessage(PgSQL_Data_Stream* myds,
 	case PROCESSING_STMT_DESCRIBE:
 	case PROCESSING_STMT_EXECUTE:
 	case PROCESSING_QUERY:
-		PgSQL_Result_to_PgSQL_wire(myconn, myds);
+		if (status != PROCESSING_QUERY) {
+				note_extended_backend_error_response(myds);
+			}
+			PgSQL_Result_to_PgSQL_wire(myconn, myds);
 		break;
 	default:
 		// LCOV_EXCL_START
@@ -3828,27 +3831,51 @@ handler_again:
 			if (extended_query_frame.empty() == false) {
 				NEXT_IMMEDIATE(PROCESSING_EXTENDED_QUERY_SYNC);
 			}
+			if (!extended_client_sync_received()) {
+				extended_query_phase = EXTQ_PHASE_BUILDING;
+				goto handler_again;
+			}
 
 			proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Extended query sync completed for session %p\n", this);
-			// we are done with extended query sync
-			bind_waiting_for_execute.reset(nullptr);
-			extended_query_phase = EXTQ_PHASE_IDLE;
-
-			if (PgSQL_Backend* _mybe = find_backend(current_hostgroup)) {
-				if (PgSQL_Data_Stream* myds = _mybe->server_myds) {
-					if (myds->myconn) {
-#ifdef DEBUG
-						assert(dbg_extended_query_backend_conn == myds->myconn);
-#endif
-						if (myds->myconn->is_pipeline_active() == true) {
-							NEXT_IMMEDIATE(RESYNCHRONIZING_CONNECTION);
-						}
-
-						// Return to pool if connection is reusable
-						finishQuery(myds, myds->myconn, false);
-					}
+			const ExtendedFrameFinalizeResult finalized =
+				finalize_extended_query_frame();
+			if (finalized.needs_backend_sync) {
+				current_hostgroup =
+					extended_query_frame_state.backend_hostgroup;
+				mybe = finalized.backend;
+				if (unlikely(!mybe || !mybe->server_myds ||
+						!mybe->server_myds->myconn)) {
+					proxy_error(
+						"Extended query Sync lost backend ownership: sess=%p hostgroup=%d\n",
+						this, current_hostgroup);
+					handler_ret = -1;
+					return handler_ret;
 				}
+				NEXT_IMMEDIATE(RESYNCHRONIZING_CONNECTION);
 			}
+
+			int cleanup_hg = extended_query_frame_state.backend_hostgroup >= 0
+				? extended_query_frame_state.backend_hostgroup
+				: current_hostgroup;
+			PgSQL_Backend* cleanup_backend = finalized.backend;
+			if (!cleanup_backend &&
+					extended_query_frame_state.backend_hostgroup < 0) {
+				cleanup_backend = find_backend(cleanup_hg);
+			}
+			PgSQL_Data_Stream* cleanup_myds = cleanup_backend
+				? cleanup_backend->server_myds : nullptr;
+			PgSQL_Connection* cleanup_conn = cleanup_myds
+				? cleanup_myds->myconn : nullptr;
+			emit_extended_ready_for_query(cleanup_conn);
+			if (cleanup_myds && cleanup_myds->myconn) {
+#ifdef DEBUG
+				assert(dbg_extended_query_backend_conn ==
+					cleanup_myds->myconn);
+#endif
+				// Return to pool if connection is reusable.
+				finishQuery(cleanup_myds, cleanup_myds->myconn, false);
+			}
+			complete_extended_query_frame();
 		}
 
 		goto handler_again;
@@ -4122,8 +4149,10 @@ handler_again:
 								PROXY_TRACE();
 								assert(0);
 							}
-							CurrentQuery.extended_query_info.flags |= PGSQL_EXTENDED_QUERY_FLAG_IMPLICIT_PREPARE;
-							previous_status.push(status);
+							if (unlikely(!begin_implicit_prepare(status))) {
+								handler_ret = -1;
+								return handler_ret;
+							}
 							NEXT_IMMEDIATE(PROCESSING_STMT_PREPARE);
 						}
 						CurrentQuery.extended_query_info.stmt_backend_id = backend_stmt_id;
@@ -4150,7 +4179,7 @@ handler_again:
 						proxy_error("'%s' command is not supported in Extended Query protocol mode. Use Simple Query mode to run this command\n",
 							query_to_match ? query_to_match : "");
 						client_myds->setDSS_STATE_QUERY_SENT_NET();
-						bool send_ready_packet = is_extended_query_ready_for_query();
+						bool send_ready_packet = extended_local_result_sends_ready(true);
 						client_myds->myprot.generate_error_packet(true, send_ready_packet, "Feature not supported", PGSQL_ERROR_CODES::ERRCODE_FEATURE_NOT_SUPPORTED,
 							false, true);
 						RequestEnd(myds, true);
@@ -4218,7 +4247,20 @@ handler_again:
 			}
 
 			if (rc == 0) {
-
+				const bool extended_result_has_error =
+					processing_extended_query && myconn->query_result &&
+					pgsql_query_result_has_error(
+						myconn->query_result->get_result_packet_type());
+#if POLARDB_PROXY
+				if (processing_extended_query &&
+						myconn->polardb_query_wrap_state.is_extended_wait()) {
+					// Observe the semantic Parse/Execute operation once. Pipeline Sync
+					// is transport recovery and must not confirm a failed W message.
+					myconn->polardb_query_wrap_state.
+						observe_extended_wait_completion(
+							!extended_result_has_error);
+				}
+#endif // POLARDB_PROXY
 				if (active_transactions != 0) {  // run this only if currently we think there is a transaction
 					if (myconn->IsKnownActiveTransaction() == false) { // there is no transaction on the backend connection
 						active_transactions = NumActiveTransactions(); // we check all the hostgroups/backends
@@ -4242,8 +4284,14 @@ handler_again:
 						myconn->query_result &&
 						pgsql_query_result_has_error(
 							myconn->query_result->get_result_packet_type());
-					if (!prepare_has_error &&
-							handler___rc0_PROCESSING_STMT_PREPARE(st, myds)) {
+					const PrepareCompletion prepare_completion = prepare_has_error
+						? PrepareCompletion::CLIENT_VISIBLE
+						: handler___rc0_PROCESSING_STMT_PREPARE(st, myds);
+					if (unlikely(prepare_completion == PrepareCompletion::ERROR)) {
+						handler_ret = -1;
+						return handler_ret;
+					}
+					if (prepare_completion == PrepareCompletion::IMPLICIT_RESUME) {
 						// No need to send a response: the prepared statement
 						// was created implicitly. Execute the original query next.
 						if (myconn->query_result) {
@@ -4316,9 +4364,10 @@ handler_again:
 							do {} while (0));
 					}
 					const bool polardb_result_has_error =
-						myconn->query_result &&
-						(myconn->query_result->get_result_packet_type() &
-							PGSQL_QUERY_RESULT_ERROR);
+						extended_result_has_error ||
+						(myconn->query_result &&
+						 (myconn->query_result->get_result_packet_type() &
+							PGSQL_QUERY_RESULT_ERROR));
 					if (!polardb_result_failure_checked &&
 							polardb_result_has_error) {
 						myds->query_retries_on_failure = 0;
@@ -4337,7 +4386,10 @@ handler_again:
 							do {} while (0));
 					}
 #endif // POLARDB_PROXY
-					PgSQL_Result_to_PgSQL_wire(myconn, myconn->myds);
+						if (extended_result_has_error) {
+							note_extended_backend_error_response(myds);
+						}
+						PgSQL_Result_to_PgSQL_wire(myconn, myconn->myds);
 
 					handle_transaction_state();
 					break;
@@ -4393,7 +4445,9 @@ handler_again:
 
 				RequestEnd(myds, false);
 				finishQuery(myds, myconn,
-					has_pending_messages
+					has_pending_messages ||
+					(processing_extended_query &&
+					 !extended_client_sync_received())
 #if POLARDB_PROXY
 					|| polardb_txn_reader_completed
 #endif // POLARDB_PROXY
@@ -4411,23 +4465,28 @@ handler_again:
 				}
 #endif // POLARDB_PROXY
 
-				if (processing_extended_query) {
-					if (!has_pending_messages) {
-						proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Extended query sync completed for session %p\n", this);
-						bind_waiting_for_execute.reset(nullptr);
-					} else if (old_status == PROCESSING_STMT_EXECUTE) {
+					if (processing_extended_query) {
+						if (!has_pending_messages) {
+						if (extended_client_sync_received()) {
+							proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Extended query sync completed for session %p\n", this);
+							if (!myconn->is_pipeline_active()) {
+								complete_extended_query_frame();
+								}
+							} else {
+								extended_query_phase = EXTQ_PHASE_BUILDING;
+							}
+						} else if (old_status == PROCESSING_STMT_EXECUTE) {
 						// Handle edge case: After Execute, the Bind message is no longer valid on the backend. 
 						// We must reset bind_waiting_for_execute, in case the client sends a sequence like
 						// Bind/Describe/Execute/Describe/Sync, so that a subsequent Describe Portal
 						// does not incorrectly assume a pending Bind.
-						bind_waiting_for_execute.reset(nullptr);
+						bind_waiting_for_execute.reset();
 					}
 					if (has_pending_messages) {
 						// check if there are messages remaining in extended_query_frame, 
 						// if yes, process pending messages
 						NEXT_IMMEDIATE(PROCESSING_EXTENDED_QUERY_SYNC);
 					}
-					extended_query_phase = EXTQ_PHASE_IDLE;
 				}
 			} else {
 				if (rc == -1) {
@@ -4471,11 +4530,10 @@ handler_again:
 							if (handler_minus1_ClientLibraryError(myds)) {
 								NEXT_IMMEDIATE(CONNECTING_SERVER);
 							} else if (tx_poisoned) {
-								// Backend died mid-transaction and preserve_client_on_broken_backend_in_tx
-								// is on: the client already received the synthesized ERROR 25P02 +
-								// ReadyForQuery('E'). Keep the session open so the client can issue
-								// ROLLBACK; wrap up this query and fall through to the end of the
-								// processing loop.
+								// Backend death was converted at the central poison boundary.
+								// Simple protocol already owns ERROR + RFQ('E'); extended protocol
+								// owns ERROR now and defers its single RFQ('E') to client Sync.
+								// Keep the session open so the client can issue ROLLBACK.
 								RequestEnd(myds, true);
 							} else {
 								handler_ret = -1;
@@ -4489,9 +4547,9 @@ handler_again:
 								return handler_ret;
 							}
 							if (tx_poisoned) {
-								// HandleErrorCodes destroyed the backend and already
-								// synthesized ERROR 25P02 + ReadyForQuery('E') onto
-								// the client OUT queue via handler_minus1_PoisonTransaction.
+									// HandleErrorCodes destroyed the backend and the central
+									// poison boundary synthesized ERROR 25P02. Simple protocol
+									// also queued RFQ('E'); extended protocol defers it to Sync.
 								// Skip the default GenerateErrorMessage (we don't want
 								// to forward the backend's 57P01 error) and skip
 								// HandleBackendConnection (backend already destroyed).
@@ -4569,8 +4627,9 @@ handler_again:
 				}
 
 				// query has failed
-				if (processing_extended_query && // we are processing extended query message
-					rc != 1) { // rc == 1 means query is still running, we don't reset the extended_query_frame
+					if (processing_extended_query && // we are processing extended query message
+							rc != 1 && // rc == 1 means query is still running
+							!extended_query_frame_state.waiting_for_client_sync_after_error) {
 					// we discard all pending messages
 					reset_extended_query_frame();
 					// status remains unchanged
@@ -5283,7 +5342,9 @@ void PgSQL_Session::handler_WCD_SS_MCQ_qpo_OK_msg(PtrSize_t* pkt) {
 	client_myds->DSS = STATE_QUERY_SENT_NET;
 	unsigned int nTrx = NumActiveTransactions();
 	const char txn_state = (nTrx ? 'T' : 'I');
-	client_myds->myprot.generate_ok_packet(true, true, qpo->OK_msg, 0, nullptr, txn_state);
+	client_myds->myprot.generate_ok_packet(true,
+		extended_local_result_sends_ready(), qpo->OK_msg, 0, nullptr,
+		txn_state);
 	RequestEnd(NULL, false);
 	l_free(pkt->size, pkt->ptr);
 }
@@ -5291,7 +5352,8 @@ void PgSQL_Session::handler_WCD_SS_MCQ_qpo_OK_msg(PtrSize_t* pkt) {
 // this function as inline in handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY_qpo
 void PgSQL_Session::handler_WCD_SS_MCQ_qpo_error_msg(PtrSize_t* pkt) {
 	client_myds->DSS = STATE_QUERY_SENT_NET;
-	client_myds->myprot.generate_error_packet(true, true, qpo->error_msg, 
+	client_myds->myprot.generate_error_packet(true,
+		extended_local_result_sends_ready(true), qpo->error_msg,
 		PGSQL_ERROR_CODES::ERRCODE_INSUFFICIENT_PRIVILEGE, false);
 	RequestEnd(NULL, true);
 	l_free(pkt->size, pkt->ptr);
@@ -5301,7 +5363,9 @@ void PgSQL_Session::handler_WCD_SS_MCQ_qpo_error_msg(PtrSize_t* pkt) {
 void PgSQL_Session::handler_WCD_SS_MCQ_qpo_LargePacket(PtrSize_t* pkt) {
 	// ER_NET_PACKET_TOO_LARGE
 	client_myds->DSS = STATE_QUERY_SENT_NET;
-	client_myds->myprot.generate_error_packet(true, true, "Got a packet bigger than 'max_allowed_packet' bytes",
+	client_myds->myprot.generate_error_packet(true,
+		extended_local_result_sends_ready(true),
+		"Got a packet bigger than 'max_allowed_packet' bytes",
 		PGSQL_ERROR_CODES::ERRCODE_PROGRAM_LIMIT_EXCEEDED, false);
 	RequestEnd(NULL, true);
 	l_free(pkt->size, pkt->ptr);
@@ -5368,7 +5432,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 
 	auto reject_polardb_internal_set = [&](const std::string& pvar) -> bool {
 		client_myds->DSS = STATE_QUERY_SENT_NET;
-		bool send_ready_packet = is_extended_query_ready_for_query();
+		bool send_ready_packet = extended_local_result_sends_ready(true);
 		std::string msg = "invalid value for proxysql." + pvar;
 		client_myds->myprot.generate_error_packet(true, send_ready_packet,
 			msg.c_str(),
@@ -5380,7 +5444,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 	auto reject_unrecognized_polardb_internal_set =
 		[&](const std::string& pvar) -> bool {
 		client_myds->DSS = STATE_QUERY_SENT_NET;
-		bool send_ready_packet = is_extended_query_ready_for_query();
+		bool send_ready_packet = extended_local_result_sends_ready(true);
 		std::string errmsg = "unrecognized proxysql parameter: proxysql." + pvar;
 		client_myds->myprot.generate_error_packet(true, send_ready_packet,
 			errmsg.c_str(),
@@ -5392,7 +5456,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 	auto reject_polardb_internal_policy =
 		[&](const char* message) -> bool {
 		client_myds->DSS = STATE_QUERY_SENT_NET;
-		const bool send_ready_packet = is_extended_query_ready_for_query();
+		const bool send_ready_packet = extended_local_result_sends_ready(true);
 		client_myds->myprot.generate_error_packet(
 			true, send_ready_packet, message,
 			PGSQL_ERROR_CODES::ERRCODE_INVALID_PARAMETER_VALUE,
@@ -5406,7 +5470,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 		if (extended_query_phase != EXTQ_PHASE_IDLE) {
 			return false;
 		}
-		bool send_ready_packet = is_extended_query_ready_for_query();
+		bool send_ready_packet = extended_local_result_sends_ready(false);
 		unsigned int nTrx = NumActiveTransactions();
 		const char txn_state = (nTrx ? 'T' : 'I');
 		client_myds->myprot.generate_ok_packet(true, send_ready_packet, NULL, 0,
@@ -5630,7 +5694,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 						client_myds->DSS = STATE_QUERY_SENT_NET;
 
 						reset_extended_query_frame();
-						bool send_ready_packet = is_extended_query_ready_for_query();
+						bool send_ready_packet = extended_local_result_sends_ready(true);
 						client_myds->myprot.generate_error_packet(true, send_ready_packet, errmsg,
 							PGSQL_ERROR_CODES::ERRCODE_INVALID_PARAMETER_VALUE, false, true);
 						free(errmsg);
@@ -5723,7 +5787,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 			return false;
 		}
 		
-		bool send_ready_packet = is_extended_query_ready_for_query();
+		bool send_ready_packet = extended_local_result_sends_ready(false);
 		unsigned int nTrx = NumActiveTransactions();
 		const char txn_state = (nTrx ? 'T' : 'I');
 		client_myds->myprot.generate_ok_packet(true, send_ready_packet, NULL, 0, dig, txn_state, NULL, param_status);
@@ -5769,7 +5833,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 			if (!recognized) {
 				std::string errmsg = "unrecognized proxysql parameter: proxysql." + pvar;
 				client_myds->DSS = STATE_QUERY_SENT_NET;
-				bool send_ready_packet = is_extended_query_ready_for_query();
+				bool send_ready_packet = extended_local_result_sends_ready(true);
 				client_myds->myprot.generate_error_packet(true, send_ready_packet,
 					errmsg.c_str(),
 					PGSQL_ERROR_CODES::ERRCODE_INVALID_PARAMETER_VALUE, false, true);
@@ -5777,7 +5841,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 				return true;
 			}
 			client_myds->DSS = STATE_QUERY_SENT_NET;
-			bool send_ready_packet = is_extended_query_ready_for_query();
+			bool send_ready_packet = extended_local_result_sends_ready(false);
 			unsigned int nTrx = NumActiveTransactions();
 			const char txn_state = (nTrx ? 'T' : 'I');
 			client_myds->myprot.generate_ok_packet(true, send_ready_packet, NULL, 0, dig, txn_state, NULL, {});
@@ -5816,7 +5880,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 			reset_extended_query_frame();
 			proxy_error("RESET ALL is not supported in Extended Query protocol mode. Use Simple Query mode to run this command\n");
 			client_myds->DSS = STATE_QUERY_SENT_NET;
-			bool send_ready_packet = is_extended_query_ready_for_query();
+			bool send_ready_packet = extended_local_result_sends_ready(true);
 			client_myds->myprot.generate_error_packet(true, send_ready_packet,
 				"RESET ALL is not supported in pipeline mode",
 				PGSQL_ERROR_CODES::ERRCODE_FEATURE_NOT_SUPPORTED, false, true);
@@ -5912,7 +5976,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 		param_status.clear();
 		return false;
 	}
-	bool send_ready_packet = is_extended_query_ready_for_query();
+	bool send_ready_packet = extended_local_result_sends_ready(false);
 	unsigned int nTrx = NumActiveTransactions();
 	const char txn_state = (nTrx ? 'T' : 'I');
 	client_myds->myprot.generate_ok_packet(true, send_ready_packet, NULL, 0, dig, txn_state, NULL, param_status);
@@ -5967,7 +6031,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 			reset_extended_query_frame();
 			proxy_error("DISCARD ALL is not supported in Extended Query protocol mode. Use Simple Query mode to run this command\n");
 			client_myds->DSS = STATE_QUERY_SENT_NET;
-			bool send_ready_packet = is_extended_query_ready_for_query();
+			bool send_ready_packet = extended_local_result_sends_ready(true);
 			client_myds->myprot.generate_error_packet(true, send_ready_packet,
 				"DISCARD ALL is not supported in pipeline mode",
 				PGSQL_ERROR_CODES::ERRCODE_FEATURE_NOT_SUPPORTED, false, true);
@@ -6006,7 +6070,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 			(CurrentQuery.extended_query_info.flags & PGSQL_EXTENDED_QUERY_FLAG_DESCRIBE_PORTAL) != 0) {
 			client_myds->myprot.generate_no_data_packet(true);
 		}
-		bool send_ready_packet = is_extended_query_ready_for_query();
+		bool send_ready_packet = extended_local_result_sends_ready(false);
 		unsigned int nTrx = NumActiveTransactions();
 		const char txn_state = (nTrx ? 'T' : 'I');
 		client_myds->myprot.generate_ok_packet(true, send_ready_packet, NULL, 0, dig, txn_state, NULL, {});
@@ -6057,7 +6121,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 		(CurrentQuery.extended_query_info.flags & PGSQL_EXTENDED_QUERY_FLAG_DESCRIBE_PORTAL) != 0) {
 		client_myds->myprot.generate_no_data_packet(true);
 	}
-	bool send_ready_packet = is_extended_query_ready_for_query();
+	bool send_ready_packet = extended_local_result_sends_ready(false);
 	unsigned int nTrx = NumActiveTransactions();
 	const char txn_state = (nTrx ? 'T' : 'I');
 	client_myds->myprot.generate_ok_packet(true, send_ready_packet, NULL, 0, dig, txn_state, NULL, {});
@@ -6102,7 +6166,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 
 				bool is_reset_all = (strncasecmp(nq.c_str(), "ALL", 3) == 0);
 				client_myds->DSS = STATE_QUERY_SENT_NET;
-				bool send_ready_packet = is_extended_query_ready_for_query();
+				bool send_ready_packet = extended_local_result_sends_ready(true);
 
 				if (is_reset_all) {
 					// Collect all mismatched variable names for error message
@@ -6199,7 +6263,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 		char* pta[1];
 		pta[0] = (char*)backend_pid.c_str();
 		resultset->add_row(pta);
-		bool send_ready_packet = is_extended_query_ready_for_query();
+		bool send_ready_packet = extended_local_result_sends_ready(false);
 		unsigned int nTxn = NumActiveTransactions();
 		char txn_state = (nTxn ? 'T' : 'I');
 		SQLite3_to_Postgres(client_myds->PSarrayOUT, resultset.get(), nullptr, 0, dig, send_ready_packet, txn_state);
@@ -6216,7 +6280,10 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 	return false;
 }
 
-bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY_qpo(PtrSize_t* pkt, bool* lock_hostgroup, PgSQL_Extended_Query_Type stmt_type) {
+PgSQL_Session::QpoHandlerResult
+PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY_qpo(
+		PtrSize_t* pkt, bool* lock_hostgroup,
+		PgSQL_Extended_Query_Type stmt_type) {
 	/*
 		lock_hostgroup:
 			If this variable is set to true, this session will get lock to a
@@ -6236,20 +6303,26 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_Q
 
 		if (pkt->size > (unsigned int)pgsql_thread___max_allowed_packet) {
 			handler_WCD_SS_MCQ_qpo_LargePacket(pkt);
-			return true;
+			return QpoHandlerResult::ERROR;
 		}
+	}
 
-		if (qpo->error_msg) {
-			handler_WCD_SS_MCQ_qpo_error_msg(pkt);
-			return true;
-		}
+	// Execute has a fresh QPO for the prepared statement. Unlike Parse, query
+	// rewrite and packet-size checks do not apply to its wire packet, but a rule
+	// error must still stop this frame before the Execute reaches a backend.
+	if (qpo->error_msg &&
+			(stmt_type == PGSQL_EXTENDED_QUERY_TYPE_NOT_SET ||
+			 stmt_type == PGSQL_EXTENDED_QUERY_TYPE_PARSE ||
+			 stmt_type == PGSQL_EXTENDED_QUERY_TYPE_EXECUTE)) {
+		handler_WCD_SS_MCQ_qpo_error_msg(pkt);
+		return QpoHandlerResult::ERROR;
 	}
 
 	if (stmt_type == PGSQL_EXTENDED_QUERY_TYPE_NOT_SET ||
 		stmt_type == PGSQL_EXTENDED_QUERY_TYPE_EXECUTE) {
 		if (qpo->OK_msg) {
 			handler_WCD_SS_MCQ_qpo_OK_msg(pkt);
-			return true;
+			return QpoHandlerResult::HANDLED;
 		}
 	}
 
@@ -6268,7 +6341,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_Q
 
 		// Always create a new connection to pass untracked options to the server
 		qpo->create_new_conn = true;
-		return false;
+		return QpoHandlerResult::CONTINUE;
 	}
 
 	// Exit early for specific statement types
@@ -6281,23 +6354,23 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_Q
 	}
 
 	// Handle special commands
-	if (CurrentQuery.QueryParserArgs.digest_text) {
+			if (CurrentQuery.QueryParserArgs.digest_text) {
 		const char* dig = CurrentQuery.QueryParserArgs.digest_text;
 		if (handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_special_commands(dig, lock_hostgroup)) {
 			l_free(pkt->size, pkt->ptr);
-			return true;
+			return QpoHandlerResult::HANDLED;
 		}
 	}
 
 	// Mirror session handling
 	if (mirror) {
 		current_hostgroup = qpo->destination_hostgroup;
-		return false;
+		return QpoHandlerResult::CONTINUE;
 	}
 
 	// Handle KILL command
 	if (handle_command_query_kill(pkt)) {
-		return true;
+		return QpoHandlerResult::HANDLED;
 	}
 
 #if POLARDB_PROXY
@@ -6306,7 +6379,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_Q
 	// destination override: that transaction must not serve from cache or be
 	// routed to a replica by a manual rule.
 	if (polardb_apply_reader_failure_writer_route("QPO")) {
-		return false;
+		return QpoHandlerResult::CONTINUE;
 	}
 #endif // POLARDB_PROXY
 
@@ -6337,7 +6410,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_Q
 
 			RequestEnd(NULL, false);
 			l_free(pkt->size, pkt->ptr);
-			return true;
+			return QpoHandlerResult::HANDLED;
 		}
 	}
 
@@ -6351,22 +6424,6 @@ __exit_set_destination_hostgroup:
 		current_hostgroup = qpo->destination_hostgroup;
 	}
 
-#if POLARDB_PROXY
-	// Extended-protocol requests pick their hostgroup here. Simple queries use the
-	// collect/plan/execute pipeline at dispatch entry. With v15_wait, a target-
-	// bearing Execute may use a replica and carry a protocol wait; metadata phases
-	// stay on the writer unless an implicit Parse is required on that reader.
-	polardb_reconcile_txn_wait_read_request_entry(
-		"query_processor_request_entry_stale");
-	if (stmt_type != PGSQL_EXTENDED_QUERY_TYPE_NOT_SET) {
-		if (polardb_apply_extended_route(stmt_type)) {
-			l_free(pkt->size, pkt->ptr);
-			*pkt = {0, nullptr};
-			return true;
-		}
-	}
-#endif // POLARDB_PROXY
-
 	// Hostgroup locking check
 	if (pgsql_thread___set_query_lock_on_hostgroup == 1 && locked_on_hostgroup >= 0) {
 		if (current_hostgroup != locked_on_hostgroup) {
@@ -6374,19 +6431,46 @@ __exit_set_destination_hostgroup:
 			char buf[140];
 			sprintf(buf, "ProxySQL Error: connection is locked to hostgroup %d but trying to reach hostgroup %d",
 				locked_on_hostgroup, current_hostgroup);
-			client_myds->myprot.generate_error_packet(true, true, buf,
+			client_myds->myprot.generate_error_packet(true,
+				extended_local_result_sends_ready(true), buf,
 				PGSQL_ERROR_CODES::ERRCODE_RAISE_EXCEPTION, false);
 			thread->status_variables.stvar[st_var_hostgroup_locked_queries]++;
 			RequestEnd(NULL, true);
 			l_free(pkt->size, pkt->ptr);
-			return true;
+			return QpoHandlerResult::ERROR;
 		}
 	}
 
-	return false;
+	return QpoHandlerResult::CONTINUE;
 }
 
-#if 0
+#if POLARDB_PROXY
+PgSQL_Session::QpoHandlerResult
+PgSQL_Session::apply_extended_backend_route(PtrSize_t* pkt) {
+	// Local Parse/Describe completions never enter here. Route the operation that
+	// actually claims the backend, then keep the whole extended cycle pinned.
+	// The protocol caller owns the active/route-required gate; do not repeat its
+	// two hot-path branches here.
+
+	// Every destination, including an ordinary hostgroup selected by a manual
+	// query rule, must pass the common request-entry cleanup and accounting.
+	if (polardb_route_query(
+			*pkt, extended_query_frame_state.writer_required)) {
+		return QpoHandlerResult::ERROR;
+	}
+	POLARDB_TRACE(
+		"PolarDB EXTENDED ROUTE: target_hg=%d writer_required=%d "
+		"sess=%p sid=%u frame=%lu\n",
+		current_hostgroup,
+		extended_query_frame_state.writer_required ? 1 : 0,
+		(void*)this, thread_session_id,
+		(unsigned long)polardb_extended_trace_frame_id());
+	extended_query_frame_state.consume_backend_route();
+	return QpoHandlerResult::CONTINUE;
+}
+#endif // POLARDB_PROXY
+
+	#if 0
 void PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_STATISTICS(PtrSize_t* pkt) {
 	proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Got COM_STATISTICS packet\n");
 	l_free(pkt->size, pkt->ptr);
@@ -6769,7 +6853,11 @@ bool PgSQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 					polardb_wait_spec,
 					reader_result.wait_bypass_allowed,
 					polardb_query.reader_plan.fallback_writer_hg);
-				polardb_query.reader_wait_spec.reset();
+				// Extended frames retain the semantic target after Parse so a
+				// replacement reader or later Flush batch must prove it again.
+				if (extended_query_phase == EXTQ_PHASE_IDLE) {
+					polardb_query.reader_wait_spec.reset();
+				}
 				// Keep the selected query policy until RequestEnd. A wait can
 				// still fail after acquisition, and the failure path needs the
 				// stored timeout action to choose writer retry, client error, or
@@ -6919,14 +7007,19 @@ bool PgSQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 		mybe->server_myds->attach_connection(mc);
 		thread->status_variables.stvar[st_var_ConnPool_get_conn_success]++;
 #if POLARDB_PROXY
+		const bool enable_polardb_session =
+			!polardb_config.is_polardb_enabled &&
+			thread->polardb_is_active() &&
+			PgHGM->get_thread_cached_polardb_hg_config(
+				mybe->hostgroup_id).is_polardb_hostgroup;
 		POLARDB_TRACE("PolarDB POOL: session %p got pooled connection for HG %d (mc=%p)\n",
 			this, mybe->hostgroup_id, mc);
 		// A pooled backend is attached without running connect_start(), so the
 		// session PolarDB-enable flag (set there for fresh connects) must be
 		// established here for pooled PolarDB backends — otherwise the
 		// process_result/wait pipeline would never activate on a reused connection.
-		if (!polardb_config.is_polardb_enabled && PgHGM->is_polardb_hostgroup(mybe->hostgroup_id)) {
-			polardb_config.is_polardb_enabled = true;
+		if (enable_polardb_session) {
+			polardb_activate_session_for_request();
 			POLARDB_TRACE("PolarDB POOL: session %p set to PolarDB mode via pooled connection (HG %d)\n",
 				this, mybe->hostgroup_id);
 		}
@@ -6935,12 +7028,17 @@ bool PgSQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 	else {
 		thread->status_variables.stvar[st_var_ConnPool_get_conn_failure]++;
 #if POLARDB_PROXY
+		const bool enable_polardb_session =
+			!polardb_config.is_polardb_enabled &&
+			thread->polardb_is_active() &&
+			PgHGM->get_thread_cached_polardb_hg_config(
+				mybe->hostgroup_id).is_polardb_hostgroup;
 		POLARDB_TRACE("PolarDB POOL: session %p has no pooled connection for HG %d, will create new\n",
 			this, mybe->hostgroup_id);
 		// Fresh-connection path: mark the session PolarDB-enabled up front so the
 		// pipeline is active for this PolarDB hostgroup even before connect_start().
-		if (!polardb_config.is_polardb_enabled && PgHGM->is_polardb_hostgroup(mybe->hostgroup_id)) {
-			polardb_config.is_polardb_enabled = true;
+		if (enable_polardb_session) {
+			polardb_activate_session_for_request();
 			POLARDB_TRACE("PolarDB POOL: session %p set to PolarDB mode via fresh connection (HG %d)\n",
 				this, mybe->hostgroup_id);
 		}
@@ -7304,7 +7402,6 @@ void PgSQL_Session::handle_transaction_state() {
 }
 
 void PgSQL_Session::RequestEnd(PgSQL_Data_Stream* myds, bool called_on_failure) {
-
 	// check if multiplexing needs to be disabled
 	const char* query_digest_text = NULL;
 
@@ -7361,8 +7458,56 @@ void PgSQL_Session::RequestEnd(PgSQL_Data_Stream* myds, bool called_on_failure) 
 
 #if POLARDB_PROXY
 		if (polardb_config.is_polardb_enabled) {
-			polardb_process_result(myds, polardb_query_text,
-				polardb_query_cmd);
+			if (likely(status == PROCESSING_QUERY)) {
+				// Keep the Simple Query completion path out of extended-frame
+				// classification and deferred-RFQ bookkeeping.
+				polardb_process_result(myds, polardb_query_text,
+					polardb_query_cmd);
+			} else {
+				const bool result_has_error =
+					myds->myconn->query_result &&
+					pgsql_query_result_has_error(
+						myds->myconn->query_result->get_result_packet_type());
+				const bool backend_rfq_pending =
+					extended_query_frame_state.active() &&
+					extended_query_frame_state.needs_backend_sync();
+				const bool error_resync_result =
+					extended_query_frame_state.waiting_for_client_sync_after_error;
+				if (error_resync_result) {
+					// The semantic error was handled before internal Sync. Its Sync
+					// result supplies only RFQ evidence and must not be attributed as
+					// a successful Parse/Execute result.
+				} else if (polardb_extended_rfq.pending && !backend_rfq_pending) {
+					// A later Sync-terminated Execute positions every successful
+					// Flush batch before it. Include that final Execute before
+					// applying the one RFQ to the aggregate.
+					if (!result_has_error && status == PROCESSING_STMT_EXECUTE) {
+						polardb_defer_extended_rfq_result(
+							myds, polardb_query_text, polardb_query_cmd);
+					}
+					polardb_prepare_deferred_extended_rfq();
+					polardb_process_deferred_extended_rfq(myds);
+				} else if (backend_rfq_pending) {
+					// Flush returned the semantic result, but libpq still exposes
+					// the previous RFQ. Only Execute contributes result attribution;
+					// Parse/Describe are retained by the normal extended state.
+					if (!result_has_error && status == PROCESSING_STMT_EXECUTE) {
+						polardb_defer_extended_rfq_result(
+							myds, polardb_query_text, polardb_query_cmd);
+					}
+				} else {
+					polardb_process_result(myds, polardb_query_text,
+						polardb_query_cmd);
+				}
+				if (extended_query_frame_state.frontend_ready_sent() &&
+						polardb_extended_rfq.publication_pending &&
+						!polardb_extended_rfq.pending) {
+					// The backend-owned Sync RFQ was generated before RequestEnd().
+					// Attribution is now consumed, so end its independent publication
+					// lifetime at the same extended-request boundary.
+					polardb_complete_deferred_extended_rfq_publication();
+				}
+			}
 		}
 #endif // POLARDB_PROXY
 
@@ -7383,6 +7528,11 @@ void PgSQL_Session::RequestEnd(PgSQL_Data_Stream* myds, bool called_on_failure) 
 	LogQuery(myds);
 
 __cleanup:
+	// An implicit Parse can retry through transport setup, but a terminal request
+	// must never leak its logical Execute/Describe continuation to the next query.
+	if (unlikely(has_implicit_prepare())) {
+		clear_implicit_prepare();
+	}
 
 #if POLARDB_PROXY
 
@@ -7714,7 +7864,7 @@ void PgSQL_Session::send_parameter_error_response(const char* error_message, PGS
 		(error_message ? error_message : "parameter error") + "\"";
 	client_myds->setDSS_STATE_QUERY_SENT_NET();
 	// Generate and send error packet using PostgreSQL protocol
-	client_myds->myprot.generate_error_packet(true, is_extended_query_ready_for_query(), 
+	client_myds->myprot.generate_error_packet(true, extended_local_result_sends_ready(true),
 		full_error.c_str(), error_code, false, true);
 	
 	RequestEnd(NULL, true);
@@ -7732,7 +7882,7 @@ bool PgSQL_Session::handle_kill_success(int32_t pid, int tki, const char* digest
 	char* pta[1];
 	pta[0] = (char*)"t";
 	resultset->add_row(pta);
-	bool send_ready_packet = is_extended_query_ready_for_query();
+	bool send_ready_packet = extended_local_result_sends_ready(false);
 	unsigned int nTxn = NumActiveTransactions();
 	char txn_state = (nTxn ? 'T' : 'I');
 	SQLite3_to_Postgres(client_myds->PSarrayOUT, resultset.get(), nullptr, 0, digest_text, send_ready_packet, txn_state);
@@ -7793,7 +7943,15 @@ void PgSQL_Session::finishQuery(PgSQL_Data_Stream* myds, PgSQL_Connection* mycon
 	const bool conn_is_reusable = myds->myconn->reusable == true && !is_active_transaction && multiplex_disabled;
 
 	if (pgsql_thread___multiplexing && conn_is_reusable) {
-		if ((pgsql_thread___connection_delay_multiplex_ms || multiplex_delayed_with_timeout) && mirror == false) {
+		if (unlikely(sticky_backend_connection == true)) {
+			// An unfinished extended frame owns this backend until its Sync.
+			// Delayed multiplexing is a pool policy and cannot override protocol
+			// ownership after Execute+Flush exposed a result.
+			myconn->async_state_machine = ASYNC_IDLE;
+			myds->DSS = STATE_MARIADB_GENERIC;
+			myds->wait_until = 0;
+			myconn->multiplex_delayed = false;
+		} else if ((pgsql_thread___connection_delay_multiplex_ms || multiplex_delayed_with_timeout) && mirror == false) {
 			if (multiplex_delayed_with_timeout) {
 				uint64_t delay_multiplex_us = pgsql_thread___connection_delay_multiplex_ms * 1000;
 				uint64_t auto_increment_delay_us = pgsql_thread___auto_increment_delay_multiplex_timeout_ms * 1000;
@@ -7807,11 +7965,6 @@ void PgSQL_Session::finishQuery(PgSQL_Data_Stream* myds, PgSQL_Connection* mycon
 			myconn->async_state_machine = ASYNC_IDLE;
 			myconn->multiplex_delayed = true;
 			myds->DSS = STATE_MARIADB_GENERIC;
-		} else if (sticky_backend_connection == true) {
-			myconn->async_state_machine = ASYNC_IDLE;
-			myds->DSS = STATE_MARIADB_GENERIC;
-			myds->wait_until = 0;
-			myconn->multiplex_delayed = false;
 		} else {
 			// CONNECTION BEING DETACHED - Reset transaction state
 			// This handles: (1) normal pool return, (2) pipeline reset, (3) connection destroyed
@@ -8090,9 +8243,126 @@ void PgSQL_Session::switch_fast_forward_to_normal_mode() {
 	}
 }
 
+bool PgSQL_Session::extended_local_result_sends_ready(bool ends_frame) {
+	const bool owns_extended_ready =
+		extended_query_frame_state.active() ||
+		(extended_query_phase &
+			(EXTQ_PHASE_EXECUTING_SYNC_CLIENT |
+			 EXTQ_PHASE_EXECUTING_SYNC_IMPLICIT)) != 0;
+	if (likely(!owns_extended_ready)) {
+		// Simple and other idle local responses own their RFQ directly. They must
+		// not create or retain extended-frame Sync state.
+		return true;
+	}
+	if (ends_frame) {
+		extended_query_frame_state.mark_error_waiting_for_sync();
+	}
+	if (extended_query_frame_state.frontend_ready_sent()) {
+		return false;
+	}
+	const bool client_sync_received = extended_client_sync_received();
+	const bool send_ready = ends_frame
+		? client_sync_received &&
+			!extended_query_frame_state.needs_backend_sync()
+		: is_extended_query_ready_for_query();
+	if (!send_ready) {
+		return false;
+	}
+	extended_query_frame_state.mark_frontend_ready_sent();
+	return true;
+}
+
+bool PgSQL_Session::extended_backend_result_sends_ready(bool has_error) {
+	if (extended_query_frame_state.frontend_ready_sent()) {
+		return false;
+	}
+	const bool client_sync_received = extended_client_sync_received();
+	const bool send_ready = has_error
+		? client_sync_received &&
+			!extended_query_frame_state.needs_backend_sync()
+		: is_extended_query_ready_for_query();
+	if (!send_ready) {
+		return false;
+	}
+	extended_query_frame_state.mark_frontend_ready_sent();
+	return true;
+}
+
+bool PgSQL_Session::emit_extended_ready_for_query(
+		PgSQL_Connection* backend_conn, char transaction_state_override) {
+	if (!extended_client_sync_received() ||
+			(extended_query_phase & EXTQ_PHASE_EXECUTING_SYNC_IMPLICIT) != 0 ||
+			extended_query_frame_state.frontend_ready_sent() ||
+			extended_query_frame_state.needs_backend_sync()) {
+		return false;
+	}
+#if POLARDB_PROXY
+	const bool deferred_policy_prepared = unlikely(
+		polardb_extended_rfq.pending ||
+		polardb_extended_rfq.publication_pending);
+	const bool complete_deferred_publication = deferred_policy_prepared &&
+		polardb_prepare_deferred_extended_rfq();
+#endif // POLARDB_PROXY
+	client_myds->setDSS_STATE_QUERY_SENT_NET();
+	// A poisoned extended frame has deliberately outlived its failed backend.
+	// Keep the transaction truth at the central RFQ boundary instead of asking
+	// each later-Sync caller to rediscover why the backend is absent.
+	const char txn_state = transaction_state_override != 0
+		? transaction_state_override
+		: (backend_conn ? backend_conn->get_transaction_status_char()
+			: (tx_poisoned ? 'E'
+				: (NumActiveTransactions() > 0 ? 'T' : 'I')));
+	bool include_client_lsn = false;
+	uint64_t client_lsn = 0;
+#if POLARDB_PROXY
+	// Normal Sync reads RFQ/LSN evidence from its attached backend. Error+Flush
+	// releases that backend during internal resynchronization, so the later client
+	// Sync can publish only the RFQ values retained from that exact response.
+	if (backend_conn ||
+			(deferred_policy_prepared &&
+				polardb_extended_rfq.rfq_evidence.valid)) {
+		const bool backend_payload_present = backend_conn &&
+			backend_conn->has_polardb_lsn_payload();
+		const uint64_t backend_lsn = backend_payload_present
+			? backend_conn->get_polardb_lsn() : 0;
+		include_client_lsn = polardb_prepare_client_ready_lsn(
+			backend_conn, backend_payload_present, backend_lsn,
+				&client_lsn, deferred_policy_prepared
+					? PolarDB_DeferredRfqPolicy::PREPARED
+					: PolarDB_DeferredRfqPolicy::NONE);
+	}
+#else
+	(void)backend_conn;
+#endif // POLARDB_PROXY
+#if POLARDB_PROXY && POLARDB_DEBUG
+	if (extended_query_frame_state.active()) {
+		POLARDB_TRACE(
+			"PolarDB EXTENDED RFQ: emit txn=%c deferred=%d backend=%d "
+			"retained=%d include_lsn=%d lsn=%lu sess=%p sid=%u frame=%lu\n",
+			txn_state, deferred_policy_prepared ? 1 : 0,
+			backend_conn ? 1 : 0,
+			polardb_extended_rfq.rfq_evidence.valid ? 1 : 0,
+			include_client_lsn ? 1 : 0,
+			(unsigned long)client_lsn,
+			(void*)this, thread_session_id,
+			(unsigned long)polardb_extended_trace_frame_id());
+	}
+#endif // POLARDB_PROXY && POLARDB_DEBUG
+	client_myds->myprot.generate_ready_for_query_packet(
+		true, txn_state, nullptr, include_client_lsn, client_lsn);
+#if POLARDB_PROXY
+	if (complete_deferred_publication) {
+		polardb_complete_deferred_extended_rfq_publication();
+	}
+#endif // POLARDB_PROXY
+	extended_query_frame_state.mark_frontend_ready_sent();
+	return true;
+}
+
 void PgSQL_Session::handle_post_sync_error(PGSQL_ERROR_CODES errcode, const char* errmsg, bool fatal) {
 	client_myds->setDSS_STATE_QUERY_SENT_NET();
-	client_myds->myprot.generate_error_packet(true, true, errmsg, errcode, fatal, true);
+	client_myds->myprot.generate_error_packet(true,
+		extended_local_result_sends_ready(true), errmsg, errcode, fatal, true);
 	client_myds->DSS = STATE_SLEEP;
 	status = WAITING_CLIENT_DATA;
 }
@@ -8109,7 +8379,9 @@ void PgSQL_Session::handle_post_sync_locked_on_hostgroup_error(const char* query
 	const char* err_msg = "Session trying to reach HG %d while locked on HG %d . Rejecting query: %s%s";
 	char* buf = (char*)malloc(strlen(err_msg) + strlen(nqn.c_str()) + strlen(end) + 64);
 	sprintf(buf, err_msg, current_hostgroup, locked_on_hostgroup, nqn.c_str(), end);
-	client_myds->myprot.generate_error_packet(true, true, buf, PGSQL_ERROR_CODES::ERRCODE_RAISE_EXCEPTION,
+	client_myds->myprot.generate_error_packet(true,
+		extended_local_result_sends_ready(true), buf,
+		PGSQL_ERROR_CODES::ERRCODE_RAISE_EXCEPTION,
 		false, true);
 	free(buf);
 	thread->status_variables.stvar[st_var_hostgroup_locked_queries]++;
@@ -8123,6 +8395,9 @@ int PgSQL_Session::handle_post_sync_parse_message(PgSQL_Parse_Message* parse_msg
 
 	bool lock_hostgroup = false;
 	const PgSQL_Parse_Data& parse_data = parse_msg->data();
+	if (unlikely(!note_extended_backend_candidate())) {
+		return reject_extended_frame_accounting("Parse");
+	}
 	PgSQL_Extended_Query_Info& extended_query_info = CurrentQuery.extended_query_info;
 
 	CurrentQuery.begin((unsigned char*)parse_data.query_string, strlen(parse_data.query_string) + 1, false);
@@ -8170,10 +8445,13 @@ int PgSQL_Session::handle_post_sync_parse_message(PgSQL_Parse_Message* parse_msg
 
 	if (extended_query_exec_qp) {
 		// setting 'prepared' to prevent fetching results from the cache if the digest matches
-		bool handled_in_handler = handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY_qpo(&parse_pkt, &lock_hostgroup, PGSQL_EXTENDED_QUERY_TYPE_PARSE);
-		if (handled_in_handler == true) {
+		const QpoHandlerResult qpo_result =
+			handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY_qpo(
+				&parse_pkt, &lock_hostgroup,
+				PGSQL_EXTENDED_QUERY_TYPE_PARSE);
+		if (qpo_result != QpoHandlerResult::CONTINUE) {
 			// parse_pkt memory is already freed in the handler
-			return 0;
+			return qpo_result == QpoHandlerResult::ERROR ? 2 : 0;
 		}
 		extended_query_exec_qp = false; // reset the flag, we have processed the query and destination_hostgroup is set
 	} else {
@@ -8184,34 +8462,28 @@ int PgSQL_Session::handle_post_sync_parse_message(PgSQL_Parse_Message* parse_msg
 
 		if (parse_pkt.size > (unsigned int)pgsql_thread___max_allowed_packet) {
 			handler_WCD_SS_MCQ_qpo_LargePacket(&parse_pkt);
-			return 0;
+			return 2;
 		}
 
 		if (qpo->error_msg) {
 			handler_WCD_SS_MCQ_qpo_error_msg(&parse_pkt);
-			return 0;
+			return 2;
 		}
 
-		assert(previous_hostgroup != -1); // previous_hostgroup should be set before 
-		current_hostgroup = previous_hostgroup; // reset current hostgroup to previous hostgroup
-		proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Session=%p client_myds=%p. Using previous hostgroup '%d'\n",
-			this, client_myds, previous_hostgroup);
+		current_hostgroup = extended_qpo_target_hostgroup(
+			qpo->destination_hostgroup);
+		if (unlikely(current_hostgroup < 0)) {
+			l_free(parse_pkt.size, parse_pkt.ptr);
+			return reject_extended_missing_hostgroup();
+		}
+		proxy_debug(PROXY_DEBUG_MYSQL_COM, 5,
+			"Session=%p client_myds=%p. Using previous hostgroup '%d'\n",
+			this, client_myds, current_hostgroup);
 	}
-
-	if (pgsql_thread___set_query_lock_on_hostgroup == 1) {
-		if (locked_on_hostgroup < 0) {
-			if (lock_hostgroup) {
-				// we are locking on hostgroup now
-				locked_on_hostgroup = current_hostgroup;
-			}
-		}
-		if (locked_on_hostgroup >= 0) {
-			if (current_hostgroup != locked_on_hostgroup) {
-				handle_post_sync_locked_on_hostgroup_error((const char*)CurrentQuery.QueryPointer, CurrentQuery.QueryLength);
-				l_free(parse_pkt.size, parse_pkt.ptr);
-				return 2;
-			}
-		}
+	if (unlikely(!select_extended_frame_hostgroup(current_hostgroup))) {
+		const int result = reject_extended_frame_hostgroup(current_hostgroup);
+		l_free(parse_pkt.size, parse_pkt.ptr);
+		return result;
 	}
 
 	// If a client provides a statement name that already exists in the local map,
@@ -8260,7 +8532,7 @@ int PgSQL_Session::handle_post_sync_parse_message(PgSQL_Parse_Message* parse_msg
 			extended_query_info.stmt_global_id = local_stmt_info->statement_id;
 			client_myds->setDSS_STATE_QUERY_SENT_NET();
 			char txn_state = NumActiveTransactions() > 0 ? 'T' : 'I';
-			bool send_ready_packet = is_extended_query_ready_for_query();
+			bool send_ready_packet = extended_local_result_sends_ready(false);
 			client_myds->myprot.generate_parse_completion_packet(true, send_ready_packet, txn_state);
 			RequestEnd(NULL, false);
 			l_free(parse_pkt.size, parse_pkt.ptr);
@@ -8275,15 +8547,12 @@ int PgSQL_Session::handle_post_sync_parse_message(PgSQL_Parse_Message* parse_msg
 	// ----------------------------------------------------------------------
 	auto stmt_info = GloPgStmt->find_prepared_statement_by_hash(hash);
 	if (stmt_info) {
-		std::shared_ptr<const PgSQL_STMT_Global_info>* local_stmt_info_ptr = nullptr;
-		if (local_stmt_info_itr != local_stmts->stmt_name_to_global_info.end()) {
-			local_stmt_info_ptr = &local_stmt_info_itr->second;  // reference to shared_ptr inside map
-		}
-		local_stmts->client_insert(stmt_info, client_stmt_name, local_stmt_info_ptr);
+		local_stmts->client_insert_at(
+			stmt_info, client_stmt_name, local_stmt_info_itr);
 		extended_query_info.stmt_global_id = stmt_info->statement_id;
 		client_myds->setDSS_STATE_QUERY_SENT_NET();
 		char txn_state = NumActiveTransactions() > 0 ? 'T' : 'I';
-		bool send_ready_packet = is_extended_query_ready_for_query();
+		bool send_ready_packet = extended_local_result_sends_ready(false);
 		client_myds->myprot.generate_parse_completion_packet(true, send_ready_packet, txn_state);
 		RequestEnd(NULL, false);
 		l_free(parse_pkt.size, parse_pkt.ptr);
@@ -8295,21 +8564,50 @@ int PgSQL_Session::handle_post_sync_parse_message(PgSQL_Parse_Message* parse_msg
 	//    Clean up the old entry before creating a new global statement later.
 	// ----------------------------------------------------------------------
 	if (local_stmt_info_itr != local_stmts->stmt_name_to_global_info.end()) {
-		auto& local_stmt_info = local_stmt_info_itr->second;
-
-		// Decrement global reference and remove stale local pointer
-		if (local_stmt_info) {
-			GloPgStmt->ref_count_client(local_stmt_info.get(), -1);
-			local_stmt_info.reset();
-		}
-		local_stmts->stmt_name_to_global_info.erase(local_stmt_info_itr);
+		local_stmts->client_close_at(local_stmt_info_itr);
 	}
 
-	if (extended_query_frame.empty() == true) {
+	if (!enforce_extended_query_hostgroup_lock(lock_hostgroup,
+			(const char*)CurrentQuery.QueryPointer,
+			CurrentQuery.QueryLength)) {
+		l_free(parse_pkt.size, parse_pkt.ptr);
+		return 2;
+	}
+
+	bool routed_backend = false;
+#if POLARDB_PROXY
+	routed_backend = extended_query_frame_state.route_required();
+	if (routed_backend) {
+		const QpoHandlerResult route_result =
+			apply_extended_backend_route(&parse_pkt);
+		if (route_result == QpoHandlerResult::ERROR) {
+			l_free(parse_pkt.size, parse_pkt.ptr);
+			return 2;
+		}
+	}
+#endif // POLARDB_PROXY
+	if (routed_backend &&
+			unlikely(!select_extended_frame_hostgroup(current_hostgroup))) {
+		const int result = reject_extended_frame_hostgroup(current_hostgroup);
+		l_free(parse_pkt.size, parse_pkt.ptr);
+		return result;
+	}
+
+	const bool sends_sync = should_send_extended_backend_sync();
+	if (sends_sync) {
 		extended_query_info.flags |= PGSQL_EXTENDED_QUERY_FLAG_SYNC;
 	}
+	mark_extended_backend_dispatch(extended_query_info,
+		/*snapshot_capable=*/true);
 
-	// Fallback: forward to backend
+	// Fallback: forward to backend. From this point the Sync frame owns this
+	// backend until its pipeline completes or is explicitly resynchronized.
+	if (!can_claim_extended_frame_backend()) {
+		handle_post_sync_error(PGSQL_ERROR_CODES::ERRCODE_RAISE_EXCEPTION,
+			"extended query frame cannot switch backend hostgroups", false);
+		l_free(parse_pkt.size, parse_pkt.ptr);
+		return 2;
+	}
 	mybe = find_or_create_backend(current_hostgroup);
 
 	// set query retries
@@ -8377,7 +8675,8 @@ int PgSQL_Session::handle_post_sync_describe_message(PgSQL_Describe_Message* des
 			}
 		}
 
-		portal_name = describe_data.stmt_name; // currently only supporting unanmed portals
+		// Named portals were rejected above; this is the supported unnamed portal.
+		portal_name = describe_data.stmt_name;
 		stmt_client_name = bind_waiting_for_execute->data().stmt_name; // data() will always be a valid pointer
 		assert(strcmp(portal_name, bind_waiting_for_execute->data().portal_name) == 0); // portal name should match the one in bind_waiting_for_execute 
 		break;
@@ -8388,9 +8687,16 @@ int PgSQL_Session::handle_post_sync_describe_message(PgSQL_Describe_Message* des
 		assert(0); // Invalid statement type, should never happen
 	}
 	assert(stmt_client_name);
+	if (unlikely(!note_extended_backend_candidate())) {
+		return reject_extended_frame_accounting("Describe");
+	}
 
-	// Look up an existing local statement info for client-provided statement name
-	const PgSQL_STMT_Global_info* stmt_info = client_myds->myconn->local_stmts->find_stmt_info_from_stmt_name(stmt_client_name);
+	// A portal describes the statement captured by Bind. Statement Describe
+	// still resolves the current client-name mapping.
+	const PgSQL_STMT_Global_info* stmt_info = stmt_type == 'P'
+		? bind_waiting_for_execute.statement_info()
+		: client_myds->myconn->local_stmts->
+			find_stmt_info_from_stmt_name(stmt_client_name);
 	if (!stmt_info) {
 		const std::string& errmsg = stmt_client_name[0] != '\0' ? ("prepared statement \"" + std::string(stmt_client_name) + "\" does not exist") :
 			"unnamed prepared statement does not exist";
@@ -8429,41 +8735,67 @@ int PgSQL_Session::handle_post_sync_describe_message(PgSQL_Describe_Message* des
 	// setting 'prepared' to prevent fetching results from the cache if the digest matches
 	if (extended_query_exec_qp) {
 		auto describe_pkt = describe_msg->get_raw_pkt(); 
-		bool handled_in_handler = handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY_qpo(&describe_pkt,
-			&lock_hostgroup, PGSQL_EXTENDED_QUERY_TYPE_DESCRIBE);
-		if (handled_in_handler == true) {
+		const QpoHandlerResult qpo_result =
+			handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY_qpo(
+				&describe_pkt, &lock_hostgroup,
+				PGSQL_EXTENDED_QUERY_TYPE_DESCRIBE);
+		if (qpo_result != QpoHandlerResult::CONTINUE) {
 			// describe_pkt memory is already freed in the handler
 			// we can detach the describe_msg now
 			describe_msg->detach();
-			return 0;
+			return qpo_result == QpoHandlerResult::ERROR ? 2 : 0;
 		}
 		extended_query_exec_qp = false;
 	} else {
-		assert(previous_hostgroup != -1); // previous_hostgroup should be set before 
-		current_hostgroup = previous_hostgroup; // reset current hostgroup to previous hostgroup
-		proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Session=%p client_myds=%p. Using previous hostgroup '%d'\n",
-			this, client_myds, previous_hostgroup);
-	}
-	if (pgsql_thread___set_query_lock_on_hostgroup == 1) {
-		if (locked_on_hostgroup < 0) {
-			if (lock_hostgroup) {
-				// we are locking on hostgroup now
-				locked_on_hostgroup = current_hostgroup;
-			}
+		current_hostgroup = extended_qpo_target_hostgroup(
+			qpo->destination_hostgroup);
+		if (unlikely(current_hostgroup < 0)) {
+			return reject_extended_missing_hostgroup();
 		}
-		if (locked_on_hostgroup >= 0) {
-			if (current_hostgroup != locked_on_hostgroup) {
-				handle_post_sync_locked_on_hostgroup_error(CurrentQuery.extended_query_info.stmt_info->query, 
-					CurrentQuery.extended_query_info.stmt_info->query_length);
-				return 2;
-			}
-		}
+		proxy_debug(PROXY_DEBUG_MYSQL_COM, 5,
+			"Session=%p client_myds=%p. Using previous hostgroup '%d'\n",
+			this, client_myds, current_hostgroup);
 	}
-	
-	if (extended_query_frame.empty() == true) {
-		extended_query_info.flags |= PGSQL_EXTENDED_QUERY_FLAG_SYNC;
+	if (unlikely(!select_extended_frame_hostgroup(current_hostgroup))) {
+		return reject_extended_frame_hostgroup(current_hostgroup);
 	}
 
+	if (!enforce_extended_query_hostgroup_lock(lock_hostgroup,
+			CurrentQuery.extended_query_info.stmt_info->query,
+			CurrentQuery.extended_query_info.stmt_info->query_length)) {
+		return 2;
+	}
+
+	bool routed_backend = false;
+#if POLARDB_PROXY
+	routed_backend = extended_query_frame_state.route_required();
+	if (routed_backend) {
+		auto describe_route_pkt = describe_msg->get_raw_pkt();
+		const QpoHandlerResult route_result =
+			apply_extended_backend_route(&describe_route_pkt);
+		if (route_result == QpoHandlerResult::ERROR) {
+			auto failed_pkt = describe_msg->detach();
+			l_free(failed_pkt.size, failed_pkt.ptr);
+			return 2;
+		}
+	}
+#endif // POLARDB_PROXY
+	if (routed_backend &&
+			unlikely(!select_extended_frame_hostgroup(current_hostgroup))) {
+		return reject_extended_frame_hostgroup(current_hostgroup);
+	}
+	const bool sends_sync = should_send_extended_backend_sync();
+	if (sends_sync) {
+		extended_query_info.flags |= PGSQL_EXTENDED_QUERY_FLAG_SYNC;
+	}
+	mark_extended_backend_dispatch(extended_query_info,
+		/*snapshot_capable=*/false);
+
+	if (!can_claim_extended_frame_backend()) {
+		handle_post_sync_error(PGSQL_ERROR_CODES::ERRCODE_RAISE_EXCEPTION,
+			"extended query frame cannot switch backend hostgroups", false);
+		return 2;
+	}
 	mybe = find_or_create_backend(current_hostgroup);
 
 	// set query retries
@@ -8499,11 +8831,11 @@ int PgSQL_Session::handle_post_sync_close_message(PgSQL_Close_Message* close_msg
 	switch (stmt_type) {
 	case 'P': // Portal
 		if (close_data.stmt_name[0] != '\0') {
-			// we don't support unnamed portals yet
+			// Named portals are unsupported; the unnamed portal is handled below.
 			handle_post_sync_error(PGSQL_ERROR_CODES::ERRCODE_FEATURE_NOT_SUPPORTED, "only unnamed portals are supported", false);
 			return 2;
 		}
-		bind_waiting_for_execute.reset(nullptr); // release the ownership of the bind message
+		bind_waiting_for_execute.reset(); // release the bound portal
 		break;
 	case 'S': // Statement
 		client_myds->myconn->local_stmts->client_close(close_data.stmt_name);
@@ -8515,7 +8847,7 @@ int PgSQL_Session::handle_post_sync_close_message(PgSQL_Close_Message* close_msg
 	client_myds->setDSS_STATE_QUERY_SENT_NET();
 	unsigned int nTxn = NumActiveTransactions();
 	char txn_state = (nTxn ? 'T' : 'I');
-	bool send_ready_packet = is_extended_query_ready_for_query();
+	bool send_ready_packet = extended_local_result_sends_ready(false);
 	client_myds->myprot.generate_close_completion_packet(true, send_ready_packet, txn_state);
 	client_myds->DSS = STATE_SLEEP;
 	status = WAITING_CLIENT_DATA;
@@ -8533,13 +8865,17 @@ int PgSQL_Session::handle_post_sync_bind_message(PgSQL_Bind_Message* bind_msg) {
 	const char* stmt_client_name = bind_data.stmt_name;
 
 	if (portal_name[0] != '\0') {
-		// we don't support portals yet
+		// Named portals are unsupported; the unnamed portal is handled below.
 		handle_post_sync_error(PGSQL_ERROR_CODES::ERRCODE_FEATURE_NOT_SUPPORTED, "only unnamed portals are supported", false);
 		return 2;
 	}
 	
-	// Look up an existing local statement info for client-provided statement name
-	const PgSQL_STMT_Global_info* stmt_info = client_myds->myconn->local_stmts->find_stmt_info_from_stmt_name(stmt_client_name);
+	// Bind records statement identity without touching shared ownership. If a
+	// later Parse/Close removes this map entry, PgSQL_STMT_Local transfers that
+	// existing owner into the portal at the release boundary.
+	const PgSQL_STMT_Global_info* stmt_info =
+		client_myds->myconn->local_stmts->find_stmt_info_from_stmt_name(
+			stmt_client_name);
 	if (!stmt_info) {
 		const std::string& errmsg = stmt_client_name[0] != '\0' ? ("prepared statement \"" + std::string(stmt_client_name) + "\" does not exist") :
 			"unnamed prepared statement does not exist";
@@ -8575,42 +8911,43 @@ int PgSQL_Session::handle_post_sync_bind_message(PgSQL_Bind_Message* bind_msg) {
 	
 		auto bind_pkt = bind_msg->get_raw_pkt();
 
-		bool handled_in_handler = handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY_qpo(&bind_pkt,
-			&lock_hostgroup, PGSQL_EXTENDED_QUERY_TYPE_BIND);
-		if (handled_in_handler == true) {
+		const QpoHandlerResult qpo_result =
+			handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY_qpo(
+				&bind_pkt, &lock_hostgroup,
+				PGSQL_EXTENDED_QUERY_TYPE_BIND);
+		if (qpo_result != QpoHandlerResult::CONTINUE) {
 			// bind_msg now has dangling pointer to bind_pkt, which is already freed in the handler
 			bind_msg->detach(); // detach the packet from the bind message
-			return 0;
+			return qpo_result == QpoHandlerResult::ERROR ? 2 : 0;
 		}
 		extended_query_exec_qp = false;
 	} else {
-		assert(previous_hostgroup != -1); // previous_hostgroup should be set before 
-		current_hostgroup = previous_hostgroup; // reset current hostgroup to previous hostgroup
+		current_hostgroup = extended_qpo_target_hostgroup(
+			qpo->destination_hostgroup);
+		if (unlikely(current_hostgroup < 0)) {
+			return reject_extended_missing_hostgroup();
+		}
 		proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Session=%p client_myds=%p. Using previous hostgroup '%d'\n",
-			this, client_myds, previous_hostgroup);
+			this, client_myds, current_hostgroup);
+	}
+	if (unlikely(!select_extended_frame_hostgroup(current_hostgroup))) {
+		return reject_extended_frame_hostgroup(current_hostgroup);
 	}
 
-	if (pgsql_thread___set_query_lock_on_hostgroup == 1) {
-		if (locked_on_hostgroup < 0) {
-			if (lock_hostgroup) {
-				// we are locking on hostgroup now
-				locked_on_hostgroup = current_hostgroup;
-			}
-		}
-		if (locked_on_hostgroup >= 0) {
-			if (current_hostgroup != locked_on_hostgroup) {
-				handle_post_sync_locked_on_hostgroup_error(CurrentQuery.extended_query_info.stmt_info->query,
-					CurrentQuery.extended_query_info.stmt_info->query_length);
-				return 2;
-			}
-		}
+	if (!enforce_extended_query_hostgroup_lock(lock_hostgroup,
+			CurrentQuery.extended_query_info.stmt_info->query,
+			CurrentQuery.extended_query_info.stmt_info->query_length)) {
+		return 2;
 	}
 
-	bind_waiting_for_execute.reset(bind_msg->release()); // release the ownership of the bind message
+	// PostgreSQL binds a portal to this statement identity now. A later Parse
+	// may replace the same client name, but it must not retarget this portal.
+	bind_waiting_for_execute.capture(
+		bind_msg->release(), stmt_info);
 	client_myds->setDSS_STATE_QUERY_SENT_NET();
 	unsigned int nTxn = NumActiveTransactions();
 	char txn_state = (nTxn ? 'T' : 'I');
-	bool send_ready_packet = is_extended_query_ready_for_query();
+	bool send_ready_packet = extended_local_result_sends_ready(false);
 	client_myds->myprot.generate_bind_completion_packet(true, send_ready_packet, txn_state);
 	client_myds->DSS = STATE_SLEEP;
 	status = WAITING_CLIENT_DATA;
@@ -8624,6 +8961,9 @@ int PgSQL_Session::handle_post_sync_execute_message(PgSQL_Execute_Message* execu
 
 	bool lock_hostgroup = false;
 	const PgSQL_Execute_Data& execute_data = execute_msg->data();
+	if (unlikely(!note_extended_backend_candidate())) {
+		return reject_extended_frame_accounting("Execute");
+	}
 
 	if (execute_data.portal_name[0] != '\0') {
 		// we don't support named portals yet
@@ -8642,8 +8982,10 @@ int PgSQL_Session::handle_post_sync_execute_message(PgSQL_Execute_Message* execu
 	// bind_waiting_for_execute will be released on CurrentQuery.end() call or session destory
 	const char* stmt_client_name = bind_waiting_for_execute->data().stmt_name;
 
-	// Look up an existing local statement info for client-provided statement name
-	const PgSQL_STMT_Global_info* stmt_info = client_myds->myconn->local_stmts->find_stmt_info_from_stmt_name(stmt_client_name);
+	// Execute the statement captured by Bind, not whichever statement currently
+	// occupies the same client name after an unnamed Parse replacement.
+	const PgSQL_STMT_Global_info* stmt_info =
+		bind_waiting_for_execute.statement_info();
 	if (!stmt_info) {
 		const std::string& errmsg = stmt_client_name[0] != '\0' ? ("prepared statement \"" + std::string(stmt_client_name) + "\" does not exist") :
 			"unnamed prepared statement does not exist";
@@ -8660,6 +9002,9 @@ int PgSQL_Session::handle_post_sync_execute_message(PgSQL_Execute_Message* execu
 	extended_query_info.flags |= execute_msg->send_describe_portal_result ? 
 		PGSQL_EXTENDED_QUERY_FLAG_DESCRIBE_PORTAL : PGSQL_EXTENDED_QUERY_FLAG_NONE;
 	CurrentQuery.start_time = thread->curtime;
+	// Execute reuses the command classification captured when Parse was planned.
+	// Consistency routing must see locking SELECT and transaction commands too.
+	CurrentQuery.PgQueryCmd = stmt_info->PgQueryCmd;
 
 	timespec begint;
 	timespec endt;
@@ -8691,23 +9036,32 @@ int PgSQL_Session::handle_post_sync_execute_message(PgSQL_Execute_Message* execu
 	if (extended_query_exec_qp) {
 		auto execute_pkt = execute_msg->get_raw_pkt(); // detach the packet from the describe message
 		// setting 'prepared' to prevent fetching results from the cache if the digest matches
-		bool handled_in_handler = handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY_qpo(&execute_pkt, &lock_hostgroup,
-			PGSQL_EXTENDED_QUERY_TYPE_EXECUTE);
-		if (handled_in_handler == true) {
+		const QpoHandlerResult qpo_result =
+			handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY_qpo(
+				&execute_pkt, &lock_hostgroup,
+				PGSQL_EXTENDED_QUERY_TYPE_EXECUTE);
+		if (qpo_result != QpoHandlerResult::CONTINUE) {
 			// execute_pkt memory is already freed in the handler
 			execute_msg->detach(); // detach the packet from the execute message
-			return 0;
+			return qpo_result == QpoHandlerResult::ERROR ? 2 : 0;
 		}
 		extended_query_exec_qp = false;
 	} else {
-		
+		// Execute always has a freshly computed QPO, even when routing reuses the
+		// frame's previous hostgroup. Enforce a rule error here without adding a
+		// common-handler call to the normal prepared-query hot path.
+		if (qpo->error_msg) {
+			auto execute_pkt = execute_msg->detach();
+			handler_WCD_SS_MCQ_qpo_error_msg(&execute_pkt);
+			return 2;
+		}
+
 		if (qpo->OK_msg) {
 			auto execute_pkt = execute_msg->detach(); // detach the packet from the describe message
 			handler_WCD_SS_MCQ_qpo_OK_msg(&execute_pkt);
 			return 0;
 		}
 
-		assert(previous_hostgroup != -1); // previous_hostgroup should be set before 
 		if (CurrentQuery.QueryParserArgs.digest_text) {
 			const char* dig = CurrentQuery.QueryParserArgs.digest_text;
 			if (handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_special_commands(dig, &lock_hostgroup)) {
@@ -8715,10 +9069,9 @@ int PgSQL_Session::handle_post_sync_execute_message(PgSQL_Execute_Message* execu
 				return 0;
 			}
 
-			PGSQL_QUERY_command pg_query_cmd = extended_query_info.stmt_info->PgQueryCmd;
+			PGSQL_QUERY_command pg_query_cmd = CurrentQuery.PgQueryCmd;
 			if (pg_query_cmd == PGSQL_QUERY_CANCEL_BACKEND ||
 				pg_query_cmd == PGSQL_QUERY_TERMINATE_BACKEND) {
-				CurrentQuery.PgQueryCmd = pg_query_cmd;
 				auto execute_pkt = execute_msg->get_raw_pkt(); // detach the packet from the describe message
 				if (handle_command_query_kill(&execute_pkt)) {
 					execute_msg->detach(); // detach the packet from the execute message
@@ -8726,41 +9079,56 @@ int PgSQL_Session::handle_post_sync_execute_message(PgSQL_Execute_Message* execu
 				}
 			}
 		}
-		current_hostgroup = previous_hostgroup; // reset current hostgroup to previous hostgroup
-		proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Session=%p client_myds=%p. Using previous hostgroup '%d'\n",
-			this, client_myds, previous_hostgroup);
+		current_hostgroup = extended_qpo_target_hostgroup(
+			qpo->destination_hostgroup);
+		if (unlikely(current_hostgroup < 0)) {
+			return reject_extended_missing_hostgroup();
+		}
+		proxy_debug(PROXY_DEBUG_MYSQL_COM, 5,
+			"Session=%p client_myds=%p. Using previous hostgroup '%d'\n",
+			this, client_myds, current_hostgroup);
+	}
+	if (unlikely(!select_extended_frame_hostgroup(current_hostgroup))) {
+		return reject_extended_frame_hostgroup(current_hostgroup);
+	}
 
+	if (!enforce_extended_query_hostgroup_lock(lock_hostgroup,
+			CurrentQuery.extended_query_info.stmt_info->query,
+			CurrentQuery.extended_query_info.stmt_info->query_length)) {
+		return 2;
+	}
+
+	bool routed_backend = false;
 #if POLARDB_PROXY
-		if (polardb_extended_route.execute_pending &&
-				polardb_apply_extended_route(
-					PGSQL_EXTENDED_QUERY_TYPE_EXECUTE)) {
-			auto execute_pkt = execute_msg->detach();
-			l_free(execute_pkt.size, execute_pkt.ptr);
-			return 0;
+	routed_backend = extended_query_frame_state.route_required();
+	if (routed_backend) {
+		auto execute_route_pkt = execute_msg->get_raw_pkt();
+		const QpoHandlerResult route_result =
+			apply_extended_backend_route(&execute_route_pkt);
+		if (route_result == QpoHandlerResult::ERROR) {
+			auto failed_pkt = execute_msg->detach();
+			l_free(failed_pkt.size, failed_pkt.ptr);
+			return 2;
 		}
+	}
 #endif // POLARDB_PROXY
+	if (routed_backend &&
+			unlikely(!select_extended_frame_hostgroup(current_hostgroup))) {
+		return reject_extended_frame_hostgroup(current_hostgroup);
 	}
 
-	if (pgsql_thread___set_query_lock_on_hostgroup == 1) {
-		if (locked_on_hostgroup < 0) {
-			if (lock_hostgroup) {
-				// we are locking on hostgroup now
-				locked_on_hostgroup = current_hostgroup;
-			}
-		}
-		if (locked_on_hostgroup >= 0) {
-			if (current_hostgroup != locked_on_hostgroup) {
-				handle_post_sync_locked_on_hostgroup_error(CurrentQuery.extended_query_info.stmt_info->query,
-					CurrentQuery.extended_query_info.stmt_info->query_length);
-				return 2;
-			}
-		}
-	}
-
-	if (extended_query_frame.empty() == true) {
+	const bool sends_sync = should_send_extended_backend_sync();
+	if (sends_sync) {
 		extended_query_info.flags |= PGSQL_EXTENDED_QUERY_FLAG_SYNC;
 	}
+	mark_extended_backend_dispatch(extended_query_info,
+		/*snapshot_capable=*/true);
 
+	if (!can_claim_extended_frame_backend()) {
+		handle_post_sync_error(PGSQL_ERROR_CODES::ERRCODE_RAISE_EXCEPTION,
+			"extended query frame cannot switch backend hostgroups", false);
+		return 2;
+	}
 	mybe = find_or_create_backend(current_hostgroup);
 
 	// set query retries
@@ -8786,25 +9154,240 @@ int PgSQL_Session::handle_post_sync_execute_message(PgSQL_Execute_Message* execu
 	return 1;
 }
 
+int PgSQL_Session::reject_extended_frame_hostgroup(
+		int selected_hostgroup) {
+	char errmsg[192];
+	snprintf(errmsg, sizeof(errmsg),
+		"extended query frame is pinned to hostgroup %d but this operation selected hostgroup %d",
+		extended_query_frame_state.backend_hostgroup, selected_hostgroup);
+	handle_post_sync_error(PGSQL_ERROR_CODES::ERRCODE_RAISE_EXCEPTION,
+		errmsg, false);
+	return 2;
+}
+
+int PgSQL_Session::reject_extended_missing_hostgroup() {
+	handle_post_sync_error(PGSQL_ERROR_CODES::ERRCODE_RAISE_EXCEPTION,
+		"extended query has no resolvable destination hostgroup", false);
+	return 2;
+}
+
+int PgSQL_Session::reject_extended_frame_accounting(
+		const char* operation) {
+	char errmsg[160];
+	snprintf(errmsg, sizeof(errmsg),
+		"extended query frame lost backend-candidate accounting before %s",
+		operation ? operation : "operation");
+	proxy_error("%s (sess=%p)\n", errmsg, this);
+	handle_post_sync_error(PGSQL_ERROR_CODES::ERRCODE_PROTOCOL_VIOLATION,
+		errmsg, false);
+	return 2;
+}
+
+bool PgSQL_Session::enforce_extended_query_hostgroup_lock(
+		bool lock_hostgroup, const char* query, int query_len) {
+	if (pgsql_thread___set_query_lock_on_hostgroup != 1) {
+		return true;
+	}
+	if (locked_on_hostgroup < 0 && lock_hostgroup) {
+		// Latch the QPO-selected hostgroup before PolarDB may choose a reader.
+		locked_on_hostgroup = current_hostgroup;
+		thread->status_variables.stvar[st_var_hostgroup_locked]++;
+		thread->status_variables.stvar[st_var_hostgroup_locked_set_cmds]++;
+	}
+	if (locked_on_hostgroup >= 0 &&
+			current_hostgroup != locked_on_hostgroup) {
+		handle_post_sync_locked_on_hostgroup_error(query, query_len);
+		return false;
+	}
+	return true;
+}
+
+void PgSQL_Session::note_extended_error_response() {
+	const bool in_extended_cycle = extended_query_phase != EXTQ_PHASE_IDLE;
+	bool created_frame = false;
+	if (!extended_query_frame_state.active() && in_extended_cycle &&
+			!extended_client_sync_received()) {
+		// Local errors can be emitted before a backend owns the cycle. Retain
+		// only the protocol recovery state needed to discard through client Sync.
+		extended_query_frame_state.begin(
+			previous_hostgroup, false, false, false);
+		created_frame = true;
+	}
+#if POLARDB_PROXY && POLARDB_DEBUG
+	if (created_frame) {
+		POLARDB_TRACE(
+			"PolarDB EXTENDED FRAME: begin sync=0 route=0 writer_required=0 "
+			"backend_hg=%d sess=%p sid=%u frame=%lu\n",
+			extended_query_frame_state.backend_hostgroup,
+			(void*)this, thread_session_id,
+			(unsigned long)polardb_extended_trace_frame_id());
+	}
+#else
+	(void)created_frame;
+#endif
+	extended_query_frame_state.mark_error_waiting_for_sync();
+}
+
+void PgSQL_Session::note_extended_backend_error_response(
+		PgSQL_Data_Stream* myds) {
+	if (!extended_query_frame_state.active() &&
+			extended_query_phase == EXTQ_PHASE_IDLE) {
+		return;
+	}
+#if POLARDB_PROXY
+	POLARDB_TRACE(
+		"PolarDB EXTENDED ERROR: backend ErrorResponse frame_active=%d "
+		"client_sync=%d backend_sync=%d queued=%zu "
+		"sess=%p sid=%u frame=%lu\n",
+		extended_query_frame_state.active() ? 1 : 0,
+		extended_query_frame_state.client_sync_received ? 1 : 0,
+		extended_query_frame_state.backend_sync_sent ? 1 : 0,
+		extended_query_frame.size(),
+		(void*)this, thread_session_id,
+		(unsigned long)polardb_extended_trace_frame_id());
+#endif // POLARDB_PROXY
+#if POLARDB_PROXY
+	// ErrorResponse is visible before the backend's positioning RFQ. Preserve
+	// request policy now; RequestEnd may clear the live query before client Sync.
+	polardb_retain_extended_rfq_publication(myds);
+#else
+	(void)myds;
+#endif // POLARDB_PROXY
+	// This is also the protocol discard boundary: no queued operation may run
+	// after the failed backend command and before the client's Sync.
+	reset_extended_query_frame();
+}
+
+void PgSQL_Session::transfer_extended_frame_backend(int hostgroup) {
+	if (!extended_query_frame_state.active()) {
+		return;
+	}
+	// The old backend pipeline has already been released. A controlled retry now
+	// owns the complete remaining operation, including any fresh W + implicit Parse.
+	extended_query_frame_state.hostgroup = hostgroup;
+	extended_query_frame_state.backend_hostgroup = hostgroup;
+	extended_query_frame_state.backend_route_pending = false;
+	extended_query_frame_state.backend_sync_sent = false;
+	extended_query_frame_state.reset_frontend_ready();
+}
+
+void PgSQL_Session::begin_extended_query_frame(bool client_sync_received) {
+	bool route_batch = false;
+#if POLARDB_PROXY
+	const bool route_active = thread->polardb_is_active();
+	const bool activity_changed =
+		extended_query_frame_state.batch_activity_changed(route_active);
+	// Preserve a batch that began under PolarDB ownership long enough to pin
+	// it safely even if the topology is disabled before Sync.
+	route_batch = route_active ||
+		(activity_changed &&
+		 extended_query_frame_state.batch_classify_route);
+#endif // POLARDB_PROXY
+
+	// Ordinary Sync-terminated traffic needs only the incrementally maintained
+	// candidate count. Flush and PolarDB routing require durable backend ownership.
+	if (!extended_query_frame_state.active() && client_sync_received &&
+			!route_batch) {
+		extended_query_frame_state.clear_batch_shape();
+		return;
+	}
+
+	bool writer_required = false;
+#if POLARDB_PROXY
+	if (route_batch) {
+		// Only one logical statement may use a reader. Mixed or metadata-only
+		// batches are pinned to the writer before their first backend command.
+		writer_required = extended_query_frame_state.batch_requires_writer(
+			activity_changed);
+	}
+#endif // POLARDB_PROXY
+	extended_query_frame_state.clear_batch_shape();
+
+	extended_query_frame_state.begin(previous_hostgroup, writer_required,
+		client_sync_received, route_batch);
+	POLARDB_TRACE(
+		"PolarDB EXTENDED FRAME: begin sync=%d route=%d "
+		"writer_required=%d backend_hg=%d sess=%p sid=%u frame=%lu\n",
+		client_sync_received ? 1 : 0, route_batch ? 1 : 0,
+		writer_required ? 1 : 0,
+		extended_query_frame_state.backend_hostgroup,
+		(void*)this, thread_session_id,
+		(unsigned long)polardb_extended_trace_frame_id());
+}
+
+bool PgSQL_Session::should_send_extended_backend_sync() const {
+	if (extended_query_frame_state.active()) {
+		return extended_query_frame_state.should_send_backend_sync();
+	}
+	return extended_client_sync_received() &&
+		extended_query_frame_state.backend_candidates_remaining == 0;
+}
+
+PgSQL_Session::ExtendedFrameFinalizeResult
+PgSQL_Session::finalize_extended_query_frame() {
+	ExtendedFrameFinalizeResult result;
+	if (!extended_client_sync_received() ||
+			!extended_query_frame.empty()) {
+		return result;
+	}
+	if (extended_query_frame_state.backend_hostgroup >= 0) {
+		result.backend = find_backend(
+			extended_query_frame_state.backend_hostgroup);
+	}
+	if (extended_query_frame_state.needs_backend_sync()) {
+		PgSQL_Connection* conn = result.backend && result.backend->server_myds
+			? result.backend->server_myds->myconn : nullptr;
+		if (conn && conn->is_pipeline_active()) {
+			result.needs_backend_sync = true;
+			return result;
+		}
+		// A released or failed backend has no pipeline left to synchronize.
+		extended_query_frame_state.mark_backend_sync_sent(true);
+	}
+	return result;
+}
+
+void PgSQL_Session::complete_extended_query_frame() {
+	extended_query_exec_qp = false;
+	bind_waiting_for_execute.reset();
+	extended_query_phase = EXTQ_PHASE_IDLE;
+	extended_query_frame_state.complete();
+}
+
 void PgSQL_Session::reset_extended_query_frame() {
+	// Every caller abandons a frame because of an ErrorResponse. Mark recovery
+	// before clearing local ownership so Flush-batch errors still discard to Sync.
+	note_extended_error_response();
+#if POLARDB_PROXY && POLARDB_DEBUG
+	if (extended_query_frame_state.active()) {
+		POLARDB_TRACE(
+			"PolarDB EXTENDED FRAME: discard queued=%zu client_sync=%d "
+			"backend_sync=%d sess=%p sid=%u frame=%lu\n",
+			extended_query_frame.size(),
+			extended_query_frame_state.client_sync_received ? 1 : 0,
+			extended_query_frame_state.backend_sync_sent ? 1 : 0,
+			(void*)this, thread_session_id,
+			(unsigned long)polardb_extended_trace_frame_id());
+	}
+#endif
 	proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Session=%p client_myds=%p. Discarding all '%lu' messages in extended query frame\n",
 		this, client_myds, extended_query_frame.size());
-	// Reset the extended query frame and bind to execute
+	// Reset the extended query frame and bind to execute.
 	while (!extended_query_frame.empty()) {
 		extended_query_frame.pop();
 	}
-	bind_waiting_for_execute.reset(nullptr);
-	extended_query_phase = EXTQ_PHASE_IDLE;
-#if POLARDB_PROXY
-	polardb_extended_route.reset();
-#endif // POLARDB_PROXY
+	extended_query_frame_state.clear_backend_candidates();
+	bind_waiting_for_execute.reset();
+	if (extended_query_frame_state.waiting_for_client_sync_after_error) {
+		extended_query_phase = EXTQ_PHASE_BUILDING;
+	}
 }
 
 int  PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_SYNC() {
 	PROXY_TRACE();
 	if (session_type != PROXYSQL_SESSION_PGSQL) { // only PgSQL module supports prepared statement!!
 		client_myds->setDSS_STATE_QUERY_SENT_NET();
-		client_myds->myprot.generate_error_packet(true, false, "Prepared statements not supported", PGSQL_ERROR_CODES::ERRCODE_FEATURE_NOT_SUPPORTED,
+		client_myds->myprot.generate_error_packet(true, true, "Prepared statements not supported", PGSQL_ERROR_CODES::ERRCODE_FEATURE_NOT_SUPPORTED,
 			false, true);
 		client_myds->DSS = STATE_SLEEP;
 		status = WAITING_CLIENT_DATA;
@@ -8815,17 +9398,32 @@ int  PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_S
 		this, client_myds, extended_query_frame.size());
 
 	if (extended_query_frame.empty() == true) {
-		client_myds->setDSS_STATE_QUERY_SENT_NET();
-		unsigned int nTxn = NumActiveTransactions();
-		const char txn_state = (nTxn ? 'T' : 'I');
-		client_myds->myprot.generate_ready_for_query_packet(true, txn_state);
-		writeout();
+			const ExtendedFrameFinalizeResult finalized =
+				finalize_extended_query_frame();
+		if (finalized.needs_backend_sync) {
+			current_hostgroup =
+				extended_query_frame_state.backend_hostgroup;
+			mybe = finalized.backend;
+			if (!mybe || !mybe->server_myds ||
+					!mybe->server_myds->myconn) {
+				return -1;
+			}
+			status = RESYNCHRONIZING_CONNECTION;
+			return 1;
+		}
+		if (!extended_client_sync_received()) {
+			extended_query_phase = EXTQ_PHASE_BUILDING;
+			return 0;
+		}
+		PgSQL_Connection* finalized_conn =
+			finalized.backend && finalized.backend->server_myds
+				? finalized.backend->server_myds->myconn : nullptr;
+		if (emit_extended_ready_for_query(finalized_conn)) {
+			writeout();
+		}
 		client_myds->DSS = STATE_SLEEP;
 		status = WAITING_CLIENT_DATA;
-		extended_query_phase = EXTQ_PHASE_IDLE;
-#if POLARDB_PROXY
-		polardb_extended_route.reset();
-#endif // POLARDB_PROXY
+		complete_extended_query_frame();
 		return 0;
 	}
 
@@ -8868,16 +9466,41 @@ int PgSQL_Session::handler___status_PROCESSING_EXTENDED_QUERY_SYNC() {
 			return handle_post_sync_execute_message(msg_ptr.get());
 		}
 		else {
-			proxy_error("Unknown extended query message\n");
-			assert(false);
+			proxy_error(
+				"Unknown extended query message variant: sess=%p\n", this);
 			return -1;
 		}
-		}, packet);
+	}, packet);
 
-	if (rc == 2) {
+	const bool discarded_on_error = rc == 2;
+	if (discarded_on_error) {
 		// incase of error, we discard all pending messages
 		reset_extended_query_frame();
 		rc = 0;
+	}
+	if (rc == 0 && extended_query_frame.empty()) {
+		const ExtendedFrameFinalizeResult finalized =
+			finalize_extended_query_frame();
+		if (finalized.needs_backend_sync) {
+			current_hostgroup =
+				extended_query_frame_state.backend_hostgroup;
+			mybe = finalized.backend;
+			if (!mybe || !mybe->server_myds ||
+					!mybe->server_myds->myconn) {
+				return -1;
+			}
+			status = RESYNCHRONIZING_CONNECTION;
+			return 1;
+		}
+		if (extended_client_sync_received()) {
+			if (!discarded_on_error) {
+				PgSQL_Connection* finalized_conn =
+					finalized.backend && finalized.backend->server_myds
+						? finalized.backend->server_myds->myconn : nullptr;
+				emit_extended_ready_for_query(finalized_conn);
+			}
+			complete_extended_query_frame();
+		}
 	}
 
 	return rc;
@@ -8887,7 +9510,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_P
 	if (session_type != PROXYSQL_SESSION_PGSQL) { // only PgSQL module supports prepared statement!!
 		l_free(pkt.size, pkt.ptr);
 		client_myds->setDSS_STATE_QUERY_SENT_NET();
-		client_myds->myprot.generate_error_packet(true, false, "Prepared statements not supported", PGSQL_ERROR_CODES::ERRCODE_FEATURE_NOT_SUPPORTED,
+		client_myds->myprot.generate_error_packet(true, true, "Prepared statements not supported", PGSQL_ERROR_CODES::ERRCODE_FEATURE_NOT_SUPPORTED,
 			false, true);
 		client_myds->DSS = STATE_SLEEP;
 		status = WAITING_CLIENT_DATA;
@@ -8904,7 +9527,9 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_P
 		writeout();
 		return false;
 	}
-	extended_query_frame.push(std::move(parse_msg)); // we will process it later, after sync packet
+	const char* stmt_name = parse_msg->data().stmt_name;
+	queue_extended_message(std::move(parse_msg),
+		ExtendedFrameMessageKind::PARSE, stmt_name); // process after Sync or Flush
 	return true;
 }
 
@@ -8912,7 +9537,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_D
 	if (session_type != PROXYSQL_SESSION_PGSQL) { // only PgSQL module supports prepared statement!!
 		l_free(pkt.size, pkt.ptr);
 		client_myds->setDSS_STATE_QUERY_SENT_NET();
-		client_myds->myprot.generate_error_packet(true, false, "Prepared statements not supported", PGSQL_ERROR_CODES::ERRCODE_FEATURE_NOT_SUPPORTED,
+		client_myds->myprot.generate_error_packet(true, true, "Prepared statements not supported", PGSQL_ERROR_CODES::ERRCODE_FEATURE_NOT_SUPPORTED,
 			false, true);
 		client_myds->DSS = STATE_SLEEP;
 		status = WAITING_CLIENT_DATA;
@@ -8929,7 +9554,10 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_D
 		writeout();
 		return false;
 	}
-	extended_query_frame.push(std::move(describe_msg)); // we will process it later, after sync packet
+	const ExtendedFrameMessageKind kind = describe_msg->data().stmt_type == 'P'
+		? ExtendedFrameMessageKind::DESCRIBE_PORTAL
+		: ExtendedFrameMessageKind::DESCRIBE_STATEMENT;
+	queue_extended_message(std::move(describe_msg), kind); // process after Sync or Flush
 	return true;
 }
 
@@ -8937,7 +9565,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_C
 	if (session_type != PROXYSQL_SESSION_PGSQL) { // only PgSQL module supports prepared statement!!
 		l_free(pkt.size, pkt.ptr);
 		client_myds->setDSS_STATE_QUERY_SENT_NET();
-		client_myds->myprot.generate_error_packet(true, false, "Prepared statements not supported", PGSQL_ERROR_CODES::ERRCODE_FEATURE_NOT_SUPPORTED,
+		client_myds->myprot.generate_error_packet(true, true, "Prepared statements not supported", PGSQL_ERROR_CODES::ERRCODE_FEATURE_NOT_SUPPORTED,
 			false, true);
 		client_myds->DSS = STATE_SLEEP;
 		status = WAITING_CLIENT_DATA;
@@ -8953,7 +9581,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_C
 		writeout();
 		return false;
 	}
-	extended_query_frame.push(std::move(close_msg)); // we will process it later, after sync packet
+	queue_extended_message(std::move(close_msg), ExtendedFrameMessageKind::LOCAL); // process after Sync or Flush
 	return true;
 }
 
@@ -8961,7 +9589,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_B
 	if (session_type != PROXYSQL_SESSION_PGSQL) { // only PgSQL module supports prepared statement!!
 		l_free(pkt.size, pkt.ptr);
 		client_myds->setDSS_STATE_QUERY_SENT_NET();
-		client_myds->myprot.generate_error_packet(true, false, "Prepared statements not supported", PGSQL_ERROR_CODES::ERRCODE_FEATURE_NOT_SUPPORTED,
+		client_myds->myprot.generate_error_packet(true, true, "Prepared statements not supported", PGSQL_ERROR_CODES::ERRCODE_FEATURE_NOT_SUPPORTED,
 			false, true);
 		client_myds->DSS = STATE_SLEEP;
 		status = WAITING_CLIENT_DATA;
@@ -8977,7 +9605,9 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_B
 		writeout();
 		return false;
 	}
-	extended_query_frame.push(std::move(bind_msg)); // we will process it later, after sync packet
+	const char* stmt_name = bind_msg->data().stmt_name;
+	queue_extended_message(std::move(bind_msg),
+		ExtendedFrameMessageKind::BIND, stmt_name); // process after Sync or Flush
 	return true;
 
 }
@@ -8986,7 +9616,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_E
 	if (session_type != PROXYSQL_SESSION_PGSQL) { // only PgSQL module supports prepared statement!!
 		l_free(pkt.size, pkt.ptr);
 		client_myds->setDSS_STATE_QUERY_SENT_NET();
-		client_myds->myprot.generate_error_packet(true, false, "Prepared statements not supported", PGSQL_ERROR_CODES::ERRCODE_FEATURE_NOT_SUPPORTED,
+		client_myds->myprot.generate_error_packet(true, true, "Prepared statements not supported", PGSQL_ERROR_CODES::ERRCODE_FEATURE_NOT_SUPPORTED,
 			false, true);
 		client_myds->DSS = STATE_SLEEP;
 		status = WAITING_CLIENT_DATA;
@@ -9002,12 +9632,14 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_E
 		writeout();
 		return false;
 	}
-	extended_query_frame.push(std::move(execute_msg)); // we will process it later, after sync packet
+	queue_extended_message(std::move(execute_msg), ExtendedFrameMessageKind::EXECUTE); // process after Sync or Flush
 	return true;
 
 }
 
-bool PgSQL_Session::handler___rc0_PROCESSING_STMT_PREPARE(enum session_status& st, PgSQL_Data_Stream* myds) {
+PgSQL_Session::PrepareCompletion
+PgSQL_Session::handler___rc0_PROCESSING_STMT_PREPARE(
+		enum session_status& st, PgSQL_Data_Stream* myds) {
 	thread->status_variables.stvar[st_var_backend_stmt_prepare]++;
 
 	auto stmt_info = GloPgStmt->add_prepared_statement(
@@ -9021,7 +9653,10 @@ bool PgSQL_Session::handler___rc0_PROCESSING_STMT_PREPARE(enum session_status& s
 		CurrentQuery.QueryParserArgs.digest,
 		CurrentQuery.PgQueryCmd
 		);
-	assert(stmt_info); // GloPgStmt->add_prepared_statement() should always return a valid pointer
+	if (unlikely(!stmt_info)) {
+		proxy_error("Failed to register prepared statement: sess=%p\n", this);
+		return PrepareCompletion::ERROR;
+	}
 
 	PgSQL_Extended_Query_Info& extended_query_info = CurrentQuery.extended_query_info;
 	extended_query_info.stmt_info = stmt_info.get();
@@ -9029,26 +9664,60 @@ bool PgSQL_Session::handler___rc0_PROCESSING_STMT_PREPARE(enum session_status& s
 	myds->myconn->local_stmts->backend_insert(stmt_info, extended_query_info.stmt_backend_id);
 	st = status;
 	
-	if (previous_status.empty() == false) {
-		CurrentQuery.extended_query_info.flags &= ~PGSQL_EXTENDED_QUERY_FLAG_IMPLICIT_PREPARE;
+	if (resume_implicit_prepare(st)) {
 		myds->myconn->async_state_machine = ASYNC_IDLE;
 		myds->DSS = STATE_MARIADB_GENERIC;
-		st = previous_status.top();
-		previous_status.pop();
-
-		return true;
+		return PrepareCompletion::IMPLICIT_RESUME;
 	}
 	// We only perform the client_insert when there is no previous status, this
 	// is, when 'PROCESSING_STMT_PREPARE' is reached directly without transitioning from a previous status
 	// like 'PROCESSING_STMT_EXECUTE'.
-	assert(extended_query_info.stmt_client_name);
-#ifdef DEBUG
-	auto* stmt_info_dbg = client_myds->myconn->local_stmts->find_stmt_info_from_stmt_name(extended_query_info.stmt_client_name);
-	assert(stmt_info_dbg == nullptr);
-#endif
-	client_myds->myconn->local_stmts->client_insert(stmt_info, extended_query_info.stmt_client_name, nullptr);
+	if (unlikely(!extended_query_info.stmt_client_name)) {
+		proxy_error(
+			"Prepared statement completion lost client name: sess=%p\n", this);
+		return PrepareCompletion::ERROR;
+	}
+	client_myds->myconn->local_stmts->client_insert(
+		stmt_info, extended_query_info.stmt_client_name);
 
-	return false;
+	return PrepareCompletion::CLIENT_VISIBLE;
+}
+
+bool PgSQL_Session::begin_implicit_prepare(
+		enum session_status continuation) {
+	const bool supported = continuation == PROCESSING_STMT_EXECUTE ||
+		continuation == PROCESSING_STMT_DESCRIBE;
+	const bool compatible =
+		implicit_prepare_continuation == session_status___NONE ||
+		implicit_prepare_continuation == continuation;
+	if (unlikely(!supported || !compatible)) {
+		proxy_error(
+			"Invalid implicit prepare transition: sess=%p requested=%d active=%d\n",
+			this, continuation, implicit_prepare_continuation);
+		return false;
+	}
+	implicit_prepare_continuation = continuation;
+	CurrentQuery.extended_query_info.flags |=
+		PGSQL_EXTENDED_QUERY_FLAG_IMPLICIT_PREPARE;
+	return true;
+}
+
+bool PgSQL_Session::resume_implicit_prepare(
+		enum session_status& continuation) {
+	if (implicit_prepare_continuation == session_status___NONE) {
+		return false;
+	}
+	continuation = implicit_prepare_continuation;
+	clear_implicit_prepare();
+	return true;
+}
+
+void PgSQL_Session::clear_implicit_prepare() {
+	if (unlikely(has_implicit_prepare())) {
+		implicit_prepare_continuation = session_status___NONE;
+		CurrentQuery.extended_query_info.flags &=
+			~PGSQL_EXTENDED_QUERY_FLAG_IMPLICIT_PREPARE;
+	}
 }
 
 char* PgSQL_Session::get_current_query(int max_length) {

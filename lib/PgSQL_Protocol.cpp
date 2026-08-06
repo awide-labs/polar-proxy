@@ -1470,10 +1470,17 @@ void PgSQL_Protocol::welcome_client() {
 void PgSQL_Protocol::generate_error_packet(bool send, bool ready, const char* msg, PGSQL_ERROR_CODES code, bool fatal, bool track, PtrSize_t* _ptr) {
 	// to avoid memory leak
 	assert(send == true || _ptr);
+	if (send && sess) {
+		// ErrorResponse is the protocol-wide transition into skip-until-Sync.
+		// This includes local special-command errors that bypass frame helpers.
+		sess->note_extended_error_response();
+	}
 
-	if (send) {
-		if (ready == fatal)
-			ready = !ready;
+	// Fatal errors terminate the connection and never carry ReadyForQuery.
+	// Nonfatal callers own the protocol boundary and their ready decision must
+	// be preserved, especially for extended cycles that wait for client Sync.
+	if (fatal) {
+		ready = false;
 	}
 
 
@@ -1766,14 +1773,20 @@ bool PgSQL_Protocol::generate_ok_packet(bool send, bool ready, const char* msg, 
 	return true;
 }
 
-bool PgSQL_Protocol::generate_ready_for_query_packet(bool send, char trx_state, PtrSize_t* _ptr) {
+bool PgSQL_Protocol::generate_ready_for_query_packet(bool send, char trx_state,
+		PtrSize_t* _ptr, bool include_polardb_lsn, uint64_t polardb_lsn) {
 	// to avoid memory leak
 	assert(send == true || _ptr);
 
-	PG_pkt pgpkt(8);
+	const unsigned int size = 1 + 4 + 1 +
+		(include_polardb_lsn ? sizeof(uint64_t) : 0);
+	PG_pkt pgpkt(size);
 	pgpkt.put_char('Z');
-	pgpkt.put_uint32(5);
+	pgpkt.put_uint32(size - 1);
 	pgpkt.put_char(trx_state); // transaction state
+	if (include_polardb_lsn) {
+		pgpkt.put_uint64(polardb_lsn);
+	}
 	auto buff = pgpkt.detach();
 	if (send == true) {
 		(*myds)->PSarrayOUT->add((void*)buff.first, buff.second);

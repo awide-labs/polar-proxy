@@ -181,6 +181,46 @@ unsigned int PgSQL_Session::polardb_enqueue_notice_packet(
 	return written;
 }
 
+unsigned int PgSQL_Session::polardb_enqueue_notice_packet(
+		const PGresult* result) {
+	if (!result) {
+		return 0;
+	}
+
+	const PolarDB_NoticeField fields[] = {
+		{'S', PQresultErrorField(result, PG_DIAG_SEVERITY)},
+		{'V', PQresultErrorField(result, PG_DIAG_SEVERITY_NONLOCALIZED)},
+		{'C', PQresultErrorField(result, PG_DIAG_SQLSTATE)},
+		{'M', PQresultErrorField(result, PG_DIAG_MESSAGE_PRIMARY)},
+		{'D', PQresultErrorField(result, PG_DIAG_MESSAGE_DETAIL)},
+		{'H', PQresultErrorField(result, PG_DIAG_MESSAGE_HINT)},
+		{'P', PQresultErrorField(result, PG_DIAG_STATEMENT_POSITION)},
+		{'p', PQresultErrorField(result, PG_DIAG_INTERNAL_POSITION)},
+		{'q', PQresultErrorField(result, PG_DIAG_INTERNAL_QUERY)},
+		{'W', PQresultErrorField(result, PG_DIAG_CONTEXT)},
+		{'s', PQresultErrorField(result, PG_DIAG_SCHEMA_NAME)},
+		{'t', PQresultErrorField(result, PG_DIAG_TABLE_NAME)},
+		{'c', PQresultErrorField(result, PG_DIAG_COLUMN_NAME)},
+		{'d', PQresultErrorField(result, PG_DIAG_DATATYPE_NAME)},
+		{'n', PQresultErrorField(result, PG_DIAG_CONSTRAINT_NAME)},
+		{'F', PQresultErrorField(result, PG_DIAG_SOURCE_FILE)},
+		{'L', PQresultErrorField(result, PG_DIAG_SOURCE_LINE)},
+		{'R', PQresultErrorField(result, PG_DIAG_SOURCE_FUNCTION)}
+	};
+	const size_t field_count = sizeof(fields) / sizeof(fields[0]);
+	const unsigned int size =
+		polardb_notice_response_packet_size(fields, field_count);
+	unsigned char* pkt = (unsigned char*)l_alloc(size);
+	const unsigned int written = polardb_write_notice_response_packet(
+		pkt, size, fields, field_count);
+	if (written == 0) {
+		l_free(size, pkt);
+		return 0;
+	}
+	enqueue_pending_notice(pkt, written);
+	return written;
+}
+
 /**
  * @brief Queue a WARNING that ProxySQL generates itself when a read is routed to
  *        a reader without a usable LSN wait target.
@@ -264,6 +304,8 @@ bool polardb_handle_lsn_wait_timeout_notice(PgSQL_Connection* conn, const PGresu
 		return false;
 	}
 
+	// Require both the private DETAIL token and the backend source function.
+	// Client-provided text or DETAIL alone does not identify this timeout.
 	if (!polardb_is_lsn_wait_timeout_result(result)) {
 		return false;
 	}
@@ -338,17 +380,12 @@ bool polardb_handle_lsn_wait_timeout_notice(PgSQL_Connection* conn, const PGresu
 
 	POLARDB_TRACE("PolarDB WAIT: saving timeout notice to session notice queue\n");
 
-	const char* severity = PQresultErrorField(result, PG_DIAG_SEVERITY);
-	const char* severity_nonlocalized =
-		PQresultErrorField(result, PG_DIAG_SEVERITY_NONLOCALIZED);
-	const char* sqlstate = PQresultErrorField(result, PG_DIAG_SQLSTATE);
-	const char* primary = PQresultErrorField(result, PG_DIAG_MESSAGE_PRIMARY);
-	const char* detail = PQresultErrorField(result, PG_DIAG_MESSAGE_DETAIL);
-
-	const unsigned int bytes_recv = sess->polardb_enqueue_notice_packet(
-		severity, sqlstate, primary, detail, severity_nonlocalized);
+	const unsigned int bytes_recv =
+		sess->polardb_enqueue_notice_packet(result);
 	if (bytes_recv == 0) {
-		return true;
+		// Queue serialization failed, so leave the notice with the generic
+		// query-result path instead of silently claiming and dropping it.
+		return false;
 	}
 	conn->update_bytes_recv(bytes_recv);
 

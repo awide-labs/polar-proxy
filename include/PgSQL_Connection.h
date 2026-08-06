@@ -743,6 +743,11 @@ public:
 			wrapper_kind = PolarDB_Query_WrapperKind::NONE;
 			txn_split_xids_reset = false;
 		}
+		bool active() const {
+			return wrapper_stmts != 0 ||
+				wrapper_kind != PolarDB_Query_WrapperKind::NONE ||
+				txn_split_xids_reset;
+		}
 	};
 	PolarDB_Query_DispatchState dispatch_state;
 
@@ -853,7 +858,7 @@ public:
 	 *    back the wrapper SETs, so updating at wrapper-build time would desync the
 	 *    tracked state from the backend connection.
 	 */
-	struct PolarDB_Query_WrapState {
+		struct PolarDB_Query_WrapState {
 		bool was_wrapped{false};   // sticky: this query was sent wrapped (survives consumption)
 		bool stmt_failed{false};   // sticky: a wrapper statement failed before the user result
 		bool stmt_succeeded{false}; // sticky: every wrapper statement completed successfully
@@ -914,16 +919,17 @@ public:
 			txn_split_xids_reset_pending = false;
 			extended_wait_notice_owner = notice_owner;
 		}
-		void mark_extended_wait_result_received() {
-			if (is_extended_wait()) {
-				extended_wait_notice_owner =
-					PolarDB_ExtendedWaitNoticeOwner::QUERY_RESULT;
+		void observe_extended_wait_completion(bool succeeded) {
+			if (!is_extended_wait()) {
+				return;
 			}
-		}
-		void mark_extended_wait_succeeded() {
-			if (is_extended_wait()) {
+			if (succeeded) {
 				stmt_succeeded = true;
 			}
+			// This hook runs once for the semantic Parse/Execute operation, never
+			// for the later pipeline-control result used to resynchronize libpq.
+			extended_wait_notice_owner =
+				PolarDB_ExtendedWaitNoticeOwner::QUERY_RESULT;
 		}
 		void mark_wrapper_set_failed() {
 			stmt_failed = true;
@@ -949,10 +955,30 @@ public:
 			extended_wait_notice_owner =
 				PolarDB_ExtendedWaitNoticeOwner::QUERY_RESULT;
 		}
-	};
-	PolarDB_Query_WrapState polardb_query_wrap_state;
+		bool active() const {
+			return was_wrapped || stmt_failed || stmt_succeeded ||
+				stmt_total != 0 || stmt_pending != 0 ||
+				wrapper_kind != PolarDB_Query_WrapperKind::NONE ||
+				txn_split_xids_reset_pending;
+		}
+		};
+		PolarDB_Query_WrapState polardb_query_wrap_state;
 
-	/**
+		/**
+		 * @brief Remove request-owned state before this connection leaves a session.
+		 *
+		 * Outcome capture and wait publication must finish before this boundary.
+		 * Backend-persistent split-XID safety state is deliberately not cleared here.
+		 */
+		void polardb_clear_request_state_for_release() {
+			if (!dispatch_state.active() && !polardb_query_wrap_state.active()) {
+				return;
+			}
+			dispatch_state.reset();
+			polardb_query_wrap_state.clear();
+		}
+
+		/**
 	 * @brief A split-XID wrapper has not yet reached a safe query boundary.
 	 *
 	 * PolarDB clears its mock split transaction on commit or abort. Keep this
@@ -1126,8 +1152,12 @@ private:
 	static void notice_handler_cb(void* arg, const PGresult* result);
 	static void unhandled_notice_cb(void* arg, const PGresult* result);
 	void init_query_result();
+	__attribute__((always_inline)) inline
+	bool _note_extended_backend_command_sent();
+	__attribute__((always_inline)) inline
+	bool _note_extended_backend_sync_sent();
 
-#if POLARDB_PROXY
+	#if POLARDB_PROXY
 	/**
 	 * @brief Resolve the PolarDB startup profile for this backend hostgroup.
 	 *

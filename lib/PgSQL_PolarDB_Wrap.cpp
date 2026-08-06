@@ -811,10 +811,13 @@ bool PgSQL_Session::polardb_account_wait_timeout(const char* source) {
  * It does NOT return or destroy backend connections and does NOT clear the session
  * write/observed LSNs. Those LSNs record committed positions this client has
  * already observed; a RESET clears session configuration, not that history, so
- * read-your-writes still holds after a RESET. It also deliberately leaves the
- * transaction-split reader state and polardb_txn_has_no_write_xids alone — those
- * belong to the session-recycle path and are cleared only by
- * polardb_clear_session_state_for_recycle().
+ * read-your-writes still holds after a RESET. It also preserves
+ * polardb_extended_rfq: that state belongs to an open extended frame whose
+ * successful Flush results still need attribution at the later Sync. Terminal
+ * frame failure abandons it through polardb_abandon_deferred_extended_rfq(), and
+ * session recycle clears it in polardb_clear_session_state_for_recycle(). The
+ * transaction-split reader state and polardb_txn_has_no_write_xids likewise
+ * belong to the session-recycle path.
  *
  * @param reset_override When true, also clears the per-session PolarDB
  *                       consistency-mode override and the transaction-split
@@ -827,6 +830,14 @@ void PgSQL_Session::polardb_clear_staged_wait_state_for_reset(bool reset_overrid
 	polardb_leave_reader_capacity_wait(
 		PolarDB_ReaderStatus::READER_UNAVAILABLE);
 	polardb_reader_capacity_wait.reset();
+	if (!extended_query_frame_state.active() &&
+			(polardb_extended_rfq.pending ||
+			 polardb_extended_rfq.publication_pending)) {
+		// Only an open extended frame can retain Flush attribution across a
+		// statement RESET. Inactive state is orphaned; abandon it so a
+		// successful deferred write fails closed instead of crossing RESET ALL.
+		polardb_abandon_deferred_extended_rfq();
+	}
 	polardb_query.reset_for_new_query();
 	discard_pending_notices();
 	polardb_route_state.clear_resettable();
@@ -856,6 +867,7 @@ void PgSQL_Session::polardb_clear_session_state_for_recycle() {
 		PolarDB_ReaderStatus::READER_UNAVAILABLE);
 	polardb_reader_capacity_wait.reset();
 	polardb_query.reset_for_new_query();
+	polardb_extended_rfq.reset();
 	polardb_route_state.clear_session();
 	polardb_teardown_transaction_reader_state("session_reset", /*want_reuse=*/false);
 	discard_pending_notices();
@@ -884,6 +896,32 @@ void PgSQL_Session::polardb_clear_session_state_for_recycle() {
  */
 void PgSQL_Session::polardb_clear_request_state_for_query_end(
 		PgSQL_Data_Stream* myds, bool called_on_failure) {
+	const bool preserve_error_rfq_publication = called_on_failure &&
+		polardb_extended_rfq.publication_pending &&
+		extended_query_frame_state.waiting_for_client_sync_after_error;
+	if (called_on_failure && (polardb_extended_rfq.pending ||
+			polardb_extended_rfq.publication_pending) &&
+			!preserve_error_rfq_publication) {
+		polardb_abandon_deferred_extended_rfq();
+	} else if (preserve_error_rfq_publication) {
+		// The failed operation has no successful-result attribution. Keep only
+		// the policy needed to publish its later positioning RFQ at client Sync.
+		// A prior flushed write can no longer be attributed exactly, so fail closed.
+		POLARDB_TRACE(
+			"PolarDB EXTENDED RFQ: failure cleanup preserve publication "
+			"discard_attribution=%d saw_write=%d sess=%p sid=%u frame=%lu\n",
+			polardb_extended_rfq.pending ? 1 : 0,
+			polardb_extended_rfq.saw_write ? 1 : 0,
+			(void*)this, thread_session_id,
+			(unsigned long)polardb_extended_trace_frame_id());
+		if (polardb_extended_rfq.pending &&
+				polardb_extended_rfq.saw_write) {
+			polardb_session_consistency.write_unknown = true;
+		}
+		polardb_extended_rfq.pending = false;
+		polardb_extended_rfq.saw_write = false;
+		polardb_extended_rfq.can_preserve_session_lsn = true;
+	}
 	if (called_on_failure) {
 		polardb_txn_has_no_write_xids = false;
 	}

@@ -114,11 +114,7 @@ PgSQL_STMT_Local::~PgSQL_STMT_Local() {
 	// Note: we do not free the prepared statements because we assume that
 	// if we call this destructor the connection is being destroyed anyway
 	if (is_client_) {
-		for (auto it = stmt_name_to_global_info.begin(); it != stmt_name_to_global_info.end(); ++it) {
-			auto* stmt_info = it->second.get();
-			GloPgStmt->ref_count_client(stmt_info, -1);
-		}
-		stmt_name_to_global_info.clear();
+		client_close_all();
 	}
 	else {
 		for (auto it = backend_stmt_to_global_info.begin(); it != backend_stmt_to_global_info.end(); ++it) {
@@ -130,20 +126,23 @@ PgSQL_STMT_Local::~PgSQL_STMT_Local() {
 }
 
 void PgSQL_STMT_Local::client_insert(std::shared_ptr<const PgSQL_STMT_Global_info>& stmt_info,
-	const std::string& client_stmt_name, std::shared_ptr<const PgSQL_STMT_Global_info>* local_stmt_info_ptr) {
+		const std::string& client_stmt_name) {
+	client_insert_at(stmt_info, client_stmt_name,
+		stmt_name_to_global_info.find(client_stmt_name));
+}
+
+void PgSQL_STMT_Local::client_insert_at(
+		std::shared_ptr<const PgSQL_STMT_Global_info>& stmt_info,
+		const std::string& client_stmt_name, ClientStatementMap::iterator local) {
 	assert(stmt_info);
 
-	if (local_stmt_info_ptr && (*local_stmt_info_ptr)) {
-		auto& local_stmt_info = *local_stmt_info_ptr;
+	if (local != stmt_name_to_global_info.end()) {
+		auto& local_stmt_info = local->second;
 		if (local_stmt_info->statement_id == stmt_info->statement_id)
 			return; // no change
 
-		// Adjust refcounts: decrement old, increment new
-		GloPgStmt->ref_count_client(local_stmt_info.get(), -1);
-		local_stmt_info.reset();
-		
+		release_client_statement_owner(local_stmt_info);
 		GloPgStmt->ref_count_client(stmt_info.get(), 1);
-		// Update existing entry to new global stmt info one
 		local_stmt_info = stmt_info;
 		return;
 	}
@@ -161,19 +160,36 @@ const PgSQL_STMT_Global_info* PgSQL_STMT_Local::find_stmt_info_from_stmt_name(co
 	return ret;
 }
 
-bool PgSQL_STMT_Local::client_close(const std::string& client_stmt_name) {
-	if (auto s = stmt_name_to_global_info.find(client_stmt_name); s != stmt_name_to_global_info.end()) {  // found
-		const PgSQL_STMT_Global_info* stmt_info = s->second.get();
-		GloPgStmt->ref_count_client(stmt_info, -1);
-		stmt_name_to_global_info.erase(s);
-		return true;
+void PgSQL_STMT_Local::release_client_statement_owner(
+		std::shared_ptr<const PgSQL_STMT_Global_info>& stmt_info) {
+	if (!stmt_info) {
+		return;
 	}
-	return false;  // we don't really remove the prepared statement
+	GloPgStmt->ref_count_client(stmt_info.get(), -1);
+	// Bind normally keeps a non-owning pointer. Ownership moves, without a
+	// shared_ptr refcount RMW, only when Parse/Close removes that map owner.
+	if (sess) {
+		sess->bind_waiting_for_execute.retain_statement_owner(stmt_info);
+	}
+	stmt_info.reset();
+}
+
+bool PgSQL_STMT_Local::client_close(const std::string& client_stmt_name) {
+	return client_close_at(stmt_name_to_global_info.find(client_stmt_name));
+}
+
+bool PgSQL_STMT_Local::client_close_at(ClientStatementMap::iterator local) {
+	if (local == stmt_name_to_global_info.end()) {
+		return false;  // we don't really remove the prepared statement
+	}
+	release_client_statement_owner(local->second);
+	stmt_name_to_global_info.erase(local);
+	return true;
 }
 
 void PgSQL_STMT_Local::client_close_all() {
 	for (auto& [_, global_stmt_info] : stmt_name_to_global_info) {
-		GloPgStmt->ref_count_client(global_stmt_info.get(), -1);
+		release_client_statement_owner(global_stmt_info);
 	}
 	stmt_name_to_global_info.clear();
 }

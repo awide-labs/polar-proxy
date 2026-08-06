@@ -38,6 +38,7 @@ static_assert(POLARDB_PROXY_PROTOCOL_V15_WAIT == static_cast<int>(PolarDB_ProxyP
 // no active result object, because the wrapped wait recycles that object while
 // consuming the prepended SET results (see notice_handler_cb below).
 bool polardb_handle_lsn_wait_timeout_notice(PgSQL_Connection* conn, const PGresult* result);
+bool polardb_is_lsn_wait_timeout_result(const PGresult* result);
 
 /// @brief Human-readable name of a proxy protocol value, for log and trace lines.
 static const char* polardb_proxy_protocol_name(PolarDB_ProxyProtocol protocol) {
@@ -848,19 +849,6 @@ handler_again:
 				const ExecStatusType exec_status_type = PQresultStatus(result.get());
 
 #if POLARDB_PROXY
-				if (polardb_query_wrap_state.is_extended_wait()) {
-					if (exec_status_type != PGRES_BAD_RESPONSE &&
-							exec_status_type != PGRES_NONFATAL_ERROR &&
-							exec_status_type != PGRES_FATAL_ERROR &&
-							exec_status_type != PGRES_PIPELINE_ABORTED) {
-						polardb_query_wrap_state.mark_extended_wait_succeeded();
-					}
-					// Notice callbacks for W have completed once its following
-					// Parse/Execute result is available. Later user-result notices
-					// belong to the normal query result.
-					polardb_query_wrap_state.mark_extended_wait_result_received();
-				}
-
 				// Consume the wrapper SET results inline. A wrapped LSN-wait read
 				// prepends N SET statements; each completes as PGRES_COMMAND_OK or
 				// PGRES_EMPTY_QUERY. We silently discard those results (do NOT buffer
@@ -1027,9 +1015,9 @@ handler_again:
 					break;
 				case PGRES_BAD_RESPONSE:
 				case PGRES_NONFATAL_ERROR:
-				case PGRES_FATAL_ERROR:
-				default:
-					// if on previous call we encountered a FATAL error, we will not process the result, as it will contain residual protocol messages
+					case PGRES_FATAL_ERROR:
+					default:
+						// if on previous call we encountered a FATAL error, we will not process the result, as it will contain residual protocol messages
 					// from the broken connection
 					if (is_error_present() == true && get_error_severity() == PGSQL_ERROR_SEVERITY::ERRSEVERITY_FATAL) {
 						NEXT_IMMEDIATE(ASYNC_USE_RESULT_CONT);
@@ -1180,28 +1168,38 @@ handler_again:
 		}
 
 		if (fetch_result_end_st != ASYNC_QUERY_END) {
-			bool has_error = (query_result->get_result_packet_type() & PGSQL_QUERY_RESULT_ERROR) != 0;
-
-			// Normally, ReadyForQuery is not sent immediately if we are in extended query mode
-			// and there are pending messages in the queue, as it will be sent once the entire
-			// extended query frame has been processed.
-			//
-			// Edge case: if a message fails with an error while the queue still contains pending
-			// messages, the queue will be cleared later in the session. In this situation,
-			// ReadyForQuery would never be sent because the pending messages are discarded.
-			//
-			// Fix: if the result indicates an error, explicitly send ReadyForQuery immediately.
-			// The extended query frame will still be reset later in the session.
-			if (!myds->sess->is_extended_query_ready_for_query() && !has_error) {
-				// Skip sending ReadyForQuery if there are still extended query messages pending in the queue
-				NEXT_IMMEDIATE(fetch_result_end_st);
-			}
+			const bool has_error =
+				(query_result->get_result_packet_type() &
+				 PGSQL_QUERY_RESULT_ERROR) != 0;
 
 			// An error has occurred while executing extended query sequence,  
 			// and connection is not in 'Ready for Query' state, i.e., unsynchronized.  
 			// To recover, we must resync by sending a SYNC to the backend connection.
 			if (!exit_pipeline_mode && has_error) {
 				NEXT_IMMEDIATE(ASYNC_RESYNC_START);
+			}
+
+			// A standalone backend resync is transport control, not another
+			// statement result. Its query_result is discarded by
+			// async_perform_resync(); the session publishes the one client RFQ.
+			const bool control_resync_result =
+				fetch_result_end_st == ASYNC_RESYNC_END &&
+				myds && myds->sess &&
+				myds->sess->status == RESYNCHRONIZING_CONNECTION;
+			if (control_resync_result) {
+#if POLARDB_PROXY
+				if (myds->sess->polardb_query.backend_isolation_status_needed) {
+					myds->sess->polardb_apply_backend_isolation_status(
+						this, "query_result");
+				}
+#endif // POLARDB_PROXY
+				NEXT_IMMEDIATE(fetch_result_end_st);
+			}
+
+			// The session frame owns the single frontend ReadyForQuery. Errors are
+			// resynchronized first; queued frontend messages are discarded later.
+			if (!myds->sess->extended_backend_result_sends_ready(has_error)) {
+				NEXT_IMMEDIATE(fetch_result_end_st);
 			}
 		}
 
@@ -1278,20 +1276,21 @@ handler_again:
 		 *
 		 * Query cache is disabled for LSN-aware clients because cached wire bytes
 		 * would otherwise replay a stale or missing ReadyForQuery LSN.
-		 */
-		bool include_client_lsn = false;
-		uint64_t client_lsn = 0;
-		if (myds && myds->sess) {
-			const bool backend_payload_present = has_polardb_lsn_payload();
-			const uint64_t backend_lsn = backend_payload_present
-				? get_polardb_lsn()
-				: 0;
-			include_client_lsn = myds->sess->polardb_prepare_client_ready_lsn(
-				this, backend_payload_present, backend_lsn, &client_lsn);
-		}
-		const unsigned int ready_bytes = query_result->add_ready_status(
-			PQtransactionStatus(pgsql_conn), include_client_lsn, client_lsn);
-		update_bytes_recv(ready_bytes);
+			 */
+			bool include_client_lsn = false;
+			uint64_t client_lsn = 0;
+			if (myds && myds->sess) {
+				const bool backend_payload_present = has_polardb_lsn_payload();
+				const uint64_t backend_lsn = backend_payload_present
+					? get_polardb_lsn()
+					: 0;
+				include_client_lsn = myds->sess->polardb_prepare_client_ready_lsn(
+					this, backend_payload_present, backend_lsn, &client_lsn,
+					PolarDB_DeferredRfqPolicy::NONE);
+			}
+			const unsigned int ready_bytes = query_result->add_ready_status(
+				PQtransactionStatus(pgsql_conn), include_client_lsn, client_lsn);
+			update_bytes_recv(ready_bytes);
 #else
 		query_result->add_ready_status(PQtransactionStatus(pgsql_conn));
 		update_bytes_recv(6);
@@ -1712,10 +1711,9 @@ void PgSQL_Connection::connect_start() {
 			if (!polardb_append_startup_params(conninfo, polardb_startup_profile, polardb_hid)) {
 				return;
 			}
-			// Mark the session PolarDB-enabled whenever its backend is in a PolarDB
-			// hostgroup. This flag gates the response-side LSN result processing;
-			// it is only ever turned on, never cleared, for the life of the session.
-			myds->sess->polardb_config.is_polardb_enabled = true;
+			// Every first activation establishes the conservative unknown-write
+			// boundary before response-side LSN processing can begin.
+			myds->sess->polardb_activate_session_for_request();
 		}
 #endif // POLARDB_PROXY
 	}
@@ -1815,15 +1813,13 @@ void PgSQL_Connection::connect_start() {
 #if POLARDB_PROXY
 PolarDB_StartupProfile PgSQL_Connection::polardb_build_startup_profile(unsigned int hid) const {
 	// A non-PolarDB hostgroup never gets PolarDB startup parameters.
-	if (!parent || !parent->myhgc || !PgHGM->is_polardb_hostgroup(hid)) {
+	if (!parent || !parent->myhgc) {
 		return PolarDB_StartupProfile::from_protocol(PolarDB_ProxyProtocol::OFF);
 	}
-	if (pgsql_thread___polardb_profile_off) {
-		return PolarDB_StartupProfile::from_protocol(PolarDB_ProxyProtocol::OFF);
-	}
-
-	return PgHGM->polardb_startup_profile_for_hostgroup(
-		hid, pgsql_thread___polardb_proxy_protocol);
+	const auto config = PgHGM->get_polardb_hg_config(hid);
+	return PgHGM->polardb_startup_profile_for_config(
+		config, pgsql_thread___polardb_proxy_protocol,
+		pgsql_thread___polardb_profile_off);
 }
 
 void PgSQL_Connection::set_polardb_startup_settings(
@@ -2862,6 +2858,38 @@ void PgSQL_Connection::next_multi_statement_result(PGresult* result) {
 	query_result->buffer_to_PSarrayOut();
 }
 
+__attribute__((always_inline)) inline
+bool PgSQL_Connection::_note_extended_backend_command_sent() {
+	if (myds && myds->sess && parent && parent->myhgc) {
+		if (likely(myds->sess->note_extended_backend_command_sent(
+				parent->myhgc->hid))) {
+			return true;
+		}
+		reusable = false;
+		set_error(PGSQL_ERROR_CODES::ERRCODE_PROTOCOL_VIOLATION,
+			"extended query backend ownership changed after command construction",
+			true);
+		return false;
+	}
+	return true;
+}
+
+__attribute__((always_inline)) inline
+bool PgSQL_Connection::_note_extended_backend_sync_sent() {
+	if (myds && myds->sess && parent && parent->myhgc) {
+		if (likely(myds->sess->note_extended_backend_sync_sent(
+				parent->myhgc->hid))) {
+			return true;
+		}
+		reusable = false;
+		set_error(PGSQL_ERROR_CODES::ERRCODE_PROTOCOL_VIOLATION,
+			"extended query backend ownership changed before Sync publication",
+			true);
+		return false;
+	}
+	return true;
+}
+
 void PgSQL_Connection::stmt_prepare_start() {
 	PROXY_TRACE();
 	reset_error();
@@ -2880,16 +2908,27 @@ void PgSQL_Connection::stmt_prepare_start() {
 
 	const PgSQL_Extended_Query_Info* extended_query_info = query.extended_query_info;
 	const Parse_Param_Types& parse_param_types = extended_query_info->parse_param_types;
+	const bool track_frame_backend =
+		(extended_query_info->flags &
+			PGSQL_EXTENDED_QUERY_FLAG_TRACK_FRAME_BACKEND) != 0;
 
 	int send_rc = 0;
 #if POLARDB_PROXY
 	PgSQL_Session* polardb_sess = myds ? myds->sess : nullptr;
+	if (unlikely((extended_query_info->flags &
+			PGSQL_EXTENDED_QUERY_FLAG_PREPARE_POLAR_WAIT) != 0) &&
+			(!polardb_sess ||
+			 !polardb_sess->polardb_prepare_extended_wait(this))) {
+		set_error(PGSQL_ERROR_CODES::ERRCODE_PROTOCOL_VIOLATION,
+			"PolarDB extended wait could not bind to the selected backend", true);
+		return;
+	}
 	const bool implicit_prepare =
 		(extended_query_info->flags & PGSQL_EXTENDED_QUERY_FLAG_IMPLICIT_PREPARE) != 0;
-	// Cold path only: an ordinary Parse takes the else branch without touching
-	// connection-local wait state. An implicit backend Parse starts W once and
-	// retains its state for the Execute that follows.
-	if (unlikely(implicit_prepare && polardb_sess &&
+	// W must precede the first snapshot-capable backend command. That can be a
+	// client Parse or a lazy backend Parse; the latter retains notice ownership
+	// for the Execute result that follows.
+	if (unlikely(polardb_sess &&
 			polardb_sess->polardb_wait_active())) {
 		PolarDB_Query_WaitState& wait_state = polardb_sess->polardb_query.wait;
 		if (wait_state.wrapper_finalized) {
@@ -2915,13 +2954,18 @@ void PgSQL_Connection::stmt_prepare_start() {
 				wait_state.spec.target, wait_state.spec.timeout_ms, wait_mode);
 			if (send_rc != 0) {
 				polardb_query_wrap_state.begin_extended_wait(
-					PolarDB_ExtendedWaitNoticeOwner::SESSION_QUEUE);
+					implicit_prepare
+						? PolarDB_ExtendedWaitNoticeOwner::SESSION_QUEUE
+						: PolarDB_ExtendedWaitNoticeOwner::QUERY_RESULT);
 				wait_state.wrapper_finalized = true;
 				POLARDB_THREAD_COUNT_ONE(polardb_sess->thread, wait_lsn_sent);
-				POLARDB_TRACE("PolarDB EXTENDED WAIT: dispatched before implicit Parse "
-					"target=%lu timeout_ms=%u mode=%d\n",
+				POLARDB_TRACE("PolarDB EXTENDED WAIT: dispatched before %sParse "
+					"target=%lu timeout_ms=%u mode=%d sess=%p sid=%u frame=%lu\n",
+					implicit_prepare ? "implicit " : "",
 					(unsigned long)wait_state.spec.target,
-					wait_state.spec.timeout_ms, wait_mode);
+					wait_state.spec.timeout_ms, wait_mode,
+					(void*)polardb_sess, polardb_sess->thread_session_id,
+					(unsigned long)polardb_sess->polardb_extended_trace_frame_id());
 			}
 		}
 	} else
@@ -2933,6 +2977,10 @@ void PgSQL_Connection::stmt_prepare_start() {
 	if (send_rc == 0) {
 		set_error_from_PQerrorMessage();
 		proxy_error("Failed to send prepare. %s\n", get_error_code_with_message().c_str());
+		return;
+	}
+	if (unlikely(track_frame_backend) &&
+			unlikely(!_note_extended_backend_command_sent())) {
 		return;
 	}
 
@@ -2949,6 +2997,10 @@ void PgSQL_Connection::stmt_prepare_start() {
 		if (PQsendPipelineSync(pgsql_conn) == 0) {
 			set_error_from_PQerrorMessage();
 			proxy_error("Failed to send pipeline sync. %s\n", get_error_code_with_message().c_str());
+			return;
+		}
+		if (unlikely(track_frame_backend) &&
+				unlikely(!_note_extended_backend_sync_sent())) {
 			return;
 		}
 	}
@@ -2981,6 +3033,9 @@ void PgSQL_Connection::stmt_describe_start() {
 	PQsetNoticeReceiver(pgsql_conn, &PgSQL_Connection::notice_handler_cb, this);
 
 	const PgSQL_Extended_Query_Info* extended_query_info = query.extended_query_info;
+	const bool track_frame_backend =
+		(extended_query_info->flags &
+			PGSQL_EXTENDED_QUERY_FLAG_TRACK_FRAME_BACKEND) != 0;
 
 	switch (extended_query_info->stmt_type) {
 	case 'P': // Portal
@@ -3002,6 +3057,10 @@ void PgSQL_Connection::stmt_describe_start() {
 		proxy_error("Failed to send describe message. %s\n", get_error_code_with_message().c_str());
 		return;
 	}
+	if (unlikely(track_frame_backend) &&
+			unlikely(!_note_extended_backend_command_sent())) {
+		return;
+	}
 
 	// Send a Flush if this is not the last extended query message in the sequence/frame;  
 	// otherwise, send a SYNC.
@@ -3015,6 +3074,10 @@ void PgSQL_Connection::stmt_describe_start() {
 		if (PQsendPipelineSync(pgsql_conn) == 0) {
 			set_error_from_PQerrorMessage();
 			proxy_error("Failed to send pipeline sync. %s\n", get_error_code_with_message().c_str());
+			return;
+		}
+		if (unlikely(track_frame_backend) &&
+				unlikely(!_note_extended_backend_sync_sent())) {
 			return;
 		}
 	}
@@ -3038,6 +3101,10 @@ void PgSQL_Connection::resync_start() {
 
 	if (PQsendPipelineSync(pgsql_conn) == 0) {
 		proxy_error("Failed to send pipeline sync.\n");
+		resync_failed = true;
+		return;
+	}
+	if (unlikely(!_note_extended_backend_sync_sent())) {
 		resync_failed = true;
 		return;
 	}
@@ -3070,6 +3137,9 @@ void PgSQL_Connection::stmt_execute_start() {
 	PQsetNoticeReceiver(pgsql_conn, &PgSQL_Connection::notice_handler_cb, this);
 
 	const PgSQL_Extended_Query_Info* extended_query_info = query.extended_query_info;
+	const bool track_frame_backend =
+		(extended_query_info->flags &
+			PGSQL_EXTENDED_QUERY_FLAG_TRACK_FRAME_BACKEND) != 0;
 	const PgSQL_Bind_Message* bind_msg = extended_query_info->bind_msg;
 	assert(bind_msg); // should never be null
 	const PgSQL_Bind_Data& bind_data = bind_msg->data(); // will always have valid data
@@ -3161,6 +3231,14 @@ void PgSQL_Connection::stmt_execute_start() {
 	int send_rc = 0;
 #if POLARDB_PROXY
 	PgSQL_Session* polardb_sess = myds ? myds->sess : nullptr;
+	if (unlikely((extended_query_info->flags &
+			PGSQL_EXTENDED_QUERY_FLAG_PREPARE_POLAR_WAIT) != 0) &&
+			(!polardb_sess ||
+			 !polardb_sess->polardb_prepare_extended_wait(this))) {
+		set_error(PGSQL_ERROR_CODES::ERRCODE_PROTOCOL_VIOLATION,
+			"PolarDB extended wait could not bind to the selected backend", true);
+		return;
+	}
 	// Cold path only: ordinary prepared Execute goes straight to libpq. An
 	// active wait either sends W here or reuses the W state retained by the
 	// preceding implicit backend Parse.
@@ -3197,9 +3275,11 @@ void PgSQL_Connection::stmt_execute_start() {
 				wait_state.wrapper_finalized = true;
 				POLARDB_THREAD_COUNT_ONE(polardb_sess->thread, wait_lsn_sent);
 				POLARDB_TRACE("PolarDB EXTENDED WAIT: dispatched before Bind/Execute "
-					"target=%lu timeout_ms=%u mode=%d\n",
+					"target=%lu timeout_ms=%u mode=%d sess=%p sid=%u frame=%lu\n",
 					(unsigned long)wait_state.spec.target,
-					wait_state.spec.timeout_ms, wait_mode);
+					wait_state.spec.timeout_ms, wait_mode,
+					(void*)polardb_sess, polardb_sess->thread_session_id,
+					(unsigned long)polardb_sess->polardb_extended_trace_frame_id());
 			}
 		}
 	} else
@@ -3213,6 +3293,10 @@ void PgSQL_Connection::stmt_execute_start() {
 	if (send_rc == 0) {
 		set_error_from_PQerrorMessage();
 		proxy_error("Failed to send execute prepared statement. %s\n", get_error_code_with_message().c_str());
+		return;
+	}
+	if (unlikely(track_frame_backend) &&
+			unlikely(!_note_extended_backend_command_sent())) {
 		return;
 	}
 #if POLARDB_PROXY && POLARDB_DEBUG
@@ -3231,6 +3315,10 @@ void PgSQL_Connection::stmt_execute_start() {
 		if (PQsendPipelineSync(pgsql_conn) == 0) {
 			set_error_from_PQerrorMessage();
 			proxy_error("Failed to send pipeline sync. %s\n", get_error_code_with_message().c_str());
+			return;
+		}
+		if (unlikely(track_frame_backend) &&
+				unlikely(!_note_extended_backend_sync_sent())) {
 			return;
 		}
 	}

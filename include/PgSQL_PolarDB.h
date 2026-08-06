@@ -8,19 +8,21 @@
  * message is abbreviated "RFQ" throughout this file and the .cpp files:
  *   - health check via polar_node_type() / polar_is_available()
  *   - per-session write-LSN tracking for read-your-writes consistency
- *   - a prepended SET block (consistency mode, wait timeout, and the
- *     `SET polar_xact_split_wait_lsn` wait condition) on replica-eligible autocommit
- *     reads
+ *   - one staged wait intent for replica-eligible autocommit reads, encoded as
+ *     a prepended SET block for simple query or an in-band W immediately before
+ *     Parse or Bind/Execute for negotiated v15_wait extended connections
  *
- * Build switch: everything PolarDB-specific is compiled only under
- * POLARDB_PROXY (see Makefiles). With POLARDB_PROXY=0 the feature compiles to
- * no-op stubs in PgSQL_PolarDB_Stubs.cpp, leaving ProxySQL behavior unchanged.
+ * Build switch: PolarDB routing, configuration, counters, startup metadata, and
+ * patched-libpq calls compile only under POLARDB_PROXY (see Makefiles). With
+ * POLARDB_PROXY=0 they are absent and vanilla libpq is linked; generic extended
+ * protocol framing, ownership, and error-boundary fixes remain shared.
  *
  * This header contains the complete LSN session-consistency surface: monitor
  * health parsing, per-server LSN cache helpers, query wait state, routing
  * context/plan types, wait wrapping, notice capture and forwarding, and
  * response-side LSN result processing. A replica read is allowed only when its
- * required wait prefix can be attached before dispatch.
+ * required SQL or protocol wait can be attached before the semantic command,
+ * or when a fresh reader-LSN snapshot proves that the target is already ready.
  */
 
 #ifndef __CLASS_PGSQL_POLARDB_H
@@ -446,9 +448,10 @@ enum class PolarDB_NodeType {
 /**
  * @brief Type of consistency wait to apply before a read query.
  *
- * Only NONE and LSN exist; the wait wrapper renders LSN as a
- * SET polar_xact_split_wait_lsn statement. The value 1 is left unassigned so the
- * stored integer stays stable if another wait kind is added later.
+ * Only NONE and LSN exist. Simple protocol renders LSN in the SQL wait wrapper;
+ * extended protocol encodes the same wait intent as an in-band W command. The
+ * value 1 is left unassigned so the stored integer stays stable if another wait
+ * kind is added later.
  */
 enum class PolarDB_WaitType : uint8_t {
     NONE = 0,  // No wait needed
@@ -2807,11 +2810,6 @@ struct PolarDB_WriterScope {
     }
 };
 
-/**
- * @brief Per-session PolarDB consistency state.
- *
- * The write component tracks this session's positioned writes. The observed
- * component tracks every positioned result this client has seen. SESSION_LSN
 // Plain-value topology copied by HGM for one routing decision. Keeping this
 // type outside HGM lets Session reuse one snapshot without introducing a
 // Session <-> HostGroups_Manager header cycle.
@@ -2831,6 +2829,11 @@ struct PolarDB_HG_ConfigSnapshot {
 	uint64_t writer_epoch{0};
 };
 
+/**
+ * @brief Per-session PolarDB consistency state.
+ *
+ * The write component tracks this session's positioned writes. The observed
+ * component tracks every positioned result this client has seen. SESSION_LSN
  * reads wait on max(write_lsn, observed_lsn), so a later read never goes behind
  * either its own writes or a fresher replica result it already observed.
  *
@@ -3823,11 +3826,9 @@ static inline bool polardb_should_handle_wait_timeout_result(
  */
 static inline bool polardb_extended_wait_retry_packet_ready(
 		bool extended_query,
-		bool wait_active,
-		bool wait_spec_present,
+		bool wait_required,
 		bool retry_packet_present) {
-	return extended_query && wait_active && wait_spec_present &&
-		retry_packet_present;
+	return extended_query && wait_required && retry_packet_present;
 }
 
 /**
@@ -4150,10 +4151,11 @@ public:
  *   SET polar_xact_split_wait_lsn = ...; <user query>
  *
  * A v15_wait backend instead accepts a negotiated W message before the first
- * snapshot-bearing message. ProxySQL keeps explicit Parse/Bind/Describe on the
- * writer; Execute may select a reader, where an implicit prepare emits W before P
- * or an existing prepared statement emits W before B/E. W has no success reply,
- * so this remains one wire flush and adds no round trip.
+ * snapshot-bearing message. A one-shot Parse/Bind/Execute frame is routed before
+ * its first backend Parse and emits W before P. A reusable prepared statement is
+ * routed at Execute and emits W before B/E. Metadata and multi-operation frames
+ * remain on the writer. W has no success reply, so this remains one wire flush
+ * and adds no round trip.
  *
  * Therefore:
  *   - simple-query + replica_eligible=1 may route to a reader with a wait wrapper;
@@ -4198,7 +4200,7 @@ struct PolarDB_Query_RouteCtx {
     bool is_polar_hg = false;              // from HGM cache (resolved once)
     bool replica_eligible = false;         // from qpo->replica_eligible (policy condition)
     bool is_multi_statement = false;       // semicolon scan (hard safety check)
-    bool is_extended_protocol = false;     // Parse/Bind/Execute: regular ProxySQL routing only; no PolarDB wait wrapper
+    bool is_extended_protocol = false;     // Parse/Bind/Execute; v15_wait can carry an in-band wait before execution
     bool in_transaction = false;           // session is inside an explicit transaction
     bool txn_split_enabled = false;        // LSN mode and per-hostgroup split permission are both required
     bool is_txn_split_safe_read = false;   // split: top-level SELECT with no locking clause
@@ -4222,10 +4224,11 @@ struct PolarDB_Query_RouteCtx {
  * PolarDB_Query_RoutePlan::wait_spec and are passed beside this record to reader
  * acquisition.
  *
- * The wait target is normally enforced by the SET polar_xact_split_wait_lsn
- * statement on the wire. Backend acquisition may skip that wrapper only after
- * the selected reader is confirmed to have a fresh cached LSN at or beyond the
- * target from the wait spec.
+ * Simple protocol enforces the wait target with the SQL wait wrapper; extended
+ * protocol uses an in-band W command on a negotiated v15_wait backend. Backend
+ * acquisition may skip either wire mechanism only after the selected reader is
+ * confirmed to have a fresh cached LSN at or beyond the target from the wait
+ * spec.
  */
 struct PolarDB_Query_ReaderPlan {
     // Factory helpers construct this record before the planner copies the
@@ -4367,6 +4370,7 @@ struct PolarDB_QueryState {
         const PolarDB_WriterScope writer_scope = request_writer_scope;
         const PolarDB_Query_ReaderPlan plan = reader_plan;
         const PolarDB_WaitSpec wait_spec = reader_wait_spec;
+		const uint64_t bypass_target = wait_bypass_target;
         const int consistency_mode = effective_consistency_mode;
         const bool enabled = profile_enabled;
         const bool split_enabled = txn_split_enabled;
@@ -4378,6 +4382,7 @@ struct PolarDB_QueryState {
         request_writer_scope = writer_scope;
         reader_plan = plan;
         reader_wait_spec = wait_spec;
+		wait_bypass_target = bypass_target;
         effective_consistency_mode = consistency_mode;
         profile_enabled = enabled;
         txn_split_enabled = split_enabled;
@@ -4398,6 +4403,80 @@ struct PolarDB_QueryState {
         keep_session_lsn = false;
         reset_dispatch_wrapper();
     }
+};
+
+/**
+ * @brief RFQ-dependent result attribution retained across extended Flushes.
+ *
+ * Flush exposes command results without ending the backend extended cycle, so
+ * the RFQ that positions those results is not available until a later Sync.
+ * This record aggregates only the response facts needed at that final RFQ;
+ * ordinary per-query logging and accounting still finish at each Execute.
+ * A successful result may be attributed before the frontend RFQ is published,
+ * so result attribution and RFQ publication have separate pending flags.
+ */
+struct PolarDB_RfqEvidence {
+    PolarDB_WriterScope writer_scope;
+    uint64_t lsn = 0;
+    int backend_hostgroup = -1;
+    bool valid = false;
+    bool payload_present = false;
+    bool keep_session_lsn_candidate = false;
+
+    void reset() {
+        writer_scope.reset();
+        lsn = 0;
+        backend_hostgroup = -1;
+        valid = false;
+        payload_present = false;
+        keep_session_lsn_candidate = false;
+    }
+};
+
+struct PolarDB_ExtendedRfqState {
+    PolarDB_WriterScope writer_scope;
+    // Internal error resynchronization consumes the backend RFQ before the
+    // client's later Sync. Retain values only; pooled connection ownership must
+    // never escape the request boundary.
+    PolarDB_RfqEvidence rfq_evidence;
+    uint64_t confirmed_read_target = 0;
+    int effective_consistency_mode =
+        static_cast<int>(PolarDB_ConsistencyMode::OFF);
+    /** Successful result attribution still needs a positioning backend RFQ. */
+    bool pending = false;
+    /** Frontend RFQ still needs the retained request publication policy. */
+    bool publication_pending = false;
+    bool saw_write = false;
+    bool can_preserve_session_lsn = true;
+    bool profile_enabled = false;
+    bool scope_consistent = true;
+
+    void reset() {
+        writer_scope.reset();
+        rfq_evidence.reset();
+        confirmed_read_target = 0;
+        effective_consistency_mode =
+            static_cast<int>(PolarDB_ConsistencyMode::OFF);
+        pending = false;
+        publication_pending = false;
+        saw_write = false;
+        can_preserve_session_lsn = true;
+        profile_enabled = false;
+        scope_consistent = true;
+    }
+};
+
+/**
+ * @brief Controls whether frontend RFQ preparation may inspect deferred state.
+ *
+ * Simple-query RFQ generation uses NONE and therefore never touches extended
+ * publication state. DETECT is used only when a caller has not yet restored a
+ * deferred publication; PREPARED means that restoration already happened.
+ */
+enum class PolarDB_DeferredRfqPolicy : uint8_t {
+    NONE,
+    DETECT,
+    PREPARED,
 };
 
 /**
@@ -4484,7 +4563,7 @@ struct PolarDB_Query_RoutePlan {
      */
     enum class RouteActionReason : uint8_t {
         NONE = 0,
-        EXTENDED_PROTOCOL,     // extended-protocol read has a session wait target; the wait wrapper is simple-query only
+        EXTENDED_PROTOCOL,     // extended protocol is unsupported for this transaction-split/defensive planner path
         IN_TRANSACTION,        // transaction state is not eligible for the safe pre-write/XID split route
         MULTI_STATEMENT,       // multi-statement read — never offloaded to a replica
         READ_TARGET_PRIMARY,   // read target is primary
@@ -4519,7 +4598,7 @@ struct PolarDB_Query_RoutePlan {
     RouteAction action = RouteAction::PASSTHROUGH;
     RouteActionReason action_reason = RouteActionReason::NONE;
     RouteActionReason split_reason = RouteActionReason::NONE;
-    bool degraded_rfq_route : 1;           // best-effort route without enforceable RFQ target
+    bool degraded_rfq_route : 1;           // warning route without enforceable RFQ target
     bool txn_wait_read : 1;                // pre-write transaction read using a temporary reader
     bool split_checked : 1;                // transaction-split checks ran for this plan
 
@@ -4800,7 +4879,8 @@ enum class PolarDB_ReaderAction : uint8_t {
 enum class PolarDB_ReaderFailureKind : uint8_t {
     CONNECTION_LOST = 0,
     WAIT_TIMEOUT = 1,
-    REUSABLE_ERROR = 2
+    REUSABLE_ERROR = 2,
+    QUERY_CANCELED = 3
 };
 
 /// @brief Destination selected when a reader-failure policy chooses RETRY.
@@ -4845,6 +4925,8 @@ static inline const char* polardb_reader_failure_kind_name(
         return "wait_timeout";
     case PolarDB_ReaderFailureKind::REUSABLE_ERROR:
         return "reusable_error";
+    case PolarDB_ReaderFailureKind::QUERY_CANCELED:
+        return "query_canceled";
     }
     return "unknown";
 }
@@ -4880,19 +4962,35 @@ static inline const char* polardb_reader_failure_route_name(
  * it. Each present field adds its type byte, its value, and a NUL terminator. A
  * null field pointer is skipped (the field is omitted from the message).
  */
+struct PolarDB_NoticeField {
+    unsigned char code;
+    const char* value;
+};
+
+static inline unsigned int polardb_notice_response_packet_size(
+    const PolarDB_NoticeField* fields, size_t field_count) {
+    unsigned int size = 1 + 4 + 1; // type + length + field-list terminator
+    for (size_t i = 0; i < field_count; ++i) {
+        if (fields[i].value) size += strlen(fields[i].value) + 2;
+    }
+    return size;
+}
+
 static inline unsigned int polardb_notice_response_packet_size(
     const char* severity,
     const char* sqlstate,
     const char* primary,
     const char* detail = nullptr,
     const char* severity_nonlocalized = nullptr) {
-    unsigned int size = 1 + 4 + 1; // type + length + field-list terminator
-    if (severity) size += strlen(severity) + 2; // 'S' + value + NUL
-    if (severity_nonlocalized) size += strlen(severity_nonlocalized) + 2; // 'V' + value + NUL
-    if (sqlstate) size += strlen(sqlstate) + 2; // 'C' + value + NUL
-    if (primary) size += strlen(primary) + 2;   // 'M' + value + NUL
-    if (detail) size += strlen(detail) + 2;     // 'D' + value + NUL
-    return size;
+    const PolarDB_NoticeField fields[] = {
+        {'S', severity},
+        {'V', severity_nonlocalized},
+        {'C', sqlstate},
+        {'M', primary},
+        {'D', detail}
+    };
+    return polardb_notice_response_packet_size(
+        fields, sizeof(fields) / sizeof(fields[0]));
 }
 
 /**
@@ -4908,13 +5006,10 @@ static inline unsigned int polardb_notice_response_packet_size(
 static inline unsigned int polardb_write_notice_response_packet(
     unsigned char* pkt,
     unsigned int capacity,
-    const char* severity,
-    const char* sqlstate,
-    const char* primary,
-    const char* detail = nullptr,
-    const char* severity_nonlocalized = nullptr) {
+    const PolarDB_NoticeField* fields,
+    size_t field_count) {
     const unsigned int size = polardb_notice_response_packet_size(
-        severity, sqlstate, primary, detail, severity_nonlocalized);
+        fields, field_count);
     if (!pkt || capacity < size) {
         return 0;
     }
@@ -4935,13 +5030,30 @@ static inline unsigned int polardb_write_notice_response_packet(
         write_cursor += value_len;
     };
 
-    write_field('S', severity);
-    write_field('V', severity_nonlocalized);
-    write_field('C', sqlstate);
-    write_field('M', primary);
-    write_field('D', detail);
+    for (size_t i = 0; i < field_count; ++i) {
+        write_field(fields[i].code, fields[i].value);
+    }
     *write_cursor++ = '\0';
     return size;
+}
+
+static inline unsigned int polardb_write_notice_response_packet(
+    unsigned char* pkt,
+    unsigned int capacity,
+    const char* severity,
+    const char* sqlstate,
+    const char* primary,
+    const char* detail = nullptr,
+    const char* severity_nonlocalized = nullptr) {
+    const PolarDB_NoticeField fields[] = {
+        {'S', severity},
+        {'V', severity_nonlocalized},
+        {'C', sqlstate},
+        {'M', primary},
+        {'D', detail}
+    };
+    return polardb_write_notice_response_packet(
+        pkt, capacity, fields, sizeof(fields) / sizeof(fields[0]));
 }
 
 /**

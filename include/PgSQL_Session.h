@@ -4,6 +4,7 @@
 #define PROXYSQL_PGSQL_SESSION_H
 
 #include <functional>
+#include <queue>
 #include <vector>
 #include <variant>
 #include <string_view>
@@ -130,6 +131,10 @@ enum PgSQL_Extended_Query_Flags : uint8_t {
 	PGSQL_EXTENDED_QUERY_FLAG_DESCRIBE_PORTAL	= 0x01,
 	PGSQL_EXTENDED_QUERY_FLAG_SYNC				= 0x02,
 	PGSQL_EXTENDED_QUERY_FLAG_IMPLICIT_PREPARE  = 0x04,
+	// These two flags keep generic connection sends cheap: ordinary Sync frames
+	// neither publish backend ownership nor enter PolarDB wait preparation.
+	PGSQL_EXTENDED_QUERY_FLAG_TRACK_FRAME_BACKEND = 0x08,
+	PGSQL_EXTENDED_QUERY_FLAG_PREPARE_POLAR_WAIT = 0x10,
 };
 
 enum ExtendedQueryPhase : uint8_t {
@@ -225,30 +230,496 @@ class PgSQL_Session : public Base_Session<PgSQL_Session, PgSQL_Data_Stream, PgSQ
 private:
 	using PktType = std::variant<std::unique_ptr<PgSQL_Parse_Message>,std::unique_ptr<PgSQL_Describe_Message>,
 		std::unique_ptr<PgSQL_Close_Message>, std::unique_ptr<PgSQL_Bind_Message>, std::unique_ptr<PgSQL_Execute_Message>>;
+	struct ExtendedBoundPortal {
+		std::unique_ptr<const PgSQL_Bind_Message> message;
+		const PgSQL_STMT_Global_info* statement{nullptr};
+		std::shared_ptr<const PgSQL_STMT_Global_info> retained_statement;
+
+		explicit operator bool() const {
+			return message != nullptr;
+		}
+
+		const PgSQL_Bind_Message* operator->() const {
+			return message.get();
+		}
+
+		const PgSQL_Bind_Message* get() const {
+			return message.get();
+		}
+
+		const PgSQL_STMT_Global_info* statement_info() const {
+			return statement;
+		}
+
+		void capture(const PgSQL_Bind_Message* bind_message,
+			const PgSQL_STMT_Global_info* stmt);
+		void retain_statement_owner(
+			std::shared_ptr<const PgSQL_STMT_Global_info>& stmt);
+		void reset();
+	};
+	struct ExtendedQueryFrameState {
+		static constexpr int INACTIVE_BACKEND = -1;
+		static constexpr int UNCLAIMED_BACKEND = -2;
+		int hostgroup{-1};
+		int backend_hostgroup{INACTIVE_BACKEND};
+		bool writer_required{false};
+		bool backend_route_pending{false};
+		bool backend_sync_sent{false};
+		bool client_sync_received{false};
+		bool frontend_ready_sent_flag{false};
+		bool waiting_for_client_sync_after_error{false};
+		unsigned int backend_candidates_remaining{0};
+		bool batch_last_was_portal_describe{false};
+#if POLARDB_PROXY && POLARDB_DEBUG
+		// Correlates interleaved debug traces without affecting release sessions.
+		uint64_t trace_sequence{0};
+#endif
+#if POLARDB_PROXY
+		uint8_t batch_parse_count{0};
+		uint8_t batch_execute_count{0};
+		uint8_t batch_backend_metadata_count{0};
+		const char* batch_parse_stmt_name{nullptr};
+		bool batch_saw_parse{false};
+		bool batch_saw_bind{false};
+		bool batch_stmt_names_match{false};
+		bool batch_parse_precedes_execute{false};
+		bool batch_route_shape_complete{true};
+		bool batch_classification_latched{false};
+		bool batch_classify_route{false};
+#endif // POLARDB_PROXY
+
+		bool active() const {
+			return backend_hostgroup != INACTIVE_BACKEND;
+		}
+
+		void begin(int fallback_hostgroup, bool require_writer,
+				bool has_client_sync, bool route_batch) {
+			if (!active()) {
+#if POLARDB_PROXY && POLARDB_DEBUG
+				++trace_sequence;
+#endif
+				hostgroup = fallback_hostgroup;
+				backend_hostgroup = UNCLAIMED_BACKEND;
+				writer_required = require_writer;
+				backend_route_pending = route_batch;
+				backend_sync_sent = false;
+				client_sync_received = has_client_sync;
+				frontend_ready_sent_flag = false;
+				waiting_for_client_sync_after_error = false;
+				return;
+			}
+			if (backend_hostgroup == UNCLAIMED_BACKEND) {
+				// A Flush batch that completed locally has not pinned a backend.
+				// Let the next batch classify its first real backend operation.
+				writer_required = require_writer;
+				backend_route_pending = route_batch;
+			} else {
+				// Once one command is on the wire, the extended cycle cannot move.
+				writer_required |= require_writer;
+				// A later Flush batch still has a fresh QPO decision. Re-run the
+				// common route plan and validate it against the pinned backend.
+				backend_route_pending = route_batch;
+			}
+			client_sync_received |= has_client_sync;
+		}
+
+		bool route_required() const {
+			return backend_route_pending;
+		}
+
+		void consume_backend_route() {
+			backend_route_pending = false;
+		}
+
+		bool consume_backend_candidate() {
+			if (unlikely(backend_candidates_remaining == 0)) {
+				return false;
+			}
+			--backend_candidates_remaining;
+			return true;
+		}
+
+		void clear_backend_candidates() {
+			backend_candidates_remaining = 0;
+		}
+
+#if POLARDB_PROXY
+		bool latch_batch_classification(bool route_active) {
+			if (!batch_classification_latched) {
+				batch_classification_latched = true;
+				batch_classify_route = route_active;
+			}
+			return batch_classify_route;
+		}
+
+		bool batch_activity_changed(bool route_active) const {
+			return batch_classification_latched &&
+				batch_classify_route != route_active;
+		}
+
+		static void increment_shape_count(uint8_t& count) {
+			// The classifier distinguishes only zero, one, and multiple messages.
+			if (count != UINT8_MAX) {
+				++count;
+			}
+		}
+#endif // POLARDB_PROXY
+
+		void note_parse(const char* stmt_name, bool classify_route) {
+			++backend_candidates_remaining;
+			batch_last_was_portal_describe = false;
+#if POLARDB_PROXY
+			if (!classify_route) {
+				return;
+			}
+			// Parse after Bind cannot describe the statement already captured by
+			// that portal, even when both client names are the empty string.
+			batch_route_shape_complete &= !batch_saw_bind;
+			increment_shape_count(batch_parse_count);
+			batch_parse_stmt_name = stmt_name;
+			batch_saw_parse = true;
+#else
+			(void)stmt_name;
+			(void)classify_route;
+#endif // POLARDB_PROXY
+		}
+
+		void note_bind(const char* stmt_name, bool classify_route) {
+			batch_last_was_portal_describe = false;
+#if POLARDB_PROXY
+			if (!classify_route) {
+				return;
+			}
+			batch_stmt_names_match = batch_saw_parse &&
+				batch_parse_stmt_name && stmt_name &&
+				strcmp(batch_parse_stmt_name, stmt_name) == 0;
+			batch_saw_bind = true;
+#else
+			(void)stmt_name;
+			(void)classify_route;
+#endif // POLARDB_PROXY
+		}
+
+		void note_describe(bool portal, bool classify_route) {
+			++backend_candidates_remaining;
+			batch_last_was_portal_describe = portal;
+#if POLARDB_PROXY
+			if (classify_route) {
+				increment_shape_count(batch_backend_metadata_count);
+			}
+#else
+			(void)classify_route;
+#endif // POLARDB_PROXY
+		}
+
+		void note_execute(bool classify_route) {
+			if (batch_last_was_portal_describe) {
+				// The local portal Describe is replaced by this Execute.
+				if (unlikely(backend_candidates_remaining == 0)) {
+					// Preserve candidate balance and force the batch to the writer if
+					// an internal queue-shape invariant was lost.
+					++backend_candidates_remaining;
+#if POLARDB_PROXY
+					batch_route_shape_complete = false;
+#endif // POLARDB_PROXY
+				}
+#if POLARDB_PROXY
+				if (classify_route) {
+					if (likely(batch_backend_metadata_count != 0)) {
+						--batch_backend_metadata_count;
+					} else {
+						batch_route_shape_complete = false;
+					}
+				}
+#endif // POLARDB_PROXY
+			} else {
+				++backend_candidates_remaining;
+			}
+#if POLARDB_PROXY
+			if (classify_route) {
+				increment_shape_count(batch_execute_count);
+				batch_parse_precedes_execute = batch_saw_parse;
+			}
+#else
+			(void)classify_route;
+#endif // POLARDB_PROXY
+			batch_last_was_portal_describe = false;
+		}
+
+		void note_local_message() {
+			batch_last_was_portal_describe = false;
+		}
+
+#if POLARDB_PROXY
+		bool batch_requires_writer(bool activity_changed) const {
+			if (activity_changed || !batch_route_shape_complete) {
+				// A topology transition or ambiguous Parse/Bind order cannot be
+				// classified safely as one reader-eligible execution.
+				return true;
+			}
+			bool one_statement_execution = batch_execute_count == 1 &&
+				batch_backend_metadata_count == 0 && batch_parse_count <= 1;
+			if (one_statement_execution && batch_parse_count == 1) {
+				one_statement_execution = batch_parse_precedes_execute &&
+					batch_stmt_names_match;
+			}
+			return !one_statement_execution;
+		}
+#endif // POLARDB_PROXY
+
+		void clear_batch_shape() {
+#if POLARDB_PROXY
+			if (batch_classify_route) {
+				batch_parse_count = 0;
+				batch_execute_count = 0;
+				batch_backend_metadata_count = 0;
+				batch_parse_stmt_name = nullptr;
+				batch_saw_parse = false;
+				batch_saw_bind = false;
+				batch_stmt_names_match = false;
+				batch_parse_precedes_execute = false;
+				batch_route_shape_complete = true;
+			}
+			batch_classification_latched = false;
+			batch_classify_route = false;
+#endif // POLARDB_PROXY
+			batch_last_was_portal_describe = false;
+		}
+
+		bool should_send_backend_sync() const {
+			return client_sync_received &&
+				backend_candidates_remaining == 0;
+		}
+
+		bool select_hostgroup(int selected_hostgroup) {
+			if (!active()) {
+				return true;
+			}
+			if (backend_hostgroup >= 0 &&
+					backend_hostgroup != selected_hostgroup) {
+				return false;
+			}
+			hostgroup = selected_hostgroup;
+			return true;
+		}
+
+		bool can_claim_backend(int selected_hostgroup) const {
+			return !active() || backend_hostgroup == UNCLAIMED_BACKEND ||
+				backend_hostgroup == selected_hostgroup;
+		}
+
+		bool claim_backend(int selected_hostgroup) {
+			if (!active()) {
+				return true;
+			}
+			if (!can_claim_backend(selected_hostgroup)) {
+				return false;
+			}
+			if (backend_hostgroup == UNCLAIMED_BACKEND) {
+				backend_hostgroup = selected_hostgroup;
+			}
+			return backend_hostgroup == selected_hostgroup;
+		}
+
+		void mark_backend_sync_sent(bool sent) {
+			backend_sync_sent = sent;
+		}
+
+		bool frontend_ready_sent() const {
+			return frontend_ready_sent_flag;
+		}
+
+		void mark_frontend_ready_sent() {
+			frontend_ready_sent_flag = true;
+		}
+
+		void reset_frontend_ready() {
+			frontend_ready_sent_flag = false;
+		}
+
+		bool ready_for_query() const {
+			return !active() || (client_sync_received &&
+				!frontend_ready_sent() &&
+				(backend_hostgroup < 0 || backend_sync_sent));
+		}
+
+		bool needs_backend_sync() const {
+			return backend_hostgroup >= 0 && !backend_sync_sent;
+		}
+
+		void mark_error_waiting_for_sync() {
+			if (active() && !client_sync_received) {
+				waiting_for_client_sync_after_error = true;
+			}
+		}
+
+		bool discards_until_sync(char command) const {
+			return waiting_for_client_sync_after_error &&
+				command != 'S' && command != 'X';
+		}
+
+		int selected_or(int fallback_hostgroup) const {
+			return hostgroup >= 0 ? hostgroup : fallback_hostgroup;
+		}
+
+		void complete() {
+			hostgroup = -1;
+			backend_hostgroup = INACTIVE_BACKEND;
+			writer_required = false;
+			backend_route_pending = false;
+			backend_sync_sent = false;
+			client_sync_received = false;
+			frontend_ready_sent_flag = false;
+			waiting_for_client_sync_after_error = false;
+			backend_candidates_remaining = 0;
+			clear_batch_shape();
+		}
+	};
+	struct ExtendedFrameFinalizeResult {
+		PgSQL_Backend* backend{nullptr};
+		bool needs_backend_sync{false};
+	};
+	enum class ExtendedFrameMessageKind : uint8_t {
+		PARSE,
+		BIND,
+		DESCRIBE_STATEMENT,
+		DESCRIBE_PORTAL,
+		EXECUTE,
+		LOCAL
+	};
+	enum class QpoHandlerResult : uint8_t {
+		CONTINUE = 0,
+		HANDLED,
+		ERROR
+	};
 
 	bool extended_query_exec_qp { false };
 	uint8_t extended_query_phase { EXTQ_PHASE_IDLE };
 	std::queue<PktType> extended_query_frame;
-	std::unique_ptr<const PgSQL_Bind_Message> bind_waiting_for_execute;
-#if POLARDB_PROXY
-	struct PolarDB_ExtendedRouteState {
-		bool execute_pending{false};
-
-		void reset() {
-			execute_pending = false;
-		}
-	} polardb_extended_route;
-
+	ExtendedQueryFrameState extended_query_frame_state;
+	ExtendedBoundPortal bind_waiting_for_execute;
+	// The logical Execute/Describe resumed after an implicit Parse is distinct
+	// from previous_status, which carries transport state across reconnects.
+	enum session_status implicit_prepare_continuation{session_status___NONE};
+	#if POLARDB_PROXY
 	inline bool polardb_extended_request_continues(
 			bool called_on_failure, bool result_has_error) const {
 		return !called_on_failure &&
 			!result_has_error &&
-			!extended_query_frame.empty() &&
+			extended_query_frame_state.active() &&
+			(!extended_query_frame_state.client_sync_received ||
+			 !extended_query_frame.empty()) &&
 			(extended_query_phase &
 				(EXTQ_PHASE_PROCESSING_PARSE |
 				 EXTQ_PHASE_PROCESSING_DESCRIBE));
 	}
+	QpoHandlerResult apply_extended_backend_route(PtrSize_t* pkt);
+	#endif // POLARDB_PROXY
+
+	inline int extended_frame_hostgroup_or_previous() const {
+		return extended_query_frame_state.selected_or(previous_hostgroup);
+	}
+
+	inline bool select_extended_frame_hostgroup(int hostgroup) {
+		return extended_query_frame_state.select_hostgroup(hostgroup);
+	}
+	inline int extended_qpo_target_hostgroup(int destination_hostgroup) const {
+		if (transaction_persistent_hostgroup >= 0) {
+			return transaction_persistent_hostgroup;
+		}
+		if (destination_hostgroup >= 0) {
+			return destination_hostgroup;
+		}
+		if (extended_query_frame_state.hostgroup >= 0) {
+			return extended_query_frame_state.hostgroup;
+		}
+		if (previous_hostgroup >= 0) {
+			return previous_hostgroup;
+		}
+		return default_hostgroup;
+	}
+	int reject_extended_frame_hostgroup(int selected_hostgroup);
+	int reject_extended_missing_hostgroup();
+	int reject_extended_frame_accounting(const char* operation);
+	bool enforce_extended_query_hostgroup_lock(bool lock_hostgroup,
+		const char* query, int query_len);
+
+	inline bool can_claim_extended_frame_backend() const {
+		return !extended_query_frame_state.active() ||
+			extended_query_frame_state.can_claim_backend(current_hostgroup);
+	}
+	inline bool extended_client_sync_received() const {
+		if (extended_query_frame_state.active()) {
+			return extended_query_frame_state.client_sync_received;
+		}
+		return (extended_query_phase &
+			(EXTQ_PHASE_EXECUTING_SYNC_CLIENT |
+			 EXTQ_PHASE_EXECUTING_SYNC_IMPLICIT)) != 0;
+	}
+	__attribute__((always_inline)) inline bool
+	needs_implicit_sync_before_simple_query() const {
+		return (!extended_query_frame.empty() ||
+			 extended_query_frame_state.active()) &&
+			!extended_query_frame_state.waiting_for_client_sync_after_error;
+	}
+	template <typename Message>
+	__attribute__((always_inline)) inline void queue_extended_message(
+			std::unique_ptr<Message> packet, ExtendedFrameMessageKind kind,
+			const char* stmt_name = nullptr) {
+		bool classify_route = false;
+#if POLARDB_PROXY
+		classify_route = extended_query_frame_state.batch_classification_latched
+			? extended_query_frame_state.batch_classify_route
+			: extended_query_frame_state.latch_batch_classification(
+				thread->polardb_is_active());
 #endif // POLARDB_PROXY
+		switch (kind) {
+		case ExtendedFrameMessageKind::PARSE:
+			extended_query_frame_state.note_parse(stmt_name, classify_route);
+			break;
+		case ExtendedFrameMessageKind::BIND:
+			extended_query_frame_state.note_bind(stmt_name, classify_route);
+			break;
+		case ExtendedFrameMessageKind::DESCRIBE_STATEMENT:
+			extended_query_frame_state.note_describe(false, classify_route);
+			break;
+		case ExtendedFrameMessageKind::DESCRIBE_PORTAL:
+			extended_query_frame_state.note_describe(true, classify_route);
+			break;
+		case ExtendedFrameMessageKind::EXECUTE:
+			extended_query_frame_state.note_execute(classify_route);
+			break;
+		case ExtendedFrameMessageKind::LOCAL:
+			extended_query_frame_state.note_local_message();
+			break;
+		}
+		extended_query_frame.push(std::move(packet));
+	}
+	inline void mark_extended_backend_dispatch(
+			PgSQL_Extended_Query_Info& info, bool snapshot_capable) const {
+		if (!extended_query_frame_state.active()) {
+			return;
+		}
+		info.flags |= PGSQL_EXTENDED_QUERY_FLAG_TRACK_FRAME_BACKEND;
+#if POLARDB_PROXY
+		info.flags &= ~PGSQL_EXTENDED_QUERY_FLAG_PREPARE_POLAR_WAIT;
+		if (snapshot_capable && polardb_query.reader_wait_spec.has_wait()) {
+			info.flags |= PGSQL_EXTENDED_QUERY_FLAG_PREPARE_POLAR_WAIT;
+		}
+#endif // POLARDB_PROXY
+	}
+	void transfer_extended_frame_backend(int hostgroup);
+	void begin_extended_query_frame(bool client_sync_received);
+	__attribute__((always_inline)) inline bool note_extended_backend_candidate() {
+		return extended_query_frame_state.consume_backend_candidate();
+	}
+	bool should_send_extended_backend_sync() const;
+	ExtendedFrameFinalizeResult finalize_extended_query_frame();
+	bool extended_local_result_sends_ready(bool ends_frame = false);
+	bool emit_extended_ready_for_query(PgSQL_Connection* backend_conn,
+		char transaction_state_override = 0);
+	void emit_tx_poisoned_response(const char* backend_warning);
+	void complete_extended_query_frame();
 
 	//int handler_ret;
 	void handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(PtrSize_t*, bool*);
@@ -303,7 +774,7 @@ private:
 	bool handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_DEALLOCATE_command(const char* dig);
 	bool handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_special_commands(const char* dig, bool* lock_hostgroup);
 	void reapply_user_attributes_after_reset();
-	bool handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY_qpo(PtrSize_t*, bool* lock_hostgroup, 
+	QpoHandlerResult handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY_qpo(PtrSize_t*, bool* lock_hostgroup,
 		PgSQL_Extended_Query_Type stmt_type = PGSQL_EXTENDED_QUERY_TYPE_NOT_SET);
 	bool handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_PARSE(PtrSize_t& pkt);
 	bool handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_DESCRIBE(PtrSize_t& pkt);
@@ -311,9 +782,27 @@ private:
 	bool handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_BIND(PtrSize_t& pkt);
 	bool handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_EXECUTE(PtrSize_t& pkt);
 	int handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_SYNC();
-	bool handler___rc0_PROCESSING_STMT_PREPARE(enum session_status& st, PgSQL_Data_Stream* myds);
+	enum class PrepareCompletion : uint8_t {
+		CLIENT_VISIBLE,
+		IMPLICIT_RESUME,
+		ERROR
+	};
+	PrepareCompletion handler___rc0_PROCESSING_STMT_PREPARE(
+		enum session_status& st, PgSQL_Data_Stream* myds);
+	bool begin_implicit_prepare(enum session_status continuation);
+	bool resume_implicit_prepare(enum session_status& continuation);
+	inline bool has_implicit_prepare() const {
+		return implicit_prepare_continuation != session_status___NONE ||
+			(CurrentQuery.extended_query_info.flags &
+				PGSQL_EXTENDED_QUERY_FLAG_IMPLICIT_PREPARE) != 0;
+	}
+	void clear_implicit_prepare();
 	// FIXME: unused. Remove in next iteration
 	//void handler___rc0_PROCESSING_STMT_DESCRIBE_PREPARE(PgSQL_Data_Stream* myds);
+	// Post-Sync handler result contract:
+	//   0: handled synchronously; continue processing the frame
+	//   1: a backend operation started; wait for its result
+	//   2: error; discard the remaining frame messages
 	int handler___status_PROCESSING_EXTENDED_QUERY_SYNC();
 	int handle_post_sync_parse_message(PgSQL_Parse_Message* parse_msg);
 	int handle_post_sync_describe_message(PgSQL_Describe_Message* describe_msg);
@@ -322,6 +811,7 @@ private:
 	int handle_post_sync_execute_message(PgSQL_Execute_Message* execute_msg);
 	void handle_post_sync_error(PGSQL_ERROR_CODES errcode, const char* errmsg, bool fatal);
 	void handle_post_sync_locked_on_hostgroup_error(const char* query, int query_len);
+	void note_extended_backend_error_response(PgSQL_Data_Stream* myds);
 	void reset_extended_query_frame();
 
 
@@ -410,11 +900,11 @@ private:
 	int handler_ProcessingQueryError_CheckBackendConnectionStatus(PgSQL_Data_Stream* myds);
 	void SetQueryTimeout();
 	bool handler_minus1_ClientLibraryError(PgSQL_Data_Stream* myds);
-	// Synthesize ErrorResponse(25P02) + NoticeResponse(backend text, no 57P01) +
-	// ReadyForQuery('E') to the client, destroy the backend pool connection, set
-	// tx_poisoned=true. Returns true if poison was applied; false means the
-	// caller must fall back to the current terminate-the-session flow (e.g.
-	// admin var off, result transfer already started, or a preflight failed).
+	// Synthesize ErrorResponse(25P02) + NoticeResponse(backend text, no 57P01),
+	// set tx_poisoned=true, and preserve protocol ownership. Simple protocol also
+	// emits ReadyForQuery('E'); extended protocol defers it to the real client
+	// Sync boundary. Returns true if poison was applied; false means the caller
+	// must fall back to terminating the session.
 	bool handler_minus1_PoisonTransaction(PgSQL_Data_Stream* myds);
 	// While tx_poisoned, classify a 'Q' packet and either clear the poison
 	// and synthesize a ROLLBACK response (for plain whole-transaction
@@ -470,6 +960,12 @@ private:
 public:
 	void handle_transaction_state();
 
+#if POLARDB_PROXY && POLARDB_DEBUG
+	uint64_t polardb_extended_trace_frame_id() const {
+		return extended_query_frame_state.trace_sequence;
+	}
+#endif
+
 	inline bool is_extended_query_frame_empty() const {
 		return extended_query_frame.empty();
 	}
@@ -480,8 +976,44 @@ public:
 
 	inline bool is_extended_query_ready_for_query() const {
 		return extended_query_frame.empty() &&
-			((extended_query_phase & EXTQ_PHASE_EXECUTING_SYNC_IMPLICIT) == 0);
+			((extended_query_phase & EXTQ_PHASE_EXECUTING_SYNC_IMPLICIT) == 0) &&
+			extended_query_frame_state.ready_for_query();
 	}
+	bool extended_backend_result_sends_ready(bool has_error);
+
+	// Connection/protocol publication hooks. They run only after a real backend
+	// send or a client-visible ErrorResponse has been constructed.
+	__attribute__((always_inline)) inline bool
+	note_extended_backend_command_sent(int hostgroup) {
+		if (!extended_query_frame_state.active()) {
+			return true;
+		}
+		const bool claimed =
+			extended_query_frame_state.claim_backend(hostgroup);
+		if (!claimed) {
+			proxy_error(
+				"Extended query command owner mismatch: frame_hg=%d sent_hg=%d\n",
+				extended_query_frame_state.backend_hostgroup, hostgroup);
+		}
+		return claimed;
+	}
+	__attribute__((always_inline)) inline bool
+	note_extended_backend_sync_sent(int hostgroup) {
+		if (!extended_query_frame_state.active()) {
+			return true;
+		}
+		const bool owner =
+			extended_query_frame_state.backend_hostgroup == hostgroup;
+		if (owner) {
+			extended_query_frame_state.mark_backend_sync_sent(true);
+		} else {
+			proxy_error(
+				"Extended query Sync owner mismatch: frame_hg=%d sent_hg=%d\n",
+				extended_query_frame_state.backend_hostgroup, hostgroup);
+		}
+		return owner;
+	}
+	void note_extended_error_response();
 
 	bool handler_again___status_SETTING_GENERIC_VARIABLE(int* _rc, const char* var_name, const char* var_value, bool no_quote = false, bool set_transaction = false);
 #if 0
@@ -525,11 +1057,17 @@ public:
 	 *   both     request at BEGIN and after a later split-read pool miss
 	 */
 	struct PolarDB_SessionConfig {
+		static constexpr uint64_t UNREGISTERED_ACTIVATION_GENERATION = UINT64_MAX;
 		// Set true once this session attaches to a backend in a PolarDB-enabled
 		// hostgroup (on fresh connect, or when a pooled connection is reused). It
 		// controls the response-path result processing. Only ever turned on: once a
 		// session has used a PolarDB backend it keeps capturing LSNs for its life.
 		bool is_polardb_enabled = false;
+		// Worker-local topology activation observed when this session first entered
+		// a worker. A mismatch means a PolarDB topology became active while the
+		// session could have had an unattributed writer request in flight.
+		uint64_t activation_generation =
+			UNREGISTERED_ACTIVATION_GENERATION;
 		// Per-session consistency-mode override, and the top tier of mode resolution
 		// (session override > hostgroup > global). -1 means "no override", so the
 		// resolved mode falls through to the per-hostgroup and global settings.
@@ -708,6 +1246,9 @@ public:
 	// wait state, the wrapped-query buffer, and the request writer scope. Reset
 	// before each query and at query end, so nothing leaks into the next query.
 	PolarDB_QueryState polardb_query;
+	// Successful Flush-delimited Executes are positioned by the RFQ produced by
+	// the later Sync. Keep only their aggregate attribution until that boundary.
+	PolarDB_ExtendedRfqState polardb_extended_rfq;
 
 	/**
 	 * @brief Per-session state for one wait on reader-pool capacity.
@@ -1004,6 +1545,13 @@ public:
 	 */
 	PolarDB_Query_RouteCtx polardb_collect(int current_hg, int qpo_replica_eligible,
 		bool qpo_force_primary_hint) const;
+	PolarDB_Query_RouteCtx polardb_observe_and_collect(
+		int current_hg, int qpo_replica_eligible,
+		bool qpo_force_primary_hint);
+	PolarDB_Query_RouteCtx polardb_observe_and_collect(
+		int current_hg, int qpo_replica_eligible,
+		bool qpo_force_primary_hint,
+		const PolarDB_HG_ConfigSnapshot& hg_config);
 	/**
 	 * @brief Apply durable session observations needed before building a route snapshot.
 	 *
@@ -1011,13 +1559,20 @@ public:
 	 * transaction reader-wait safety flags from the current query text.
 	 */
 	void polardb_observe_route_inputs(int current_hg);
+	void polardb_observe_route_inputs(int current_hg,
+		const PolarDB_HG_ConfigSnapshot& hg_config);
+	PolarDB_Query_RouteCtx polardb_collect(int current_hg,
+		int qpo_replica_eligible, bool qpo_force_primary_hint,
+		const PolarDB_HG_ConfigSnapshot& hg_config) const;
 	/**
 	 * @brief Select the route for one query from the collected snapshot.
 	 *
 	 * Makes no routing, session, or counter changes and reads HGM only for
-	 * snapshots. The LSN consistency feature applies to autocommit, simple-query
-	 * reads only; multi-statement and extended-protocol queries are routed to the
-	 * writer.
+	 * snapshots. LSN consistency applies to eligible autocommit reads in both
+	 * protocols: simple queries use the SQL wait wrapper, while extended queries
+	 * use a target-ready reader or an in-band W on a negotiated v15_wait backend.
+	 * Multi-statement, ambiguous, unsupported, and in-transaction extended frames
+	 * use the writer.
 	 * Explicit transactions stay on the writer unless the transaction-split policy
 	 * and primary RFQ evidence allow one read to take a replica connection from
 	 * the pool and return it after that read.
@@ -1028,7 +1583,12 @@ public:
 	void polardb_report_route_result(const PolarDB_Query_RoutePlan& plan,
 		const PolarDB_Query_RouteCtx& route_ctx);
 	/** @brief Count a manual query-rule/sticky-hostgroup route that bypassed the planner. */
-	void polardb_account_manual_route(int effective_hg, bool forced_writer);
+	void polardb_account_manual_route(int effective_hg, bool forced_writer,
+		const PolarDB_HG_ConfigSnapshot& hg_config);
+	/** @brief Clear stale reader state, capture scope, and count one manual query-rule route. */
+	void polardb_prepare_manual_query_rule_route(int scope_hg,
+		int effective_hg, bool forced_writer, const char* reason,
+		const PolarDB_HG_ConfigSnapshot& hg_config);
 	/** @brief Apply writer routing required after a transaction reader failure. */
 	bool polardb_apply_reader_failure_writer_route(const char* stage);
 	/**
@@ -1087,24 +1647,37 @@ public:
 	 * the scope so the response path can determine whether an RFQ LSN belongs to the
 	 * current writer timeline.
 	 *
-	 * The per-query request writer scope is cleared on entry, so any scope captured
-	 * earlier for this request is discarded even when the new capture fails.
-	 *
 	 * @param scope_hg  Hostgroup whose writer scope this request runs under.
+	 * @param hg_config Pre-resolved plain-value topology snapshot for @p scope_hg.
+	 *                  The hostgroup must be this snapshot's writer or reader.
 	 * @return true when a valid scope was captured. false when @p scope_hg is not a
-	 *         PolarDB hostgroup, which leaves the request with no writer scope: the
-	 *         response path then treats every backend RFQ LSN as out of scope and
-	 *         drops it, so no LSN attribution happens for this request.
+	 *         PolarDB hostgroup. Both paths replace the previous request scope: the
+	 *         false path leaves it reset and invalid.
 	 */
-	bool polardb_capture_request_writer_scope(int scope_hg);
+	bool polardb_capture_request_writer_scope(int scope_hg,
+		const PolarDB_HG_ConfigSnapshot& hg_config);
 	/**
-	 * @brief Apply automatic routing for an extended-protocol request.
+	 * @brief Enter PolarDB routing with no assumption about pre-activation writes.
 	 *
-	 * Manual destination rules are left untouched. Parse, Bind, and Describe stay
-	 * on the writer. Execute may select a reader directly when it is target-ready,
-	 * or carry a protocol-level wait to a v15_wait reader when it is behind.
+	 * A session may have an ordinary writer query in flight while its worker
+	 * consumes the first PolarDB topology publication. The next PolarDB request
+	 * therefore starts with write_unknown and stays on the writer until a
+	 * positioned primary RFQ establishes a safe session target.
 	 */
-	bool polardb_apply_extended_route(PgSQL_Extended_Query_Type stmt_type);
+	void polardb_activate_session_for_request();
+	void polardb_note_worker_activation_generation();
+	/**
+	 * @brief Run the shared PolarDB observe -> collect -> plan -> apply pipeline.
+	 *
+	 * Both simple and extended protocol enter here after QPO selected the ordinary
+	 * hostgroup. Extended frames may require the writer when several backend
+	 * operations must remain on one libpq pipeline.
+	 *
+	 * @return true when routing generated a client-visible consistency error.
+	 */
+	bool polardb_route_query(PtrSize_t& pkt, bool frame_requires_writer = false);
+	bool polardb_route_query(PtrSize_t& pkt, bool frame_requires_writer,
+		const PolarDB_HG_ConfigSnapshot& hg_config);
 	/**
 	 * @brief Attach lag-cap inputs (group LSN and byte cap) to the reader plan.
 	 *
@@ -1185,6 +1758,8 @@ public:
 	 * @param backend_lsn             LSN read from that payload; meaningless when
 	 *                                @p backend_payload_present is false.
 	 * @param client_lsn              Out parameter receiving the LSN to append.
+	 * @param deferred_policy Controls whether deferred extended-RFQ state may be
+	 *                        inspected or was already restored by the caller.
 	 * @return true when *client_lsn holds the LSN to append to the client
 	 *         ReadyForQuery. false when nothing must be appended: a null
 	 *         @p client_lsn returns false without touching any state, while every
@@ -1193,7 +1768,11 @@ public:
 	 */
 	bool polardb_prepare_client_ready_lsn(PgSQL_Connection* conn,
 		bool backend_payload_present, uint64_t backend_lsn,
-		uint64_t* client_lsn);
+		uint64_t* client_lsn,
+		PolarDB_DeferredRfqPolicy deferred_policy =
+			PolarDB_DeferredRfqPolicy::NONE);
+	PolarDB_RfqEvidence polardb_capture_rfq_evidence(
+		PgSQL_Connection* conn, bool payload_present, uint64_t lsn) const;
 
 	/**
 	 * @brief Observe transaction-split RFQ metadata from an accepted primary result.
@@ -1321,6 +1900,14 @@ public:
 	bool polardb_finish_reader_wait_selection(
 		const PolarDB_WaitSpec& wait_spec, bool target_reached,
 		int fallback_writer_hg);
+	/**
+	 * @brief Finalize an extended wait against the concrete selected reader.
+	 *
+	 * Routing records only the target. This pre-send boundary samples the actual
+	 * connection selected by the normal pool/create path, then either records a
+	 * target-ready confirmation or activates W before the first backend command.
+	 */
+	bool polardb_prepare_extended_wait(PgSQL_Connection* conn);
 
 	/**
 	 * @brief Finish a wait, update the reader LSN after success, and stop timing.
@@ -1387,6 +1974,7 @@ public:
 	unsigned int polardb_enqueue_notice_packet(const char* severity, const char* sqlstate,
 		const char* primary, const char* detail = nullptr,
 		const char* severity_nonlocalized = nullptr);
+	unsigned int polardb_enqueue_notice_packet(const PGresult* result);
 	/** @brief Queue a synthetic client-visible warning for a degraded RFQ route. */
 	void polardb_enqueue_degraded_rfq_notice(const char* reason,
 		int reader_hg, int writer_hg);
@@ -1400,9 +1988,10 @@ public:
 	 * Covers RESET / RESET ALL / DISCARD ALL / RESET CONNECTION. Clears the
 	 * per-query wait, notices, and wrapper state, and lifts the wait-disabled
 	 * sticky flag. It deliberately does NOT clear the durable session write/observed
-	 * LSNs: a RESET clears session settings, not the fact that the client has
-	 * written, so read-your-writes must survive it. @p reset_override additionally
-	 * clears per-session PolarDB overrides.
+	 * LSNs or an open extended frame's deferred RFQ attribution: a RESET clears
+	 * current statement/session settings, not a successful Flush result that still
+	 * needs the later Sync. @p reset_override additionally clears per-session
+	 * PolarDB overrides.
 	 */
 	void polardb_clear_staged_wait_state_for_reset(bool reset_override);
 	/**
@@ -1475,6 +2064,7 @@ private:
 		PGSQL_QUERY_command query_cmd = PGSQL_QUERY___NONE;
 		uint64_t lsn = 0;
 		bool is_write = false;
+		bool query_can_preserve_session_lsn = false;
 		PgSQL_SrvC* backend_srv = nullptr;
 		int backend_hg = -1;
 		bool backend_is_polar_hg = false;
@@ -1502,6 +2092,19 @@ private:
 	void polardb_clear_session_state_for_recycle();
 	void polardb_clear_request_state_for_query_end(
 		PgSQL_Data_Stream* myds, bool called_on_failure);
+	void polardb_defer_extended_rfq_result(
+		PgSQL_Data_Stream* myds, const char* query_text,
+		PGSQL_QUERY_command query_cmd);
+	void polardb_retain_extended_rfq_publication(PgSQL_Data_Stream* myds);
+	void polardb_retain_extended_rfq_evidence(PgSQL_Data_Stream* myds);
+	bool polardb_prepare_deferred_extended_rfq();
+	void polardb_complete_deferred_extended_rfq_publication();
+	void polardb_process_deferred_extended_rfq(PgSQL_Data_Stream* myds);
+	void polardb_abandon_deferred_extended_rfq();
+	void polardb_process_result_with_attribution(
+		PgSQL_Data_Stream* myds, const char* query_text,
+		PGSQL_QUERY_command query_cmd, bool is_write,
+		bool query_can_preserve_session_lsn);
 	/**
 	 * @brief Fold a backend RFQ LSN into the per-server cache and report acceptance.
 	 *
@@ -1582,6 +2185,9 @@ private:
 	void polardb_record_txn_split_wait_latency();
 	/** @brief Copy failed backend state before normal rc==-1 error handling changes it. */
 	PolarDB_RequestOutcome polardb_capture_request_outcome(PgSQL_Backend* backend);
+	/** @brief Accept only a timeout already identified from backend diagnostics. */
+	static bool polardb_request_has_wait_timeout_evidence(
+		bool structured_timeout);
 	/** @brief Classify a PolarDB rc==-1 replica-reader failure and apply its
 	 *         retry/forward/terminate policy before generic retries. */
 	PolarDB_FailureAction polardb_handle_reader_failure(const PolarDB_RequestOutcome& outcome);
@@ -1687,16 +2293,24 @@ private:
 	 *        stops automatic routing but changes nothing, leaving the core
 	 *        locked-hostgroup check to report the mismatch. The extended-protocol
 	 *        path uses this.
+	 * @param polar_scope Optional output set true only when the applied lock names a
+	 *        PolarDB writer scope. It remains false for no lock, mismatch, or an
+	 *        ordinary PostgreSQL hostgroup.
+	 * @param hg_config Pre-resolved plain-value topology snapshot for the QPO-selected
+	 *        hostgroup. Core lock enforcement guarantees an applied lock names the
+	 *        same hostgroup before this helper is entered.
 	 * @return true when automatic PolarDB routing must be skipped. That does NOT
 	 *         imply the route was applied: with @p require_current_match set and the
 	 *         hostgroups differing, current_hostgroup is left alone, no writer scope
 	 *         is captured, and no manual route is counted. In every other true case
-	 *         current_hostgroup is set to the locked hostgroup, its writer scope is
-	 *         captured, and the manual route is counted. false means no hostgroup
-	 *         lock is in effect and the caller routes normally.
+	 *         current_hostgroup is set to the locked hostgroup. PolarDB locks also
+	 *         capture writer scope and route accounting; ordinary locks do not touch
+	 *         PolarDB state. false means no hostgroup lock is in effect and the caller
+	 *         routes normally.
 	 */
 	bool polardb_handle_locked_hostgroup_route(
-		const char* stage, bool require_current_match = false);
+		const char* stage, bool require_current_match,
+		bool* polar_scope, const PolarDB_HG_ConfigSnapshot& hg_config);
 	/** @brief Redispatch the original client query on an existing live writer. */
 	bool polardb_try_redispatch_to_writer(PolarDB_ReaderFailure& failure,
 		int writer_hg, PgSQL_Backend* writer_backend);
@@ -1792,6 +2406,7 @@ private:
 	friend class Base_Session<PgSQL_Session, PgSQL_Data_Stream, PgSQL_Backend, PgSQL_Thread>;
 #endif
 	friend struct PolarDB_SessionUnitAccess;
+	friend class PgSQL_STMT_Local;
 };
 
 

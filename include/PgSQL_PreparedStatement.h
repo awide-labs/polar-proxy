@@ -48,18 +48,17 @@ public:
 	/**
 	 * Map client statement name to a global prepared statement.
 	 *
-	 *  - If client statement (local_stmt_info_ptr) already references a different global stmt: decrement old refcount,
+	 *  - If the client name already references a different global stmt: decrement old refcount,
 	 *    increment new, and replace pointer.
-	 *  - If client statement (local_stmt_info_ptr) references the same stmt: no-op.
+	 *  - If the client name references the same stmt: no-op.
 	 *  - Otherwise: insert into stmt_name_to_global_info and increment client refcount.
 	 *
 	 * Parameters:
 	 *  stmt_info            Global prepared statement (shared_ptr, must be valid).
 	 *  client_stmt_name     Statement name from client scope.
-	 *  local_stmt_info_ptr  Optional existing local pointer to update instead of map insert.
 	 */
-	void client_insert(std::shared_ptr<const PgSQL_STMT_Global_info>& stmt_info, const std::string& client_stmt_name, 
-		std::shared_ptr<const PgSQL_STMT_Global_info>* local_stmt_info_ptr);
+	void client_insert(std::shared_ptr<const PgSQL_STMT_Global_info>& stmt_info,
+		const std::string& client_stmt_name);
 
 	/**
 	 * @brief Find statement info by client statement name in stmt_name_to_global_info.
@@ -131,8 +130,16 @@ public:
 		unsigned int query_length, const Parse_Param_Types& param_types);
 
 private:
+	using ClientStatementMap =
+		std::map<std::string, std::shared_ptr<const PgSQL_STMT_Global_info>>;
+	void client_insert_at(std::shared_ptr<const PgSQL_STMT_Global_info>& stmt_info,
+		const std::string& client_stmt_name, ClientStatementMap::iterator local);
+	bool client_close_at(ClientStatementMap::iterator local);
+	void release_client_statement_owner(
+		std::shared_ptr<const PgSQL_STMT_Global_info>& stmt_info);
+
 	// this map associate client_stmt_id to global_stmt_info : this is used only for client connections
-	std::map<std::string, std::shared_ptr<const PgSQL_STMT_Global_info>> stmt_name_to_global_info;
+	ClientStatementMap stmt_name_to_global_info;
 
 	// this map associate backend_stmt_id to global_stmt_info : this is used only for backend connections
 	std::map<uint32_t, std::shared_ptr<const PgSQL_STMT_Global_info>> backend_stmt_to_global_info;

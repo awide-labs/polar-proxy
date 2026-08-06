@@ -113,6 +113,11 @@ static bool polardb_failed_connection_is_reusable(PgSQL_Connection* conn) {
 		conn->is_connection_in_reusable_state();
 }
 
+bool PgSQL_Session::polardb_request_has_wait_timeout_evidence(
+		bool structured_timeout) {
+	return structured_timeout;
+}
+
 #if POLARDB_DEBUG
 static const char* polardb_writer_state_name(PolarDB_WriterState state) {
 	switch (state) {
@@ -233,7 +238,9 @@ PolarDB_RequestOutcome PgSQL_Session::polardb_capture_request_outcome(
 		polardb_failed_connection_is_poolable(conn);
 	outcome.result_started = conn->query_result &&
 		conn->query_result->is_transfer_started();
-	outcome.timeout_error = polardb_query.wait.timeout_error;
+	outcome.backend_error_code = static_cast<int>(conn->get_error_code());
+	outcome.timeout_error = polardb_request_has_wait_timeout_evidence(
+		polardb_query.wait.timeout_error);
 	outcome.wrapper_set_failure =
 		conn->polardb_query_wrap_state.wrapper_set_failed() ||
 		conn->polardb_query_wrap_state.consuming_wrapper_set();
@@ -248,7 +255,6 @@ PolarDB_RequestOutcome PgSQL_Session::polardb_capture_request_outcome(
 		outcome.timeout_error = true;
 		outcome.timeout_already_accounted = true;
 	}
-	outcome.backend_error_code = static_cast<int>(conn->get_error_code());
 	outcome.error_message = polardb_truncate_error_message(conn->get_error_message());
 
 	if (conn->parent) {
@@ -703,6 +709,13 @@ PolarDB_ReaderFailureKind PgSQL_Session::polardb_reader_failure_kind_for(
 	if (failure.timeout) {
 		return PolarDB_ReaderFailureKind::WAIT_TIMEOUT;
 	}
+	// SQLSTATE 57014 without the structured PolarDB wait-timeout marker is a
+	// client cancellation or statement_timeout. It must retain normal PostgreSQL
+	// cancellation ownership and must never be replayed on another backend.
+	if (failure.backend_error_code ==
+			PGSQL_ERROR_CODES::ERRCODE_QUERY_CANCELED) {
+		return PolarDB_ReaderFailureKind::QUERY_CANCELED;
+	}
 	if (!failure.reusable) {
 		return PolarDB_ReaderFailureKind::CONNECTION_LOST;
 	}
@@ -802,6 +815,10 @@ PgSQL_Session::polardb_reader_failure_decision(
 		}
 		break;
 	}
+	case PolarDB_ReaderFailureKind::QUERY_CANCELED:
+		decision.action = PolarDB_ReaderAction::RETURN_ERROR;
+		decision.allow_writer_retry = false;
+		break;
 	}
 
 	// Reader-only placement turns any defensive writer retry into an error.
@@ -1012,6 +1029,7 @@ bool PgSQL_Session::polardb_move_retry_packet_to_writer(
 	// the parser to its new owner. Extended protocol keeps its prepared-statement
 	// metadata in CurrentQuery and only needs the state-machine return point.
 	if (extended_query) {
+		transfer_extended_frame_backend(writer_hg);
 		polardb_prepare_extended_retry();
 	} else {
 		polardb_restart_query_dispatch_from_packet(
@@ -1072,8 +1090,6 @@ void PgSQL_Session::polardb_return_or_destroy_backend_stream(
 
 void PgSQL_Session::polardb_forward_reader_error(
 		const PolarDB_ReaderFailure& failure, char rfq) {
-	PG_pkt pgpkt{};
-	pgpkt.set_multi_pkt_mode(true);
 	const PGSQL_ERROR_CODES code = failure.has_backend_error
 		? failure.backend_error_code
 		: PGSQL_ERROR_CODES::ERRCODE_CONNECTION_FAILURE;
@@ -1083,15 +1099,32 @@ void PgSQL_Session::polardb_forward_reader_error(
 	POLARDB_TRACE(
 		"PolarDB FAILURE: forwarding reader error code=%s rfq=%c message='%s'\n",
 		PgSQL_Error_Helper::get_error_code(code), rfq, message);
-	pgpkt.write_generic('E', "cscscscsc",
-		'S', "ERROR", 'V', "ERROR",
-		'C', PgSQL_Error_Helper::get_error_code(code),
-		'M', message,
-		0);
-	pgpkt.write_ReadyForQuery(rfq);
-	pgpkt.set_multi_pkt_mode(false);
-	auto buff = pgpkt.detach();
-	client_myds->PSarrayOUT->add((void*)buff.first, buff.second);
+
+	const bool extended_cycle =
+		extended_query_phase != EXTQ_PHASE_IDLE ||
+		extended_query_frame_state.active();
+	bool send_ready = true;
+	if (extended_cycle) {
+		// The failed backend has been released before forwarding. Its pipeline
+		// cannot own a later Sync, so only the client Sync boundary remains.
+		if (extended_query_frame_state.needs_backend_sync()) {
+			extended_query_frame_state.mark_backend_sync_sent(true);
+		}
+		reset_extended_query_frame();
+		send_ready = extended_local_result_sends_ready(true);
+	}
+
+	client_myds->setDSS_STATE_QUERY_SENT_NET();
+	client_myds->myprot.generate_error_packet(
+		true, false, message, code, false, true);
+	if (send_ready) {
+		// ErrorResponse construction deliberately omits RFQ so this boundary can
+		// preserve the backend's exact transaction state instead of defaulting to I.
+		client_myds->myprot.generate_ready_for_query_packet(true, rfq);
+		if (extended_cycle) {
+			complete_extended_query_frame();
+		}
+	}
 	client_myds->DSS = STATE_SLEEP;
 }
 
@@ -1491,13 +1524,13 @@ bool PgSQL_Session::polardb_try_redispatch_to_other_reader(
 
 PolarDB_FailureAction PgSQL_Session::polardb_forward_error_and_keep_writer(
 		PolarDB_ReaderFailure& failure) {
+	polardb_release_reader_backend(
+		failure.reader_backend, failure.reusable);
 	polardb_forward_reader_error(failure, 'T');
 	POLARDB_THREAD_COUNT_ONE(thread, split_reads_forwarded);
 	POLARDB_TRACE(
 		"PolarDB FAILURE: forwarded reader error; transaction remains on writer_hg=%d\n",
 		polardb_txn_reader_failure.writer_hg);
-	polardb_release_reader_backend(
-		failure.reader_backend, failure.reusable);
 	polardb_free_retry_pkt_if_owned(failure);
 	return PolarDB_FailureAction::FORWARD;
 }
@@ -1769,6 +1802,10 @@ bool PgSQL_Session::polardb_try_redispatch_reader_read_to_other_reader(
 	}
 	polardb_query.reader_retry_attempts++;
 	if (failure.extended_query) {
+		// A replacement physical reader starts a new backend pipeline even when
+		// it belongs to the same reader hostgroup. Drop synchronization evidence
+		// from the failed connection before the retry can complete the frame.
+		transfer_extended_frame_backend(failure.reader_hg);
 		polardb_prepare_extended_retry();
 	} else {
 		polardb_restart_query_dispatch_from_packet(
@@ -1805,9 +1842,18 @@ PgSQL_Session::PolarDB_ReaderFailure
 PgSQL_Session::polardb_capture_wait_read_failure(
 		PolarDB_ReaderFailure failure) {
 	failure.extended_query = status != PROCESSING_QUERY;
-	failure.fallback_writer_hg = polardb_query.wait.fallback_writer_hg;
 	failure.reader_plan = polardb_query.reader_plan;
-	failure.wait_spec = polardb_query.wait.spec;
+	// An extended wait is a route requirement, not disposable evidence from the
+	// Parse command. Parse completion clears the active dispatch wait, but the
+	// requirement remains until Execute finishes. A replacement physical reader
+	// must therefore confirm the same target again.
+	failure.wait_spec = polardb_query.wait.spec.has_wait()
+		? polardb_query.wait.spec
+		: (failure.extended_query
+			? polardb_query.reader_wait_spec : PolarDB_WaitSpec{});
+	failure.fallback_writer_hg = polardb_query.wait.fallback_writer_hg >= 0
+		? polardb_query.wait.fallback_writer_hg
+		: failure.reader_plan.fallback_writer_hg;
 	// Preserve the original query for a possible writer retry.
 	failure.retry_query = polardb_query.original_query;
 
@@ -1823,7 +1869,6 @@ PgSQL_Session::polardb_capture_wait_read_failure(
 	const bool extended_wait_packet_ready =
 		polardb_extended_wait_retry_packet_ready(
 			failure.extended_query,
-			polardb_wait_active(),
 			failure.wait_spec.has_wait(),
 			failure.failed_myds &&
 			failure.failed_myds->pgsql_real_query.pkt.ptr);
@@ -1922,7 +1967,10 @@ PolarDB_FailureAction PgSQL_Session::polardb_handle_failed_reader_read(
 	}
 	auto count_wait_retry = [&](std::atomic<unsigned long long>& counter,
 			const char* name) {
-		if (failure.is_wait()) {
+		// Cancellation and statement_timeout retain normal PostgreSQL ownership.
+		// They never enter retry policy, so they must not alter retry counters.
+		if (failure.is_wait() &&
+				decision.kind != PolarDB_ReaderFailureKind::QUERY_CANCELED) {
 			polardb_count_wait_retry_counter(counter, name);
 		}
 	};
@@ -2016,6 +2064,10 @@ PolarDB_FailureAction PgSQL_Session::polardb_handle_failed_reader_read(
 		// A completed PostgreSQL ErrorResponse is already staged in query_result.
 		// Leave it to the normal wire path while the failed stream still owns it.
 		if (failure.reusable && failure.failed_myds) {
+			// Extended wait capture moved the original packet out of this stream.
+			// Generic RequestEnd either needs it restored while CurrentQuery aliases
+			// the packet or needs it released before this local failure record dies.
+			finish_retry_packet(true);
 			return PolarDB_FailureAction::PASSTHROUGH;
 		}
 		release_failed_reader(false);

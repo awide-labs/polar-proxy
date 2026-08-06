@@ -1652,6 +1652,12 @@ void PgSQL_Data_Stream::return_MySQL_Connection_To_Pool() {
 		) {
 		sess->create_new_session_and_reset_connection(this);
 	} else {
+		// This is the ownership boundary shared by every reusable return path.
+		// Request-local dispatch/wrapper evidence must never reach the next
+		// session; persistent split-XID safety state remains on the connection.
+#if POLARDB_PROXY
+		mc->polardb_clear_request_state_for_release();
+#endif // POLARDB_PROXY
 		detach_connection();
 		unplug_backend();
 #ifdef STRESSTEST_POOL

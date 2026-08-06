@@ -277,8 +277,7 @@ static bool polardb_try_normalize_split_cleanup_connection(
 	POLARDB_THREAD_COUNT_ONE(sess->thread,
 		split_conn_cleanup_recovery_terminal);
 	conn->async_free_result();
-	conn->dispatch_state.reset();
-	conn->polardb_query_wrap_state.clear();
+	conn->polardb_clear_request_state_for_release();
 	POLARDB_THREAD_COUNT_ONE(sess->thread, split_conn_cleanup_normalized);
 	POLARDB_TRACE(
 		"PolarDB TXN_SPLIT: normalized terminal split connection during cleanup "
@@ -380,7 +379,8 @@ void PgSQL_Session::polardb_begin_txn_reader_read(
  * @param reader_myds     Stream of that backend.
  * @param pkt             Client simple-query packet. Ownership of the buffer
  *                        moves to reader_myds->pgsql_real_query, which frees it
- *                        in end(). The caller's PtrSize_t is cleared.
+ *                        in end(). The caller's PtrSize_t is cleared immediately
+ *                        so ownership is explicit at this boundary.
  * @param writer_scope    Writer hostgroup and epoch this read was planned under.
  */
 void PgSQL_Session::polardb_begin_txn_wait_read(

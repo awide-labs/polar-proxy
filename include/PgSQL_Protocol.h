@@ -839,7 +839,9 @@ public:
 		const std::vector<std::pair<std::string,std::string>>& param_status = std::vector<std::pair<std::string, std::string>>());
 
 	bool generate_parse_completion_packet(bool send, bool ready, char trx_state, PtrSize_t* _ptr = NULL);
-	bool generate_ready_for_query_packet(bool send, char trx_state, PtrSize_t* _ptr = NULL);
+	bool generate_ready_for_query_packet(bool send, char trx_state,
+		PtrSize_t* _ptr = NULL, bool include_polardb_lsn = false,
+		uint64_t polardb_lsn = 0);
 	bool generate_close_completion_packet(bool send, bool ready, char trx_state, PtrSize_t* _ptr = NULL);
 	bool generate_bind_completion_packet(bool send, bool ready, char trx_state, PtrSize_t* _ptr = NULL);
 	bool generate_no_data_packet(bool send, PtrSize_t* _ptr = NULL);
