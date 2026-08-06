@@ -392,9 +392,14 @@ template<typename T>
 void Base_Thread::read_one_byte_from_pipe(unsigned int n) {
 	T* thr = static_cast<T*>(this);
 	if (thr->mypolls.fds[n].revents) {
-		unsigned char c;
+		unsigned char c = 0;
 		if (read(thr->mypolls.fds[n].fd, &c, 1)==-1) {// read just one byte
 			proxy_error("Error during read from signal_all_threads()\n");
+		} else if constexpr (std::is_same_v<T, PgSQL_Thread>) {
+			// Any queued byte proves the worker was woken after all publications
+			// preceding that write. Refresh before processing ready clients; the
+			// version check coalesces ordinary wakes and full-pipe notifications.
+			thr->on_pipe_wakeup(c);
 		}
 		proxy_debug(PROXY_DEBUG_GENERIC,3, "Got signal from admin , done nothing\n");
 		//fprintf(stderr,"Got signal from admin , done nothing\n"); // FIXME: this is just the skeleton for issue #253

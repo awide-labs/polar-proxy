@@ -230,6 +230,12 @@ class __attribute__((aligned(64))) PgSQL_Thread : public Base_Thread
 private:
 	unsigned int servers_table_version_previous;
 	unsigned int servers_table_version_current;
+	void refresh_hgm_publication(bool maintenance);
+	#if POLARDB_PROXY
+	bool polardb_active_cache{false};
+	uint64_t polardb_activation_generation_cache{0};
+	friend struct PolarDB_SessionUnitAccess;
+	#endif // POLARDB_PROXY
 	unsigned long long last_processing_idles;
 	PgSQL_Connection** my_idle_conns;
 	bool processing_idles;
@@ -441,6 +447,26 @@ protected:
 	int nfds;
 
 public:
+	// Topology publication uses a normal zero-byte wake. Every worker-pipe wake
+	// checks the already-published version before processing client descriptors.
+	static constexpr unsigned char TOPOLOGY_PUBLICATION_WAKE = 0;
+
+	// Called immediately after the worker consumes its signal-pipe byte.
+	void on_pipe_wakeup(unsigned char signal_byte);
+	#if POLARDB_PROXY
+	/**
+	 * Query-path PolarDB activity gate, refreshed with this worker's topology
+	 * version. It is worker-local so inactive traffic performs no shared atomic
+	 * load.
+	 */
+	inline bool polardb_is_active() const {
+		return polardb_active_cache;
+	}
+	inline uint64_t polardb_activation_generation() const {
+		return polardb_activation_generation_cache;
+	}
+	#endif // POLARDB_PROXY
+
 
 	void* gen_args;	// this is a generic pointer to create any sort of structure
 

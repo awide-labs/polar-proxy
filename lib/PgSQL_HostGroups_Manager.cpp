@@ -3493,7 +3493,8 @@ bool PgSQL_HostGroups_Manager::commit(
 	proxy_info("PgSQL_HostGroups_Manager::commit() locked for %llums\n", curtime2-curtime1);
 
 	if (GloPTH) {
-		GloPTH->signal_all_threads(1);
+		GloPTH->signal_all_threads(
+			PgSQL_Thread::TOPOLOGY_PUBLICATION_WAKE);
 	}
 
 	return true;
@@ -3961,8 +3962,17 @@ void PgSQL_HostGroups_Manager::generate_pgsql_replication_hostgroups_table() {
 		std::memory_order_release);
 	polardb_topology_generation_.store(next_polardb_snapshot->generation,
 		std::memory_order_release);
-	status.polardb_active.store(!next_polardb_snapshot->by_hostgroup.empty(),
-		std::memory_order_release);
+	const bool next_polardb_active =
+		!next_polardb_snapshot->by_hostgroup.empty();
+	const bool was_polardb_active = status.polardb_active.load(
+		std::memory_order_relaxed);
+	if (next_polardb_active && !was_polardb_active) {
+		status.polardb_activation_generation.fetch_add(
+			1, std::memory_order_relaxed);
+	}
+	// The release publishes the generation increment before workers observe the
+	// active topology and copy both values into their local caches.
+	status.polardb_active.store(next_polardb_active, std::memory_order_release);
 #else
 	for (std::vector<SQLite3_row *>::iterator it = incoming_replication_hostgroups->rows.begin() ; it != incoming_replication_hostgroups->rows.end(); ++it) {
 		SQLite3_row *r=*it;
@@ -5092,18 +5102,15 @@ PgSQL_Connection * PgSQL_SrvConnList::get_random_MyConn_unlocked(
 			const PolarDB_StartupProfile* startup_profile_ptr = nullptr;
 			PolarDB_StartupClientContext startup_client;
 			const PolarDB_StartupClientContext* startup_client_ptr = nullptr;
-			const auto polardb_config = PgHGM
-				? PgHGM->get_polardb_hg_config(hostgroup_id)
-				: PgSQL_HostGroups_Manager::PolarDB_HG_Config{};
-			if (polardb_config.is_polardb_hostgroup) {
-				const int protocol =
-					polardb_config.policy.proxy_protocol >= 0
-						? polardb_config.policy.proxy_protocol
-						: pgsql_thread___polardb_proxy_protocol;
-				startup_profile = PolarDB_StartupProfile::from_protocol(
-					pgsql_thread___polardb_profile_off
-						? PolarDB_ProxyProtocol::OFF
-						: polardb_proxy_protocol_from_int(protocol));
+			const auto* polardb_config =
+				sess && sess->thread && sess->thread->polardb_is_active() && PgHGM
+					? PgHGM->find_thread_cached_polardb_hg_config(hostgroup_id)
+					: nullptr;
+			if (polardb_config) {
+				startup_profile =
+					PgSQL_HostGroups_Manager::polardb_startup_profile_for_config(
+					*polardb_config, pgsql_thread___polardb_proxy_protocol,
+					pgsql_thread___polardb_profile_off);
 				startup_profile_ptr = &startup_profile;
 				if (startup_profile.emits_startup_params() &&
 						polardb_startup_client_from_session(

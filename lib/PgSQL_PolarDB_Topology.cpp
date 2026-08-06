@@ -19,6 +19,32 @@
 extern PgSQL_Threads_Handler* GloPTH;
 
 #if POLARDB_PROXY
+namespace {
+
+struct PolarDB_TopologyThreadCache {
+	const PgSQL_HostGroups_Manager* owner{nullptr};
+	uint64_t generation{UINT64_MAX};
+	std::shared_ptr<const PgSQL_HostGroups_Manager::PolarDB_TopologySnapshot>
+		snapshot;
+};
+
+thread_local PolarDB_TopologyThreadCache polardb_topology_thread_cache;
+
+PgSQL_HostGroups_Manager::PolarDB_HG_Config polardb_config_from_snapshot(
+		const PgSQL_HostGroups_Manager::PolarDB_TopologySnapshot* snapshot,
+		unsigned int hostgroup_id) {
+	if (!snapshot) return {};
+	auto it = snapshot->by_hostgroup.find(hostgroup_id);
+	if (it == snapshot->by_hostgroup.end()) return {};
+	PgSQL_HostGroups_Manager::PolarDB_HG_Config config = it->second.config;
+	if (it->second.writer_epoch) {
+		config.writer_epoch =
+			it->second.writer_epoch->load(std::memory_order_acquire);
+	}
+	return config;
+}
+} // namespace
+
 /**
  * @brief Take the PolarDB fast-topology lock for writing.
  *
@@ -711,24 +737,21 @@ void PgSQL_HostGroups_Manager::polardb_refresh_all_writer_epochs_under_hgm_write
 const PgSQL_HostGroups_Manager::PolarDB_TopologySnapshot*
 PgSQL_HostGroups_Manager::get_polardb_topology_snapshot_cached() const {
 	const uint64_t generation = polardb_topology_generation_.load(std::memory_order_acquire);
-	static thread_local const PgSQL_HostGroups_Manager* cached_owner = nullptr;
-	static thread_local uint64_t cached_generation = UINT64_MAX;
-	static thread_local std::shared_ptr<const PolarDB_TopologySnapshot> cached_snapshot;
-
-	if (cached_owner != this) {
-		cached_owner = this;
-		cached_generation = UINT64_MAX;
-		cached_snapshot.reset();
+	PolarDB_TopologyThreadCache& cache = polardb_topology_thread_cache;
+	if (cache.owner != this) {
+		cache.owner = this;
+		cache.generation = UINT64_MAX;
+		cache.snapshot.reset();
 	}
 
-	if (cached_generation != generation) {
+	if (cache.generation != generation) {
 		auto snapshot = std::atomic_load_explicit(&polardb_topology_snapshot_,
 			std::memory_order_acquire);
-		cached_snapshot = snapshot;
-		cached_generation = snapshot ? snapshot->generation : generation;
+		cache.snapshot = snapshot;
+		cache.generation = snapshot ? snapshot->generation : generation;
 	}
 
-	return cached_snapshot.get();
+	return cache.snapshot.get();
 }
 
 bool PgSQL_HostGroups_Manager::is_polardb_hostgroup(unsigned int hostgroup_id) {
@@ -769,18 +792,35 @@ int PgSQL_HostGroups_Manager::get_reader_hostgroup_for_writer(unsigned int write
 PgSQL_HostGroups_Manager::PolarDB_HG_Config
 PgSQL_HostGroups_Manager::get_polardb_hg_config(unsigned int hostgroup_id) {
 	if (!status.polardb_active.load(std::memory_order_relaxed)) return {};
+	return get_active_polardb_hg_config(hostgroup_id);
+}
 
-	const auto snapshot = get_polardb_topology_snapshot_cached();
-	if (!snapshot) return {};
+PgSQL_HostGroups_Manager::PolarDB_HG_Config
+PgSQL_HostGroups_Manager::get_active_polardb_hg_config(
+		unsigned int hostgroup_id) {
+	return polardb_config_from_snapshot(
+		get_polardb_topology_snapshot_cached(), hostgroup_id);
+}
 
-	auto it = snapshot->by_hostgroup.find(hostgroup_id);
-	if (it == snapshot->by_hostgroup.end()) return {};
-	PolarDB_HG_Config config = it->second.config;
-	if (it->second.writer_epoch) {
-		config.writer_epoch =
-			it->second.writer_epoch->load(std::memory_order_acquire);
-	}
-	return config;
+PgSQL_HostGroups_Manager::PolarDB_HG_Config
+PgSQL_HostGroups_Manager::get_thread_cached_polardb_hg_config(
+		unsigned int hostgroup_id) const {
+	const PolarDB_TopologyThreadCache& cache = polardb_topology_thread_cache;
+	if (cache.owner != this) return {};
+	// Policy and topology stay immutable for the snapshot lifetime. The writer
+	// epoch is the one mutable routing fact: failover can advance it without a
+	// topology-shape publication, so active PolarDB routing reads it live here.
+	return polardb_config_from_snapshot(cache.snapshot.get(), hostgroup_id);
+}
+
+const PgSQL_HostGroups_Manager::PolarDB_HG_Config*
+PgSQL_HostGroups_Manager::find_thread_cached_polardb_hg_config(
+		unsigned int hostgroup_id) const {
+	const PolarDB_TopologyThreadCache& cache = polardb_topology_thread_cache;
+	if (cache.owner != this || !cache.snapshot) return nullptr;
+	auto entry = cache.snapshot->by_hostgroup.find(hostgroup_id);
+	return entry != cache.snapshot->by_hostgroup.end()
+		? &entry->second.config : nullptr;
 }
 
 PgSQL_HostGroups_Manager::PolarDB_HG_Policy PgSQL_HostGroups_Manager::get_polardb_hg_policy(unsigned int hostgroup_id) {
@@ -813,14 +853,8 @@ PgSQL_HGC* PgSQL_HostGroups_Manager::polardb_find_hostgroup(
 PolarDB_StartupProfile PgSQL_HostGroups_Manager::polardb_startup_profile_for_hostgroup(
 		unsigned int hostgroup_id, int fallback_proxy_protocol) {
 	const auto config = get_polardb_hg_config(hostgroup_id);
-	if (!config.is_polardb_hostgroup ||
-			pgsql_thread___polardb_profile_off) {
-		return PolarDB_StartupProfile::from_protocol(PolarDB_ProxyProtocol::OFF);
-	}
-	const int protocol = config.policy.proxy_protocol >= 0 ?
-		config.policy.proxy_protocol : fallback_proxy_protocol;
-	return PolarDB_StartupProfile::from_protocol(
-		polardb_proxy_protocol_from_int(protocol));
+	return polardb_startup_profile_for_config(
+		config, fallback_proxy_protocol, pgsql_thread___polardb_profile_off);
 }
 
 bool PgSQL_HostGroups_Manager::polardb_hostgroup_requests_rfq_lsn(

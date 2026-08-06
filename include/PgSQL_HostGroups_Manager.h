@@ -2197,6 +2197,10 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 		// hostgroup is configured. Set from the current snapshot on each commit.
 		// Own cache line so the hot read does not false-share with the counters above.
 		alignas(64) std::atomic<bool> polardb_active{false};  // true when polardb_hostgroups_ is non-empty
+		// Incremented only on an inactive-to-active topology transition. Workers
+		// cache it with polardb_active so sessions can detect an activation window
+		// without loading shared state on the query path.
+		std::atomic<uint64_t> polardb_activation_generation{0};
 #endif // POLARDB_PROXY
 
 		//////////////////////////////////////////////////////
@@ -2594,21 +2598,20 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 	 * @brief Resolved PolarDB policy for a hostgroup (tri-state values).
 	 * -1 = not configured (inherit global), 0 = explicitly disabled, >0 = explicit value.
 	*/
-	struct PolarDB_HG_Policy {
-		bool txn_split_enabled{false};  // request/observe RFQ XID data and allow split reads
-		int consistency_mode{-1};
-		int lsn_wait_timeout_ms{-1};
-		int max_lag_bytes{-1};
-		int proxy_protocol{-1};
-	};
-
-	struct PolarDB_HG_Config {
-		bool is_polardb_hostgroup{false};
-		int writer_hostgroup{-1};
-		int reader_hostgroup{-1};
-		PolarDB_HG_Policy policy;
-		uint64_t writer_epoch{0};
-	};
+	using PolarDB_HG_Policy = PolarDB_HG_PolicySnapshot;
+	using PolarDB_HG_Config = PolarDB_HG_ConfigSnapshot;
+	static inline PolarDB_StartupProfile polardb_startup_profile_for_config(
+			const PolarDB_HG_Config& config, int fallback_proxy_protocol,
+			bool profile_off) {
+		if (!config.is_polardb_hostgroup || profile_off) {
+			return PolarDB_StartupProfile::from_protocol(
+				PolarDB_ProxyProtocol::OFF);
+		}
+		const int protocol = config.policy.proxy_protocol >= 0
+			? config.policy.proxy_protocol : fallback_proxy_protocol;
+		return PolarDB_StartupProfile::from_protocol(
+			polardb_proxy_protocol_from_int(protocol));
+	}
 
 	struct PolarDB_HG_SnapshotEntry {
 		PolarDB_HG_Config config;
@@ -2663,6 +2666,20 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 	 * reload.
 	 */
 	PolarDB_HG_Config get_polardb_hg_config(unsigned int hostgroup_id);
+	/** Same lookup after the caller has already observed polardb_active=true. */
+	PolarDB_HG_Config get_active_polardb_hg_config(unsigned int hostgroup_id);
+	/**
+	 * Query-worker lookup from the snapshot refreshed by the publication wake.
+	 * Immutable policy comes directly from that snapshot; the returned value
+	 * samples the live writer epoch so a failover cannot leave request routing on
+	 * an old timeline. It performs no topology-generation or shared_ptr operation
+	 * and fails closed before the first refresh.
+	 */
+	PolarDB_HG_Config get_thread_cached_polardb_hg_config(
+		unsigned int hostgroup_id) const;
+	/** Immutable-policy lookup; callers must not use writer_epoch from this view. */
+	const PolarDB_HG_Config* find_thread_cached_polardb_hg_config(
+		unsigned int hostgroup_id) const;
 
 	PolarDB_HG_Policy get_polardb_hg_policy(unsigned int hostgroup_id);
 	std::shared_ptr<const PolarDB_ServerListSnapshot>

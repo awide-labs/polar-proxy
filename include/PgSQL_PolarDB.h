@@ -2812,6 +2812,25 @@ struct PolarDB_WriterScope {
  *
  * The write component tracks this session's positioned writes. The observed
  * component tracks every positioned result this client has seen. SESSION_LSN
+// Plain-value topology copied by HGM for one routing decision. Keeping this
+// type outside HGM lets Session reuse one snapshot without introducing a
+// Session <-> HostGroups_Manager header cycle.
+struct PolarDB_HG_PolicySnapshot {
+	bool txn_split_enabled{false};
+	int consistency_mode{-1};
+	int lsn_wait_timeout_ms{-1};
+	int max_lag_bytes{-1};
+	int proxy_protocol{-1};
+};
+
+struct PolarDB_HG_ConfigSnapshot {
+	bool is_polardb_hostgroup{false};
+	int writer_hostgroup{-1};
+	int reader_hostgroup{-1};
+	PolarDB_HG_PolicySnapshot policy;
+	uint64_t writer_epoch{0};
+};
+
  * reads wait on max(write_lsn, observed_lsn), so a later read never goes behind
  * either its own writes or a fresher replica result it already observed.
  *

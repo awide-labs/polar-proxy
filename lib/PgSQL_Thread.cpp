@@ -3754,6 +3754,16 @@ bool PgSQL_Thread::init() {
 	memset(my_idle_conns, 0, sizeof(PgSQL_Connection*) * SESSIONS_FOR_CONNECTIONS_HANDLER);
 	GloPgQPro->init_thread();
 	refresh_variables();
+	#if POLARDB_PROXY
+	polardb_active_cache = PgHGM &&
+		PgHGM->status.polardb_active.load(std::memory_order_acquire);
+	if (PgHGM) {
+		polardb_activation_generation_cache =
+			PgHGM->status.polardb_activation_generation.load(
+				std::memory_order_relaxed);
+		PgHGM->polardb_refresh_thread_snapshots();
+	}
+	#endif // POLARDB_PROXY
 	i = pipe(pipefd);
 	ioctl_FIONBIO(pipefd[0], 1);
 	ioctl_FIONBIO(pipefd[1], 1);
@@ -3775,6 +3785,39 @@ bool PgSQL_Thread::init() {
 	copy_cmd_matcher = new CopyCmdMatcher();
 
 	return true;
+}
+
+void PgSQL_Thread::refresh_hgm_publication(bool maintenance) {
+	if (!maintenance) {
+#if POLARDB_PROXY
+		// Publication wakes update only PolarDB worker-local state. Rotating the
+		// generic version here would consume the delta used by bug-#1085 cleanup.
+		polardb_active_cache = PgHGM->status.polardb_active.load(
+			std::memory_order_acquire);
+		polardb_activation_generation_cache =
+			PgHGM->status.polardb_activation_generation.load(
+				std::memory_order_relaxed);
+		PgHGM->polardb_refresh_thread_snapshots();
+#endif // POLARDB_PROXY
+		return;
+	}
+	servers_table_version_previous = servers_table_version_current;
+	servers_table_version_current = PgHGM->get_servers_table_version();
+#if POLARDB_PROXY
+	polardb_active_cache = PgHGM->status.polardb_active.load(
+		std::memory_order_acquire);
+	polardb_activation_generation_cache =
+		PgHGM->status.polardb_activation_generation.load(
+			std::memory_order_relaxed);
+	PgHGM->polardb_refresh_thread_snapshots();
+#else
+	(void)maintenance;
+#endif // POLARDB_PROXY
+}
+
+void PgSQL_Thread::on_pipe_wakeup(unsigned char signal_byte) {
+	(void)signal_byte;
+	refresh_hgm_publication(false);
 }
 
 struct pollfd* PgSQL_Thread::get_pollfd(unsigned int i) {
@@ -4093,17 +4136,13 @@ void PgSQL_Thread::run() {
 		if (curtime > last_maintenance_time + maintenance_interval) {
 			last_maintenance_time = curtime;
 			maintenance_loop = true;
-			servers_table_version_previous = servers_table_version_current;
-			servers_table_version_current = PgHGM->get_servers_table_version();
 		}
 		else {
 			maintenance_loop = false;
 		}
-#if POLARDB_PROXY
-		if (maintenance_loop && PgHGM) {
-			PgHGM->polardb_refresh_thread_snapshots();
+		if (maintenance_loop) {
+			refresh_hgm_publication(true);
 		}
-#endif // POLARDB_PROXY
 
 		handle_kill_queues();
 
@@ -6546,9 +6585,9 @@ void PgSQL_Threads_Handler::signal_all_threads(unsigned char _c) {
 	if (pgsql_threads == 0) return;
 	for (i = 0; i < num_threads; i++) {
 		PgSQL_Thread* thr = (PgSQL_Thread*)pgsql_threads[i].worker;
-		if (thr == NULL) return; // quick exit, at least one thread is not ready
+		if (thr == NULL) continue;
 		int fd = thr->pipefd[1];
-		if (write(fd, &c, 1) == -1) {
+		if (write(fd, &c, 1) == -1 && errno != EAGAIN) {
 			proxy_error("Error during write in signal_all_threads()\n");
 		}
 	}
@@ -6556,9 +6595,9 @@ void PgSQL_Threads_Handler::signal_all_threads(unsigned char _c) {
 	if (GloVars.global.idle_threads)
 		for (i = 0; i < num_threads; i++) {
 			PgSQL_Thread* thr = (PgSQL_Thread*)pgsql_threads_idles[i].worker;
-			if (thr == NULL) return; // quick exit, at least one thread is not ready
+			if (thr == NULL) continue;
 			int fd = thr->pipefd[1];
-			if (write(fd, &c, 1) == -1) {
+			if (write(fd, &c, 1) == -1 && errno != EAGAIN) {
 				proxy_error("Error during write in signal_all_threads()\n");
 			}
 		}
@@ -6992,10 +7031,12 @@ PgSQL_Connection* PgSQL_Thread::get_MyConn_local(unsigned int _hid, PgSQL_Sessio
 	std::vector<PgSQL_SrvC*> parents; // this is a vector of srvers that needs to be excluded in case gtid_uuid is used
 	PgSQL_Connection* c = NULL;
 #if POLARDB_PROXY
-	const bool polardb_hostgroup =
-		PgHGM && PgHGM->is_polardb_hostgroup(_hid);
+	const auto polardb_config = polardb_active_cache && PgHGM
+		? PgHGM->get_thread_cached_polardb_hg_config(_hid)
+		: PgSQL_HostGroups_Manager::PolarDB_HG_Config{};
+	const bool polardb_hostgroup = polardb_config.is_polardb_hostgroup;
 	const bool polardb_keyed_writer_reuse =
-		sess->polardb_query.profile_enabled &&
+		polardb_hostgroup && sess->polardb_query.profile_enabled &&
 		sess->polardb_query.request_writer_scope.valid() &&
 		sess->polardb_query.request_writer_scope.hg ==
 			static_cast<int>(_hid) &&
@@ -7021,8 +7062,10 @@ PgSQL_Connection* PgSQL_Thread::get_MyConn_local(unsigned int _hid, PgSQL_Sessio
 			}
 			if (!writer_pool_request) {
 				const PolarDB_StartupProfile writer_startup_profile =
-					PgHGM->polardb_startup_profile_for_hostgroup(
-						_hid, pgsql_thread___polardb_proxy_protocol);
+					PgHGM->polardb_startup_profile_for_config(
+						polardb_config,
+						pgsql_thread___polardb_proxy_protocol,
+						pgsql_thread___polardb_profile_off);
 				writer_pool_request.emplace(
 					polardb_prepare_pool_request_for_session(
 						writer_startup_profile, /*only_pooled=*/false,
@@ -7055,9 +7098,11 @@ PgSQL_Connection* PgSQL_Thread::get_MyConn_local(unsigned int _hid, PgSQL_Sessio
 		}
 		if (polardb_hostgroup) {
 			if (!startup_request_ready) {
-				startup_profile =
-					PgHGM->polardb_startup_profile_for_hostgroup(
-						_hid, pgsql_thread___polardb_proxy_protocol);
+					startup_profile =
+						PgHGM->polardb_startup_profile_for_config(
+							polardb_config,
+						pgsql_thread___polardb_proxy_protocol,
+						pgsql_thread___polardb_profile_off);
 				if (startup_profile.emits_startup_params() &&
 						polardb_startup_client_from_session(
 							sess, &startup_client)) {

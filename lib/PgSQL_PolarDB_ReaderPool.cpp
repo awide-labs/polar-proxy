@@ -402,8 +402,9 @@ bool PgSQL_PolarDB_ReaderPool::reader_pool_reservation_match_key(
 		return false;
 	}
 	const PolarDB_StartupProfile startup_profile =
-		hgm_->polardb_startup_profile_for_hostgroup(
-			hostgroup_id, pgsql_thread___polardb_proxy_protocol);
+		hgm_->polardb_startup_profile_for_config(
+			hg_config, pgsql_thread___polardb_proxy_protocol,
+			pgsql_thread___polardb_profile_off);
 	if (wait_spec.has_wait() && !startup_profile.requests_rfq_lsn()) {
 		return false;
 	}
@@ -1189,8 +1190,9 @@ static PolarDB_ReaderResult polardb_try_acquire_reader_connection(
 	const bool has_wait_target = wait_spec.has_wait();
 	const bool lag_cap_enabled = reader_plan.lag_cap_enabled();
 	const PolarDB_StartupProfile startup_profile =
-		hgm->polardb_startup_profile_for_hostgroup(
-			hostgroup_id, pgsql_thread___polardb_proxy_protocol);
+		hgm->polardb_startup_profile_for_config(
+			hg_config, pgsql_thread___polardb_proxy_protocol,
+			pgsql_thread___polardb_profile_off);
 	if (has_wait_target && !startup_profile.requests_rfq_lsn()) {
 		result.status = PolarDB_ReaderStatus::RFQ_UNAVAILABLE;
 		return result;
