@@ -95,6 +95,65 @@ patch -p0 -d "$PG_SRC" < "$PATCH" >/dev/null 2>&1 \
 ORIG="$(find "$PG_SRC" -name '*.orig' 2>/dev/null || true)"
 [ -z "$ORIG" ] || fail "PolarDB libpq patch produced .orig (fuzz): $ORIG"
 
+# --- public ABI and W wire-layout contract --------------------------------
+EXPECTED_EXPORTS=(
+	"PQgetLSN 188"
+	"PQhasLSN 189"
+	"PQsetPolarSendLSN 190"
+	"PQgetXactSplitXids 191"
+	"PQisXactSplittable 192"
+	"PQisXactWalPending 193"
+	"PQsetPolarSendXact 194"
+	"PSpeekRowRun 195"
+	"PSrowRunPending 196"
+	"PSadvanceInput 197"
+	"PSdetachRowRun 198"
+	"PQsendQueryParamsPolarWait 199"
+	"PQsendPreparePolarWait 200"
+	"PQsendQueryPreparedPolarWait 201"
+)
+
+for entry in "${EXPECTED_EXPORTS[@]}"; do
+	read -r symbol ordinal <<< "$entry"
+	awk -v symbol="$symbol" -v ordinal="$ordinal" \
+		'$1 == symbol && $2 == ordinal { found = 1 } END { exit !found }' \
+		"$PG_SRC/src/interfaces/libpq/exports.txt" \
+		|| fail "libpq export mismatch: expected $symbol at ordinal $ordinal"
+	grep -Fq "$symbol" "$PG_SRC/src/interfaces/libpq/libpq-fe.h" \
+		|| fail "libpq public header missing expected symbol: $symbol"
+done
+
+FE_EXEC="$PG_SRC/src/interfaces/libpq/fe-exec.c"
+grep -Fq '#define POLAR_WAIT_PROTOCOL_VERSION 1' "$FE_EXEC" \
+	|| fail "W protocol version is not fixed at 1"
+grep -Fq '#define POLAR_WAIT_PROTOCOL_FLAGS 0' "$FE_EXEC" \
+	|| fail "W protocol flags are not fixed at 0"
+
+# Payload order is part of the client/server contract:
+# version:u8, mode:u8, flags:u16, timeout_ms:u32, target_lsn:u64.
+WIRE_FIELDS=(
+	"pqPutc(POLAR_WAIT_PROTOCOL_VERSION, conn)"
+	"pqPutc(wait_spec->consistency_mode, conn)"
+	"pqPutInt(POLAR_WAIT_PROTOCOL_FLAGS, 2, conn)"
+	"pqPutInt((int) wait_spec->timeout_ms, 4, conn)"
+	"pqPutInt((int) (wait_spec->target_lsn >> 32), 4, conn)"
+	"pqPutInt((int) wait_spec->target_lsn, 4, conn)"
+)
+
+previous_line=0
+for field in "${WIRE_FIELDS[@]}"; do
+	line="$(grep -nF "$field" "$FE_EXEC" | head -n 1 | cut -d: -f1)"
+	[ -n "$line" ] || fail "W encoder missing field: $field"
+	[ "$line" -gt "$previous_line" ] \
+		|| fail "W encoder field is out of order: $field"
+	previous_line="$line"
+done
+
+grep -Fq "pqPutMsgStart('W', conn)" "$FE_EXEC" \
+	|| fail "libpq does not encode the W frontend message"
+grep -Fq 'pqPutMsgEndNoFlush(conn)' "$FE_EXEC" \
+	|| fail "W is not staged for the compound command flush"
+
 # --- belt-and-suspenders: xact is expected, CSN is still deferred ----------
 if grep -qiE 'csn|PQgetCSN|PQhasCSN|PQsetPolarSendCSN|_polar_send_csn|_polar_proxy_send_csn|polar_proxy_send_csn|polar_last_csn|polar_has_csn' "$PATCH"; then
 	fail "PolarDB libpq patch references deferred CSN tokens"
@@ -104,6 +163,12 @@ REQUIRED_PATCH_TOKENS=(
 	PQgetLSN
 	PQhasLSN
 	PQsetPolarSendLSN
+	PQPolarConsistencyMode
+	PQsendQueryParamsPolarWait
+	PQsendPreparePolarWait
+	PQsendQueryPreparedPolarWait
+	pqPutPolarWait
+	_pq_.polar_proxy_wait_v1
 	PQgetXactSplitXids
 	PQisXactSplittable
 	PQisXactWalPending
@@ -113,8 +178,11 @@ REQUIRED_PATCH_TOKENS=(
 )
 
 for token in "${REQUIRED_PATCH_TOKENS[@]}"; do
-	grep -q "$token" "$PATCH" || fail "PolarDB libpq patch missing expected token: $token"
+	grep -Fq "$token" "$PATCH" || fail "PolarDB libpq patch missing expected token: $token"
 done
 
-echo "PASS: PolarDB LSN/Xact libpq patch applies cleanly as the LAST patch"
+grep -Fq "pqPutMsgStart('W', conn)" "$PATCH" \
+	|| fail "PolarDB libpq patch does not encode the W frontend message"
+
+echo "PASS: PolarDB LSN/Xact/Wait libpq patch applies cleanly as the LAST patch"
 exit 0

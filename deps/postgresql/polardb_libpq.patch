@@ -216,7 +216,15 @@
 +}
 --- src/interfaces/libpq/fe-exec.c
 +++ src/interfaces/libpq/fe-exec.c
-@@ -62,6 +62,7 @@
+@@ -27,6 +27,7 @@
+ #include "libpq-fe.h"
+ #include "libpq-int.h"
+ #include "mb/pg_wchar.h"
++#include "port/pg_bswap.h"
+ 
+ /* keep this in same order as ExecStatusType in libpq-fe.h */
+ char	   *const pgresStatus[] = {
+@@ -62,6 +63,7 @@
  static PGEvent *dupEvents(PGEvent *events, int count, size_t *memSize);
  static bool pqAddTuple(PGresult *res, PGresAttValue *tup,
  					   const char **errmsgp);
@@ -224,7 +232,7 @@
  static int	PQsendQueryInternal(PGconn *conn, const char *query, bool newQuery);
  static bool PQsendQueryStart(PGconn *conn, bool newQuery);
  static int	PQsendQueryGuts(PGconn *conn,
-@@ -73,6 +74,16 @@
+@@ -73,6 +75,16 @@
  							const int *paramLengths,
  							const int *paramFormats,
  							int resultFormat);
@@ -241,7 +249,7 @@
  static void parseInput(PGconn *conn);
  static PGresult *getCopyResult(PGconn *conn, ExecStatusType copytype);
  static bool PQexecStart(PGconn *conn);
-@@ -83,6 +94,64 @@
+@@ -83,6 +95,97 @@
  static void pqPipelineProcessQueue(PGconn *conn);
  static int	pqPipelineFlush(PGconn *conn);
  
@@ -251,6 +259,9 @@
 +	uint32		timeout_ms;
 +	int			consistency_mode;
 +};
++
++#define POLAR_WAIT_PROTOCOL_VERSION 1
++#define POLAR_WAIT_PROTOCOL_FLAGS 0
 +
 +struct pgOutputBufferCheckpoint
 +{
@@ -277,23 +288,53 @@
 +	conn->outMsgEnd = checkpoint->out_msg_end;
 +}
 +
++static void
++pqTraceStagedOutput(PGconn *conn, int start)
++{
++	if (!conn->Pfdebug)
++		return;
++
++	while (start < conn->outCount)
++	{
++		uint32		msg_len;
++		int			wire_len;
++
++		if (conn->outCount - start < 5)
++			break;
++		memcpy(&msg_len, conn->outBuffer + start + 1, sizeof(msg_len));
++		wire_len = 1 + (int) pg_ntoh32(msg_len);
++		if (wire_len < 5 || wire_len > conn->outCount - start)
++			break;
++		pqTraceOutputMessage(conn, conn->outBuffer + start, true);
++		start += wire_len;
++	}
++}
++
 +static int
 +pqPutPolarWait(const struct pgPolarWaitSpec *wait_spec, PGconn *conn)
 +{
 +	if (!wait_spec)
-+		return 0;
-+	if (wait_spec->target_lsn == 0 ||
-+		(wait_spec->consistency_mode != PQ_POLAR_CONSISTENCY_BEST_EFFORT &&
-+		 wait_spec->consistency_mode != PQ_POLAR_CONSISTENCY_STRICT))
 +	{
-+		libpq_append_conn_error(conn, "invalid PolarDB proxy wait parameters");
++		libpq_append_conn_error(conn, "PolarDB proxy wait specification is null");
++		return -1;
++	}
++	if (wait_spec->target_lsn == 0)
++	{
++		libpq_append_conn_error(conn, "PolarDB proxy wait target LSN must be nonzero");
++		return -1;
++	}
++	if (wait_spec->consistency_mode != PQ_POLAR_CONSISTENCY_BEST_EFFORT &&
++		wait_spec->consistency_mode != PQ_POLAR_CONSISTENCY_STRICT)
++	{
++		libpq_append_conn_error(conn, "invalid PolarDB proxy wait consistency mode: %d",
++								wait_spec->consistency_mode);
 +		return -1;
 +	}
 +
 +	if (pqPutMsgStart('W', conn) < 0 ||
-+		pqPutc(1, conn) < 0 ||
++		pqPutc(POLAR_WAIT_PROTOCOL_VERSION, conn) < 0 ||
 +		pqPutc(wait_spec->consistency_mode, conn) < 0 ||
-+		pqPutInt(0, 2, conn) < 0 ||
++		pqPutInt(POLAR_WAIT_PROTOCOL_FLAGS, 2, conn) < 0 ||
 +		pqPutInt((int) wait_spec->timeout_ms, 4, conn) < 0 ||
 +		pqPutInt((int) (wait_spec->target_lsn >> 32), 4, conn) < 0 ||
 +		pqPutInt((int) wait_spec->target_lsn, 4, conn) < 0 ||
@@ -306,7 +347,7 @@
  
  /* ----------------
   * Space management for PGresult.
-@@ -1533,6 +1602,42 @@
+@@ -1533,6 +1636,42 @@
  						   resultFormat);
  }
  
@@ -323,7 +364,7 @@
 +						   uint32_t timeoutMs,
 +						   int consistencyMode)
 +{
-+	struct pgPolarWaitSpec wait_spec = {
++	const struct pgPolarWaitSpec wait_spec = {
 +		(uint64) targetLSN, (uint32) timeoutMs, consistencyMode
 +	};
 +
@@ -349,7 +390,7 @@
  /*
   * PQsendPrepare
   *	 Submit a Parse message, but don't wait for it to finish
-@@ -1540,10 +1645,10 @@
+@@ -1540,10 +1679,10 @@
   * Returns: 1 if successfully submitted
   *			0 if error (conn->errorMessage is set)
   */
@@ -364,7 +405,7 @@
  {
  	PGcmdQueueEntry *entry = NULL;
  
-@@ -1633,6 +1738,122 @@
+@@ -1633,6 +1772,123 @@
  }
  
  /*
@@ -446,6 +487,7 @@
 +	entry->query = strdup(query);
 +
 +	/* pqPipelineFlush is the first point allowed to publish staged bytes. */
++	pqTraceStagedOutput(conn, checkpoint.out_count);
 +	output_committed = true;
 +	if (pqPipelineFlush(conn) < 0)
 +		goto sendFailed;
@@ -487,7 +529,7 @@
   * PQsendQueryPrepared
   *		Like PQsendQuery, but execute a previously prepared statement,
   *		using extended query protocol so we can pass parameters
-@@ -1673,6 +1894,41 @@
+@@ -1673,6 +1929,41 @@
  						   resultFormat);
  }
  
@@ -529,7 +571,7 @@
  /*
   * PQsendQueryStart
   *	Common startup code for PQsendQuery and sibling routines
-@@ -1931,6 +2187,190 @@
+@@ -1931,6 +2222,191 @@
  	return 0;
  }
  
@@ -700,6 +742,7 @@
 +	 * threshold).  In nonblock mode, don't complain if we're unable to send
 +	 * it all; PQgetResult() will do any additional flushing needed.
 +	 */
++	pqTraceStagedOutput(conn, checkpoint.out_count);
 +	output_committed = true;
 +	if (pqPipelineFlush(conn) < 0)
 +		goto sendFailed;
@@ -720,7 +763,7 @@
  /*
   * Select row-by-row processing mode
   */
-@@ -4558,6 +4998,30 @@
+@@ -4558,6 +5034,30 @@
      return psHandleRowData(conn, is_first_packet, result);
  }
  
@@ -753,7 +796,7 @@
  {
 --- src/interfaces/libpq/fe-misc.c
 +++ src/interfaces/libpq/fe-misc.c
-@@ -577,6 +577,40 @@
+@@ -577,6 +577,31 @@
  	return 0;
  }
  
@@ -777,16 +820,7 @@
 +		memcpy(conn->outBuffer + conn->outMsgStart, &msgLen, 4);
 +	}
 +
-+	/* Trace construction consistently with pqPutMsgEnd(). */
-+	if (conn->Pfdebug)
-+	{
-+		if (conn->outCount < conn->outMsgStart)
-+			pqTraceOutputMessage(conn, conn->outBuffer + conn->outCount, true);
-+		else
-+			pqTraceOutputNoTypeByteMessage(conn,
-+										   conn->outBuffer + conn->outMsgStart);
-+	}
-+
++	/* The compound sender traces all staged messages only after commit. */
 +	conn->outCount = conn->outMsgEnd;
 +	return 0;
 +}
@@ -1186,19 +1220,30 @@
 +}
 --- src/interfaces/libpq/fe-trace.c
 +++ src/interfaces/libpq/fe-trace.c
-@@ -514,6 +514,31 @@
+@@ -514,6 +514,42 @@
  		pqTraceOutputInt16(f, message, cursor);
  }
  
 +/* PolarDB proxy wait */
 +static void
-+pqTraceOutputPolarWait(FILE *f, const char *message, int *cursor)
++pqTraceOutputPolarWait(FILE *f, const char *message, int *cursor, int length)
 +{
 +	uint16		flags;
 +	uint32		timeout_ms;
 +	uint64		target_lsn;
-+	unsigned char version = message[(*cursor)++];
-+	unsigned char mode = message[(*cursor)++];
++	unsigned char version;
++	unsigned char mode;
++
++	if (length + 1 - *cursor != 16)
++	{
++		fprintf(f, "PolarWait\t malformed payload_length=%d",
++				length + 1 - *cursor);
++		*cursor = length + 1;
++		return;
++	}
++
++	version = message[(*cursor)++];
++	mode = message[(*cursor)++];
 +
 +	memcpy(&flags, message + *cursor, sizeof(flags));
 +	*cursor += sizeof(flags);
@@ -1218,7 +1263,7 @@
  /* ReadyForQuery */
  static void
  pqTraceOutputZ(FILE *f, const char *message, int *cursor)
-@@ -658,8 +683,11 @@
+@@ -658,8 +694,12 @@
  		case 'V':				/* Function Call response */
  			pqTraceOutputV(conn->Pfdebug, message, &logCursor);
  			break;
@@ -1226,7 +1271,8 @@
 -			pqTraceOutputW(conn->Pfdebug, message, &logCursor, length);
 +		case 'W':				/* Polar wait(F) or Start Copy Both(B) */
 +			if (toServer)
-+				pqTraceOutputPolarWait(conn->Pfdebug, message, &logCursor);
++				pqTraceOutputPolarWait(conn->Pfdebug, message, &logCursor,
++									  length);
 +			else
 +				pqTraceOutputW(conn->Pfdebug, message, &logCursor, length);
  			break;
