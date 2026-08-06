@@ -410,7 +410,7 @@ admin_sql "LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null
 	[ "$(global_var pgsql-polardb_proxy_identity_host)" = "127.0.0.2" ]
 ok $? "RFQ startup fallback identity rejects wildcard host at runtime load"
 
-if grep -q 'replica_eligible=-1' "$PROXYSQL_CONFIG_FILE" && grep -q 'check_type="polardb"' "$PROXYSQL_CONFIG_FILE" && grep -q 'txn_split_enabled=1' "$PROXYSQL_CONFIG_FILE" && grep -q 'lsn_wait_timeout_ms=0' "$PROXYSQL_CONFIG_FILE" && grep -q 'proxy_protocol="legacy"' "$PROXYSQL_CONFIG_FILE"; then
+if grep -q 'replica_eligible=-1' "$PROXYSQL_CONFIG_FILE" && grep -q 'check_type="polardb"' "$PROXYSQL_CONFIG_FILE" && grep -q 'txn_split_enabled=1' "$PROXYSQL_CONFIG_FILE" && grep -q 'lsn_wait_timeout_ms=0' "$PROXYSQL_CONFIG_FILE" && grep -q 'proxy_protocol="v15_wait"' "$PROXYSQL_CONFIG_FILE"; then
 	ok 0 "saved config file contains PolarDB fields"
 else
 	diag "saved config excerpt:"

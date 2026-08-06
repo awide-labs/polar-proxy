@@ -20,11 +20,12 @@ LSN-only session-consistency feature — the behavior a compile can't check on i
 own:
 
 - the primary reports its LSN, and the session tracks it so a client reads its own writes;
-- simple-query reads get wrapped with a wait, and the wrapper's own results are hidden;
+- simple-query reads get a SQL wait wrapper, while `v15_wait` extended reads get
+  an in-band `W` message before their semantic Parse/Bind/Execute operation;
 - all four LSN wait timeout actions behave correctly, including timeout `0`;
 - a real backend timeout is told apart from a user warning that just looks like one;
 - reads respect the byte-lag cap when a replica is chosen;
-- only simple-query reads are wrapped (extended protocol is out of scope here);
+- both `PQexecParams` and reused `PQprepare`/`PQexecPrepared` reads preserve RYW;
 - PolarDB config fields survive a save and reload.
 
 These tests need a live PolarDB primary/replica setup and a ProxySQL binary built
@@ -281,7 +282,13 @@ for maintainers reading the executable test body.
 
 - **Config round-trip and wrapper safety** — query-rule columns survive save/load; an unbuildable wait wrapper stops the read before dispatch instead of sending an unwrapped replica read.
 - **RYW and basic routing modes** — the session moves forward only: reads are monotonic (read-after-read never goes backward) and honor the session's own writes (read-after-write); plus `off`/`primary` modes and manual routes.
-- **Extended protocol routing** — Parse/Bind/Execute reads are not wait-wrapped in this version; manual routes are still honored.
+- **Extended protocol routing** — `v15_wait` carries the wait in the same backend
+  pipeline as Parse/Bind/Execute; tests cover `PQexecParams`, reused prepared
+  statements, manual routes, target-free reads, read-after-write routing,
+  successful and error Flush boundaries, delayed-multiplex backend ownership,
+  local RESET within an open Flush frame, exact transaction-status recovery,
+  and conservative writer pinning for a multi-operation Sync frame. The opt-in
+  replay-lag group verifies an actual `W` timeout and writer retry.
 - **Proxy-protocol RFQ scope** — `v15`/`legacy`/`off` and hostgroup-override negotiation of RFQ-LSN capability.
 - **Startup identity fallback** — where the RFQ startup client address comes from, and rejecting the backend connection when it cannot be formed.
 - **Missing-LSN actions** — primary fallback, a warned replica route, or an error when no required RFQ LSN is available, plus the missing-LSN flags.

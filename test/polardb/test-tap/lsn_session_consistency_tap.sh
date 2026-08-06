@@ -20,7 +20,7 @@
 #   - RFQ-vs-monitor LSN stat separation
 #   - freshness-controlled lag cap fallback to primary
 #   - wrapper SET timeout/error attribution
-#   - extended protocol stays outside v1 PolarDB wait wrapping
+#   - v15_wait protects extended Parse/Bind/Execute reads without an extra round trip
 #   - debug fault injection shows wrapper-finalize failure stops before RunQuery
 #
 # Requires the writer and reader endpoints configured in `.env` and a built
@@ -71,7 +71,7 @@ export POLARDB_DEBUG_FAIL_WRAP_FINALIZE_ONCE="${POLARDB_DEBUG_FAIL_WRAP_FINALIZE
 WRITER_HG="$POLARDB_WRITER_HG"
 READER_HG="$POLARDB_READER_HG"
 
-PLAN=90
+PLAN=96
 FAIL=0
 STARTED_PROXY=0
 TIMEOUT_EDGE_LAG_SET=0
@@ -328,6 +328,54 @@ lsn_trace_delta() {
     echo $((after - before))
 }
 
+lsn_trace_line_count() {
+    wc -l <"$(lsn_trace_log)" 2>/dev/null || echo 0
+}
+
+lsn_trace_since_has() {
+    local before="$1"
+    local pattern="$2"
+    awk -v start="$((before + 1))" -v pattern="$pattern" '
+        NR >= start && index($0, pattern) { found=1; exit }
+        END { exit(found ? 0 : 1) }
+    ' "$(lsn_trace_log)" 2>/dev/null
+}
+
+lsn_trace_since_matches() {
+    local before="$1"
+    local pattern="$2"
+    awk -v start="$((before + 1))" -v pattern="$pattern" '
+        NR >= start && $0 ~ pattern { found=1; exit }
+        END { exit(found ? 0 : 1) }
+    ' "$(lsn_trace_log)" 2>/dev/null
+}
+
+# Require ordered ownership transitions within one focused request. Re-reading
+# the cold test log keeps production code free of test-only request identifiers.
+lsn_trace_since_sequence() {
+    local before="$1"
+    shift
+    local pattern line last=0
+
+    for pattern in "$@"; do
+        line=$(awk -v start="$((before + 1))" -v last="$last" \
+            -v pattern="$pattern" '
+            NR >= start {
+                relative=NR-start+1
+                if (relative > last && index($0, pattern)) {
+                    print relative
+                    exit
+                }
+            }
+        ' "$(lsn_trace_log)" 2>/dev/null)
+        if [ -z "$line" ]; then
+            diag "missing ordered trace after line $before: $pattern"
+            return 1
+        fi
+        last="$line"
+    done
+}
+
 QUERY_EVENT_BUFFER_OLD=""
 QUERY_EVENT_DEFAULT_OLD=""
 
@@ -494,6 +542,16 @@ run_extended_query() {
             POLARDB_EXTENDED_SETUP_SQL2="${POLARDB_EXTENDED_SETUP_SQL2:-}" \
             POLARDB_EXTENDED_REPORT_NOTICES="${POLARDB_EXTENDED_REPORT_NOTICES:-}" \
             POLARDB_EXTENDED_PREPARED="${POLARDB_EXTENDED_PREPARED:-}" \
+            POLARDB_EXTENDED_PIPELINE_FLUSH="${POLARDB_EXTENDED_PIPELINE_FLUSH:-}" \
+            POLARDB_EXTENDED_PIPELINE_FLUSH_SUCCESS="${POLARDB_EXTENDED_PIPELINE_FLUSH_SUCCESS:-}" \
+            POLARDB_EXTENDED_PIPELINE_FLUSH_RESET="${POLARDB_EXTENDED_PIPELINE_FLUSH_RESET:-}" \
+            POLARDB_EXTENDED_PIPELINE_RESET_SQL="${POLARDB_EXTENDED_PIPELINE_RESET_SQL:-}" \
+            POLARDB_EXTENDED_PIPELINE_MULTI="${POLARDB_EXTENDED_PIPELINE_MULTI:-}" \
+            POLARDB_EXTENDED_PIPELINE_SQL2="${POLARDB_EXTENDED_PIPELINE_SQL2:-}" \
+            POLARDB_EXTENDED_RECOVERY_SQL="${POLARDB_EXTENDED_RECOVERY_SQL:-}" \
+            POLARDB_EXTENDED_REQUEST_LSN="${POLARDB_EXTENDED_REQUEST_LSN:-}" \
+            POLARDB_EXTENDED_PRE_SYNC_DELAY_MS="${POLARDB_EXTENDED_PRE_SYNC_DELAY_MS:-}" \
+            POLARDB_EXTENDED_EXPECT_IDLE="${POLARDB_EXTENDED_EXPECT_IDLE:-}" \
             "$EXTENDED_HELPER" "$sql"
         return
     fi
@@ -509,6 +567,16 @@ run_extended_query() {
         POLARDB_EXTENDED_SETUP_SQL2="${POLARDB_EXTENDED_SETUP_SQL2:-}" \
         POLARDB_EXTENDED_REPORT_NOTICES="${POLARDB_EXTENDED_REPORT_NOTICES:-}" \
         POLARDB_EXTENDED_PREPARED="${POLARDB_EXTENDED_PREPARED:-}" \
+        POLARDB_EXTENDED_PIPELINE_FLUSH="${POLARDB_EXTENDED_PIPELINE_FLUSH:-}" \
+        POLARDB_EXTENDED_PIPELINE_FLUSH_SUCCESS="${POLARDB_EXTENDED_PIPELINE_FLUSH_SUCCESS:-}" \
+        POLARDB_EXTENDED_PIPELINE_FLUSH_RESET="${POLARDB_EXTENDED_PIPELINE_FLUSH_RESET:-}" \
+        POLARDB_EXTENDED_PIPELINE_RESET_SQL="${POLARDB_EXTENDED_PIPELINE_RESET_SQL:-}" \
+        POLARDB_EXTENDED_PIPELINE_MULTI="${POLARDB_EXTENDED_PIPELINE_MULTI:-}" \
+        POLARDB_EXTENDED_PIPELINE_SQL2="${POLARDB_EXTENDED_PIPELINE_SQL2:-}" \
+        POLARDB_EXTENDED_RECOVERY_SQL="${POLARDB_EXTENDED_RECOVERY_SQL:-}" \
+        POLARDB_EXTENDED_REQUEST_LSN="${POLARDB_EXTENDED_REQUEST_LSN:-}" \
+        POLARDB_EXTENDED_PRE_SYNC_DELAY_MS="${POLARDB_EXTENDED_PRE_SYNC_DELAY_MS:-}" \
+        POLARDB_EXTENDED_EXPECT_IDLE="${POLARDB_EXTENDED_EXPECT_IDLE:-}" \
         "$EXTENDED_HELPER_RUNNER" extended_protocol "$sql"
 }
 
@@ -1641,6 +1709,224 @@ case_extended_replica_loss_actions() {
     set_global_var_runtime "pgsql-polardb_profile" "session_warning"
 }
 
+# A Flush exposes command results without ending the extended cycle. An error
+# must remain in discard-until-Sync state, produce exactly one pipeline Sync
+# result, and leave the client session usable. A frame with two backend
+# operations is conservatively pinned to the writer before its first send.
+case_extended_frame_boundaries() {
+    local out rc proxy_alive marker old_delay trace_before trace_ok
+
+    if ! ensure_extended_helper; then
+        skip_ok "extended Flush error: Sync recovers the same client session" \
+            "cannot build proxysql_extended_protocol_test"
+        skip_ok "extended Flush error: deferred RFQ preserves failed-transaction state" \
+            "cannot build proxysql_extended_protocol_test"
+        skip_ok "extended successful Flush: Sync RFQ protects the next reader read" \
+            "cannot build proxysql_extended_protocol_test"
+        skip_ok "extended local RESET: open-frame write attribution survives until Sync" \
+            "cannot build proxysql_extended_protocol_test"
+        skip_ok "extended multi-operation frame: reader/write batch is pinned to writer" \
+            "cannot build proxysql_extended_protocol_test"
+        return
+    fi
+
+    set_select_rule_auto
+    set_read_policy eventual replica primary
+    set_global_var_runtime "pgsql-polardb_action_replica_error" "error"
+    set_global_var_runtime "pgsql-polardb_proxy_protocol" "v15_wait"
+
+    out=$(POLARDB_EXTENDED_PIPELINE_FLUSH=1 \
+        POLARDB_EXTENDED_RECOVERY_SQL="SELECT 42" \
+        run_extended_query "SELECT 1 / 0;" 2>&1)
+    rc=$?
+    proxy_alive=0
+    admin_sql "SELECT 1;" >/dev/null 2>&1 && proxy_alive=1
+    if [ "$rc" -eq 0 ] && [ "$proxy_alive" -eq 1 ] &&
+        printf '%s\n' "$out" | grep -qx 'pipeline_error=1' &&
+        printf '%s\n' "$out" | grep -qx 'pre_sync_result=none' &&
+        [ "$(printf '%s\n' "$out" | grep -c '^pipeline_sync=1$')" -eq 1 ] &&
+        printf '%s\n' "$out" | grep -qx 'recovery_result=42'; then
+        ok 0 "extended Flush error: Sync recovers the same client session"
+    else
+        diag "extended Flush output: $out"
+        diag "extended Flush rc=$rc proxy_alive=$proxy_alive"
+        ok 1 "extended Flush error: Sync recovers the same client session"
+    fi
+
+    # The backend's RFQ after internal error resync is deferred until the client
+    # Sync. The active transaction independently pins this backend; the RFQ must
+    # retain its LSN policy and exact failed-transaction byte, then ROLLBACK must
+    # restore idle state.
+    old_delay=$(runtime_var "pgsql-connection_delay_multiplex_ms")
+    set_global_var_runtime "pgsql-connection_delay_multiplex_ms" "10"
+    trace_before=$(lsn_trace_line_count)
+    out=$(POLARDB_EXTENDED_SETUP_SQL="BEGIN" \
+        POLARDB_EXTENDED_PIPELINE_FLUSH=1 \
+        POLARDB_EXTENDED_EXPECT_INERROR=1 \
+        POLARDB_EXTENDED_REQUEST_LSN=1 \
+        POLARDB_EXTENDED_PRE_SYNC_DELAY_MS=200 \
+        POLARDB_EXTENDED_RECOVERY_SQL="ROLLBACK" \
+        run_extended_query "SELECT 1 / 0;" 2>&1)
+    rc=$?
+    set_global_var_runtime "pgsql-connection_delay_multiplex_ms" "${old_delay:-0}"
+    trace_ok=1
+    if tap_trace_checks_enabled "$(lsn_trace_log)"; then
+        lsn_trace_since_sequence "$trace_before" \
+            "PolarDB EXTENDED ERROR: backend ErrorResponse" \
+            "PolarDB EXTENDED RFQ: retain publication" \
+            "PolarDB EXTENDED FRAME: discard" \
+            "PolarDB EXTENDED RFQ: failure cleanup preserve publication" \
+            "PolarDB EXTENDED RFQ: emit txn=E deferred=1" || trace_ok=0
+        if lsn_trace_since_has "$trace_before" \
+            "PolarDB EXTENDED RFQ: emit txn=E deferred=1 backend=1 retained=0 include_lsn=1"; then
+            : # The attached backend still owns the exact RFQ evidence.
+        elif lsn_trace_since_has "$trace_before" \
+            "PolarDB EXTENDED RFQ: emit txn=E deferred=1 backend=1 retained=1 include_lsn=1"; then
+            # Early client Sync may retain a defensive copy before publishing
+            # from the still-attached backend.
+            lsn_trace_since_sequence "$trace_before" \
+                "PolarDB EXTENDED RFQ: retain evidence" \
+                "PolarDB EXTENDED RFQ: emit txn=E deferred=1 backend=1 retained=1 include_lsn=1" ||
+                trace_ok=0
+        else
+            lsn_trace_since_sequence "$trace_before" \
+                "PolarDB EXTENDED RFQ: retain evidence" \
+                "PolarDB EXTENDED RFQ: emit txn=E deferred=1 backend=0 retained=1 include_lsn=1" ||
+                trace_ok=0
+        fi
+    elif tap_debug_traces_required; then
+        diag "extended failed-transaction RFQ trace is unavailable"
+        trace_ok=0
+    fi
+    if [ "$rc" -eq 0 ] &&
+        [ "$trace_ok" -eq 1 ] &&
+        printf '%s\n' "$out" | grep -qx 'pipeline_error=1' &&
+        printf '%s\n' "$out" | grep -qx 'pre_sync_result=none' &&
+        printf '%s\n' "$out" | grep -qx 'pipeline_sync=1' &&
+        printf '%s\n' "$out" | grep -qx 'transaction_status_after_setup=T' &&
+        printf '%s\n' "$out" | grep -qx 'transaction_status=E' &&
+        printf '%s\n' "$out" | grep -Eq '^rfq_lsn=[0-9]+$' &&
+        printf '%s\n' "$out" | grep -qx 'recovery=1' &&
+        printf '%s\n' "$out" | grep -qx 'transaction_status_after_recovery=I'; then
+        ok 0 "extended Flush error: deferred RFQ preserves failed-transaction state"
+    else
+        diag "extended failed-transaction RFQ output: $out"
+        diag "extended failed-transaction RFQ rc=$rc"
+        ok 1 "extended Flush error: deferred RFQ preserves failed-transaction state"
+    fi
+
+    set_read_policy session_lsn replica primary
+    marker="extended_flush_success_$$"
+    snapshot_consistency_counters extended_flush_before
+    old_delay=$(runtime_var "pgsql-connection_delay_multiplex_ms")
+    set_global_var_runtime "pgsql-connection_delay_multiplex_ms" "10"
+    trace_before=$(lsn_trace_line_count)
+    out=$(POLARDB_EXTENDED_PIPELINE_FLUSH_SUCCESS=1 \
+        POLARDB_EXTENDED_EXPECT_IDLE=1 \
+        POLARDB_EXTENDED_REQUEST_LSN=1 \
+        POLARDB_EXTENDED_PRE_SYNC_DELAY_MS=200 \
+        POLARDB_EXTENDED_RECOVERY_SQL="SELECT host(inet_server_addr()) || ':' || inet_server_port() || '|' || data FROM $TEST_TABLE WHERE id=704" \
+        run_extended_query "INSERT INTO $TEST_TABLE VALUES (704, '$marker') ON CONFLICT (id) DO UPDATE SET data='$marker'" 2>&1)
+    rc=$?
+    set_global_var_runtime "pgsql-connection_delay_multiplex_ms" "${old_delay:-0}"
+    trace_ok=1
+    if tap_trace_checks_enabled "$(lsn_trace_log)"; then
+        lsn_trace_since_sequence "$trace_before" \
+            "PolarDB EXTENDED RFQ: retain publication" \
+            "PolarDB EXTENDED RFQ: emit txn=I deferred=1" || trace_ok=0
+        lsn_trace_since_matches "$trace_before" \
+            "PolarDB EXTENDED RFQ: emit txn=I deferred=1 .*include_lsn=1" ||
+            trace_ok=0
+    elif tap_debug_traces_required; then
+        diag "extended successful-Flush RFQ trace is unavailable"
+        trace_ok=0
+    fi
+    snapshot_consistency_counters extended_flush_after
+    local flush_protect_delta flush_result
+    flush_protect_delta=$(snapshot_protect_delta \
+        extended_flush_before extended_flush_after)
+    flush_result=$(printf '%s\n' "$out" |
+        sed -n 's/^recovery_result=//p' | tail -1)
+    if [ "$rc" -eq 0 ] &&
+        [ "$trace_ok" -eq 1 ] &&
+        printf '%s\n' "$out" | grep -qx 'flush_success=1' &&
+        printf '%s\n' "$out" | grep -qx 'pre_sync_result=none' &&
+        [ "$(printf '%s\n' "$out" | grep -c '^pipeline_sync=1$')" -eq 1 ] &&
+        printf '%s\n' "$out" | grep -Eq '^rfq_lsn=[0-9]+$' &&
+        printf '%s\n' "$out" | grep -qx 'transaction_status=I' &&
+        reader_payload_matches "$flush_result" "$marker" &&
+        [ "$flush_protect_delta" -ge 1 ]; then
+        ok 0 "extended successful Flush: Sync RFQ protects the next reader read"
+    else
+        diag "extended successful Flush output: $out"
+        diag "extended successful Flush rc=$rc result=$flush_result protect_delta=$flush_protect_delta"
+        ok 1 "extended successful Flush: Sync RFQ protects the next reader read"
+    fi
+
+    # A proxy-local RESET is another statement in the same open extended frame.
+    # It may clear its own staged wait state, but not a successful write whose
+    # attribution and RFQ-LSN publication still belong to the later Sync.
+    marker="extended_flush_reset_$$"
+    snapshot_consistency_counters extended_flush_reset_before
+    out=$(POLARDB_EXTENDED_PIPELINE_FLUSH_RESET=1 \
+        POLARDB_EXTENDED_REQUEST_LSN=1 \
+        POLARDB_EXTENDED_PRE_SYNC_DELAY_MS=50 \
+        POLARDB_EXTENDED_RECOVERY_SQL="SELECT host(inet_server_addr()) || ':' || inet_server_port() || '|' || data FROM $TEST_TABLE WHERE id=705" \
+        run_extended_query "INSERT INTO $TEST_TABLE VALUES (705, '$marker') ON CONFLICT (id) DO UPDATE SET data='$marker'" 2>&1)
+    rc=$?
+    snapshot_consistency_counters extended_flush_reset_after
+    local reset_protect_delta reset_result
+    reset_protect_delta=$(snapshot_protect_delta \
+        extended_flush_reset_before extended_flush_reset_after)
+    reset_result=$(printf '%s\n' "$out" |
+        sed -n 's/^recovery_result=//p' | tail -1)
+    if [ "$rc" -eq 0 ] &&
+        printf '%s\n' "$out" | grep -qx 'write_flush_success=1' &&
+        printf '%s\n' "$out" | grep -qx 'reset_flush_success=1' &&
+        printf '%s\n' "$out" | grep -qx 'pre_sync_result=none' &&
+        [ "$(printf '%s\n' "$out" | grep -c '^pipeline_sync=1$')" -eq 1 ] &&
+        printf '%s\n' "$out" | grep -Eq '^rfq_lsn=[0-9]+$' &&
+        printf '%s\n' "$out" | grep -qx 'transaction_status=I' &&
+        reader_payload_matches "$reset_result" "$marker" &&
+        [ "$reset_protect_delta" -ge 1 ]; then
+        ok 0 "extended local RESET: open-frame write attribution survives until Sync"
+    else
+        diag "extended Flush+RESET output: $out"
+        diag "extended Flush+RESET rc=$rc result=$reset_result protect_delta=$reset_protect_delta"
+        ok 1 "extended local RESET: open-frame write attribution survives until Sync"
+    fi
+
+    marker="extended_multi_writer_$$"
+    trace_before=$(lsn_trace_line_count)
+    out=$(POLARDB_EXTENDED_PIPELINE_MULTI=1 \
+        POLARDB_EXTENDED_PIPELINE_SQL2="INSERT INTO $TEST_TABLE VALUES (703, '$marker') ON CONFLICT (id) DO UPDATE SET data='$marker'" \
+        run_extended_query "SELECT polar_node_type();" 2>&1)
+    rc=$?
+    trace_ok=1
+    if tap_trace_checks_enabled "$(lsn_trace_log)"; then
+        lsn_trace_since_sequence "$trace_before" \
+            "PolarDB EXTENDED FRAME: begin sync=1 route=1 writer_required=1" \
+            "PolarDB EXTENDED ROUTE: target_hg=$WRITER_HG writer_required=1" ||
+            trace_ok=0
+    elif tap_debug_traces_required; then
+        diag "extended multi-operation writer-pinning trace is unavailable"
+        trace_ok=0
+    fi
+    if [ "$rc" -eq 0 ] &&
+        [ "$trace_ok" -eq 1 ] &&
+        printf '%s\n' "$out" | grep -qx 'result1=primary' &&
+        [ "$(printf '%s\n' "$out" | grep -c '^pipeline_sync=1$')" -eq 1 ]; then
+        ok 0 "extended multi-operation frame: reader/write batch is pinned to writer"
+    else
+        diag "extended multi-operation output: $out"
+        diag "extended multi-operation rc=$rc"
+        ok 1 "extended multi-operation frame: reader/write batch is pinned to writer"
+    fi
+
+    set_global_var_runtime "pgsql-polardb_action_replica_error" "primary"
+    set_global_var_runtime "pgsql-polardb_proxy_protocol" "v15"
+}
+
 # Manual query-rule route: a destination_hostgroup=replica rule bypasses the
 # PolarDB planner (primary target) with no wait.
 case_manual_rule_route() {
@@ -1727,37 +2013,90 @@ case_cf3_extended_auto_no_write() {
     fi
 }
 
-# CF-3: an automatic extended-protocol read after a write is forced to the
-# primary with no wait wrapper (extended protocol stays outside v1 wrapping).
+# CF-3: v15_wait protects automatic extended reads after a write on a reader.
+# Exercise both one-shot PQexecParams and reused PQprepare/PQexecPrepared paths.
 case_cf3_extended_auto_after_write() {
-    prepared_before=$(counter PolarDB_Wait_Wrap_Prepared)
-    wait_before=$(counter PolarDB_Wait_LSN_Sent)
-    extended_marker="extended_after_write_$$"
-    extended_setup_sql="INSERT INTO $TEST_TABLE VALUES (701, '$extended_marker') ON CONFLICT (id) DO UPDATE SET data='$extended_marker';"
-    if ensure_extended_helper; then
-        extended_out=$(POLARDB_EXTENDED_SETUP_SQL="$extended_setup_sql" \
-            run_extended_query "SELECT host(inet_server_addr()) || ':' || inet_server_port() || '|' || (SELECT COUNT(*)::text FROM $TEST_TABLE WHERE id=701);" 2>&1)
-        extended_rc=$?
-        prepared_after=$(counter PolarDB_Wait_Wrap_Prepared)
-        wait_after=$(counter PolarDB_Wait_LSN_Sent)
-        extended_result=$(first_endpoint_payload_from_output "$extended_out")
-        extended_endpoint=${extended_result%%|*}
-        extended_count=${extended_result##*|}
-        if [ "$extended_rc" -eq 0 ] &&
-            [ "$extended_endpoint" = "$PRIMARY_SERVER_ENDPOINT" ] &&
-            [ "$extended_count" = "1" ] &&
-            [ $((prepared_after - prepared_before)) -eq 0 ] &&
-            [ $((wait_after - wait_before)) -eq 0 ]; then
-            ok 0 "CF-3: automatic extended protocol after write forces writer without wait wrapper"
-        else
-            diag "extended-after-write output: $extended_out"
-            diag "extended_rc=$extended_rc endpoint=$extended_endpoint expected_writer=$PRIMARY_SERVER_ENDPOINT count=$extended_count prepared_delta=$((prepared_after - prepared_before)) wait_delta=$((wait_after - wait_before))"
-            ok 1 "CF-3: automatic extended protocol after write forces writer without wait wrapper"
-        fi
-    else
-        sed 's/^/#   /' "$EXTENDED_HELPER_BUILD_LOG" 2>/dev/null || true
-        skip_ok "CF-3: automatic extended protocol after write forces writer without wait wrapper" "cannot build proxysql_extended_protocol_test"
-    fi
+	local trace_before trace_ok
+	set_global_var_runtime "pgsql-polardb_proxy_protocol" "v15_wait"
+	if ensure_extended_helper; then
+		all_extended_modes_ok=1
+		for extended_mode in params prepared; do
+			if [ "$extended_mode" = "prepared" ]; then
+				prepared_env=1
+				row_id=702
+			else
+				prepared_env=
+				row_id=701
+			fi
+			prepared_before=$(counter PolarDB_Wait_Wrap_Prepared)
+			bypass_before=$(counter PolarDB_Wait_Wrap_Bypassed)
+			wait_before=$(counter PolarDB_Wait_LSN_Sent)
+			extended_marker="extended_after_write_${extended_mode}_$$"
+			extended_setup_sql="INSERT INTO $TEST_TABLE VALUES ($row_id, '$extended_marker') ON CONFLICT (id) DO UPDATE SET data='$extended_marker';"
+			trace_before=$(lsn_trace_line_count)
+			extended_out=$(POLARDB_EXTENDED_PREPARED="$prepared_env" \
+				POLARDB_EXTENDED_SETUP_SQL="$extended_setup_sql" \
+				run_extended_query "SELECT host(inet_server_addr()) || ':' || inet_server_port() || '|' || (SELECT COUNT(*)::text FROM $TEST_TABLE WHERE id=$row_id);" 2>&1)
+			extended_rc=$?
+			prepared_after=$(counter PolarDB_Wait_Wrap_Prepared)
+			bypass_after=$(counter PolarDB_Wait_Wrap_Bypassed)
+			wait_after=$(counter PolarDB_Wait_LSN_Sent)
+			extended_result=$(first_endpoint_payload_from_output "$extended_out")
+			extended_endpoint=${extended_result%%|*}
+			extended_count=${extended_result##*|}
+			protection_delta=$((prepared_after - prepared_before +
+				bypass_after - bypass_before))
+			trace_ok=1
+			if tap_trace_checks_enabled "$(lsn_trace_log)"; then
+				lsn_trace_since_has "$trace_before" \
+					"PolarDB EXTENDED ROUTE: target_hg=$READER_HG writer_required=0" ||
+					trace_ok=0
+				if [ $((wait_after - wait_before)) -gt 0 ]; then
+					if [ "$extended_mode" = "params" ]; then
+						# A client Parse can be forwarded, completed from the statement
+						# cache, or lazily recreated on the selected reader.
+						if ! lsn_trace_since_has "$trace_before" \
+							"PolarDB EXTENDED WAIT: dispatched before Parse" &&
+							! lsn_trace_since_has "$trace_before" \
+							"PolarDB EXTENDED WAIT: dispatched before implicit Parse" &&
+							! lsn_trace_since_has "$trace_before" \
+							"PolarDB EXTENDED WAIT: dispatched before Bind/Execute"; then
+							trace_ok=0
+						fi
+					elif ! lsn_trace_since_has "$trace_before" \
+						"PolarDB EXTENDED WAIT: dispatched before implicit Parse" &&
+						! lsn_trace_since_has "$trace_before" \
+						"PolarDB EXTENDED WAIT: dispatched before Bind/Execute"; then
+						# A named statement needs an implicit backend Parse on a reader
+						# without it; an existing statement sends W with Bind/Execute.
+						trace_ok=0
+					fi
+				else
+					lsn_trace_since_has "$trace_before" \
+						"PolarDB DIRECT READ: selected reader reached target_lsn=" ||
+						trace_ok=0
+				fi
+			elif tap_debug_traces_required; then
+				diag "extended v15_wait trace is unavailable for mode=$extended_mode"
+				trace_ok=0
+			fi
+			if [ "$extended_rc" -ne 0 ] ||
+				! reader_endpoint_matches "$extended_endpoint" ||
+				[ "$extended_count" != "1" ] ||
+				[ "$protection_delta" -le 0 ] ||
+				[ "$trace_ok" -ne 1 ]; then
+				all_extended_modes_ok=0
+				diag "extended-after-write mode=$extended_mode output: $extended_out"
+				diag "extended_rc=$extended_rc endpoint=$extended_endpoint expected_reader=$REPLICA_SERVER_ENDPOINT count=$extended_count prepared_delta=$((prepared_after - prepared_before)) bypass_delta=$((bypass_after - bypass_before)) wait_delta=$((wait_after - wait_before))"
+			fi
+		done
+		ok "$((1 - all_extended_modes_ok))" \
+			"CF-3: v15_wait protects PQexecParams and prepared extended reads on a reader"
+	else
+		sed 's/^/#   /' "$EXTENDED_HELPER_BUILD_LOG" 2>/dev/null || true
+		skip_ok "CF-3: v15_wait protects PQexecParams and prepared extended reads on a reader" "cannot build proxysql_extended_protocol_test"
+	fi
+	set_global_var_runtime "pgsql-polardb_proxy_protocol" "v15"
 }
 
 # Explicit transaction: a SELECT inside BEGIN/COMMIT stays on the primary with
@@ -2964,6 +3303,39 @@ SQL
                 ok 1 "primary action: timed-out replica read retries on primary"
             fi
 
+            set_global_var_runtime "pgsql-polardb_proxy_protocol" "v15_wait"
+            wait_before=$(counter PolarDB_Wait_LSN_Sent)
+            timeout_before=$(counter PolarDB_Wait_Error_Timeout)
+            lsn_timeout_before=$(counter PolarDB_Wait_Error_LSN_Wait_Timeout)
+            retry_before=$(counter PolarDB_Wait_Reads_Retried_On_Writer)
+            extended_strict_marker="extended_strict_timeout_$$"
+            if ensure_extended_helper; then
+                extended_strict_out=$(POLARDB_EXTENDED_SETUP_SQL="INSERT INTO $TEST_TABLE VALUES (303, '$extended_strict_marker') ON CONFLICT (id) DO UPDATE SET data='$extended_strict_marker'" \
+                    run_extended_query "SELECT data FROM $TEST_TABLE WHERE id=303;" 2>&1)
+                extended_strict_rc=$?
+                wait_after=$(counter PolarDB_Wait_LSN_Sent)
+                timeout_after=$(counter PolarDB_Wait_Error_Timeout)
+                lsn_timeout_after=$(counter PolarDB_Wait_Error_LSN_Wait_Timeout)
+                retry_after=$(counter PolarDB_Wait_Reads_Retried_On_Writer)
+                if [ "$extended_strict_rc" -eq 0 ] &&
+                    printf '%s\n' "$extended_strict_out" | grep -qx "$extended_strict_marker" &&
+                    [ $((wait_after - wait_before)) -ge 1 ] &&
+                    [ $((timeout_after - timeout_before)) -eq 1 ] &&
+                    [ $((lsn_timeout_after - lsn_timeout_before)) -eq 1 ] &&
+                    [ $((retry_after - retry_before)) -eq 1 ]; then
+                    ok 0 "v15_wait extended strict timeout retries on primary after a real W"
+                else
+                    diag "extended strict output: $extended_strict_out"
+                    diag "extended_strict_rc=$extended_strict_rc wait_delta=$((wait_after - wait_before)) timeout_delta=$((timeout_after - timeout_before)) lsn_timeout_delta=$((lsn_timeout_after - lsn_timeout_before)) retry_delta=$((retry_after - retry_before))"
+                    ok 1 "v15_wait extended strict timeout retries on primary after a real W"
+                fi
+            else
+                sed 's/^/#   /' "$EXTENDED_HELPER_BUILD_LOG" 2>/dev/null || true
+                skip_ok "v15_wait extended strict timeout retries on primary after a real W" \
+                    "cannot build proxysql_extended_protocol_test"
+            fi
+            set_global_var_runtime "pgsql-polardb_proxy_protocol" "v15"
+
             set_lsn_wait_timeout_action warning
             timeout_before=$(counter PolarDB_Wait_Error_Timeout)
             lsn_timeout_before=$(counter PolarDB_Wait_Error_LSN_Wait_Timeout)
@@ -3030,11 +3402,13 @@ SQL
             fi
         else
             skip_ok "primary action: timed-out replica read retries on primary" "cannot set polar_replay_min_lag_size through managed DCS"
+            skip_ok "v15_wait extended strict timeout retries on primary after a real W" "cannot set polar_replay_min_lag_size through managed DCS"
             skip_ok "warning action: timeout notice is forwarded and query continues" "cannot set polar_replay_min_lag_size through managed DCS"
             skip_ok "warning action followed by extended protocol leaves no LSN wait notice" "cannot set polar_replay_min_lag_size through managed DCS"
         fi
     else
         skip_ok "primary action: timed-out replica read retries on primary" "set POLARDB_TIMEOUT_EDGE_TESTS=1 to alter managed replay lag"
+        skip_ok "v15_wait extended strict timeout retries on primary after a real W" "set POLARDB_TIMEOUT_EDGE_TESTS=1 to alter managed replay lag"
         skip_ok "warning action: timeout notice is forwarded and query continues" "set POLARDB_TIMEOUT_EDGE_TESTS=1 to alter managed replay lag"
         skip_ok "warning action followed by extended protocol leaves no LSN wait notice" "set POLARDB_TIMEOUT_EDGE_TESTS=1 to alter managed replay lag"
     fi
@@ -3234,6 +3608,7 @@ case_manual_sql_hint
 # ==== Extended protocol routing ====
 case_extended_replica_error_actions
 case_extended_replica_loss_actions
+case_extended_frame_boundaries
 case_cf3_extended_manual_reader
 case_cf3_extended_auto_no_write
 case_cf3_extended_auto_after_write

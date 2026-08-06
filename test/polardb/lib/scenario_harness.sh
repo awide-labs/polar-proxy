@@ -2454,7 +2454,9 @@ EOSQL
 		echo ""
 		echo "[$(ts)] STEP 7: Verify"
 
-		# Common stats (skip for extended protocol — no query wrapping means no LSN updates)
+		# The extended transaction-split variant stays writer-bound; it has no
+		# split-wrapper counter contract. Autocommit extended reads are covered
+		# separately by the v15_wait tests.
 		if [ "${SPLIT_VARIANT:-basic}" != "extended" ]; then
 			verify_preset "$outcome" "${COMMON_STATS[@]}"
 		fi

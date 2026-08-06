@@ -53,6 +53,18 @@ TRACE = {
     "process_result": "PolarDB PROCESS_RESULT:",
     "conninfo_protocol_re": r"PolarDB CONNINFO: .*protocol=([A-Za-z0-9_]+)",
 
+    # Extended-protocol frame, wait, error, and RFQ ownership boundaries.
+    "extended_frame_begin": "PolarDB EXTENDED FRAME: begin",
+    "extended_route": "PolarDB EXTENDED ROUTE:",
+    "extended_wait": "PolarDB EXTENDED WAIT: dispatched before",
+    "extended_backend_error": "PolarDB EXTENDED ERROR: backend ErrorResponse",
+    "extended_frame_discard": "PolarDB EXTENDED FRAME: discard",
+    "extended_rfq_publication": "PolarDB EXTENDED RFQ: retain publication",
+    "extended_rfq_failure_cleanup": (
+        "PolarDB EXTENDED RFQ: failure cleanup preserve publication"),
+    "extended_rfq_evidence": "PolarDB EXTENDED RFQ: retain evidence",
+    "extended_rfq_emit": "PolarDB EXTENDED RFQ: emit",
+
     # Startup-variable hygiene (must be absent).
     "invalid_value": "Invalid value",
     "stale_split_mode": "polardb_split_mode",
@@ -158,6 +170,19 @@ TEST_LOG = {
 LSN_WAIT_RE = re.compile(
     r"PROCESS_RESULT: write query digest='INSERT[^\n]*session_write_lsn=(\d+)"
 )
+EXTENDED_TRACE_ID_RE = re.compile(
+    r"\bsess=(0x[0-9A-Fa-f]+)\s+sid=(\d+)\s+frame=(\d+)\b")
+EXTENDED_EVENT_MARKERS = (
+    ("frame_begin", TRACE["extended_frame_begin"]),
+    ("route", TRACE["extended_route"]),
+    ("wait", TRACE["extended_wait"]),
+    ("backend_error", TRACE["extended_backend_error"]),
+    ("frame_discard", TRACE["extended_frame_discard"]),
+    ("rfq_publication", TRACE["extended_rfq_publication"]),
+    ("rfq_failure_cleanup", TRACE["extended_rfq_failure_cleanup"]),
+    ("rfq_evidence", TRACE["extended_rfq_evidence"]),
+    ("rfq_emit", TRACE["extended_rfq_emit"]),
+)
 
 
 @dataclass(frozen=True)
@@ -188,6 +213,15 @@ class RunKind:
         return self.timeout_action == "warning"
 
 
+@dataclass(frozen=True)
+class ExtendedTraceEvent:
+    kind: str
+    session_key: str
+    frame: int
+    line_no: int
+    text: str
+
+
 class Audit:
     def __init__(self, run_dir: Path) -> None:
         self.run_dir = run_dir
@@ -198,6 +232,12 @@ class Audit:
         self.replica_log = self._read("polardb_replica.log", required=False)
         self.is_wait_timeout = "timeout cleanup assertions completed" in self.test_log
         self.kind = self._detect_kind()
+        self.extended_verified = {
+            "matched": 0,
+            "attached": 0,
+            "detached": 0,
+            "ambiguous": 0,
+        }
 
     def _read(self, name: str, required: bool = True) -> str:
         path = self.run_dir / name
@@ -296,6 +336,7 @@ class Audit:
         self.check(bool(self.startup_protocols()), "missing startup-profile trace")
 
         self._audit_fsm_trace()
+        self._audit_extended_protocol()
 
         if self.is_wait_timeout:
             self._audit_wait_timeout()
@@ -322,6 +363,134 @@ class Audit:
                    "missing [SH] session-handler trace in proxysql_debug.log")
         self.check(TRACE["fsm_wire"] in self.proxy_debug,
                    "missing [W] wire-entry trace in proxysql_debug.log")
+
+    def _extended_events(self) -> list[ExtendedTraceEvent]:
+        events: list[ExtendedTraceEvent] = []
+        for line_no, line in enumerate(self.proxy_debug.splitlines(), 1):
+            kind = next((name for name, marker in EXTENDED_EVENT_MARKERS
+                         if marker in line), None)
+            if kind is None:
+                continue
+            identity = EXTENDED_TRACE_ID_RE.search(line)
+            if identity is None:
+                self.failures.append(
+                    f"extended trace line {line_no} lacks session/frame identity")
+                self.extended_verified["ambiguous"] += 1
+                continue
+            session_ptr, session_id, frame = identity.groups()
+            session_key = (f"sid={session_id}" if session_id != "0"
+                           else f"sess={session_ptr}")
+            events.append(ExtendedTraceEvent(
+                kind, session_key, int(frame), line_no, line))
+        return events
+
+    def _audit_extended_protocol(self) -> None:
+        extended_seen = any(
+            TRACE[key] in self.proxy_debug
+            for key in ("extended_frame_begin", "extended_route",
+                        "extended_wait", "extended_backend_error")
+        )
+        if not extended_seen:
+            return
+
+        events = self._extended_events()
+        frames: dict[tuple[str, int], list[ExtendedTraceEvent]] = {}
+        for event in events:
+            frames.setdefault(
+                (event.session_key, event.frame), []).append(event)
+
+        def frame_failure(key: tuple[str, int], message: str) -> None:
+            self.failures.append(
+                f"extended {key[0]} frame={key[1]}: {message}")
+            self.extended_verified["ambiguous"] += 1
+
+        for key, frame_events in frames.items():
+            kinds = [event.kind for event in frame_events]
+            if "frame_begin" not in kinds:
+                frame_failure(key, "missing frame-begin boundary")
+
+            for index, event in enumerate(frame_events):
+                if event.kind != "wait":
+                    continue
+                latest_begin = max(
+                    (prior for prior in range(index)
+                     if frame_events[prior].kind == "frame_begin"),
+                    default=-1)
+                if not any(prior.kind == "route"
+                           for prior in frame_events[latest_begin + 1:index]):
+                    frame_failure(
+                        key, f"W at line {event.line_no} has no prior route")
+
+            error_indices = [index for index, event in enumerate(frame_events)
+                             if event.kind == "backend_error"]
+            if not error_indices:
+                continue
+            if len(error_indices) != 1:
+                frame_failure(
+                    key, f"expected one terminal backend error, got {len(error_indices)}")
+                continue
+
+            error_index = error_indices[0]
+            emit_indices = [index for index, event in enumerate(frame_events)
+                            if event.kind == "rfq_emit" and index > error_index]
+            if len(emit_indices) != 1:
+                frame_failure(
+                    key, f"expected one RFQ after backend error, got {len(emit_indices)}")
+                continue
+
+            emit_index = emit_indices[0]
+            chain = frame_events[error_index:emit_index + 1]
+            required = (
+                "backend_error",
+                "rfq_publication",
+                "frame_discard",
+                "rfq_failure_cleanup",
+                "rfq_emit",
+            )
+            cursor = 0
+            ordered = True
+            for required_kind in required:
+                found = next((index for index in range(cursor, len(chain))
+                              if chain[index].kind == required_kind), None)
+                if found is None:
+                    frame_failure(
+                        key, f"missing ordered ownership event {required_kind}")
+                    ordered = False
+                    break
+                cursor = found + 1
+
+            emit = frame_events[emit_index]
+            ownership = re.search(r"\bbackend=(\d)\s+retained=(\d)\b", emit.text)
+            evidence_before_emit = any(
+                event.kind == "rfq_evidence" for event in chain)
+            valid_ownership = ownership is not None
+            ownership_kind = ""
+            if ownership is None:
+                frame_failure(key, "RFQ emit lacks backend/retained ownership")
+            else:
+                backend, retained = ownership.groups()
+                if backend == "0":
+                    valid_ownership = retained == "1" and evidence_before_emit
+                    if not valid_ownership:
+                        frame_failure(
+                            key, "detached RFQ lacks retained evidence")
+                    else:
+                        ownership_kind = "detached"
+                elif backend == "1":
+                    valid_ownership = retained in {"0", "1"}
+                    if retained == "1" and not evidence_before_emit:
+                        valid_ownership = False
+                        frame_failure(
+                            key, "retained attached RFQ lacks evidence-copy event")
+                    elif valid_ownership:
+                        ownership_kind = "attached"
+                else:
+                    valid_ownership = False
+                    frame_failure(key, f"invalid RFQ backend flag {backend}")
+
+            if ordered and valid_ownership:
+                self.extended_verified["matched"] += 1
+                self.extended_verified[ownership_kind] += 1
 
 
     def _audit_wait_timeout(self) -> None:
@@ -584,6 +753,17 @@ class Audit:
               f"RQ={self.count(self.proxy_debug, TRACE['fsm_runquery'])} "
               f"SH={self.count(self.proxy_debug, TRACE['fsm_session_handler'])} "
               f"W={self.count(self.proxy_debug, TRACE['fsm_wire'])}")
+        print(
+            "  extended: "
+            f"FRAME={self.count(self.proxy_debug, TRACE['extended_frame_begin'])} "
+            f"ROUTE={self.count(self.proxy_debug, TRACE['extended_route'])} "
+            f"WAIT={self.count(self.proxy_debug, TRACE['extended_wait'])} "
+            f"ERROR={self.count(self.proxy_debug, TRACE['extended_backend_error'])} "
+            f"RFQ={self.count(self.proxy_debug, TRACE['extended_rfq_emit'])} "
+            f"MATCHED={self.extended_verified['matched']} "
+            f"ATTACHED={self.extended_verified['attached']} "
+            f"DETACHED={self.extended_verified['detached']} "
+            f"AMBIGUOUS={self.extended_verified['ambiguous']}")
         for failure in self.failures:
             print(f"  - {failure}")
         return not self.failures
