@@ -1,24 +1,24 @@
 # 21 — Future: Other Capabilities from the full implementation
 
-> Scope: the remaining PolarDB capabilities that exist in the full implementation but are NOT in this LSN-only PolarDB feature — connection-pool warmup, version-aware connection naming, session-identity generation, deeper health checks, the extra config knobs, and the reader-acquisition quality controls — described as a delta from this implementation: what each one does and exactly where it would slot back into this implementation's hooks. | Audience: R/M/O/C | Status: stable | Prereqs: [01-BACKGROUND-AND-DESIGN.md](01-BACKGROUND-AND-DESIGN.md), [05-MONITOR-AND-HGM-LSN-STATE.md](05-MONITOR-AND-HGM-LSN-STATE.md), [11-CONNECTION-AND-LIBPQ.md](11-CONNECTION-AND-LIBPQ.md), [12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md), [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md) | Verified against: this branch
+> Scope: the remaining supporting PolarDB capabilities not in this branch: automatic version-derived connection naming, session identity/cancel metadata, CSN health, hard caught-up filtering, and optional split-mode ranking. Demand pool warmup is already implemented and is described only as current context. | Audience: R/M/O/C | Status: stable | Prereqs: [01-BACKGROUND-AND-DESIGN.md](01-BACKGROUND-AND-DESIGN.md), [05-MONITOR-AND-HGM-LSN-STATE.md](05-MONITOR-AND-HGM-LSN-STATE.md), [11-CONNECTION-AND-LIBPQ.md](11-CONNECTION-AND-LIBPQ.md), [12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md), [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md) | Verified against: this branch
 
 ---
 
 ## 1. What this document is
 
-This is a **future / not-in-this-feature** document. It describes the PolarDB capabilities that live in the **full implementation** but are **absent from this implementation**.
+This is a future-delta document. It separates capabilities still absent from this branch from adjacent infrastructure, such as demand pool warmup, that is already implemented.
 
 Three of the big future capabilities have their own dedicated documents:
 
 | Capability | Document |
 |---|---|
 | CSN (commit sequence number) global consistency | [18-FUTURE-CSN-DESIGN.md](18-FUTURE-CSN-DESIGN.md) |
-| In-transaction read offload (transaction split) | [19-FUTURE-TXN-SPLIT-DESIGN.md](19-FUTURE-TXN-SPLIT-DESIGN.md) |
-| Reader-failure recovery / retry | [20-FUTURE-READER-FAILURE-RETRY-DESIGN.md](20-FUTURE-READER-FAILURE-RETRY-DESIGN.md) |
+| Remaining transaction-split extensions | [19-FUTURE-TXN-SPLIT-DESIGN.md](19-FUTURE-TXN-SPLIT-DESIGN.md) |
+| Remaining reader-failure policy extensions | [20-FUTURE-READER-FAILURE-RETRY-DESIGN.md](20-FUTURE-READER-FAILURE-RETRY-DESIGN.md) |
 
-**This document (21) covers everything else**: the supporting and lower-profile capabilities that the full implementation has and this feature does not. They are:
+**This document (21) covers the remaining supporting capabilities and records warmup as already shipped:**
 
-1. Lazy connection-pool warmup (background opening of reader connections).
+1. Demand connection-pool warmup (implemented; background opening of compatible reader connections).
 2. Version-aware connection naming (different startup parameter names for PolarDB 11 vs PolarDB 15).
 3. Session-identity generation (proxy session id and cancel key).
 4. Deeper health checks (the CSN health column — today a no-op even in the full implementation).
@@ -49,7 +49,7 @@ against the current branch before using any line number.
 | hostgroup (HG) | A ProxySQL numbered group of backend servers. A PolarDB replication-hostgroup row pairs a writer hostgroup with a reader hostgroup. |
 | HGM (HostGroups Manager) | `PgSQL_HostGroups_Manager`: the class that owns backend topology and the connection pool. |
 | connection pool | ProxySQL's cache of already-open, already-authenticated backend connections, reused across client requests so it does not pay connect cost per query. |
-| transaction split | A future feature: running a read-only statement that sits **inside an open `BEGIN…COMMIT` transaction** on a replica. This implementation sends such reads to the writer. See [19-FUTURE-TXN-SPLIT-DESIGN.md](19-FUTURE-TXN-SPLIT-DESIGN.md). |
+| transaction split | Running an eligible read-only statement inside an open `BEGIN…COMMIT` transaction on a temporary replica backend. The simple-query form is implemented; extended-protocol split and additional ranking policy remain future work. See [19-FUTURE-TXN-SPLIT-DESIGN.md](19-FUTURE-TXN-SPLIT-DESIGN.md). |
 | GUC | "Grand Unified Configuration" variable — a PostgreSQL runtime setting changed with `SET name = value`. |
 | collect / plan / execute / process_result | The four PolarDB request-pipeline stages in this implementation, all methods of `PgSQL_Session` in `lib/PgSQL_PolarDB_Flow.cpp`. See [06-ROUTING-PIPELINE.md](06-ROUTING-PIPELINE.md). |
 
@@ -335,7 +335,10 @@ The full implementation has two extra reader-acquisition mechanisms that this fe
 
 The selector is `get_MyConn_polardb_reader` (full implementation, `lib/PgSQL_HostGroups_Manager.cpp:2773`); the mode is chosen by the `polardb_split_mode` knob (0 disables split entirely). The smart path sorts replicas by LSN and prefers the freshest.
 
-**Why this exact split-mode ranking is not in this feature:** smart ranking is part of transaction-split reader acquisition. This feature has no transaction split and no `polardb_split_mode` knob. This feature does have target-LSN preference for autocommit RYW reads, but it does not sort all replicas by freshness or add split-mode simple/smart policy.
+**Why this exact split-mode ranking is not in this feature:** the current
+simple-query transaction-split path has no `polardb_split_mode` knob. It reuses
+the existing reader selector and target-LSN preference, but does not sort all
+replicas by freshness or add a separate simple/smart ranking policy.
 
 **Where it would slot into this feature:** **HOOK 2**, as part of the transaction-split feature (doc 19) reader acquisition, extending the existing consistency-target preference path inside `get_MyConn_polardb_reader`.
 
@@ -347,17 +350,24 @@ This was covered in §6.2: the full implementation's monitor CSN update (`update
 
 ## 8. Capability: the extra config knobs
 
-This feature registers **24** PolarDB knobs (`lib/PgSQL_Thread.cpp` registration array at `:501` onward):
+This feature registers **28** PolarDB knobs in the `#if POLARDB_PROXY` block of
+`lib/PgSQL_Thread.cpp`'s variable-name array:
 
 | Knob in this feature | Default |
 |---|---|
-| `polardb_consistency_mode` | `"off"` |
-| `polardb_lag_bytes` | `0` |
-| `polardb_lag_ms` | `0` (deferred — see below) |
-| `polardb_lag_wait_ms` | `1000` |
-| `polardb_lsn_freshness_ms` | `5000` |
+| `polardb_profile` | `"session_fallback"` |
+| `polardb_consistency_mode` | `"session_lsn"` |
+| `polardb_read_target` | `"replica"` |
+| `polardb_action_read_fallback` | `"primary"` |
+| `polardb_max_reader_lsn_gap_bytes` | `0` |
+| `polardb_max_reader_lag_ms` | `0` (deferred — see below) |
+| `polardb_lsn_wait_timeout_ms` | `1000` |
+| `polardb_reader_lsn_max_age_ms` | `5000` |
 | `polardb_lag_cap_freshness_ms` | `250` |
 | `polardb_reader_lsn_lag_range_bytes` | `0` |
+| `polardb_reader_prefer_freshest_below_target` | `false` |
+| `polardb_reader_prefer_less_loaded` | `false` |
+| `polardb_reader_connection_retention` | `0` |
 | `polardb_output_coalesce_bytes` | `0` |
 | `polardb_output_coalesce_packets` | `0` |
 | `polardb_monitor_lsn_updates` | `true` |
@@ -365,13 +375,11 @@ This feature registers **24** PolarDB knobs (`lib/PgSQL_Thread.cpp` registration
 | `polardb_writev_direct` | `true` |
 | `polardb_result_fast_forward` | `false` |
 | `polardb_split_warmup_max_connections_per_request` | `1` |
-| `polardb_wait_timeout_mode` | `"best_effort"` |
+| `polardb_action_lsn_timeout` | `"primary"` |
 | `polardb_proxy_protocol` | `"v15"` |
-| `polardb_route_rfq_policy` | `"strict"` |
-| `polardb_session_lsn_baseline` | `"observed"` |
-| `polardb_reader_death_action` | `"retry"` |
-| `polardb_reader_timeout_action` | `"retry"` |
-| `polardb_reader_error_action` | `"forward"` |
+| `polardb_action_missing_lsn` | `"primary"` |
+| `polardb_action_replica_loss` | `"replica_then_primary"` |
+| `polardb_action_replica_error` | `"primary"` |
 | `polardb_proxy_identity_mode` | `"proxy"` |
 | `polardb_proxy_identity_host` | `""` |
 | `polardb_proxy_identity_port` | `0` |
@@ -382,11 +390,15 @@ The full implementation adds one more knob that this branch does not ship — `p
 |---|---|---|
 | `polardb_split_mode` | transaction split (doc 19) + smart ranking (§7.2) | reference tree only; not registered in this branch |
 
-In this branch the three reader-action knobs are **string-valued** (`retry`, `forward`, `terminate`; defaults `retry`/`retry`/`forward`), mapped to `enum class PolarDB_ReaderAction { RETRY, FORWARD, TERMINATE }` (`include/PgSQL_PolarDB.h:2828`) via `polardb_reader_action_from_string` (`include/PgSQL_PolarDB.h:2861`). See [20-FUTURE-READER-FAILURE-RETRY-DESIGN.md](20-FUTURE-READER-FAILURE-RETRY-DESIGN.md).
+Failure policy is event-specific. `action_replica_loss` can try another reader
+before primary/error; `action_replica_error` chooses primary/error/disconnect;
+and `action_lsn_timeout` chooses warning/primary/error/disconnect. The common
+failure executor normalizes those public actions to retry, return-error, or
+disconnect. See [20-FUTURE-READER-FAILURE-RETRY-DESIGN.md](20-FUTURE-READER-FAILURE-RETRY-DESIGN.md).
 
 ### 8.1 The deferred ms-lag knob (inert in this feature today)
 
-One knob in this feature is registered but **inert**: `polardb_lag_ms`. Its default is 0 (set in this branch at `lib/PgSQL_Thread.cpp:1125`, name entry at `:377`, runtime range 0 only at `:2417`), but it has **no producer** — the PolarDB path has no millisecond-lag source feeding it. The header says so directly: the freshness/lag comment states the millisecond lag is "intentionally deferred" and "Do not treat `polardb_lag_ms` as a supported routing condition" (this branch, `include/PgSQL_PolarDB.h:510-513`), and the time-lag-cap predicate carries "TODO: wire only after PgSQL/PolarDB has a real millisecond-lag producer" (this branch, `include/PgSQL_PolarDB.h:542`).
+One knob in this feature is registered but **inert**: `polardb_max_reader_lag_ms`. Its default is 0 (set in this branch at `lib/PgSQL_Thread.cpp:1125`, name entry at `:377`, runtime range 0 only at `:2417`), but it has **no producer** — the PolarDB path has no millisecond-lag source feeding it. The header says so directly: the freshness/lag comment states the millisecond lag is "intentionally deferred" and "Do not treat `polardb_max_reader_lag_ms` as a supported routing condition" (this branch, `include/PgSQL_PolarDB.h:510-513`), and the time-lag-cap predicate carries "TODO: wire only after PgSQL/PolarDB has a real millisecond-lag producer" (this branch, `include/PgSQL_PolarDB.h:542`).
 
 Because of this, the ms-lag path is inactive in this feature. `PolarDB_LSN_Stale_Count` is still active for the separate byte-lag safety path when `max_lag_bytes` is enabled, so operator and tuning docs must not describe it as a millisecond-lag signal. See [12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md) and [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md).
 
@@ -432,7 +444,7 @@ Warmup is implemented. The remaining absent items are CSN health, hard caught-up
 | Caught-up condition (hard reader filter) | Future. Deliberately not used in this feature; target-LSN preference is implemented. CSN side is dead in the full implementation. |
 | Smart split-mode ranking | Future. Part of transaction split (doc 19), beyond this feature's target-LSN preference. |
 | Extra knobs | This feature registers 24 knobs (reader-failure and warm-up knobs shipped). Only `polardb_split_mode` remains future. |
-| `polardb_lag_ms` knob | Registered in this feature but **inert** (no producer). Deferred. |
+| `polardb_max_reader_lag_ms` knob | Registered in this feature but **inert** (no producer). Deferred. |
 | `PolarDB_LSN_Stale_Count` counter | Active for this feature's byte-lag stale/missing samples; not a millisecond-lag signal. |
 
 For the consolidated roadmap and the implemented-vs-next status matrix, see [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md).

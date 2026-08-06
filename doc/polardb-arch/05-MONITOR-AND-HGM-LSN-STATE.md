@@ -44,10 +44,10 @@ The LSN cache has **two producers** (sources that write LSN values) and **one co
       (PgSQL_Monitor.cpp:2091)                      │   PgSQL_SrvC          │   │    (lag-cap safety)
                                                     │   .polardb_current_lsn│   │
   (2) Query RFQ result update       ── polardb_update_server_lsn ─►  .lsn_updated_at      ├───┤
-      (PgSQL_PolarDB_)                  │                       │   └──► get_polardb_primary_lsn
+      (PgSQL_PolarDB_)                  │                       │   └──► get_polardb_group_lsn
                                                     │ writer HGC mirror:    │        (lag-cap safety)
                                                     │   repl_config         │
-                                                    │   .polardb_primary_lsn│
+                                                    │   .polardb_group_lsn│
                                                     └───────────────────────┘
                                                   ┌───────────────────────┐
   config commit ──────────────────────────────────► topology maps + policy │──► is_polardb_hostgroup,
@@ -214,7 +214,7 @@ Notes:
 - The `address` field on `PgSQL_SrvC` (`include/PgSQL_HostGroups_Manager.h:187`) is what `polardb_update_server_lsn()` matches against, together with `port`.
 - The header comment block (`include/PgSQL_HostGroups_Manager.h:349-367`) states two things: these two fields are read without a lock by the reader acquisition and by the lag/freshness helpers; and millisecond replica lag is a deferred PolarDB TODO (lines 357-359), because PgSQL does not currently produce a real value for `aws_aurora_current_lag_us`. See sections 7 and 9.
 
-There is also a **mirror of the primary LSN** on the writer hostgroup's runtime config (`PgSQL_HGC::repl_config.polardb_primary_lsn`), described in section 6. It is a shared atomic cell copied into the published topology snapshot, so snapshot readers can load it without holding an HGM lock. The lag cap needs both sides: the primary position from the mirror and the replica position from the per-server cache.
+There is also a **mirror of the group LSN** on the writer hostgroup's runtime config (`PgSQL_HGC::repl_config.polardb_group_lsn`), described in section 6. It is a shared atomic cell copied into the published topology snapshot, so snapshot readers can load it without holding an HGM lock. The lag cap needs both sides: the primary position from the mirror and the replica position from the per-server cache.
 
 ---
 
@@ -249,7 +249,7 @@ Behavior, step by step:
 Two subtleties an operator or reviewer should note:
 
 - **Return values are overload-specific.** The monitor host/port overload returns `true` only when the cached LSN strictly advanced, so the monitor counter counts advances. The direct RFQ overload returns `true` when the RFQ was accepted for the current writer group+epoch, so the RFQ counter counts accepted current-group/current-epoch RFQ-carried LSNs, advance or not. See section 8.
-- **The writer-scope LSN mirror is monotonic within a writer epoch.** Step 8 never lowers `polardb_primary_lsn`; an older observation cannot pull the cached position backward. The value is a trusted lower-bound observation for the replication group. Primary RFQ is backend-session scoped, replica RFQ is replay scoped, and monitor samples are role-specific; all three can safely advance the shared cell with `max()`. When the writer identity set changes, HGM bumps the writer epoch and resets the shared mirror plus the affected per-server LSN caches to avoid carrying old-timeline values forward.
+- **The writer-scope LSN mirror is monotonic within a writer epoch.** Step 8 never lowers `polardb_group_lsn`; an older observation cannot pull the cached position backward. The value is a trusted lower-bound observation for the replication group. Primary RFQ is backend-session scoped, replica RFQ is replay scoped, and monitor samples are role-specific; all three can safely advance the shared cell with `max()`. When the writer identity set changes, HGM bumps the writer epoch and resets the shared mirror plus the affected per-server LSN caches to avoid carrying old-timeline values forward.
 - **Writer publication is role-aware.** A host/port monitor sample can still refresh reader per-server cache entries, but it cannot mirror primary state from an `OFFLINE_HARD` writer entry. The direct RFQ path requires a current request writer hostgroup and epoch, so old-timeline or cross-group query results cannot repopulate cleared writer or reader LSN cache after an epoch bump.
 - **Direct RFQ result update is lock-free by construction.** The active backend connection keeps its `PgSQL_SrvC` parent alive until result processing completes; the direct overload touches only `PgSQL_SrvC` atomics and the snapshot's shared primary-LSN/epoch cells. It deliberately avoids reading mutable `PgSQL_HGC` fields or server status in the result path.
 
@@ -318,18 +318,18 @@ The per-pair policy is cached on the **writer** hostgroup container `PgSQL_HGC::
 | `lsn_wait_timeout_ms` | int (=0) | the row's `lsn_wait_timeout_ms` | the wait-timeout resolver |
 | `proxy_protocol` | std::string | the row's `proxy_protocol` word | — (only the parsed enum is read) |
 | `proxy_protocol_enum` | int (=-1) | `polardb_proxy_protocol_from_string(...)` | reader acquisition: `get_MyConn_polardb_reader` selects the RFQ-LSN startup profile (`HGM.cpp` `policy.proxy_protocol`); -1 inherits the global `polardb_proxy_protocol` |
-| `polardb_writer_identity` | std::string (="") | **runtime**, sorted live writer `address\tport` set; the writer-epoch source of truth | epoch reset detection (writer identity-set change bumps `polardb_writer_epoch` and resets the primary mirror) |
+| `polardb_writer_identity` | std::string (="") | **runtime**, sorted live writer `address\tport` set; the writer-epoch source of truth | epoch reset detection (writer identity-set change bumps `polardb_writer_epoch` and resets the group mirror) |
 | `polardb_writer_identity_initialized` | bool (=false) | **runtime**, set true once the first identity is recorded | epoch reset detection (checks the first identity sample) |
-| `polardb_primary_lsn` | `shared_ptr<atomic<uint64_t>>` (=0 cell) | **runtime**, by `polardb_update_server_lsn()`; reset on writer identity change | primary baseline and lag cap |
+| `polardb_group_lsn` | `shared_ptr<atomic<uint64_t>>` (=0 cell) | **runtime**, by `polardb_update_server_lsn()`; reset on writer identity change | group target and lag cap |
 | `polardb_writer_epoch` | `shared_ptr<atomic<uint64_t>>` (=0 cell) | bumped on active writer identity-set change | collect-side session epoch repair |
 
 `polardb_consistency_mode_from_string()` maps the schema word to an int: `default` or unknown -> `-1` (means "not set, defer to lower tier"), `off` -> 0, `lsn` -> 1, `primary` -> 3 (defined `include/PgSQL_PolarDB.h:751-767`, called at `HGM.cpp:2686`). The string-to-int and 3-tier resolution details are in [04-ADMIN-SCHEMA-AND-CONFIG.md](04-ADMIN-SCHEMA-AND-CONFIG.md).
 
-Note that `polardb_primary_lsn` is **not reset on a pure reload**. It is reset only when the sorted non-`OFFLINE_HARD` writer `address:port` set changes for that writer HG; the same epoch bump also clears the affected per-server LSN caches.
+Note that `polardb_group_lsn` is **not reset on a pure reload**. It is reset only when the sorted non-`OFFLINE_HARD` writer `address:port` set changes for that writer HG; the same epoch bump also clears the affected per-server LSN caches.
 
 ### 6.3 `get_polardb_hg_config()` — reading policy for one HG
 
-The routing pipeline asks for a hostgroup's PolarDB config through `get_polardb_hg_config()` (`HGM.cpp:5726-5731`), which resolves it via the `find_polardb_hg_config()` helper (`HGM.cpp:5713-5724`). It returns a `PolarDB_HG_Config` from the generation-cached topology snapshot. The config bundles `is_polardb_hostgroup`, the resolved writer/reader HG ids, the policy (consistency mode, lag cap, wait timeout), and the shared `primary_lsn` / `writer_epoch` cells. Logic:
+The routing pipeline asks for a hostgroup's PolarDB config through `get_polardb_hg_config()` (`HGM.cpp:5726-5731`), which resolves it via the `find_polardb_hg_config()` helper (`HGM.cpp:5713-5724`). It returns a `PolarDB_HG_Config` from the generation-cached topology snapshot. The config bundles `is_polardb_hostgroup`, the resolved writer/reader HG ids, the policy (consistency mode, lag cap, wait timeout), and the shared `group_lsn` / `writer_epoch` cells. Logic:
 
 1. Fast condition: if `polardb_active` is false, return the default (not configured) (`HGM.cpp:5715`).
 2. Take the thread-local generation-cached topology snapshot via `get_polardb_topology_snapshot_cached()`; if there is none, return the default (`HGM.cpp:5717-5718`).
@@ -364,7 +364,7 @@ Every public PolarDB HGM accessor checks `status.polardb_active` (an atomic load
 | `get_reader_hostgroup_for_writer` | `HGM.cpp:5701` | `-1` |
 | `get_polardb_hg_config` | `HGM.cpp:5715` | default (not configured) |
 | `polardb_update_server_lsn` | `HGM.cpp:5780` | `false` |
-| `get_polardb_primary_lsn` | `HGM.cpp:5900` | `0` |
+| `get_polardb_group_lsn` | `HGM.cpp:5900` | `0` |
 
 The route pipeline itself also checks the same condition before doing any PolarDB work (`PgSQL_Session.cpp:2543`). See [06-ROUTING-PIPELINE.md](06-ROUTING-PIPELINE.md).
 
@@ -374,25 +374,25 @@ The route pipeline itself also checks the same condition before doing any PolarD
 
 ### 7.1 What the lag cap is (and is not)
 
-`max_lag_bytes` is an **optional safety bound** on `primary_lsn - reader_lsn` (the replica's lag in WAL bytes). It is **not** the RYW correctness enforcement. The correctness enforcement is the wait `SET` the proxy prepends to the read; the lag cap is a separate check that refuses a replica that has fallen too far behind, regardless of the wait. When the cap is exceeded the read uses the writer instead of that replica.
+`max_lag_bytes` is an **optional safety bound** on `group_lsn - reader_lsn` (the replica's lag in WAL bytes). It is **not** the RYW correctness enforcement. The correctness enforcement is the wait `SET` the proxy prepends to the read; the lag cap is a separate check that refuses a replica that has fallen too far behind, regardless of the wait. When the cap is exceeded the read uses the writer instead of that replica.
 
-Resolution (two tiers, no session tier): per-HG `max_lag_bytes` when `>= 0`, otherwise the global `pgsql_thread___polardb_lag_bytes` (`PgSQL_PolarDB_Flow.cpp:148-149`). Values: `0` = cap disabled, `>0` = enforce.
+Resolution (two tiers, no session tier): per-HG `max_lag_bytes` when `>= 0`, otherwise the global `pgsql_thread___polardb_max_reader_lsn_gap_bytes` (`PgSQL_PolarDB_Flow.cpp:148-149`). Values: `0` = cap disabled, `>0` = enforce.
 
 ### 7.2 The cap check on the routing path
 
-The planner no longer scans readers up front. `PgSQL_Session::polardb_reader_lag_plan()` resolves the effective byte cap, reads the writer HG's primary LSN mirror once, and stores both values in `plan.reader` (`PolarDB_Query_ReaderPlan`). The actual per-reader check happens later in `PgSQL_HostGroups_Manager::get_MyConn_polardb_reader()`, in the same locked pass that chooses the connection.
+The planner no longer scans readers up front. `PgSQL_Session::polardb_reader_lag_plan()` resolves the effective byte cap, reads the writer HG's group LSN mirror once, and stores both values in `plan.reader` (`PolarDB_Query_ReaderPlan`). The actual per-reader check happens later in `PgSQL_HostGroups_Manager::get_MyConn_polardb_reader()`, in the same locked pass that chooses the connection.
 
 ```
 polardb_reader_lag_plan(plan, route_ctx):
     max_lag = (route_ctx.max_lag_bytes >= 0) ? route_ctx.max_lag_bytes
-                                       : pgsql_thread___polardb_lag_bytes
+                                       : pgsql_thread___polardb_max_reader_lsn_gap_bytes
     if max_lag <= 0:  return                  # cap off
-    plan.reader.primary_lsn = PgHGM->get_polardb_primary_lsn(writer_hg)
+    plan.reader.group_lsn = PgHGM->get_polardb_group_lsn(writer_hg)
     plan.reader.max_lag_bytes = max_lag
 
 get_MyConn_polardb_reader(reader_hg, session, plan.reader):
-    if max_lag_bytes > 0 and primary_lsn == 0:
-        return PRIMARY_LSN_UNKNOWN
+    if max_lag_bytes > 0 and group_lsn == 0:
+        return GROUP_LSN_UNKNOWN
     for each online/capacity-eligible reader:
         if LSN missing:       skip and remember READER_LSN_UNKNOWN
         if LSN stale:         skip and remember READER_LSN_STALE
@@ -403,7 +403,7 @@ get_MyConn_polardb_reader(reader_hg, session, plan.reader):
 
 Those safety statuses are not `RouteActionReason` values. The session dispatch path maps them to a one-query writer redirect and increments `PolarDB_Consistency_Writer_Fallback`. `RFQ_UNAVAILABLE` is policy-controlled: strict redirects to writer; best-effort degrades to a reader without a wait target and emits a client warning.
 
-The byte-distance predicate `PolarDB_Query_ReaderPlan::within_byte_cap(uint64_t replica_lsn)` (`include/PgSQL_PolarDB.h:1604-1609`, called from `PgSQL_HostGroups_Manager.cpp:5609` and `PgSQL_Thread.cpp:6191`). The member reads `primary_lsn` and `max_lag_bytes` from its own `PolarDB_Query_ReaderPlan` fields; only `replica_lsn` is a parameter:
+The byte-distance predicate `PolarDB_Query_ReaderPlan::within_byte_cap(uint64_t replica_lsn)` (`include/PgSQL_PolarDB.h:1604-1609`, called from `PgSQL_HostGroups_Manager.cpp:5609` and `PgSQL_Thread.cpp:6191`). The member reads `group_lsn` and `max_lag_bytes` from its own `PolarDB_Query_ReaderPlan` fields; only `replica_lsn` is a parameter:
 
 ```c
 if (max_lag_bytes <= 0)         return true;   // cap off
@@ -412,7 +412,7 @@ if (primary <= replica)         return true;   // replica caught up or ahead
 return (primary - replica) <= max_lag_bytes;
 ```
 
-When the cap is enabled and either side is unknown (LSN 0), acquisition rejects the reader and uses the writer with `PRIMARY_LSN_UNKNOWN` or `READER_LSN_UNKNOWN`.
+When the cap is enabled and either side is unknown (LSN 0), acquisition rejects the reader and uses the writer with `GROUP_LSN_UNKNOWN` or `READER_LSN_UNKNOWN`.
 
 ### 7.3 Reader freshness condition
 
@@ -426,11 +426,11 @@ if (now_us < updated_at_us)  return true;   // clock-skew check
 return (now_us - updated_at_us) <= freshness_ms * 1000;
 ```
 
-So a cached LSN counts only if it was set within `pgsql-polardb_lsn_freshness_ms` (default 5000 ms). A stale entry can still be part of the ordinary wait-capable set when only `consistency_target_lsn` is present, because the backend wait remains the correctness enforcement. Under an enabled byte-lag cap, stale or missing reader LSNs are hard skips; if every candidate is rejected this way, the query uses the writer.
+So a cached LSN counts only if it was set within `pgsql-polardb_reader_lsn_max_age_ms` (default 5000 ms). A stale entry can still be part of the ordinary wait-capable set when only `consistency_target_lsn` is present, because the backend wait remains the correctness enforcement. Under an enabled byte-lag cap, stale or missing reader LSNs are hard skips; if every candidate is rejected this way, the query uses the writer.
 
-### 7.4 `get_polardb_primary_lsn()`
+### 7.4 `get_polardb_group_lsn()`
 
-`get_polardb_primary_lsn()` returns the writer-scope mirrored group LSN through the generation-cached topology snapshot: fast check on `polardb_active`, snapshot map lookup by writer HG, then `primary_lsn->load()`. It does **not** take the HGM lock and it does not retain a `PgSQL_HGC` pointer. There is **no freshness check on this shared cell** — within a writer epoch it is treated as a monotonic trusted lower-bound observation, not as an exact current primary WAL tip. If it is still 0 (no write/RFQ/monitor sample yet, or immediately after writer-epoch reset), the cap check rejects the reader and uses the writer (section 7.2).
+`get_polardb_group_lsn()` returns the writer-scope mirrored group LSN through the generation-cached topology snapshot: fast check on `polardb_active`, snapshot map lookup by writer HG, then `group_lsn->load()`. It does **not** take the HGM lock and it does not retain a `PgSQL_HGC` pointer. There is **no freshness check on this shared cell** — within a writer epoch it is treated as a monotonic trusted lower-bound observation, not as an exact current primary WAL tip. If it is still 0 (no write/RFQ/monitor sample yet, or immediately after writer-epoch reset), the cap check rejects the reader and uses the writer (section 7.2).
 
 ### 7.5 Lag-cap data flow
 
@@ -438,11 +438,11 @@ So a cached LSN counts only if it was set within `pgsql-polardb_lsn_freshness_ms
 polardb_reader_lag_plan(plan, route_ctx)
         │ max_lag <= 0 ─► no reader cap
         ▼
-   plan.reader.primary_lsn = get_polardb_primary_lsn(writer_hg)
+   plan.reader.group_lsn = get_polardb_group_lsn(writer_hg)
    plan.reader.max_lag_bytes = max_lag
         ▼
 get_MyConn_polardb_reader(reader_hg, session, plan.reader)
-        │ primary_lsn == 0 ─► PRIMARY_LSN_UNKNOWN
+        │ group_lsn == 0 ─► GROUP_LSN_UNKNOWN
         │ reader LSN == 0  ─► READER_LSN_UNKNOWN
         │ reader LSN stale ─► READER_LSN_STALE
         │ byte lag > cap   ─► READER_LAG_EXCEEDED
@@ -454,7 +454,7 @@ get_MyConn_polardb_reader(reader_hg, session, plan.reader)
 
 ## 8. Counters fed from these subsystems
 
-Five of the 227 exported PolarDB stat counters are the primary feeds from the
+Five of the 299 exported PolarDB stat counters are the primary feeds from the
 monitor/HGM LSN state area covered here; the byte-lag cap in this area also feeds
 the `PolarDB_Lag_Cap_*` family, documented in
 [12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md).
@@ -487,7 +487,7 @@ The monitor hostname/port `polardb_update_server_lsn()` path returns `true` only
 
 ### 8.2 `PolarDB_LSN_Stale_Count` is active for byte-lag safety
 
-This counter is exported and active for the byte-lag check: reader acquisition increments it when an enabled `max_lag_bytes` check cannot trust the primary mirror or a reader LSN sample. The separate `pgsql-polardb_lag_ms` runtime variable still accepts only `0`, has no millisecond-lag producer, and remains deferred in [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md).
+This counter is exported and active for the byte-lag check: reader acquisition increments it when an enabled `max_lag_bytes` check cannot trust the group mirror or a reader LSN sample. The separate `pgsql-polardb_max_reader_lag_ms` runtime variable still accepts only `0`, has no millisecond-lag producer, and remains deferred in [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md).
 
 The active byte-lag-cap path also increments `PolarDB_LSN_Stale_Count` for primary-unknown, missing-reader-LSN, and stale-reader-LSN skips. The deferred millisecond-lag branch behind `POLARDB_PROXY_TODO` can also increment it if that future code is enabled.
 
@@ -502,7 +502,7 @@ Full counter semantics are in [12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS
 | State | Where | Protection |
 |-------|-------|------------|
 | Per-server LSN fields (`polardb_current_lsn`, `lsn_updated_at`) | `PgSQL_SrvC` | `std::atomic`, `memory_order_relaxed` — read locklessly |
-| Primary mirror (`polardb_primary_lsn`) | shared atomic cell owned by writer `repl_config` and copied into `PolarDB_TopologySnapshot` | `std::atomic`, `memory_order_relaxed` |
+| Group mirror (`polardb_group_lsn`) | shared atomic cell owned by writer `repl_config` and copied into `PolarDB_TopologySnapshot` | `std::atomic`, `memory_order_relaxed` |
 | Writer epoch (`polardb_writer_epoch`) | shared atomic cell owned by writer `repl_config` and copied into `PolarDB_TopologySnapshot` | `std::atomic`; bumped under HGM mutation paths |
 | Topology maps + the `configured` flag and policy ints | HGM private maps + generation-cached snapshot + `repl_config` | writes under HGM mutation paths; query reads use the snapshot |
 | `polardb_active` condition | `PgHGM->status` | `std::atomic<bool>` |
@@ -515,12 +515,12 @@ The atomics let the hot path read an individual LSN/epoch without taking the loc
 |----------|------|-----------------------------|
 | `is_polardb_hostgroup` | none in steady state; snapshot lookup | yes, indirectly via `get_polardb_hg_config` during collect |
 | `get_polardb_hg_config` | none in steady state; snapshot lookup | **yes, once per query** (collect stage) |
-| `get_polardb_primary_lsn` | none; snapshot lookup + atomic load | only when the lag cap or primary baseline is used |
+| `get_polardb_group_lsn` | none; snapshot lookup + atomic load | only when the lag cap or group target is used |
 | `polardb_update_server_lsn` | host/port overload takes `wrlock()` for scan/update; direct RFQ overload is lock-free and uses the topology snapshot plus atomics | once per query on result processing (RFQ feed), plus the monitor feed |
 | `get_MyConn_polardb_reader` | `wrlock()` | only for targeted consistency reads during backend acquisition |
 | `get_writer_hostgroup_for_reader` / `get_reader_hostgroup_for_writer` | none in steady state; snapshot lookup | as needed |
 
-The important cost to be aware of: reader acquisition still takes the HGM lock when it walks server lists. An enabled byte-lag cap performs one locked acquisition pass, not a separate pre-scan plus acquisition. `get_polardb_hg_config()` and `get_polardb_primary_lsn()` are snapshot lookups in steady state and do not take that lock; adding a per-connection copy of the HG config would trade a small map lookup for duplicated policy state, so this implementation keeps the single snapshot accessor.
+The important cost to be aware of: reader acquisition still takes the HGM lock when it walks server lists. An enabled byte-lag cap performs one locked acquisition pass, not a separate pre-scan plus acquisition. `get_polardb_hg_config()` and `get_polardb_group_lsn()` are snapshot lookups in steady state and do not take that lock; adding a per-connection copy of the HG config would trade a small map lookup for duplicated policy state, so this implementation keeps the single snapshot accessor.
 
 ### 9.3 Why this is correct
 
@@ -546,23 +546,23 @@ The important cost to be aware of: reader acquisition still takes the HGM lock w
 | Monitor invalid-health accounting | implemented | invalid role increments `PolarDB_Monitor_Health_Invalid_Role`; invalid availability/LSN text increments `PolarDB_Monitor_Health_Invalid_Values`; both use fail-safe defaults |
 | Availability shun from `polar_is_available()` | implemented | `PgSQL_Monitor.cpp:2067-2072` |
 | Per-server LSN cache (`polardb_current_lsn`, `lsn_updated_at`) | implemented | `HGM.h:368-369` |
-| Primary LSN mirror (`polardb_primary_lsn`) | implemented, monotonic within writer epoch, shared through topology snapshot | reset on writer identity change |
+| Group LSN mirror (`polardb_group_lsn`) | implemented, monotonic within writer epoch, shared through topology snapshot | reset on writer identity change |
 | Writer epoch (`polardb_writer_epoch`) | implemented | bumps on sorted active writer identity-set change; collect/process_result scopes stale session targets/flags |
 | Topology maps + `is_polardb_hostgroup` + `polardb_active` condition | implemented | `HGM.cpp:2660-2770`, `:5680` |
 | Byte-lag cap + freshness condition | implemented (safety-only, off by default) | `Flow.cpp:145-178`, `HGM.cpp:5939` |
 | `PolarDB_Server_LSN_Updates_From_RFQ`, `PolarDB_LSN_Updates_From_Monitor` | implemented | `Flow.cpp:1502`, `Monitor.cpp:2092` |
-| **Millisecond replica-lag cap (`pgsql-polardb_lag_ms`)** | **deferred / inert** | no PgSQL producer; default 0; `HGM.cpp:5536-5537` |
-| **`PolarDB_LSN_Stale_Count`** | **active for byte-lag** | increments when an enabled byte-lag cap sees missing or stale primary/reader LSN state |
+| **Millisecond replica-lag cap (`pgsql-polardb_max_reader_lag_ms`)** | **deferred / inert** | no PgSQL producer; default 0; `HGM.cpp:5536-5537` |
+| **`PolarDB_LSN_Stale_Count`** | **active for byte-lag** | increments when an enabled byte-lag cap sees missing or stale group/reader LSN state |
 | Reader LSN preference in `get_MyConn_polardb_reader` | implemented | `consistency_target_lsn` prefers fresh cached readers already at the target; successful preferred acquisition bypasses the wait wrapper, fallback still relies on it |
 | Per-server LSN / lag exposed as a stat gauge | not present | tracked in memory but not exported |
 
 In-code TODO/FIXME/deferred notes found in this area (for [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md)):
 
-- `HGM.cpp:5536` — `pgsql-polardb_lag_ms` is deferred; no real millisecond replica-lag producer; use byte lag and freshness instead.
+- `HGM.cpp:5536` — `pgsql-polardb_max_reader_lag_ms` is deferred; no real millisecond replica-lag producer; use byte lag and freshness instead.
 - `POLARDB_PROXY_TODO` reader millisecond-lag branch — future catch-up-time cap; this implementation normally relies on LSN preference plus the wait wrapper.
 - `HGM.cpp:4637`, `:4661-4668` — deferred millisecond-lag safety filter; keep visibly protected until a producer exists; suggested `estimated_catchup_ms = byte_lag / recent_replay_bytes_per_ms`.
-- `include/PgSQL_PolarDB.h:504-524` — same deferred millisecond-lag design note on `pgsql-polardb_lag_ms`.
-- `include/PgSQL_PolarDB.h:536` — `polardb_lag_ms_within_cap()` is a predicate for a future monitor-observed time-lag cap; wire only after a real producer exists.
+- `include/PgSQL_PolarDB.h:504-524` — same deferred millisecond-lag design note on `pgsql-polardb_max_reader_lag_ms`.
+- `include/PgSQL_PolarDB.h:536` — `polardb_reader_lag_ms_within_cap()` is a predicate for a future monitor-observed time-lag cap; wire only after a real producer exists.
 - `PgSQL_Monitor.cpp:2131` — (non-PolarDB, nearby) override-replication is hardcoded to false, to be revisited.
 
 ---
@@ -580,12 +580,12 @@ flowchart LR
     end
     subgraph HGM["Shared HGM state (atomics + wrlock)"]
       CACHE["per-server cache<br/>PgSQL_SrvC.polardb_current_lsn<br/>+ lsn_updated_at"]
-      MIRROR["writer mirror<br/>repl_config.polardb_primary_lsn"]
+      MIRROR["group mirror<br/>repl_config.polardb_group_lsn"]
       MAPS["topology maps + policy<br/>+ status.polardb_active"]
     end
     subgraph Consumers
       ACQ["get_MyConn_polardb_reader<br/>(reader acquisition)"]
-      PRIM["get_polardb_primary_lsn"]
+      PRIM["get_polardb_group_lsn"]
       PLAN["polardb_reader_lag_plan<br/>(attach cap inputs)"]
       CFGACC["is_polardb_hostgroup /<br/>get_polardb_hg_config"]
     end
@@ -632,10 +632,10 @@ flowchart TD
 flowchart TD
     A["polardb_reader_lag_plan(plan, route_ctx)"] --> B{"max_lag <= 0?"}
     B -- yes --> ALLOW["leave plan.reader cap disabled"]
-    B -- no --> C["plan.reader.primary_lsn = get_polardb_primary_lsn(writer_hg)<br/>plan.reader.max_lag_bytes = max_lag"]
+    B -- no --> C["plan.reader.group_lsn = get_polardb_group_lsn(writer_hg)<br/>plan.reader.max_lag_bytes = max_lag"]
     C --> D["get_MyConn_polardb_reader(reader_hg, plan.reader)"]
-    D --> E{"primary_lsn==0?"}
-    E -- yes --> PFAIL["PRIMARY_LSN_UNKNOWN<br/>writer fallback"]
+    D --> E{"group_lsn==0?"}
+    E -- yes --> PFAIL["GROUP_LSN_UNKNOWN<br/>writer fallback"]
     E -- no --> F{"candidate reader LSN<br/>missing/stale/over cap?"}
     F -- yes --> RFAIL["READER_LSN_UNKNOWN / READER_LSN_STALE / READER_LAG_EXCEEDED<br/>writer fallback if no candidate survives"]
     F -- no --> OK["acquire reader"]

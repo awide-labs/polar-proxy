@@ -206,7 +206,7 @@ Eligibility is decided in the planner `polardb_plan()` (`Flow.cpp:207`, full imp
 | 4 | `txn_xids` is non-empty. | `Flow.cpp:355` |
 | 5 | The read is **not** multi-statement. | `Flow.cpp:324`, `:355`; hard check repeated at `:492-499` |
 | 6 | The split mode knob is non-zero (split enabled). | `Flow.cpp:324`, `:356` |
-| 7 | The read is **not** extended protocol (Parse/Bind/Execute) — wrappers cannot be injected there. | `Flow.cpp:478-486` |
+| 7 | The read is **not** extended protocol (Parse/Bind/Execute). Autocommit extended reads can use the in-band `v15_wait` message, but transaction-split XID import and split-reader ownership are not implemented for extended frames. | `Flow.cpp:478-486` |
 | 8 | `txn_split_blocked` is false — a prior abort forces all later reads to the writer. | `Flow.cpp:285-294`, `:346-354` |
 | 9 | Lag is acceptable: writer LSN − best replica LSN ≤ `max_lag_bytes` (tri-state: -1 inherit, 0 off, >0 enforced). | `Flow.cpp:455-468` |
 | 10 | `wal_pending` is false. If xids exist but the WAL is not flushed yet, the read stays on the writer (action reason `WAL_PENDING`). | `Flow.cpp:312-321` |
@@ -322,7 +322,7 @@ txn_split_enabled INT
   NOT NULL DEFAULT 0
 ```
 
-Meaning: per writer/reader pair, **off by default**, and only settable to 1 when the hostgroup's `check_type` is `'polardb'`. This implementation's V3_0_5 schema stores and publishes this column in the hostgroup policy snapshot; the planner reads it before naming a split route, and execution may take a compatible replica connection from the pool for that read.
+Meaning: per writer/reader pair, **off by default**, and only settable to 1 when the hostgroup's `check_type` is `'polardb'`. The current `V3_0_9_V15_WAIT` schema stores and publishes this column in the hostgroup policy snapshot; the planner reads it before naming a split route, and execution may take a compatible replica connection from the pool for that read.
 
 This branch's `consistency_mode` CHECK already accepts `'global_lsn'`/`'lsn_global'`/`'global'` (all mapped to `GLOBAL_LSN`, **not** CSN) alongside `'default'/'off'/'lsn'/'primary'` (`include/PgSQL_HostGroups_Manager.h:61`). A future CSN feature would add `'csn'`/`'session'`; the word `'global'` is already taken by `GLOBAL_LSN`. CSN is experimental and incomplete (it needs PolarDB backend support, applies only in global-consistency mode, and its wait behavior is not reliably verified) — see [18-FUTURE-CSN-DESIGN.md](18-FUTURE-CSN-DESIGN.md).
 

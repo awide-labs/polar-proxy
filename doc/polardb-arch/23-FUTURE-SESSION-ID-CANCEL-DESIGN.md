@@ -467,9 +467,9 @@ connection's stable id.
 
 ## 6. ProxySQL-branch implementation design
 
-> **Build-tier check requirement (applies to everything below).** The documented
-> `POLARDB_PROXY=0` build is byte-for-byte equivalent to upstream (asserted in the
-> header of `lib/PgSQL_PolarDB_Stubs.cpp`). **Every new field, allocator,
+> **Build-tier check requirement (applies to everything below).** Off mode must
+> expose no PolarDB identity/cancel surface and must retain ordinary PostgreSQL
+> behavioral compatibility. **Every new PolarDB field, allocator,
 > counter, and code path in this section MUST sit inside `#if POLARDB_PROXY`** (or
 > be added only to the PolarDB-specific files), or that invariant breaks.
 
@@ -700,8 +700,8 @@ repointed to it during a split read (`:204`); the saved primary is
 
 - `POLARDB_PROXY=0`: all of the above compiles out via the stub path
   (`lib/PgSQL_PolarDB_Stubs.cpp`); `append_polardb_startup_params` emits nothing.
-  All new fields/logic must be `#if POLARDB_PROXY`-protected to preserve the
-  documented byte-for-byte equivalence.
+  All new PolarDB fields/logic must be `#if POLARDB_PROXY`-protected to preserve
+  the off-build runtime boundary; generic protocol fixes may remain shared.
 - `POLARDB_PROXY=1` but **vanilla PostgreSQL backend**: the new keys are only
   emitted when proxy mode resolves (a non-OFF profile with an identity) **and**
   the default-off knob is on. A vanilla backend is configured with

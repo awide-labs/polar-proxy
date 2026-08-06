@@ -25,10 +25,10 @@ These terms are defined once here and used the same way throughout. The project 
 | Hostgroup (HG) | A numbered ProxySQL group of backend servers. A PolarDB pair has a writer hostgroup (the primary) and a reader hostgroup (the replicas). "writer" and "primary" mean the same thing; "reader" and "replica" mean the same thing. |
 | GUC | A PostgreSQL runtime setting changed with `SET name = value`. PolarDB adds `polar_consistency_mode`, `polar_proxy_wait_timeout_ms`, and `polar_xact_split_wait_lsn`. |
 | Wait wrapper / wrapped read | A replica-eligible read that ProxySQL prefixes with three `SET` statements so the replica blocks until it has replayed past the session's last write LSN before answering. The client never sees the change. |
-| Consistency mode | The per-query routing policy. In this feature the values are `OFF` (no PolarDB routing), `SESSION_LSN` (wait on the session's write LSN before a replica read), and `PRIMARY_ONLY` (force all reads to the writer). |
+| Consistency mode | `OFF`, `SESSION_LSN`, `GLOBAL_LSN`, or `EVENTUAL`. Writer-only placement is the independent `read_target=primary` policy. |
 | Safe writer fallback | The design rule: when any precondition for a safe replica read is missing or uncertain, route to the writer instead, because the writer is always consistent. |
 
-The whole feature compiles only when the build flag `POLARDB_PROXY` is set. When it is `0`, every PolarDB hook compiles out and ProxySQL behaves like upstream. All file:line references below are inside `#if POLARDB_PROXY` blocks.
+The PolarDB routing, wait, startup-profile, and result-publication hooks below compile only when `POLARDB_PROXY` is set. Generic extended-protocol frame/error/RFQ ownership remains shared by both builds. Off mode has no PolarDB runtime behavior and links vanilla libpq.
 
 ---
 
@@ -110,7 +110,7 @@ This is the mental model. It does not name files. It names the questions each st
 
 ### 3.3 The single most important point
 
-The actual read-your-writes guarantee comes from **one** thing: the `SET polar_xact_split_wait_lsn = '<target>'` statement in the wrapper makes the replica block until it has caught up. It is **not** enforced by comparing LSNs in the proxy. The proxy's lag cap (a byte bound on how far behind a replica may be) is a **safety** check only — it avoids picking a replica so far behind that the wait would probably time out. If you remember one thing about this pipeline, remember that the wait `SET` is the condition and the lag cap is not (`lib/PgSQL_PolarDB_Flow.cpp:132-140`).
+The actual read-your-writes guarantee comes from the **backend wait on the staged target**: simple query encodes it as `SET polar_xact_split_wait_lsn = '<target>'`, while extended `v15_wait` encodes it in binary `W`. It is **not** enforced by comparing LSNs in the proxy. The proxy's lag cap (a byte bound on how far behind a replica may be) is a **safety** check only - it avoids picking a replica so far behind that the wait would probably time out. If you remember one thing about this pipeline, remember that the backend wait is the condition and the lag cap is not.
 
 ---
 
@@ -128,7 +128,7 @@ never leak into a passthrough read.
 ```
 Session.cpp  polardb_query.reset_reader_target();
 Session.cpp  polardb_query.request_writer_scope.reset();
-Session.cpp  if (PgHGM->status.polardb_active...) {        // any PolarDB HG configured?
+Session.cpp  if (thread->polardb_is_active()) {             // worker publication snapshot
 Session.cpp    int re   = qpo ? qpo->replica_eligible : -1;
 Session.cpp    int dest = qpo ? qpo->destination_hostgroup : -1;
 Session.cpp    bool manual_mode = (re < 0 && dest >= 0);     // user did manual routing
@@ -136,7 +136,7 @@ Session.cpp    if (!manual_mode) { ... run collect/plan/execute ... }
 ```
 
 Two conditions skip the pipeline:
-- `PgHGM->status.polardb_active` is false (no PolarDB hostgroup loaded). This is a cheap atomic condition set at `lib/PgSQL_HostGroups_Manager.cpp:2770`. (`lib/PgSQL_Session.cpp:2635`)
+- `thread->polardb_is_active()` is false (no PolarDB hostgroup loaded). This is a worker-local snapshot refreshed from HGM publication state, so query intake performs no shared atomic load.
 - **Manual mode**: the query rule did not set `replica_eligible` (it is `-1`, "unset") but did set an explicit `destination_hostgroup`. That means the user routed the query by hand, so the pipeline must not override it (`lib/PgSQL_Session.cpp:2636-2645`).
 
 `replica_eligible` is a tri-state from the matching query rule: `1` = auto (the pipeline decides), `0` = force the writer, `-1` = unset (`lib/PgSQL_Session.cpp:2632-2634`).
@@ -163,7 +163,7 @@ not a PolarDB hostgroup it returns immediately and the caller's
 | `reader_hg` | HG config reader (`-1` if none) | `:487` |
 | `effective_consistency_mode` | `polardb_resolve_consistency_mode(session, HG, global)` (session override > per-HG > global) | `:494-495` |
 | `wait_timeout_ms` | `polardb_resolve_wait_timeout_ms(HG policy)` | `:503` |
-| `wait_timeout_mode` | thread var (best_effort vs strict) | `:504` |
+| `action_lsn_timeout` | complete timeout outcome (`warning`, `primary`, `error`, or `disconnect`); backend mode is derived | collect |
 | `max_lag_bytes` | HG policy lag cap | `:507` |
 | `writer_epoch` | topology snapshot writer epoch for this replication group | `:488-491` |
 | `session.write_lsn` | `polardb_session_consistency.write_lsn` (own-write component) after epoch repair | collect |
@@ -188,13 +188,14 @@ rule returns.
 | fast | no reader HG | PASSTHROUGH (target = writer) | — | `:705-711` |
 | fast | not replica-eligible | PASSTHROUGH (target = writer) | — | `:712-718` |
 | L0 | `/* route=primary */` hint | FORCE_PRIMARY | HINT_PRIMARY | `:736-743` |
-| L1 | mode = PRIMARY_ONLY | FORCE_PRIMARY | MODE_PRIMARY | `:751-758` |
 | L1 | mode = OFF | PASSTHROUGH (target `-1`, rules own routing) | — | `:762-768` |
+| L1 | read target = PRIMARY | FORCE_PRIMARY | READ_TARGET_PRIMARY | `PgSQL_PolarDB_Flow.cpp` |
+| L1 | mode = EVENTUAL | PASSTHROUGH to reader, no wait | — | `PgSQL_PolarDB_Flow.cpp` |
 | L2 | in an explicit transaction | FORCE_PRIMARY | IN_TRANSACTION | `:871-878` |
 | L2 | multi-statement read | FORCE_PRIMARY | MULTI_STATEMENT | `:936-943` |
-| L3 | write/observed/primary target unknown | strict: FORCE_PRIMARY; best_effort: degraded reader only for simple query; extended: FORCE_PRIMARY | WRITE_LSN_UNKNOWN / OBSERVED_LSN_UNKNOWN / PRIMARY_LSN_UNKNOWN | `Flow.cpp:956+` |
+| L3 | write/observed/group target unknown | `action_missing_lsn=primary`: FORCE_PRIMARY; `warning`: degraded eligible simple-query reader plus WARNING; `error`: RETURN_ERROR. Extended unknown-target reads force the writer because no `W` target exists | WRITE_LSN_UNKNOWN / OBSERVED_LSN_UNKNOWN / GROUP_LSN_UNKNOWN | planner |
 | L4 | no wait needed (`session_lsn == 0`) | PASSTHROUGH (target = reader) | — | `Flow.cpp:1037+` |
-| L5 | extended protocol with a known wait target | FORCE_PRIMARY | EXTENDED_PROTOCOL | `Flow.cpp:1051+` |
+| L5 | extended protocol reaches this simple-query/transaction-split planner | FORCE_PRIMARY | EXTENDED_PROTOCOL | defensive branch; normal autocommit extended routing uses `apply_extended_backend_route()` |
 | L6 | byte-lag cap configured | attach cap inputs to `plan.reader`; final reader/writer choice happens during backend acquisition | acquisition returns `PolarDB_ReaderStatus` on failure | `Flow.cpp`, `HGM.cpp` |
 | L7 | otherwise | REPLICA_WITH_WAIT (target = reader) | NONE | `Flow.cpp:1070+` |
 
@@ -364,9 +365,9 @@ The state fields tracked are the important ones:
 Shared setup for traces T1–T5 (unless stated otherwise):
 
 - One PolarDB replication-hostgroup pair: writer HG `0`, reader HG `1`, `check_type='polardb'`.
-- Global `pgsql-polardb_consistency_mode = 'lsn'` (so the effective mode is SESSION_LSN unless overridden).
-- Global `pgsql-polardb_wait_timeout_mode = 'best_effort'` unless the trace says strict.
-- Global `pgsql-polardb_lag_wait_ms = 1000` (so the timeout GUC is `1000`).
+- Global `pgsql-polardb_consistency_mode = 'session_lsn'` unless overridden.
+- Global `pgsql-polardb_action_lsn_timeout` follows the trace policy.
+- Global `pgsql-polardb_lsn_wait_timeout_ms = 1000`.
 - The lag cap is off (`max_lag_bytes = 0`), so the lag-cap check always allows the reader (`lib/PgSQL_PolarDB_Flow.cpp:150-153`).
 - A query rule marks the read `SELECT` with `replica_eligible = 1`.
 - `polardb_active` is true.
@@ -461,7 +462,7 @@ Counters that move:
 
 ### 6.3 T3 — strict timeout (retry on writer)
 
-Same as T2, but the global mode is `pgsql-polardb_wait_timeout_mode = 'strict'`.
+Same as T2, but the global mode is `pgsql-polardb_action_lsn_timeout = 'error'`.
 
 The only difference on the wire is the first `SET`. GUCs / SQL sent to the reader:
 
@@ -522,9 +523,12 @@ GUCs emitted to the backend: **none**. The read runs unmodified on the writer.
 
 ---
 
-### 6.5 T5 — extended protocol or multi-statement (forced to the writer)
+### 6.5 T5 — multi-statement and extended-protocol reads
 
-Two related shapes both route to the writer because the text-only wait wrapper cannot be safely injected into them. Both keep `replica_eligible = 1` and mode SESSION_LSN.
+These shapes use different safety mechanisms. A multi-statement simple-query packet
+stays on the writer because the fixed-result SQL wrapper is unsafe. An automatic
+autocommit extended operation can instead use the negotiated in-band `W` message;
+unsupported or ambiguous extended shapes stay on the writer.
 
 #### T5a — multi-statement read
 
@@ -542,18 +546,28 @@ Reason: a wrapped read prepends three `SET`s, and the connection drops exactly t
 
 The client uses Parse/Bind/Execute instead of the simple `'Q'` query. collect sets `is_extended_protocol = true` because `extended_query_phase != EXTQ_PHASE_IDLE`.
 
-This implementation never injects the wait wrapper into extended-protocol packets. The route depends on whether an automatic RYW target exists:
+This implementation never injects the SQL-text wrapper into extended-protocol
+packets. It routes each eligible backend-producing operation before the first
+backend command and, when required, places `W` before Parse or Bind/Execute in the
+same libpq output flush. The route depends on the operation and wait target:
 
-| Case | Plan result | Wrapper |
+| Case | Route result | Wait |
 |---|---|---|
 | Manual `destination_hostgroup` reader route | manual route remains authoritative | none |
-| Automatic extended read, no prior write LSN | reader passthrough is allowed because there is no session RYW target | none |
-| Automatic extended read after a known session write LSN | FORCE_PRIMARY, reason `EXTENDED_PROTOCOL` | none |
-| Automatic extended read after an unknown writer RFQ LSN | FORCE_PRIMARY, reason `WRITE_LSN_UNKNOWN` | none |
+| Automatic autocommit read, no prior write LSN | target-free reader passthrough | none |
+| Automatic autocommit read after a known session write LSN, selected reader cache already at target | reader | confirmed-cache bypass, no `W` |
+| Automatic autocommit read after a known session write LSN, selected reader behind | reader when the connection negotiated `v15_wait` | `W` immediately before Parse or Bind/Execute in the same flush |
+| Automatic autocommit read requiring a wait, but profile/connection lacks `v15_wait` | writer | none |
+| Automatic extended read after an unknown writer RFQ LSN | writer or error according to the safe missing-LSN policy | none |
+| Explicit transaction, ambiguous/multi-operation frame, or writer-required operation | writer; once a backend command is sent, the frame remains pinned there | none |
 
-Reason: the wrapper is built as SQL text and replaces a simple `'Q'` packet. Extended-protocol messages are not a `'Q'` packet, so a future binary-aware wrapper would need a separate implementation and result-consumption model.
+`W` has no success response and is consumed as part of the following semantic
+Parse/Execute result, so it adds no protocol round trip. A failed wait is never
+published as reader progress, and cancellation/statement timeout is not replayed
+on the writer.
 
-GUCs emitted to the backend for either T5a or T5b: **none**.
+GUCs emitted for T5a: **none**. T5b emits no SQL GUC wrapper; it may emit the
+binary `W` protocol message.
 
 ---
 
@@ -567,11 +581,11 @@ No `pgsql_replication_hostgroups` row has `check_type='polardb'`, so `polardb_ac
 
 | Stage | What happens |
 |-------|--------------|
-| condition | `PgHGM->status.polardb_active` is false → the whole `if` block at `Session.cpp:2635` is skipped |
+| condition | `thread->polardb_is_active()` is false → the PolarDB route block is skipped |
 | (rest) | normal ProxySQL query-rule routing applies; no collect/plan/execute runs |
 | process_result | the process_result hook is protected by `is_polardb_enabled`, which is false, so it does not run (`Session.cpp:6720`) |
 
-The only PolarDB code that executes is the cheap atomic condition read and the
+The only PolarDB code that executes is the worker-local condition read and the
 unconditional reader-target/request-scope reset at query intake.
 
 #### T6b — PolarDB configured, but this query is on a non-PolarDB hostgroup, or manual mode
@@ -586,7 +600,7 @@ GUCs emitted to the backend: **none**. State changes: **none**.
 | `reader_plan.consistency_target_lsn` | `0` | `0` |
 | `wait_stage` | IDLE | IDLE |
 
-**Result:** the query behaves exactly as upstream ProxySQL. When the feature is compiled out (`POLARDB_PROXY=0`) there is not even the condition read; the binary is byte-equivalent to upstream by design (see [02-BUILD-TOGGLE-AND-LIBPQ.md](02-BUILD-TOGGLE-AND-LIBPQ.md)).
+**Result:** PolarDB routing adds no work to this inactive request beyond the documented worker-local checks. In `POLARDB_PROXY=0`, PolarDB checks compile out; generic extended-protocol correctness remains shared, so the contract is ordinary-protocol behavioral compatibility rather than binary identity (see [02-BUILD-TOGGLE-AND-LIBPQ.md](02-BUILD-TOGGLE-AND-LIBPQ.md)).
 
 ---
 
@@ -600,8 +614,8 @@ GUCs emitted to the backend: **none**. State changes: **none**.
 | T3 | SESSION_LSN strict | `SELECT`, replica lags | REPLICA_WITH_WAIT | reader | yes | mode='strict' + timeout + wait_lsn | unchanged | ERROR |
 | T4 | SESSION_LSN | `SELECT` in txn | FORCE_PRIMARY (IN_TRANSACTION) | writer | no | none | unchanged | rows (from writer) |
 | T5a | SESSION_LSN | multi-statement | FORCE_PRIMARY (MULTI_STATEMENT) | writer | no | none | unchanged | rows (from writer) |
-| T5b | SESSION_LSN | extended protocol | FORCE_PRIMARY (EXTENDED_PROTOCOL) | writer | no | none | unchanged | rows (from writer) |
-| T6 | any / off | any | pipeline skipped | rules | no | none | unchanged | upstream behavior |
+| T5b | SESSION_LSN | automatic autocommit extended read after write | extended-operation route | reader with negotiated `v15_wait`, otherwise writer | no SQL wrapper; `W` if reader is behind | binary `W` target/timeout/mode when needed | unchanged | own write |
+| T6 | any / off | any | PolarDB pipeline skipped | rules | no | none | unchanged | ordinary ProxySQL behavior; generic extended-frame correctness remains shared with the off build |
 
 ---
 
@@ -609,7 +623,7 @@ GUCs emitted to the backend: **none**. State changes: **none**.
 
 These are the subtle points worth checking against the code.
 
-- **The wait `SET` is the default correctness enforcement.** REPLICA_WITH_WAIT prepares `SET polar_xact_split_wait_lsn = '<target>'`. Backend acquisition may clear that staged wait only when the selected reader has a fresh cached LSN at or beyond the same consistency target. Otherwise the proxy relies on the backend wait to block. The byte-lag cap is a safety bound only: `polardb_reader_lag_plan()` attaches cap inputs, and `get_MyConn_polardb_reader()` enforces them when acquiring the actual reader. It is off by default in the traces above.
+- **The backend wait is the default correctness enforcement.** REPLICA_WITH_WAIT stages one target. Simple query emits it through `SET polar_xact_split_wait_lsn`; extended `v15_wait` emits it through `W`. Backend acquisition may clear that staged wait only when the selected reader has a fresh cached LSN at or beyond the same consistency target. Otherwise the proxy relies on the backend wait to block. The byte-lag cap is a safety bound only: `polardb_reader_lag_plan()` attaches cap inputs, and `get_MyConn_polardb_reader()` enforces them when acquiring the actual reader. It is off by default in the traces above.
 - **"is-write" in the routing matrix is about history, not the current query.** The plan never classifies the current query as a write. What decides "reader with wait" vs "reader no wait" is whether the session has a write/observed LSN target. A *prior* positioned result set that value on the result-processing path; the current read never sets it. `is_write_query()` is used only in result processing, never in plan.
 - **The per-query target is reset at every boundary.** `polardb_query.reader_plan` is reset before the pipeline, cleared when reader acquisition succeeds/degrades/redirects, and reset again at cleanup. This makes it impossible for a stale LSN target to leak into a later read.
 - **The session write LSN survives, the per-query state does not.** `polardb_session_consistency.write_lsn` is the one PolarDB session field deliberately kept across queries and across RESET. Everything else per-query is reset.
@@ -621,8 +635,8 @@ These are the subtle points worth checking against the code.
 ## 9. Status and deferred items in this lifecycle
 
 - **In this implementation (this branch):** autocommit RYW reads with an LSN wait, best_effort and strict timeout modes, one writer retry for a wait-wrapped read that fails before user output because of strict timeout or reader connection loss, the notice-forwarding path, RFQ-only result processing, and all safe fallback paths described above.
-- **Deferred today:** the millisecond lag cap `pgsql-polardb_lag_ms` has no producer in this tree. `PolarDB_LSN_Stale_Count` is active only for byte-lag stale/missing samples when `max_lag_bytes` is enabled, and that cap is off in the traces above. See [12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md) and [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md).
-- **Future (not in this feature):** in-transaction read offload (which would change the T4 outcome), extended-protocol RYW (which would change T5b), and CSN-based consistency. CSN is incomplete and experimental even in the full implementation, applies only in global-consistency mode, needs PolarDB backend support, and its wait behavior is not reliably verified. These are described as deltas in [18-FUTURE-CSN-DESIGN.md](18-FUTURE-CSN-DESIGN.md), [19-FUTURE-TXN-SPLIT-DESIGN.md](19-FUTURE-TXN-SPLIT-DESIGN.md), and [20-FUTURE-READER-FAILURE-RETRY-DESIGN.md](20-FUTURE-READER-FAILURE-RETRY-DESIGN.md).
+- **Deferred today:** the millisecond lag cap `pgsql-polardb_max_reader_lag_ms` has no producer in this tree. `PolarDB_LSN_Stale_Count` is active only for byte-lag stale/missing samples when `max_lag_bytes` is enabled, and that cap is off in the traces above. See [12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md) and [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md).
+- **Future (not in this feature):** extended-protocol transaction split and CSN commit-counter consistency. Autocommit extended RYW is implemented with `v15_wait`; simple-query transaction split is also implemented. CSN remains experimental, needs PolarDB backend support, and is described in [18-FUTURE-CSN-DESIGN.md](18-FUTURE-CSN-DESIGN.md); split extensions remain in [19-FUTURE-TXN-SPLIT-DESIGN.md](19-FUTURE-TXN-SPLIT-DESIGN.md).
 
 ---
 
@@ -658,15 +672,16 @@ flowchart TD
     D -- yes --> E{route=primary hint?}
     E -- yes --> F1["FORCE_PRIMARY (HINT_PRIMARY)"]
     E -- no --> G{mode}
-    G -- PRIMARY_ONLY --> F2["FORCE_PRIMARY (MODE_PRIMARY)"]
     G -- OFF --> P3["PASSTHROUGH (rules own, target -1)"]
+    G -- EVENTUAL --> P4["PASSTHROUGH to reader, no wait"]
     G -- SESSION_LSN --> H{in_transaction?}
+    G -- GLOBAL_LSN --> H
     H -- yes --> F3["FORCE_PRIMARY (IN_TRANSACTION)"]
     H -- no --> I{multi-statement?}
     I -- yes --> F4["FORCE_PRIMARY (MULTI_STATEMENT)"]
-    I -- no --> J{extended protocol?}
-    J -- yes --> F5["FORCE_PRIMARY (EXTENDED_PROTOCOL)"]
-    J -- no --> K{session.write_lsn > 0?}
+    I -- no --> J{simple-query planner?}
+    J -- no --> F5["extended operation route<br/>reader + W or safe writer fallback"]
+    J -- yes --> K{session.write_lsn > 0?}
     K -- no --> P4["PASSTHROUGH (reader, no wait)"]
     K -- yes --> R["REPLICA_WITH_WAIT plan\nreader acquisition checks cap"]
     R --> A{reader acquired?}

@@ -1,6 +1,6 @@
 # 11 — Connection and libpq Integration
 
-> Scope: how the backend-connection layer (`PgSQL_Connection`) carries the PolarDB LSN feature — startup profiles, proxy protocol parameters, the `is_polardb_enabled` enable flag (fresh and pooled), the ReadyForQuery (RFQ) LSN accessor, the notice receiver, the `dispatch_state` session-to-connection bridge, and the `WrapState` filter. | Audience: R/M/O/C | Status: stable | Prereqs: [10-SESSION-INTEGRATION.md](10-SESSION-INTEGRATION.md), [07-QUERY-WRAPPING.md](07-QUERY-WRAPPING.md), [08-WAIT-TIMEOUT-AND-NOTICES.md](08-WAIT-TIMEOUT-AND-NOTICES.md), [09-PUBLISH-AND-WRITE-TRACKING.md](09-PUBLISH-AND-WRITE-TRACKING.md), [02-BUILD-TOGGLE-AND-LIBPQ.md](02-BUILD-TOGGLE-AND-LIBPQ.md) | Verified against: this branch
+> Scope: how the backend-connection layer (`PgSQL_Connection`) carries the PolarDB LSN feature — startup profiles, proxy protocol parameters, fallback session activation on connect/attach, the ReadyForQuery (RFQ) LSN accessor, the notice receiver, the `dispatch_state` session-to-connection bridge, and the `WrapState` filter. | Audience: R/M/O/C | Status: stable | Prereqs: [10-SESSION-INTEGRATION.md](10-SESSION-INTEGRATION.md), [07-QUERY-WRAPPING.md](07-QUERY-WRAPPING.md), [08-WAIT-TIMEOUT-AND-NOTICES.md](08-WAIT-TIMEOUT-AND-NOTICES.md), [09-PUBLISH-AND-WRITE-TRACKING.md](09-PUBLISH-AND-WRITE-TRACKING.md), [02-BUILD-TOGGLE-AND-LIBPQ.md](02-BUILD-TOGGLE-AND-LIBPQ.md) | Verified against: this branch
 
 ---
 
@@ -15,7 +15,7 @@ The connection layer does four PolarDB jobs:
 3. **Filter the wrapped-read result.** A consistency read is sent as several `SET` statements glued in front of the user query. The connection layer silently drops the leading `SET` result sets and forwards only the user's result. It is the **sole owner** of that filtering.
 4. **Capture the wait-timeout notice.** The libpq notice receiver always forwards backend notices to the PolarDB handler, so a best-effort wait-timeout WARNING is counted and re-queued even when the generic result object (`query_result`) has already been recycled and set to null.
 
-All of this code is controlled behind the compile flag `POLARDB_PROXY`. With `POLARDB_PROXY=0` every block below compiles out and the connection layer behaves exactly like upstream ProxySQL (see [02-BUILD-TOGGLE-AND-LIBPQ.md](02-BUILD-TOGGLE-AND-LIBPQ.md)).
+PolarDB connection tracking, startup profiles, wait sends, and patched-libpq calls are controlled by `POLARDB_PROXY`. Generic extended-protocol ownership and error-boundary fixes remain shared by both builds. Off mode links vanilla libpq and has no PolarDB `W` behavior (see [02-BUILD-TOGGLE-AND-LIBPQ.md](02-BUILD-TOGGLE-AND-LIBPQ.md)).
 
 **Status:** stable. Everything in this document is implemented and active in this branch.
 
@@ -51,23 +51,22 @@ client read  ─►  route pipeline (Hook 2)
                  ASYNC_IDLE:
                  finalize_wait_timeout_injection
                  builds "SET;SET;SET;<query>"  ───────► dispatch_state snapshot
-                 sets polardb_dispatch_wrapper_*        (ASYNC_IDLE, Connection.cpp:2357)
+                 sets polardb_dispatch_wrapper_*        (ASYNC_IDLE, Connection.cpp:2545)
                                                               │
                                                         query_start():
-                                                        begin(n) consumer  (2027)
+                                                        begin(n) consumer  (2200)
                                                               │
                                                         backend runs 3 SETs + query
                                                               │
                                                         WIRE filter (Hook 3):
-                                                        drop 3 SET results,        (775)
+                                                        drop 3 SET results,        (859)
                                                         forward only user result
                                                               │
                                                         notice_handler_cb (Hook 3):
-                                                        always call               (3365)
-                                                        polardb_handle_notice
+                                                        classify wait notice first (3731)
                        ◄──────────────────────────── user result + pending notice
                  RequestEnd success (Hook 4):
-                 polardb_process_result reads ───────────────► get_polardb_lsn()  (1897)
+                 polardb_process_result reads ───────────────► get_polardb_lsn()  (2072)
                  the RFQ LSN                             (PQhasLSN / PQgetLSN)
 ```
 
@@ -83,22 +82,22 @@ This section lists every PolarDB item the connection layer adds, in the order a 
 
 | Member | Declared | Defined | Responsibility |
 |--------|----------|---------|----------------|
-| `void polardb_init_connection_tracking()` | `PgSQL_Connection.h` | `PgSQL_Connection.cpp` | After a successful connect, turn on libpq LSN parsing only when the recorded startup profile requested `REQUEST_RFQ_LSN`. No-op without a live connection or without that request bit. |
-| `uint64_t get_polardb_lsn()` | `PgSQL_Connection.h:935` | `PgSQL_Connection.cpp:1897` | Return the LSN libpq cached from the last RFQ. Pure accessor; issues no SQL query. Returns 0 if the RFQ carried no LSN or there is no connection. |
+| `void polardb_enable_requested_rfq_parsing()` | `PgSQL_Connection.h:1077` | `PgSQL_Connection.cpp:2057` | After a successful connect, enable only the RFQ payload parsers requested by the recorded startup profile. No-op without a live connection. |
+| `uint64_t get_polardb_lsn()` | `PgSQL_Connection.h:1102` | `PgSQL_Connection.cpp:2072` | Return the LSN libpq cached from the last RFQ. Pure accessor; issues no SQL query. Returns 0 if the RFQ carried no LSN or there is no connection. |
 
 ### 3.2 Private method
 
 | Member | Declared | Defined | Responsibility |
 |--------|----------|---------|----------------|
-| `PolarDB_StartupProfile build_polardb_startup_profile(unsigned int hid) const` | `PgSQL_Connection.h` | `PgSQL_Connection.cpp` | Resolve the effective startup protocol from per-HG `proxy_protocol` over global `pgsql-polardb_proxy_protocol`. |
-| `bool append_polardb_startup_params(std::ostringstream& conninfo, PolarDB_StartupProfile& profile, unsigned int hid)` | `PgSQL_Connection.h` | `PgSQL_Connection.cpp` | Append profile-driven PolarDB startup parameters. Fails connection creation early when an RFQ-requesting profile has no usable identity. |
-| `PolarDB_StartupIdentity resolve_polardb_startup_identity(...) const` | `PgSQL_Connection.h` | `PgSQL_Connection.cpp` | Choose client endpoint, listener/proxy endpoint, or configured fallback identity for startup parameters. Returns `NONE` when no usable identity exists. |
+| `PolarDB_StartupProfile polardb_build_startup_profile(unsigned int hid) const` | `PgSQL_Connection.h:1172` | `PgSQL_Connection.cpp:1814` | Resolve the effective startup protocol from per-HG `proxy_protocol` over global `pgsql-polardb_proxy_protocol`. |
+| `bool polardb_append_startup_params(...)` | `PgSQL_Connection.h:1194` | `PgSQL_Connection.cpp:1963` | Append profile-driven PolarDB startup parameters. Fails connection creation early when an RFQ-requesting profile has no usable identity. |
+| `PolarDB_StartupIdentity polardb_resolve_startup_identity(...) const` | `PgSQL_Connection.h:1226` | `PgSQL_Connection.cpp:1846` | Choose the identity source allowed by the configured mode. Returns `NONE` when no usable identity exists. |
 
 ### 3.3 The libpq notice receiver
 
 | Member | Declared | Defined | Responsibility |
 |--------|----------|---------|----------------|
-| `static void notice_handler_cb(void* arg, const PGresult* result)` | `PgSQL_Connection.h:985` | `PgSQL_Connection.cpp:3339` | libpq notice receiver. Registered with `PQsetNoticeReceiver` in `query_start()` (`PgSQL_Connection.cpp:2044`). Records the notice in the active result if there is one, and **always** falls through to `polardb_handle_notice()`. |
+| `static void notice_handler_cb(void* arg, const PGresult* result)` | `PgSQL_Connection.h:1152` | `PgSQL_Connection.cpp:3726` | libpq notice receiver. Registered in `query_start()` at `PgSQL_Connection.cpp:2225`. A recognized wait notice is owned once by the PolarDB handler; ordinary notices continue to generic result ownership. |
 
 ### 3.4 File-local helpers (in `lib/PgSQL_Connection.cpp`)
 
@@ -106,7 +105,7 @@ These two are file-static, not class members. They live only in the `.cpp`.
 
 | Helper | Defined | Responsibility |
 |--------|---------|----------------|
-| `static bool polardb_is_lsn_wait_timeout_result(const PGresult* result)` | `PgSQL_Connection.cpp:166` | Return true when the result's structured detail field `PG_DIAG_MESSAGE_DETAIL` equals the marker `POLARDB_LSN_WAIT_TIMEOUT_DETAIL`. This is how a strict-mode wait timeout is identified without matching human-readable text. |
+| `bool polardb_is_lsn_wait_timeout_result(const PGresult* result)` | `PgSQL_PolarDB_Notices.cpp` | Return true only when both `PG_DIAG_MESSAGE_DETAIL` equals `POLARDB_LSN_WAIT_TIMEOUT_DETAIL` and `PG_DIAG_SOURCE_FUNCTION` equals `polar_proxy_wait_for_lsn`. |
 | `static void polardb_account_wrapper_set_error(PgSQL_Connection* conn, const PGresult* result, const char* msg)` | `PgSQL_Connection.cpp:182` | When a wrapper SET (or the user query after wrapper consumption) errors, decide whether it is a PolarDB wait timeout and, if so, account it; then mark the wrap-state state as failed so consumption stops. |
 
 `polardb_handle_notice()` itself is **declared** in this file (`PgSQL_Connection.cpp:38`) but **defined** in `lib/PgSQL_PolarDB_Notices.cpp:225` (see [08-WAIT-TIMEOUT-AND-NOTICES.md](08-WAIT-TIMEOUT-AND-NOTICES.md)).
@@ -125,7 +124,9 @@ Both are **connection-confined**: a `PgSQL_Connection` is driven by exactly one 
 
 ## 4. Hook 1 — enabling PolarDB on the connection
 
-There are three distinct enable sites. The first two are on the connection layer (conninfo build and post-connect). The third is on the session layer (pooled/fresh attach) and is summarized here because a pooled connection never runs the connection-layer connect path.
+Session activation is owned by routing, not by connection creation. The
+connection and backend-attach paths also set the one-way session flag as
+lifecycle fallbacks because pooled connections do not run the connect path.
 
 ### 4.1 conninfo: resolve startup profile and mark the session enabled (fresh connect)
 
@@ -156,6 +157,7 @@ The effective protocol comes from per-HG `pgsql_replication_hostgroups.proxy_pro
 | Protocol | Emitted parameters |
 |---|---|
 | `v15` | `_polar_proxy_client_host=<host>`, `_polar_proxy_client_port=<port>`, `_polar_proxy_send_lsn=true`, `_polar_proxy_send_xact=true` |
+| `v15_wait` | v15 fields plus `_pq_.polar_proxy_wait_v1=1` |
 | `legacy` | `_polar_origin_client_ip=<host>`, `_polar_origin_client_port=<port>`, `_polar_send_lsn=true`, `_polar_send_xact=true` |
 | `off` | no PolarDB proxy startup parameters |
 
@@ -167,15 +169,14 @@ Notes:
 - RFQ-requesting profiles require valid identity. Empty, invalid, wildcard, or unset identity fails connection creation before `PQconnectStart()`. The configured fallback is validated on `SET`: host must be empty or a non-wildcard IP literal, and a completed fallback pair requires port `1..65535`.
 - The request bit names are `REQUEST_RFQ_LSN`, `REQUEST_RFQ_CSN`, and `REQUEST_RFQ_XID`. Current `v15` and `legacy` profiles request `REQUEST_RFQ_LSN` and `REQUEST_RFQ_XID`; `off` requests none. XID is requested at startup for capability, while `txn_split_enabled` controls whether result processing uses the XID evidence for split routing.
 
-### 4.3 `polardb_init_connection_tracking` — turn on requested libpq RFQ parsing
+### 4.3 `polardb_enable_requested_rfq_parsing` — turn on requested libpq RFQ parsing
 
-After a successful connect (the `ASYNC_CONNECT_SUCCESSFUL` branch of `connect_cont`), the connection calls `polardb_init_connection_tracking()`:
+After a successful connect, the connection calls `polardb_enable_requested_rfq_parsing()`:
 
 ```
-PgSQL_Connection.cpp:655-658
+PgSQL_Connection.cpp:723-729
   #if POLARDB_PROXY
-      // Turn on requested PolarDB RFQ parsing on this backend ...
-      polardb_init_connection_tracking();
+      polardb_enable_requested_rfq_parsing();
   #endif
 ```
 
@@ -184,24 +185,36 @@ startup bit was requested:
 
 | Step | Behavior | file:line |
 |------|----------|-----------|
-| check: live connection | Return early if `pgsql_conn` is null or `PQstatus(...) != CONNECTION_OK`. | `PgSQL_Connection.cpp:1883-1884` |
-| LSN action | If `polardb_startup_profile.has_rfq_lsn()`, call `PQsetPolarSendLSN(pgsql_conn, 1)` so `getReadyForQuery()` parses the appended LSN when present. | `PgSQL_Connection.cpp` |
-| XID action | If `polardb_startup_profile.has_rfq_xid()`, call `PQsetPolarSendXact(pgsql_conn, 1)` so libpq parses transaction-split RFQ metadata when present. | `PgSQL_Connection.cpp` |
+| check: live connection | Return early if `pgsql_conn` is null or `PQstatus(...) != CONNECTION_OK`. | `PgSQL_Connection.cpp:2058-2060` |
+| LSN action | If `polardb_startup_profile.requests_rfq_lsn()`, call `PQsetPolarSendLSN(pgsql_conn, 1)`. | `PgSQL_Connection.cpp:2061-2063` |
+| XID action | If `polardb_startup_profile.requests_rfq_xid()`, call `PQsetPolarSendXact(pgsql_conn, 1)`. | `PgSQL_Connection.cpp:2064-2066` |
 
-Citation precision: `PQsetPolarSendLSN` and `PQsetPolarSendXact` are **defined** in the libpq patch at `polardb_libpq.patch` (function definitions; see [02-BUILD-TOGGLE-AND-LIBPQ.md](02-BUILD-TOGGLE-AND-LIBPQ.md)). The call sites in this tree are inside `polardb_init_connection_tracking()`.
+Citation precision: `PQsetPolarSendLSN` and `PQsetPolarSendXact` are **defined** in the libpq patch. Their connection call sites are centralized in `polardb_enable_requested_rfq_parsing()`.
 
 This is still not capability confirmation. It only tells patched libpq to parse RFQ payloads if the backend later sends them. Missing RFQ LSN is handled in result processing and routing policy; missing transaction-split RFQ metadata simply leaves the observed split state primary-only.
 
-### 4.4 Pooled vs fresh enable (session layer, summarized)
+### 4.4 Route activation and pooled/fresh fallbacks
 
-A pooled backend connection is attached to a session **without** running `connect_start()`, so the conninfo enable at §4.1 never runs for it. The session layer therefore sets `is_polardb_enabled` itself when it gets or creates a backend for a PolarDB hostgroup. Both sites first check the flag is not already set and that the HG is a PolarDB HG:
+A pooled backend connection is attached to a session **without** running
+`connect_start()`, so connection setup alone cannot own activation. Normal
+automatic and manual PolarDB routing call
+`polardb_activate_session_for_request()` after binding the current writer scope.
+That call is the correctness boundary: on the first activation it also marks
+the write position unknown, because a writer request might have completed
+before the worker observed the topology publication.
+
+The backend lifecycle keeps two fallback sites for pooled and newly created
+connections:
 
 | Path | Action | file:line |
 |------|--------|-----------|
 | Pooled (got a pooled connection) | `polardb_config.is_polardb_enabled = true` | `PgSQL_Session.cpp:6302` |
 | Fresh (no pooled connection; will create new) | `polardb_config.is_polardb_enabled = true` | `PgSQL_Session.cpp:6316` |
 
-Net effect: whichever way the session obtains a backend for a PolarDB HG, `is_polardb_enabled` is true by the time the request runs, so the result-processing stage will execute. The flag is **never reset to false** during the session — it only ever flips on. Full detail is in [10-SESSION-INTEGRATION.md](10-SESSION-INTEGRATION.md).
+Net effect: routing activates early enough to preserve correctness, while an
+unusual lifecycle entry cannot bypass result processing. The flag is **never
+reset to false** during the session; it only ever flips on. Full detail is in
+[10-SESSION-INTEGRATION.md](10-SESSION-INTEGRATION.md).
 
 ---
 
@@ -223,26 +236,25 @@ The count of SETs to drop travels from the session to the connection in two hops
 **Hop 1 — snapshot at dispatch (`ASYNC_IDLE`).** When the query is submitted, the connection snapshots the session's handoff fields into its own `dispatch_state` and zeroes the session fields so they cannot be reused:
 
 ```
-PgSQL_Connection.cpp:2357-2363  (inside the ASYNC_IDLE case of async_query)
+PgSQL_Connection.cpp:2545-2550  (inside the ASYNC_IDLE case of async_query)
   dispatch_state.reset();
   if (!extended_query_info && myds && myds->sess &&
       myds->sess->polardb_query.dispatch_wrapper_stmts > 0) {
       dispatch_state.wrapper_stmts = myds->sess->polardb_query.dispatch_wrapper_stmts;
       dispatch_state.wrapper_kind  = myds->sess->polardb_query.dispatch_wrapper_kind;
-      myds->sess->polardb_query.dispatch_wrapper_stmts = 0;
-      myds->sess->polardb_query.dispatch_wrapper_kind  = PolarDB_Query_WrapperKind::NONE;
+      myds->sess->polardb_query.reset_dispatch_wrapper();
   }
 ```
 
 Two design points:
 
-- Only **simple queries** are wrapped. The `!extended_query_info` check at `PgSQL_Connection.cpp:2358` skips the snapshot for extended-protocol (Parse/Bind/Execute) queries, which are never wrapped.
+- Only **simple queries** receive the SQL wrapper and wrapper-result count. Extended Parse/Bind/Execute waits use the negotiated `W` message and connection-local extended-wait state instead, so the SQL snapshot remains intentionally skipped.
 - The session fields are zeroed here so a later query on the same session cannot accidentally re-skip results.
 
 **Hop 2 — consume at `query_start()`.** When the query starts, the connection turns the snapshot into the per-query countdown and then resets the snapshot:
 
 ```
-PgSQL_Connection.cpp:2025-2041
+PgSQL_Connection.cpp:2200-2222
   polardb_query_wrap_state.clear();
   if (dispatch_state.wrapper_stmts > 0) {
       polardb_query_wrap_state.begin(dispatch_state.wrapper_stmts,
@@ -253,9 +265,9 @@ PgSQL_Connection.cpp:2025-2041
   dispatch_state.reset();   // Consumed — prevent stale reuse
 ```
 
-`begin(n, kind)` (defined inline in `PgSQL_Connection.h:807`) sets `was_wrapped = (n>0)`, `stmt_total = n`, `stmt_pending = n`, and the wrapper kind. For an ordinary, non-wrapped query, `wrapper_stmts` is 0, so `begin()` is never called and `polardb_query_wrap_state` stays empty — the result path then skips the filter entirely.
+`begin(n, kind)` (defined inline in `PgSQL_Connection.h`) sets the wrapper count and kind. For an ordinary, non-wrapped query, `wrapper_stmts` is 0, so `begin()` is never called and `polardb_query_wrap_state` stays empty — the result path then skips the filter entirely.
 
-`dispatch_state` is also reset on connection cleanup (`PgSQL_Connection.cpp:3730`), and `polardb_query_wrap_state` is cleared on the same cleanup (`PgSQL_Connection.cpp:3731`), so a connection returned to the pool carries no stale wrapper state.
+`dispatch_state` is also reset on connection cleanup (`PgSQL_Connection.cpp:4117`), and `polardb_query_wrap_state` is cleared on the same cleanup (`:4118`), so a connection returned to the pool carries no stale wrapper state.
 
 ### 5.2 The leading-skip consume loop (the wire filter)
 
@@ -323,58 +335,63 @@ The comment at `PgSQL_Connection.cpp:241-245` explains the "wait active" conditi
 
 ### 5.5 The structured timeout marker (no text matching)
 
-ProxySQL does **not** match human-readable WARNING/ERROR text, because user SQL could fabricate it. It checks the structured PostgreSQL diagnostic field `PG_DIAG_MESSAGE_DETAIL` against a fixed constant:
+ProxySQL does **not** match human-readable WARNING/ERROR text, because user SQL could fabricate it. It requires two exact PostgreSQL diagnostics:
 
 ```
 include/PgSQL_PolarDB.h:186-187
   static constexpr const char* POLARDB_LSN_WAIT_TIMEOUT_DETAIL =
       "polar_proxy_lsn_wait_timeout";
+  static constexpr const char* POLARDB_LSN_WAIT_TIMEOUT_SOURCE_FUNCTION =
+      "polar_proxy_wait_for_lsn";
 ```
 
 The connection-side check is `polardb_is_lsn_wait_timeout_result()`:
 
 ```
-PgSQL_Connection.cpp:166-169
+PgSQL_PolarDB_Notices.cpp
   const char* detail = result ? PQresultErrorField(result, PG_DIAG_MESSAGE_DETAIL) : nullptr;
-  return detail && strcmp(detail, POLARDB_LSN_WAIT_TIMEOUT_DETAIL) == 0;
+  const char* source = result ? PQresultErrorField(result, PG_DIAG_SOURCE_FUNCTION) : nullptr;
+  return detail && source &&
+      strcmp(detail, POLARDB_LSN_WAIT_TIMEOUT_DETAIL) == 0 &&
+      strcmp(source, POLARDB_LSN_WAIT_TIMEOUT_SOURCE_FUNCTION) == 0;
 ```
 
-The PolarDB backend emits this exact detail (via `errdetail_internal()`) only from its proxy LSN-wait path, so the marker is trustworthy. The same marker is checked on the notice path inside `polardb_handle_notice()` (`lib/PgSQL_PolarDB_Notices.cpp`). See [08-WAIT-TIMEOUT-AND-NOTICES.md](08-WAIT-TIMEOUT-AND-NOTICES.md) for both paths together.
+The pair separates a real backend wait timeout from ordinary SQLSTATE 57014 cancellation and from user-generated text or DETAIL fields. It is classification evidence on a trusted proxy/backend connection, not authentication. The same helper is used by ERROR and WARNING handling. See [08-WAIT-TIMEOUT-AND-NOTICES.md](08-WAIT-TIMEOUT-AND-NOTICES.md).
 
 ### 5.6 The notice receiver — inline `add_notice` vs `pending_notices`
 
 A best-effort wait timeout arrives as a backend WARNING/NOTICE **while the wrapped SELECT obtains its snapshot**. By that point the leading SET results may already have been consumed: the connection recycled their result buffers and set its generic `query_result` pointer to null (see §5.2). So `query_result` can be null when the notice arrives. The capture path must still work in that case.
 
-libpq's notice receiver is `notice_handler_cb()`, registered per query in `query_start()` (`PgSQL_Connection.cpp:2044`). Its body, at `PgSQL_Connection.cpp:3339`:
+libpq's notice receiver is `notice_handler_cb()`, registered per query in `query_start()` (`PgSQL_Connection.cpp:2225`). Its body starts at `PgSQL_Connection.cpp:3726`:
 
 ```
-PgSQL_Connection.cpp:3344-3366
+PgSQL_Connection.cpp:3731-3753
+#if POLARDB_PROXY
+  if (polardb_handle_lsn_wait_timeout_notice(conn, result)) {
+      return;
+  }
+#endif
+
   if (conn->query_result != nullptr) {
       // Generic upstream path: store the notice inline in the active result so
       // its NoticeResponse is forwarded with that result and its bytes accounted.
       const unsigned int bytes_recv = conn->query_result->add_notice(result);
       conn->update_bytes_recv(bytes_recv);
   } else {
-      // No active query_result (e.g. a wrapped SET was just consumed, or during
-      // RESET SESSION). MUST NOT return — fall through so the PolarDB handler
-      // can still owe timeout accounting and a separately-forwarded NoticeResponse.
+      // No active generic result (for example during RESET SESSION).
       proxy_debug(...);   // debug log only
   }
-
-#if POLARDB_PROXY
-  // Runs regardless of query_result so wrapped-wait timeout notices are never dropped.
-  polardb_handle_notice(conn, result);
-#endif
 ```
 
 Two paths, and why there is no client duplicate:
 
 | Situation | What `notice_handler_cb` does | Where the NoticeResponse goes to the client |
 |-----------|------------------------------|---------------------------------------------|
-| There **is** an active `query_result` (a normal notice during a result) | `query_result->add_notice(result)` stores the notice **inline** in that result object. Then it still calls `polardb_handle_notice`. | The notice is forwarded as part of that result. `polardb_handle_notice` ignores it unless it is a PolarDB wait-timeout marker during an active wait (see below), so it does not also queue it. **No duplicate.** |
-| There is **no** active `query_result` (the wrapped-wait case: SETs consumed, `query_result` set to null) | The inline branch is skipped. `polardb_handle_notice` runs and, only for a marker notice during an active wait, builds a fresh NoticeResponse packet and enqueues it on the session's `pending_notices`. | The session flushes `pending_notices` once, ahead of the user result. The inline path was skipped, so there is **no duplicate**. |
+| Structured PolarDB wait-timeout marker | `polardb_handle_lsn_wait_timeout_notice()` owns accounting and either attaches the notice to the client-visible result or queues it for the session-owned result boundary, then returns true. | The early return prevents generic `add_notice()` from duplicating it. |
+| Ordinary notice with an active `query_result` | The PolarDB classifier declines it; `query_result->add_notice(result)` stores it inline. | The notice is forwarded with that result. |
+| Ordinary notice without an active `query_result` | The PolarDB classifier declines it and the generic path only logs at debug level. | No result owns the notice, matching the existing out-of-result behavior. |
 
-The key is the `if/else` on `query_result`: at most one of "store inline" and "queue in `pending_notices`" stores the notice for the client. `polardb_handle_notice()` adds to `pending_notices` only when (a) the notice carries the timeout marker and (b) the wait is active and the connection WrapState is a consistency wait (`is_consistency_wait()`); otherwise it leaves the notice to the generic path (`lib/PgSQL_PolarDB_Notices.cpp:235-273`). So a normal notice that already went inline is never re-queued, and a marker notice that arrived with no `query_result` is captured exactly once. The session-side queue (`pending_notices`, `enqueue_pending_notice`, `clear_pending_notices`) and the forward-once flush are covered in [08-WAIT-TIMEOUT-AND-NOTICES.md](08-WAIT-TIMEOUT-AND-NOTICES.md) and [10-SESSION-INTEGRATION.md](10-SESSION-INTEGRATION.md).
+The key is explicit ownership before the generic branch: a recognized wait notice returns immediately, while a declined notice follows normal libpq result ownership. This keeps hidden implicit-Parse results, visible Execute results, and SQL-wrapper results from double-publishing or dropping a warning. The session-side notice queue and forward-once flush are covered in [08-WAIT-TIMEOUT-AND-NOTICES.md](08-WAIT-TIMEOUT-AND-NOTICES.md) and [10-SESSION-INTEGRATION.md](10-SESSION-INTEGRATION.md).
 
 `add_notice` itself is a method of `PgSQL_Query_Result` (declared `include/PgSQL_Protocol.h:517`); it returns the byte count so the connection can update its received-bytes statistic.
 
@@ -385,7 +402,7 @@ The key is the `if/else` on `query_result`: at most one of "store inline" and "q
 The result-processing stage (Hook 4) needs the backend's WAL LSN after a successful query. It reads it through `get_polardb_lsn()`, which is **RFQ-only**: it returns the LSN libpq already parsed from the most recent ReadyForQuery message and issues **no** SQL query.
 
 ```
-PgSQL_Connection.cpp:1897-1908
+PgSQL_Connection.cpp:2072-2082
   uint64_t PgSQL_Connection::get_polardb_lsn() {
       if (!pgsql_conn || PQstatus(pgsql_conn) != CONNECTION_OK) {
           return 0;
@@ -399,9 +416,9 @@ PgSQL_Connection.cpp:1897-1908
 
 | Property | Detail | file:line |
 |----------|--------|-----------|
-| No round-trip | Calls only the native libpq accessors `PQhasLSN()` / `PQgetLSN()`. Safe on the hot request/result-processing path. | `PgSQL_Connection.cpp:1903-1904` |
-| Returns 0 when absent | No connection, connection not OK, or the RFQ carried no LSN -> returns 0. | `PgSQL_Connection.cpp:1898-1900`, `:1907` |
-| Enabled by | The per-connection LSN parsing must have been turned on by `PQsetPolarSendLSN(conn,1)` in `polardb_init_connection_tracking()` (`PgSQL_Connection.cpp:1887`). Without it, `PQhasLSN()` is always false. | — |
+| No round-trip | Calls only the native libpq accessors `PQhasLSN()` / `PQgetLSN()`. Safe on the hot request/result-processing path. | `PgSQL_Connection.cpp:2078-2079` |
+| Returns 0 when absent | No connection, connection not OK, or the RFQ carried no LSN -> returns 0. | `PgSQL_Connection.cpp:2073-2075`, `:2082` |
+| Enabled by | `polardb_enable_requested_rfq_parsing()` calls `PQsetPolarSendLSN(conn,1)` only when the startup profile requested RFQ LSN. | `PgSQL_Connection.cpp:2057-2063` |
 
 The caller is `polardb_process_result()` (defined in `lib/PgSQL_PolarDB_Flow.cpp`), reached from `PgSQL_Session::RequestEnd()` on the success path. Everything the result-processing stage does with the returned LSN — advancing session write/observed LSN state, maintaining missing-LSN flags, and refreshing the per-server cache — is documented in [09-PUBLISH-AND-WRITE-TRACKING.md](09-PUBLISH-AND-WRITE-TRACKING.md). The deliberate "RFQ-only, never SQL" rule keeps all SQL-based LSN probing in the monitor; see [05-MONITOR-AND-HGM-LSN-STATE.md](05-MONITOR-AND-HGM-LSN-STATE.md).
 
@@ -415,9 +432,9 @@ The connection layer depends on the PolarDB-specific libpq patch: active LSN fun
 
 | libpq item | Kind | Used by connection layer at | What it does |
 |------------|------|------------------------------|--------------|
-| `PQsetPolarSendLSN(PGconn*, int enable)` | function | `PgSQL_Connection.cpp:1887` | Turn on the runtime flag that makes libpq's RFQ parser look for an appended LSN. |
-| `PQhasLSN(const PGconn*)` | function | `PgSQL_Connection.cpp:1903` | Was an LSN present in the last RFQ? |
-| `PQgetLSN(const PGconn*)` | function | `PgSQL_Connection.cpp:1904` | Return the LSN captured from the last RFQ (0 if none). |
+| `PQsetPolarSendLSN(PGconn*, int enable)` | function | `PgSQL_Connection.cpp:2062` | Turn on the runtime flag that makes libpq's RFQ parser look for an appended LSN. |
+| `PQhasLSN(const PGconn*)` | function | `PgSQL_Connection.cpp:2078` | Was an LSN present in the last RFQ? |
+| `PQgetLSN(const PGconn*)` | function | `PgSQL_Connection.cpp:2079` | Return the LSN captured from the last RFQ (0 if none). |
 | `PQgetXactSplitXids` / `PQisXactSplittable` / `PQisXactWalPending` / `PQsetPolarSendXact` | functions | connection/result processing, planner inputs, split-read dispatch | Request and read transaction-split RFQ evidence; the planner may name a split route, and execution can take a compatible replica connection from the pool for that read. |
 | `_polar_send_lsn` / `_polar_proxy_send_lsn` | startup parameter | emitted according to the resolved startup profile | Ask the backend to append its WAL LSN to every RFQ. |
 | `_polar_send_xact` / `_polar_proxy_send_xact` | startup parameter | emitted for non-`off` PolarDB profiles | Ask the backend to append transaction-split metadata to RFQ; result processing observes it only when `txn_split_enabled=1`, and the planner can recognize split-readable state. |
@@ -446,13 +463,15 @@ future PolarDB15 cancel-session extension.
 
 ## 8. Notes for reviewers (subtleties and gotchas)
 
-- **The connection layer is the sole owner of `WrapState` filtering.** The session and client never see the dropped SET results. If a future change moved this filtering elsewhere, the count must stay consistent with the count copied through `dispatch_state` (`PgSQL_Connection.cpp:2357-2363`).
-- **The filter is bounded by `stmt_pending` and the simple-query end state.** The check `has_pending() && fetch_result_end_st == ASYNC_QUERY_END` (`PgSQL_Connection.cpp:775-776`) means a stray extra result after `stmt_pending` reaches 0 is **not** dropped — it would be forwarded to the client. The header comment (`PgSQL_Connection.h:734-736`) documents this: a `SET` appended *after* the user query is not supported because there is no trailing-skip counter. The wrap point only ever prepends, so this is safe today.
+- **The connection layer is the sole owner of `WrapState` filtering.** The session and client never see the dropped SET results. If a future change moved this filtering elsewhere, the count must stay consistent with the count copied through `dispatch_state` (`PgSQL_Connection.cpp:2545-2550`).
+- **The filter is bounded by `stmt_pending` and the simple-query end state.** The `consuming_wrapper_set() && fetch_result_end_st == ASYNC_QUERY_END` gate (`PgSQL_Connection.cpp:859-860`) means a stray extra result after `stmt_pending` reaches 0 is **not** dropped. The wrap point only ever prepends, so this is safe today.
 - **`get_polardb_lsn()` is intentionally side-effect-free.** It never issues SQL. This is what makes it safe to call on the result-processing hot path. Any future LSN probe that needs SQL must go in the monitor, not here.
-- **Enable is one-way and multi-sourced.** `is_polardb_enabled` is set in three places (conninfo `:1595`, pooled `:6302`, fresh `:6316`) and never cleared. A pooled connection cannot bypass the result-processing stage, because the session enable is set on attach even though the connection-layer connect path did not run.
-- **The notice `if/else` is essential to correctness.** The inline `add_notice` and the `pending_notices` queue are mutually exclusive for a given notice, which is why the client never sees a duplicate NoticeResponse. Removing the `else`/fall-through, or returning early when `query_result` is null, would drop wrapped-wait timeout notices (`PgSQL_Connection.cpp:3344-3366`).
-- **Structured marker, not text.** Timeout classification uses `PG_DIAG_MESSAGE_DETAIL == "polar_proxy_lsn_wait_timeout"` (`PgSQL_Connection.cpp:166-169`, marker `include/PgSQL_PolarDB.h:186-187`), so user SQL cannot fake a timeout. This is a correctness property, not a convenience.
-- **Both wrap-state and dispatch state are cleared on cleanup.** `PgSQL_Connection.cpp:3730-3731` resets `dispatch_state` and clears `polardb_query_wrap_state` so a connection returning to the pool carries no stale wrapper state into the next session.
+- **Enable is one-way and multi-sourced.** Route-time activation is primary and
+  marks the first writer position unknown; connect and backend-attach sites are
+  lifecycle fallbacks. The flag is never cleared.
+- **Notice ownership is selected before the generic path.** A recognized wait-timeout notice is handled once and returns; ordinary notices use `query_result->add_notice()` when a result exists (`PgSQL_Connection.cpp:3731-3749`).
+- **Two-field timeout provenance, not text.** Classification requires the exact DETAIL token and `PG_DIAG_SOURCE_FUNCTION == "polar_proxy_wait_for_lsn"`. Marker-less SQLSTATE 57014 remains cancellation/statement-timeout ownership and is never replayed on the writer.
+- **Both wrap-state and dispatch state are cleared on cleanup.** `PgSQL_Connection.cpp:4117-4118` resets `dispatch_state` and clears `polardb_query_wrap_state` so a connection returning to the pool carries no stale wrapper state into the next session.
 
 ---
 
@@ -464,13 +483,13 @@ future PolarDB15 cancel-session extension.
 |------------|--------|
 | Profile-driven startup params (`v15`, `legacy`, `off`) | implemented |
 | Connection-local `polardb_startup_profile` with `REQUEST_RFQ_LSN` controlling | implemented |
-| Session enable on fresh connect, pooled attach, and fresh attach | implemented (`:1595`, `PgSQL_Session.cpp:6302`, `:6316`) |
-| `polardb_init_connection_tracking` / `PQsetPolarSendLSN` | implemented (`PgSQL_Connection.cpp:1882`, `:1887`) |
-| `get_polardb_lsn` RFQ-only accessor | implemented (`PgSQL_Connection.cpp:1897`) |
-| Wrap-state filter (drop N SETs, forward user result) | implemented (`PgSQL_Connection.cpp:775-819`) |
+| Route-time session activation with fresh-connect and backend-attach fallbacks | implemented (`polardb_activate_session_for_request`) |
+| `polardb_enable_requested_rfq_parsing` / `PQsetPolarSendLSN` | implemented (`PgSQL_Connection.cpp:2057`, `:2062`) |
+| `get_polardb_lsn` RFQ-only accessor | implemented (`PgSQL_Connection.cpp:2072`) |
+| Wrap-state filter (drop N SETs, forward user result) | implemented (`PgSQL_Connection.cpp:851-918`) |
 | Wrapper-error accounting via structured marker | implemented (`PgSQL_Connection.cpp:182`, `:250`) |
-| Notice receiver fall-through to `polardb_handle_notice` | implemented (`PgSQL_Connection.cpp:3365`) |
-| `dispatch_state` session→connection bridge | implemented (`PgSQL_Connection.cpp:2357-2363`, `:2025-2041`) |
+| Notice receiver ownership through `polardb_handle_lsn_wait_timeout_notice` | implemented (`PgSQL_Connection.cpp:3726-3754`) |
+| `dispatch_state` session→connection bridge | implemented (`PgSQL_Connection.cpp:2545-2550`, `:2200-2222`) |
 
 ### 9.2 Deferred / not present in this branch
 
@@ -487,7 +506,7 @@ These belong to future features (see [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATI
 
 ## Appendix: Mermaid diagrams
 
-### A. Hook 1 — conninfo enable and post-connect LSN parsing
+### A. Connection fallback enable and post-connect LSN parsing
 
 ```mermaid
 flowchart TD
@@ -498,15 +517,15 @@ flowchart TD
   E -- v15 --> F["emit _polar_proxy_client_host / _port<br/>+ _polar_proxy_send_lsn=true"]
   E -- legacy --> G["emit _polar_origin_client_ip / _port<br/>+ _polar_send_lsn=true"]
   E -- off --> X["emit no PolarDB proxy params"]
-  F --> SE[set session is_polardb_enabled=true<br/>Connection.cpp:1595]
+  F --> SE[set fallback session enable flag]
   G --> SE
   X --> SE
   C --> PQ[PQconnectStart]
   SE --> PQ
   PQ --> I{connect OK?}
-  I -- yes --> J[polardb_init_connection_tracking<br/>Connection.cpp:658]
+  I -- yes --> J[polardb_enable_requested_rfq_parsing<br/>Connection.cpp:726]
   J --> K{live conn AND<br/>REQUEST_RFQ_LSN requested?}
-  K -- yes --> L[PQsetPolarSendLSN conn,1<br/>Connection.cpp:1887]
+  K -- yes --> L[PQsetPolarSendLSN conn,1<br/>Connection.cpp:2062]
   K -- no --> M[no-op]
 ```
 
@@ -514,15 +533,15 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-  S[session finalize_wait_timeout_injection<br/>sets polardb_query.dispatch_wrapper_stmts=3] --> A{ASYNC_IDLE, simple query?<br/>Connection.cpp:2358}
-  A -- yes --> B[snapshot into dispatch_state<br/>zero session fields<br/>Connection.cpp:2360-2362]
+  S[session finalize_wait_timeout_injection<br/>sets polardb_query.dispatch_wrapper_stmts=3] --> A{ASYNC_IDLE, simple query?<br/>Connection.cpp:2546}
+  A -- yes --> B[snapshot into dispatch_state<br/>reset session handoff<br/>Connection.cpp:2548-2550]
   A -- no/extended --> Z[no snapshot]
-  B --> C[query_start: begin n,kind<br/>Connection.cpp:2027]
+  B --> C[query_start: begin n,kind<br/>Connection.cpp:2200-2203]
   C --> D[backend runs 3 SETs + user query]
-  D --> E{result while has_pending AND<br/>simple-query end? Connection.cpp:775}
-  E -- COMMAND_OK / EMPTY_QUERY --> F[stmt_pending--, recycle buffer,<br/>fetch next Connection.cpp:777-798]
+  D --> E{consuming wrapper SET AND<br/>simple-query end? Connection.cpp:859]
+  E -- COMMAND_OK / EMPTY_QUERY --> F[stmt_pending--, recycle buffer,<br/>fetch next Connection.cpp:861-906]
   F --> E
-  E -- error status --> G[polardb_account_wrapper_set_error<br/>stop consuming Connection.cpp:799-818]
+  E -- error status --> G[polardb_handle_wrapper_set_error<br/>stop consuming Connection.cpp:907-918]
   E -- pending==0 --> H[forward user result to client]
   G --> H
 ```
@@ -531,15 +550,12 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-  N[backend NOTICE/WARNING] --> CB[notice_handler_cb<br/>Connection.cpp:3339]
-  CB --> Q{query_result != null?<br/>Connection.cpp:3344}
-  Q -- yes --> I[query_result->add_notice<br/>store inline Connection.cpp:3347]
-  Q -- no --> D[debug log only, do NOT return<br/>Connection.cpp:3353]
-  I --> P[polardb_handle_notice<br/>Connection.cpp:3365]
-  D --> P
-  P --> M{marker AND wait active AND<br/>is_consistency_wait?<br/>Notices.cpp:235-273}
-  M -- yes, captured with no query_result --> Z[enqueue on pending_notices<br/>forwarded once before result]
-  M -- no --> L[leave to generic path]
+  N[backend NOTICE/WARNING] --> CB[notice_handler_cb<br/>Connection.cpp:3726]
+  CB --> P{structured PolarDB wait notice?<br/>Connection.cpp:3731-3737}
+  P -- yes --> Z[handler owns/account notice once<br/>return before generic path]
+  P -- no --> Q{query_result != null?<br/>Connection.cpp:3740}
+  Q -- yes --> I[query_result->add_notice<br/>store inline Connection.cpp:3743]
+  Q -- no --> D[debug log only<br/>Connection.cpp:3749]
 ```
 
 ### D. Hook 4 (read side) — RFQ-only LSN accessor
@@ -547,11 +563,11 @@ flowchart TD
 ```mermaid
 flowchart TD
   A[RequestEnd success path] --> B[polardb_process_result<br/>]
-  B --> C[get_polardb_lsn<br/>Connection.cpp:1897]
+  B --> C[get_polardb_lsn<br/>Connection.cpp:2072]
   C --> D{conn OK?}
   D -- no --> Z[return 0]
-  D -- yes --> E{PQhasLSN?<br/>Connection.cpp:1903}
-  E -- yes --> F[return PQgetLSN<br/>Connection.cpp:1904]
+  D -- yes --> E{PQhasLSN?<br/>Connection.cpp:2078}
+  E -- yes --> F[return PQgetLSN<br/>Connection.cpp:2079]
   E -- no --> Z
 ```
 

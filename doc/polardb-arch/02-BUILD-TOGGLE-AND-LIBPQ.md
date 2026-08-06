@@ -1,6 +1,6 @@
 # 02 — Build, Compile Toggle, and libpq RFQ-LSN Patch
 
-> Scope: how the LSN-only PolarDB feature is controlled at build time (`POLARDB_PROXY`), why the empty stub translation unit exists, the design contract that both build tiers are equivalent, and the patched libpq that carries the WAL LSN on ReadyForQuery (which parts of the patch are used vs accepted-but-unused, and how the patch is verified/regenerated). | Audience: M (ProxySQL maintainer), C (future contributor) | Status: stable | Prereqs: [01-BACKGROUND-AND-DESIGN.md](01-BACKGROUND-AND-DESIGN.md), [03-TYPES-AND-ENUMS.md](03-TYPES-AND-ENUMS.md) | Verified against: this branch
+> Scope: how PolarDB-specific behavior is controlled by `POLARDB_PROXY`, which generic extended-protocol fixes remain shared, why the stub translation unit is empty, and the patched libpq RFQ/transaction/`W` ABI and wire contract. | Audience: M (ProxySQL maintainer), C (future contributor) | Status: stable | Prereqs: [01-BACKGROUND-AND-DESIGN.md](01-BACKGROUND-AND-DESIGN.md), [03-TYPES-AND-ENUMS.md](03-TYPES-AND-ENUMS.md) | Verified against: this branch
 
 ---
 
@@ -8,8 +8,8 @@
 
 This document explains two related things:
 
-1. **The compile toggle.** The entire PolarDB feature is behind one switch named `POLARDB_PROXY`. This section shows where the switch lives, how it turns into a C++ macro, how every PolarDB line of code is protected by it, and why a build with the feature turned off is meant to behave exactly like normal (upstream) ProxySQL.
-2. **The libpq patch.** PolarDB read-your-writes consistency needs the proxy to learn the backend's WAL LSN (Log Sequence Number) without sending an extra query. ProxySQL gets it by patching its bundled copy of libpq (the PostgreSQL client C library) so the backend appends the LSN to the ReadyForQuery wire message. The same patch also carries the xact RFQ accessors used for transaction-split observation. This section goes through the whole patch, separates what the proxy actually uses from what is staged or accepted-but-unused, and covers the scripts that regenerate and verify the patch.
+1. **The compile toggle.** PolarDB routing, configuration, counters, startup negotiation, `W`, and patched-libpq calls are behind `POLARDB_PROXY`. Generic extended frame ownership, error boundaries, and RFQ sequencing are deliberately shared by both builds.
+2. **The libpq patch.** PolarDB read-your-writes consistency learns WAL LSN and transaction metadata from ReadyForQuery and can stage an in-band `W` with an extended command. This section defines the public ABI, fixed wire layout, and regeneration/verification workflow.
 
 ### 1.1 Terms used in this document (defined on first use)
 
@@ -22,7 +22,7 @@ This document explains two related things:
 | **RFQ (ReadyForQuery)** | The PostgreSQL wire-protocol message a backend sends after each command to say "ready for the next query". The PolarDB patch makes the backend append its current WAL LSN to this message. |
 | **libpq** | The official PostgreSQL client C library. ProxySQL bundles its own copy under `deps/postgresql/` and links against it to talk to PostgreSQL/PolarDB backends. |
 | **TU (translation unit)** | One `.cpp` source file compiled on its own into one object file. |
-| **`POLARDB_PROXY`** | The compile-time switch (a make variable and a C++ macro) that turns the whole PolarDB feature on or off. Default is on (`1`). |
+| **`POLARDB_PROXY`** | The compile-time switch controlling PolarDB-specific runtime surfaces. Default is on (`1`); generic extended-protocol correctness code is not controlled by it. |
 | **conninfo / startup packet** | The connection settings libpq sends to the backend when it opens a connection. The PolarDB params are added to these settings. |
 | **GUC** | "Grand Unified Configuration" variable — a PostgreSQL runtime setting changed with `SET name = value`. |
 
@@ -38,7 +38,7 @@ The whole PolarDB feature is enabled by a single make variable. Its default is *
 POLARDB_PROXY ?= 1
 ```
 
-This default lives in the top-level Makefile at `Makefile:149`, with a comment that explains the off case: building with `POLARDB_PROXY=0` compiles the PolarDB code to no-op stubs with "no behavior change vs upstream" (`Makefile:147-148`).
+This default lives in the top-level Makefile at `Makefile:150`. Building with `POLARDB_PROXY=0` removes PolarDB routing/configuration/counters/startup/`W`, links vanilla libpq, and keeps generic extended-protocol framing and error-boundary fixes shared. The contract is ordinary PostgreSQL behavioral compatibility, not source or binary identity with upstream.
 
 To compile the feature out, build with:
 
@@ -54,19 +54,19 @@ There are two compile stages that build PolarDB code, and each has the same smal
 
 | Stage | File:line | What it does |
 |---|---|---|
-| Library compile (`libproxysql.a`) | `lib/Makefile:56-59` | `ifeq ($(POLARDB_PROXY),1)` → set `PSQLPOLAR := -DPOLARDB_PROXY` |
+| Library compile (`libproxysql.a`) | `lib/Makefile:58-61` | `ifeq ($(POLARDB_PROXY),1)` → set `PSQLPOLAR := -DPOLARDB_PROXY` |
 | Binary compile (`proxysql`) | `src/Makefile:76-79` | `ifeq ($(POLARDB_PROXY),1)` → set `PSQLPOLAR := -DPOLARDB_PROXY` |
 
-In the library stage, `PSQLPOLAR` is added to the C++ flags at `lib/Makefile:100` (the `MYCXXFLAGS` line lists `$(PSQLPOLAR)` among the other feature flags). The same pattern wires it into the `src` stage flags.
+In the library stage, `PSQLPOLAR` is added to the C++ flags at `lib/Makefile:102` (the `MYCXXFLAGS` line lists `$(PSQLPOLAR)` among the other feature flags). The same pattern wires it into the `src` stage flags.
 
-There is also an optional verbose-trace switch. Setting `POLARDB_DEBUG=1` appends `-DPOLARDB_DEBUG=1` to the same `PSQLPOLAR` flags (`lib/Makefile:60-62`, `src/Makefile:80-82`). That only controls extra tracing (the `POLARDB_TRACE` macro); it does not change behavior and is independent of whether the feature itself is on. This document does not cover the trace output further.
+There is also an optional verbose-trace switch. Setting `POLARDB_DEBUG=1` appends `-DPOLARDB_DEBUG=1` to the same `PSQLPOLAR` flags (`lib/Makefile:62-64`, `src/Makefile:80-82`). That only controls extra tracing (the `POLARDB_TRACE` macro); it does not change behavior and is independent of whether the feature itself is on. This document does not cover the trace output further.
 
-Two additional **diagnostic** build flags exist, both **default off**, wired the same way in `lib/Makefile:63-68`:
+Two additional **diagnostic** build flags exist, both **default off**, wired the same way in `lib/Makefile:65-70`:
 
 | Flag | Make block | What it adds |
 |---|---|---|
-| `POLARDB_PROFILE=1` | `lib/Makefile:63-65` → `-DPOLARDB_PROFILE=1` | pool-lock and idle-ping timing counters, plus wrap/reader-acquire/split timing and reader-target / RFQ-candidate diagnostic breakdowns (the `POLARDB_PROFILE_*_COUNTER_LIST` sublists in `include/PgSQL_PolarDB_Counters.h`) |
-| `POLARDB_PERF_DEBUG=1` | `lib/Makefile:66-68` → `-DPOLARDB_PERF_DEBUG=1` | direct-frontend writev / plain-send byte/iov/packet histograms and writev skip-reason counters (the `POLARDB_PERF_DEBUG_*_COUNTER_LIST` sublist) |
+| `POLARDB_PROFILE=1` | `lib/Makefile:65-67` → `-DPOLARDB_PROFILE=1` | pool-lock and idle-ping timing counters, plus wrap/reader-acquire/split timing and reader-target / RFQ-candidate diagnostic breakdowns (the `POLARDB_PROFILE_*_COUNTER_LIST` sublists in `include/PgSQL_PolarDB_Counters.h`) |
+| `POLARDB_PERF_DEBUG=1` | `lib/Makefile:68-70` → `-DPOLARDB_PERF_DEBUG=1` | direct-frontend writev / plain-send byte/iov/packet histograms and writev skip-reason counters (the `POLARDB_PERF_DEBUG_*_COUNTER_LIST` sublist) |
 
 Neither flag is set in default or production builds, so their counters are compiled out unless you opt in. They only add observability; they do not change routing behavior. The counters each one adds are catalogued in [12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md) (profile / perf-debug diagnostic counters); the always-on counter surface is unaffected.
 
@@ -76,9 +76,9 @@ ProxySQL builds in three stages: `deps` (vendored libraries, including libpq), t
 
 | Forwarded into | File:line |
 |---|---|
-| `deps` (release / debug) | `Makefile:400`, `Makefile:404` |
-| `lib` (release / debug) | `Makefile:408`, `Makefile:412` |
-| `src` (release / debug) | `Makefile:416`, `Makefile:422` |
+| `deps` (release / debug) | `Makefile:413-419` |
+| `lib` (release / debug) | `Makefile:421-427` |
+| `src` (release / debug) | `Makefile:429-439` |
 
 Each of those lines passes `POLARDB_PROXY=$(POLARDB_PROXY)` so the value chosen at the top flows everywhere.
 
@@ -88,12 +88,12 @@ The top-level Makefile adds a few convenience targets:
 
 | Target | File:line | What it does |
 |---|---|---|
-| `polardb` | `Makefile:441-447` | Build the binary with `POLARDB_PROXY=1` (the release tier, optimized, no trace). The target is named `polardb` (comment at `Makefile:441-443`, recipe at `:444-447`). |
-| `polardb-debug` | `Makefile:432-439` | Build with `POLARDB_PROXY=1 POLARDB_DEBUG=1` (verbose PolarDB trace enabled). |
-| `polardb-check` | `Makefile:449-462` | Clean-build **both** tiers in sequence and leave the tree at `POLARDB_PROXY=1`. |
-| `polardb-libpq` | `Makefile:464-474` | Re-extract PostgreSQL, re-apply the libpq patch stack, rebuild libpq, build bundled PostgreSQL 16 pgbench, and build the PolarDB C helper tests. |
+| `polardb` | `Makefile:506-512` | Build the binary with `POLARDB_PROXY=1` (the release tier, optimized, no trace). |
+| `polardb-debug` | `Makefile:467-474` | Build with `POLARDB_PROXY=1 POLARDB_DEBUG=1` (verbose PolarDB trace enabled). |
+| `polardb-check` | `Makefile:707-716` | Clean-build **both** tiers in sequence and leave the tree at `POLARDB_PROXY=1`. |
+| `polardb-libpq` | `Makefile:723-727` | Re-extract PostgreSQL, re-apply the libpq patch stack, rebuild libpq, build bundled PostgreSQL 16 pgbench, and build the PolarDB C helper tests. |
 
-The `polardb-check` target is the one that exercises tier equivalence at the build level. It runs three clean builds: `POLARDB_PROXY=1`, then `POLARDB_PROXY=0` (described in the echo as "stubs"), then `POLARDB_PROXY=1` again to restore the working tree (`Makefile:453-461`). Each build is preceded by `make clean` so objects from one tier never leak into the other. It shows both tiers **compile and link**; it does not byte-compare the two binaries (see §4 for what equivalence is and is not).
+The `polardb-check` target is the one that exercises tier equivalence at the build level. It runs two clean builds: `POLARDB_PROXY=0`, then `POLARDB_PROXY=1` to leave the working tree at the PolarDB release variant (`Makefile:708-714`). Each build is preceded by `make clean` so objects from one tier never leak into the other. It shows both tiers **compile and link**; it does not byte-compare the two binaries (see §4 for what equivalence is and is not).
 
 ASCII view of the toggle wiring:
 
@@ -103,7 +103,7 @@ ASCII view of the toggle wiring:
         +-------------------------+-------------------------+
         |                         |                         |
      deps stage               lib stage                 src stage
-  (Makefile:400/404)      (Makefile:408/412)        (Makefile:416/422)
+  (Makefile:413-419)      (Makefile:421-427)        (Makefile:429-439)
         |                         |                         |
    deps/Makefile             lib/Makefile               src/Makefile
    :424 ifeq ==1             :57 ifeq ==1               :77 ifeq ==1
@@ -117,87 +117,62 @@ ASCII view of the toggle wiring:
 
 ## 3. How the code is controlled, and the empty stub TU
 
-### 3.1 Every declaration and every call site is protected
+### 3.1 PolarDB-specific declarations and calls are protected
 
-The feature uses **one** checking strategy everywhere: both the PolarDB **declarations** (types, struct members, method prototypes) and every core **call site** are wrapped in `#if POLARDB_PROXY`.
+PolarDB-specific declarations, state, and calls are wrapped in `#if POLARDB_PROXY`. The dedicated implementation files cover consistency, failure, flow, notices, protocol, ReaderPool, split, topology, and wrapper behavior; their PolarDB bodies compile only in the enabled tier.
 
-- The seven PolarDB feature source files check their **entire body**. With `POLARDB_PROXY=0` each one compiles to an empty object file:
+- PolarDB types and members in shared headers are guarded.
+- Core routing, connection, monitor, thread-variable, schema, counter, and startup-profile hooks guard their PolarDB calls.
+- The bundled libpq patch is applied only in the enabled build.
+- Generic `ExtendedQueryFrameState`, implicit-prepare lifecycle, frontend error/RFQ ownership, and related session handlers are intentionally always compiled. They solve PostgreSQL extended-protocol correctness independently of PolarDB and call no PolarDB symbol in the off build.
 
-| Feature TU | Whole-body check at | Lines |
-|---|---|---|
-| `lib/PgSQL_PolarDB.cpp` | `:17` | 359 |
-| `lib/PgSQL_PolarDB_Consistency.cpp` | `:35` | 276 |
-| `lib/PgSQL_PolarDB_Wrap.cpp` | `:48` | 559 |
-| `lib/PgSQL_PolarDB_Flow.cpp` | `:41` | 1951 |
-| `lib/PgSQL_PolarDB_Notices.cpp` | `:27` | 329 |
-| `lib/PgSQL_PolarDB_Failure.cpp` | `:39` | 1449 |
-| `lib/PgSQL_PolarDB_Split.cpp` | `:26` | 942 |
-
-- The PolarDB declarations in the shared headers (`include/PgSQL_PolarDB.h`, plus the PolarDB members added to `include/PgSQL_Session.h`, `include/PgSQL_Connection.h`, `include/PgSQL_HostGroups_Manager.h`) are themselves under `#if POLARDB_PROXY`. When the feature is off, the PolarDB types and the PolarDB struct members do not exist.
-- Every place in the always-compiled core (for example the route hook in `PgSQL_Session.cpp` and the connect/result-processing hooks in `PgSQL_Connection.cpp`) wraps its PolarDB calls in `#if POLARDB_PROXY` too, so those calls disappear when the feature is off.
-
-The list of files carrying `#if POLARDB_PROXY` and the exact hook lines are inventoried in [POLARDB_ARCHITECTURE.md](POLARDB_ARCHITECTURE.md) and [10-SESSION-INTEGRATION.md](10-SESSION-INTEGRATION.md) / [11-CONNECTION-AND-LIBPQ.md](11-CONNECTION-AND-LIBPQ.md). This document only needs the rule itself: **declarations and call sites are protected together.**
+The exact hook inventory is in [POLARDB_ARCHITECTURE.md](POLARDB_ARCHITECTURE.md), [10-SESSION-INTEGRATION.md](10-SESSION-INTEGRATION.md), and [11-CONNECTION-AND-LIBPQ.md](11-CONNECTION-AND-LIBPQ.md).
 
 ### 3.2 Why there is a stub TU, and why it is empty
 
-`lib/PgSQL_PolarDB_Stubs.cpp` is an eighth PolarDB source file. It is compiled in **both** tiers (it is listed in the always-built object list at `lib/Makefile:119`). Its job is to hold link-time **no-op stubs** for any PolarDB symbol that the always-compiled core might reference when the feature is off.
-
-The pattern such a stub file uses: if some core code calls a PolarDB function **without** wrapping the call in `#if POLARDB_PROXY`, then with `POLARDB_PROXY=0` the linker would still need a definition of that function or the binary would not link. The stub file would provide an empty (do-nothing) definition under `#if !POLARDB_PROXY`.
-
-In this tree that situation does not arise, because of the rule in §3.1: every call site is protected, so there is no unguarded reference left over when the feature is off. As a result the stub file's body is **intentionally empty**. Its whole active region is:
+`lib/PgSQL_PolarDB_Stubs.cpp` is compiled in both tiers. It is reserved for link-time no-op definitions if generic always-compiled code ever needs a PolarDB symbol in the off build. That situation does not arise today, so its active body is intentionally empty:
 
 ```cpp
 #if !POLARDB_PROXY
 
-// Intentionally empty: ... no always-compiled seam symbol that needs a link-time stub.
-
-#endif // !POLARDB_PROXY
+// No always-compiled seam symbol needs a link-time stub.
+#endif
 ```
 
-That check and comment are at `lib/PgSQL_PolarDB_Stubs.cpp:28-34`. The file's header comment (`:1-24`) states the contract in full: because both the declarations and every core call site are protected, the `POLARDB_PROXY=0` build has "no always-compiled seam symbol to stub today," and the build is meant to be byte-for-byte upstream non-PolarDB behavior.
+The file header states the actual contract: off mode has no PolarDB runtime surface and links vanilla libpq; generic extended-protocol correctness remains shared. This is behavioral compatibility, not byte identity.
 
-The header also records the **maintenance rule** for the future (`:18-23`): if a later commit ever adds an **unguarded** core reference to a PolarDB symbol, its no-op stub must be added to this file — and that stub must **not** name any PolarDB type, because PolarDB types are undeclared when `POLARDB_PROXY=0`.
+Maintenance rule: if generic code gains an unguarded PolarDB reference, either restore the guard or add a type-independent no-op definition here.
 
 ASCII view of the two tiers:
 
 ```
-POLARDB_PROXY=1  (feature ON)
-  PgSQL_PolarDB.cpp ............ full body compiles  (check #if at :17)
-  PgSQL_PolarDB_Consistency.cpp  full body           (:35)
-  PgSQL_PolarDB_Wrap.cpp ....... full body           (:48)
-  PgSQL_PolarDB_Flow.cpp ....... full body           (:41)
-  PgSQL_PolarDB_Notices.cpp .... full body           (:27)
-  PgSQL_PolarDB_Failure.cpp .... full body           (:39)
-  PgSQL_PolarDB_Split.cpp ...... full body           (:26)
-  PgSQL_PolarDB_Stubs.cpp ...... empty (#if !POLARDB_PROXY false)
-  headers ...................... PolarDB types + members declared
-  core hooks ................... PolarDB calls compiled in
+both tiers
+  generic extended frame/error/RFQ ownership ........ compiled
 
-POLARDB_PROXY=0  (feature OFF)
-  PgSQL_PolarDB*.cpp (the 7) ... compile to EMPTY objects
-  PgSQL_PolarDB_Stubs.cpp ...... still empty (nothing to stub)
-  headers ...................... PolarDB types + members NOT declared
-  core hooks ................... PolarDB calls compiled OUT
-  => intended result: upstream non-PolarDB ProxySQL
+POLARDB_PROXY=1
+  PolarDB routing/config/counters/startup/W .......... compiled
+  bundled libpq ...................................... PolarDB patch applied
+
+POLARDB_PROXY=0
+  PolarDB-specific runtime surface ................... absent
+  bundled libpq ...................................... vanilla
+  ordinary PostgreSQL protocol behavior .............. compatible, not byte-identical
 ```
 
 ---
 
-## 4. Both-tier equivalence is a design contract, not a tested fact
-
-The claim "a `POLARDB_PROXY=0` build is byte-equivalent to upstream non-PolarDB ProxySQL" is stated in the source itself (`lib/PgSQL_PolarDB_Stubs.cpp:17` and the surrounding header comment `:10-23`). It is worth being precise about what kind of claim this is.
+## 4. Off-build compatibility contract
 
 | Claim | Status |
 |---|---|
-| Every PolarDB declaration is `#if POLARDB_PROXY` protected | Design rule, visible in the headers and the stub TU comment. |
-| Every PolarDB call site in core code is `#if POLARDB_PROXY` protected | Design rule, stated in `Stubs.cpp:10-15`. |
-| The stub TU is empty because there is no unguarded seam to stub | True in this tree (`Stubs.cpp:28-34`); verified by reading the file. |
-| Both tiers **compile and link** | Checked structurally by the `polardb-check` target (`Makefile:449-462`); it clean-builds both. |
-| The `POLARDB_PROXY=0` binary is **byte-for-byte** identical to upstream | **Stated as a design contract, NOT build/diff-tested.** No step in this tree compiles both and byte-compares the outputs, and no CI job records such a comparison. |
+| PolarDB routing, configuration, counters, startup profiles, and `W` are absent | Source/preprocessor contract. |
+| Bundled libpq is vanilla | `deps/Makefile` skips the PolarDB patch when the flag is off. |
+| Generic extended frame/error/RFQ fixes remain | Intentional shared correctness behavior. |
+| Both tiers compile and link from clean state | Checked by `make polardb-check`. |
+| Ordinary PostgreSQL behavior remains compatible | Required behavioral contract; focused off-mode protocol tests should cover it. |
+| Binary byte identity with upstream | **Not claimed.** Shared generic fixes make that claim false even when PolarDB functionality is absent. |
 
-So: the **mechanism** for equivalence (everything `#if`-protected plus an empty stub TU) is real and verifiable from source. The **byte-for-byte result** is a contract the code asserts, not something confirmed by a build-and-diff in this tree. A maintainer who needs byte-equivalence as a hard fact should build both tiers and diff the binaries; the foundation analysis explicitly did not do that build/diff.
-
-Also note: §3.2's "intentionally empty" is true **today**. If a future change introduces an unguarded core reference, the stub file would gain content and the off-tier would differ from a pristine upstream by exactly those no-op stubs — still functionally equivalent, but no longer literally byte-identical. The contract is written to keep that from happening silently.
+Release qualification must therefore use clean dual builds and behavioral protocol tests, not binary comparison.
 
 ---
 
@@ -219,16 +194,18 @@ The upstream patch chain that runs before it (in order) is, per `deps/Makefile`:
 
 ### 5.2 What the patch changes (file by file)
 
-The patch touches six libpq files. The table summarizes each; the detailed description follows.
+The patch touches eight libpq files. The table summarizes each; the detailed description follows.
 
 | libpq file patched | What the patch adds | Patch lines |
 |---|---|---|
-| `exports.txt` | Exports 7 new public functions as ordinals 188-194 | `:1-14` |
-| `libpq-fe.h` | `#include <stdint.h>`; declares the LSN and xact RFQ functions | `:346-371` |
-| `libpq-int.h` | New fields on `struct pg_conn`: runtime LSN state, runtime xact RFQ state, and 13 conninfo option strings | `:374-405` |
-| `fe-connect.c` | Registers the 13 conninfo options; converts send-LSN/send-xact strings to bools; frees new strings/state; writes params into the startup packet | `:17-126`, `:302-333` |
-| `fe-exec.c` | Adds the row-run accessors (`PSpeekRowRun`/`PSrowRunPending`/`PSadvanceInput`/`PSdetachRowRun`) | `:209-238` |
-| `fe-protocol3.c` | The core change: `getReadyForQuery()` reads the LSN appended to RFQ, optionally parses xact markers/XIDs, and skips any trailing bytes | `:207-298` |
+| `exports.txt` | Exports 10 PolarDB APIs at ordinals 188-194 and 199-201, plus four row-run helpers at 195-198 | patch header |
+| `libpq-fe.h` | Declares the row-run, RFQ LSN/xact, and compound `W` send APIs | public declarations near the end of the header |
+| `libpq-int.h` | Adds runtime RFQ state, startup option strings, and output-buffer checkpoint helpers | `struct pg_conn` and internal declarations |
+| `fe-connect.c` | Registers the 13 conninfo options; converts send-LSN/send-xact strings to bools; frees new strings/state; writes params into the startup packet | startup option handling |
+| `fe-exec.c` | Implements the LSN/xact accessors, row-run helpers, and atomic `W` + Parse/Bind/Execute send paths | query-send and result helpers |
+| `fe-misc.c` | Adds no-auto-flush message completion and output-buffer checkpoint/restore support for compound sends | output-buffer helpers |
+| `fe-protocol3.c` | Parses RFQ LSN/xact metadata, recognizes `W` pipeline results, and skips trailing RFQ bytes | protocol parser |
+| `fe-trace.c` | Decodes the fixed-size `W` message for libpq tracing | trace decoder |
 
 ### 5.3 The public functions
 
@@ -249,13 +226,38 @@ It also exports four transaction-split RFQ helpers used by the transaction-split
 | `PQisXactWalPending` | `int PQisXactWalPending(const PGconn*)` | Whether the backend supplied XIDs but WAL is not safe for replica split yet (`'w'` marker) | reads `polar_xact_wal_pending` | `:188-195` |
 | `PQsetPolarSendXact` | `void PQsetPolarSendXact(PGconn*, int enable)` | Turn the runtime flag that makes the RFQ parser look for xact metadata on/off | writes `polar_proxy_send_xact` | `:197-203` |
 
+Three additional APIs stage a versioned `W` wait message together with the
+extended-protocol operation that consumes its confirmation. They preserve normal
+libpq nonblocking semantics and publish the compound command with one flush:
+
+| Function | Operation composed after `W` | Export ordinal |
+|---|---|---|
+| `PQsendQueryParamsPolarWait(...)` | unnamed Parse + Bind + Describe + Execute | 199 |
+| `PQsendPreparePolarWait(...)` | Parse | 200 |
+| `PQsendQueryPreparedPolarWait(...)` | Bind + Describe + Execute | 201 |
+
+#### Authoritative `W` wire layout
+
+After the standard frontend type byte `W` and four-byte length, the payload is exactly:
+
+| Offset in payload | Width | Field | Required value/encoding |
+|---:|---:|---|---|
+| 0 | 1 | version | `1` |
+| 1 | 1 | consistency mode | `PQ_POLAR_CONSISTENCY_BEST_EFFORT` or `PQ_POLAR_CONSISTENCY_STRICT` |
+| 2 | 2 | flags | `0`, network byte order |
+| 4 | 4 | timeout_ms | unsigned 32-bit, network byte order; `0` means no PolarDB wait deadline |
+| 8 | 8 | target_lsn | nonzero unsigned 64-bit, high word then low word in network byte order |
+
+The payload is 16 bytes and the protocol length field is 20 (length field plus payload). The target begins at a wire offset that must not be read through an alignment-dependent cast; the server decoder uses message accessors that copy and convert it. `W` is accepted only after startup negotiation of `_pq_.polar_proxy_wait_v1=1`. That startup field is capability metadata, not cryptographic proxy authentication, so direct backend access still requires network and HBA restrictions.
+
 The header also adds `#include <stdint.h>` so `uint64_t` is available (`:236`). It is `<stdint.h>` (the C header), **not** `<cstdint>`, because `libpq-fe.h` is a C header used by C code.
 
 How ProxySQL uses these (the proxy side, not the patch):
 
-- After a successful connect to a PolarDB hostgroup, ProxySQL calls `PQsetPolarSendLSN(pgsql_conn, 1)` to enable LSN parsing for that connection. The enabling function `polardb_init_connection_tracking()` is **defined** at `lib/PgSQL_Connection.cpp:1882`, and the `PQsetPolarSendLSN(pgsql_conn, 1)` **call** is at `lib/PgSQL_Connection.cpp:1887`. (These are two different lines: `:1882` is the function, `:1887` is the call inside it.) The function only enables LSN parsing when this connection's startup profile requested RFQ LSN (`:1886`).
-- On the response path, ProxySQL reads the LSN with no extra round-trip via `PgSQL_Connection::get_polardb_lsn()` (`lib/PgSQL_Connection.cpp:1897-1908`), which calls `PQhasLSN()` then `PQgetLSN()` (`:1903-1904`).
-- The xact helpers back the active transaction-split path: ProxySQL calls `PQsetPolarSendXact` / `PQgetXactSplitXids` / `PQisXactSplittable` / `PQisXactWalPending` (`lib/PgSQL_Connection.cpp:1890-1941`) when `txn_split_enabled=1`.
+- After a successful connect, `polardb_enable_requested_rfq_parsing()` enables exactly the RFQ payloads negotiated by the connection startup profile (`lib/PgSQL_Connection.cpp:2057-2067`); the `PQsetPolarSendLSN()` call is at `:2062`.
+- On the response path, `PgSQL_Connection::get_polardb_lsn()` reads the cached RFQ value with no extra round-trip (`lib/PgSQL_Connection.cpp:2072-2082`); `PQhasLSN()` and `PQgetLSN()` are called at `:2078-2079`.
+- The xact helpers back the transaction-split path through the accessors at `lib/PgSQL_Connection.cpp:2096-2116`.
+- The three `PQsend*PolarWait` APIs are selected only for negotiated `v15_wait` connections; they append `W` immediately before the semantic extended-protocol operation without adding a network round trip.
 
 The full connection/result-processing integration is in [11-CONNECTION-AND-LIBPQ.md](11-CONNECTION-AND-LIBPQ.md) and [09-PUBLISH-AND-WRITE-TRACKING.md](09-PUBLISH-AND-WRITE-TRACKING.md).
 
@@ -342,15 +344,16 @@ The patch is broad on purpose: it **accepts** all 13 startup params and both spe
 | `_polar_send_xact` / `_polar_proxy_send_xact` | YES — converted to `polar_proxy_send_xact`, which controls the RFQ xact marker/XID parse. ProxySQL emits it for every non-`off` PolarDB profile; `txn_split_enabled` decides whether result processing observes it for split routing. |
 | The other 9 option strings | NO — they are written verbatim into the startup packet and never read back by libpq. They exist so a PolarDB backend can read them server-side. |
 
-**What this implementation actually emits** when connecting to a PolarDB backend is profile-driven. The function that writes the params is `PgSQL_Connection::append_polardb_startup_params()` (`lib/PgSQL_Connection.cpp:1809-1877`), called from the connect path after it resolves the per-hostgroup/global `proxy_protocol` startup profile:
+**What this implementation actually emits** when connecting to a PolarDB backend is profile-driven. The function that writes the params is `PgSQL_Connection::polardb_append_startup_params()` (`lib/PgSQL_Connection.cpp:1963-2052`), called from the connect path after it resolves the per-hostgroup/global `proxy_protocol` startup profile:
 
 | Param | Accepted by the patch | Emitted by this tree | Note |
 |---|---|---|---|
-| `_polar_send_lsn=true` | yes | **YES**, when effective protocol is `legacy` (`PgSQL_Connection.cpp:1868`) | Requests RFQ LSN using the legacy startup dialect. |
-| `_polar_origin_client_ip` | yes | **YES**, when effective protocol is `legacy` (`:1865`) | Client/fallback identity passthrough. |
-| `_polar_origin_client_port` | yes | **YES**, when effective protocol is `legacy` (`:1866`) | Client/fallback identity passthrough. |
-| `_polar_proxy_send_lsn=true` (PG15 alias) | yes | **YES**, when effective protocol is `v15` (`:1856`) | Requests RFQ LSN using the v15 startup dialect. |
-| `_polar_proxy_client_host` / `_polar_proxy_client_port` | yes | **YES**, when effective protocol is `v15` (`:1853-1854`) | Client/fallback identity passthrough using v15 names. |
+| `_polar_send_lsn=true` | yes | **YES**, when effective protocol is `legacy` (`PgSQL_Connection.cpp:2039-2044`) | Requests RFQ LSN using the legacy startup dialect. |
+| `_polar_origin_client_ip` | yes | **YES**, when effective protocol is `legacy` (`:2040`) | Client/fallback identity passthrough. |
+| `_polar_origin_client_port` | yes | **YES**, when effective protocol is `legacy` (`:2041`) | Client/fallback identity passthrough. |
+| `_polar_proxy_send_lsn=true` (PG15 alias) | yes | **YES**, when effective protocol is `v15` or `v15_wait` (`:2023-2029`) | Requests RFQ LSN using the v15 startup dialect. |
+| `_polar_proxy_client_host` / `_polar_proxy_client_port` | yes | **YES**, when effective protocol is `v15` or `v15_wait` (`:2025-2026`) | Client/fallback identity passthrough using v15 names. |
+| `_pq_.polar_proxy_wait_v1=1` | yes | **YES**, only for `v15_wait` (`:2033-2034`) | Negotiates server acceptance of the `W` message. |
 | `_polar_send_xact=true` / `_polar_proxy_send_xact=true` | yes | when effective protocol is `legacy` or `v15` | Requests transaction-split RFQ evidence at startup; `txn_split_enabled` controls its use in planning and split-read dispatch. |
 | `_polar_proxy_session_id` / `_polar_proxy_cancel_key` | yes | no | Cancel-routing metadata; unused here. |
 | `_polar_proxy_use_ssl` / `_polar_proxy_ssl_version` / `_polar_proxy_ssl_cipher_name` | yes | no | SSL passthrough metadata; unused here. |
@@ -370,7 +373,7 @@ for completeness and tracked in
   but never emitted by ProxySQL here; a future PolarDB15 cancel-session
   extension should add the session state, generators, startup emission, cancel
   request flow, tests, and docs together.
-- The **DEFERRED** lag item elsewhere in the feature is the admin knob `pgsql-polardb_lag_ms`: it has no producer today and accepts only `0`. `PolarDB_LSN_Stale_Count` is active for the separate byte-lag safety path when `max_lag_bytes` is enabled. Neither item is part of the build/libpq surface; details are in [04-ADMIN-SCHEMA-AND-CONFIG.md](04-ADMIN-SCHEMA-AND-CONFIG.md), [12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md), and [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md).
+- The **DEFERRED** lag item elsewhere in the feature is the admin knob `pgsql-polardb_max_reader_lag_ms`: it has no producer today and accepts only `0`. `PolarDB_LSN_Stale_Count` is active for the separate byte-lag safety path when `max_lag_bytes` is enabled. Neither item is part of the build/libpq surface; details are in [04-ADMIN-SCHEMA-AND-CONFIG.md](04-ADMIN-SCHEMA-AND-CONFIG.md), [12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md), and [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md).
 
 ---
 
@@ -407,11 +410,11 @@ scripts/regenerate-polardb-libpq-patch.sh --verify
 
 The wrapper builds the same upstream-patched PostgreSQL baseline as the verifier, diffs that baseline against the current expanded `deps/postgresql/postgresql` libpq files, replaces `deps/postgresql/polardb_libpq.patch`, and optionally runs the verifier. Use this after editing the expanded vendored libpq files; do not hand-maintain patch hunks.
 
-The `polardb-libpq` make target (`Makefile:464-474`) is the rebuild path:
+The `polardb-libpq` make target (`Makefile:723-727`) is the rebuild path:
 
-1. Remove the previously extracted PostgreSQL tree (`Makefile:469`).
-2. Rebuild `postgresql` with `POLARDB_PROXY=1`, which re-extracts the tarball and re-applies the whole patch chain including the PolarDB patch (`Makefile:470`; the patch application itself is `deps/Makefile:425`).
-3. Build bundled PostgreSQL 16 pgbench and the PolarDB C helper tests (`Makefile:470-471`), then print the `test/polardb/Makefile` run targets for live-cluster execution (`Makefile:473-476`).
+1. Remove the previously extracted PostgreSQL tree (`Makefile:724`).
+2. Rebuild `postgresql` with `POLARDB_PROXY=1`, which re-extracts the tarball and re-applies the whole patch chain including the PolarDB patch (`Makefile:725`; the patch application itself is `deps/Makefile:425`).
+3. Build bundled PostgreSQL 16 pgbench and the PolarDB C helper tests (`Makefile:725-726`), then print the `test/polardb/Makefile` run targets for live-cluster execution (`Makefile:727-732`).
 
 The C helpers it builds include `test/polardb/bin/libpq_lsn_test`, `test/polardb/bin/libpq_xact_test`, and `test/polardb/bin/proxysql_extended_protocol_test` (compiled from `test/polardb/test-c/*.c`, linked against the patched `-lpq`). The direct libpq helpers exercise the new libpq functions against a real PolarDB cluster using the `POLARDB_*` environment variables. The test details are in [16-TESTING-AND-VALIDATION.md](16-TESTING-AND-VALIDATION.md).
 
@@ -419,9 +422,9 @@ ASCII view of patch verify vs rebuild:
 
 ```
 verify (manual, not in CI):                 rebuild (make polardb-libpq):
-  scripts/verify-polardb-libpq-lsn-patch.sh    Makefile:464-474
-    extract tarball                              rm extracted tree (:469)
-    apply 6 upstream patches (:64-70)            make -C deps POLARDB_PROXY=1 postgresql (:470)
+  scripts/verify-polardb-libpq-lsn-patch.sh    Makefile:723-727
+    extract tarball                              rm extracted tree (:724)
+    apply 6 upstream patches (:64-70)            make -C deps POLARDB_PROXY=1 postgresql (:725)
     dry-run + real-apply PolarDB patch             -> re-applies whole chain
        must be zero fuzz/offset (:77-96)            incl. polardb_libpq.patch (deps/Makefile:425)
     CSN rejected; LSN/xact tokens required       build bundled pgbench + test helpers (:470-471)
@@ -449,8 +452,8 @@ verify (manual, not in CI):                 rebuild (make polardb-libpq):
 
 The read-your-writes guarantee depends on the LSN arriving on RFQ, which only happens with the patched libpq. The build wiring makes this exact:
 
-- With `POLARDB_PROXY=1`, the patch is applied (`deps/Makefile:424-426`) and the proxy enables LSN parsing per PolarDB connection (`PgSQL_Connection.cpp:1887`).
-- With `POLARDB_PROXY=0`, the `ifeq` check skips the patch (`deps/Makefile:424-426`), so libpq is **vanilla** and has no PolarDB LSN/xact API and no RFQ parsing extension. The whole feature is compiled out anyway.
+- With `POLARDB_PROXY=1`, the patch is applied (`deps/Makefile:424-426`) and the proxy enables requested LSN parsing per PolarDB connection (`PgSQL_Connection.cpp:2057-2063`).
+- With `POLARDB_PROXY=0`, the `ifeq` check skips the patch (`deps/Makefile:424-426`), so libpq is vanilla and has no PolarDB LSN/xact/`W` API or RFQ parsing extension. Generic extended-protocol correctness remains compiled in but cannot enter PolarDB routing.
 
 There is no middle state in a normal build: you cannot get the PolarDB C++ code without the patched libpq, because both are enabled by the same `POLARDB_PROXY` switch and built from the same tree. The operational consequence — what RYW needs at deploy time (a genuine PolarDB backend plus this patched libpq) and what happens without it — is covered in [17-OPERATOR-GUIDE.md](17-OPERATOR-GUIDE.md) and [14-INVARIANTS-AND-FAILURE-MODES.md](14-INVARIANTS-AND-FAILURE-MODES.md).
 
@@ -462,20 +465,20 @@ There is no middle state in a normal build: you cannot get the PolarDB C++ code 
 |---|---|
 | Toggle default (`POLARDB_PROXY ?= 1`) | `Makefile:149` |
 | `-DPOLARDB_PROXY` define (lib / src) | `lib/Makefile:57-58`, `src/Makefile:77-78` |
-| Flag forwarded to deps/lib/src | `Makefile:400-422` |
-| `polardb-check` (both tiers, clean) | `Makefile:449-462` |
+| Flag forwarded to deps/lib/src | `Makefile:413-439` |
+| `polardb-check` (both tiers, clean) | `Makefile:707-716` |
 | Stub TU, intentionally empty | `lib/PgSQL_PolarDB_Stubs.cpp:28-34` (contract `:10-23`) |
-| Stub TU in always-built object list | `lib/Makefile:119` |
+| Stub TU in always-built object list | `lib/Makefile:121` |
 | Byte-equivalence stated as contract | `lib/PgSQL_PolarDB_Stubs.cpp:17` |
 | Patch applied last, only if on | `deps/Makefile:424-426` |
-| 7 new libpq functions exported | LSN functions are active; xact functions back the active transaction split |
+| 10 PolarDB libpq APIs exported | 7 RFQ LSN/xact APIs at 188-194 and 3 compound `W` send APIs at 199-201; row-run helpers occupy 195-198 |
 | New `pg_conn` fields | patch `:256-279` |
 | RFQ LSN parse + skip-remaining | patch `:146-191` (skip `:185-186`) |
-| Proxy emits one LSN/identity dialect of 13 params | `lib/PgSQL_Connection.cpp:1809` |
-| `PQsetPolarSendLSN` definition vs call | def `lib/PgSQL_Connection.cpp:1882`, call `:1887` |
-| `get_polardb_lsn()` uses `PQhasLSN`/`PQgetLSN` | `lib/PgSQL_Connection.cpp:1903-1904` |
+| Proxy emits one profile-selected startup dialect | `lib/PgSQL_Connection.cpp:1963-2052` |
+| `PQsetPolarSendLSN` connection call | `lib/PgSQL_Connection.cpp:2062` |
+| `get_polardb_lsn()` uses `PQhasLSN`/`PQgetLSN` | `lib/PgSQL_Connection.cpp:2078-2079` |
 | Patch verify script | `scripts/verify-polardb-libpq-lsn-patch.sh` (not wired into any build/CI) |
-| Patch rebuild target | `Makefile:464-474` |
+| Patch rebuild target | `Makefile:723-727` |
 
 ---
 
@@ -485,9 +488,9 @@ There is no middle state in a normal build: you cannot get the PolarDB C++ code 
 
 ```mermaid
 flowchart TD
-  A["make POLARDB_PROXY=0|1<br/>default 1 (Makefile:149)"] --> B["deps stage<br/>(Makefile:400/404)"]
-  A --> C["lib stage<br/>(Makefile:408/412)"]
-  A --> D["src stage<br/>(Makefile:416/422)"]
+  A["make POLARDB_PROXY=0|1<br/>default 1 (Makefile:149)"] --> B["deps stage<br/>(Makefile:413-419)"]
+  A --> C["lib stage<br/>(Makefile:421-427)"]
+  A --> D["src stage<br/>(Makefile:429-439)"]
   B --> B1["deps/Makefile:424 ifeq ==1<br/>apply libpq patch (:425)"]
   C --> C1["lib/Makefile:57 ifeq ==1<br/>-DPOLARDB_PROXY"]
   D --> D1["src/Makefile:77 ifeq ==1<br/>-DPOLARDB_PROXY"]
@@ -539,10 +542,10 @@ flowchart LR
     V3 --> V4["CSN rejected<br/>LSN/xact tokens required"]
     V4 --> V5["PASS / FAIL (:108-109)"]
   end
-  subgraph R["make polardb-libpq (Makefile:464-474)"]
-    R1["rm extracted tree (:469)"] --> R2["make -C deps POLARDB_PROXY=1 postgresql (:470)<br/>re-applies chain incl. polardb_libpq.patch"]
-    R2 --> R3["build bundled pgbench + test helpers (:470-471)"]
-    R3 --> R4["print test/polardb make targets (:473-476)"]
+  subgraph R["make polardb-libpq (Makefile:723-727)"]
+    R1["rm extracted tree (:724)"] --> R2["make -C deps POLARDB_PROXY=1 postgresql (:725)<br/>re-applies chain incl. polardb_libpq.patch"]
+    R2 --> R3["build bundled pgbench + test helpers (:725-726)"]
+    R3 --> R4["print test/polardb make targets (:727-732)"]
   end
 ```
 

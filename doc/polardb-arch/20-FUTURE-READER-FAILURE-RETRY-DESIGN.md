@@ -44,7 +44,7 @@ When a read that ProxySQL **offloaded to a replica** fails, the proxy must decid
 | **rc == -1** | The session handler's "the backend query failed" branch (full implementation `lib/PgSQL_Session.cpp:4061` onward). This is the single seam the feature hooks. |
 | **RFQ** (ReadyForQuery) | The PostgreSQL wire message a backend sends after a command. It carries a transaction-status byte. |
 | **RFQ('T') / RFQ('E') / RFQ('I')** | The transaction-status byte in RFQ: `'T'` = the client is in a live transaction; `'E'` = the transaction is in PostgreSQL's aborted state; `'I'` = idle (no transaction). The proxy must send the **truthful** byte. |
-| **tx_poisoned** | An existing session flag in this implementation and upstream. When a backend dies mid-transaction, the proxy synthesizes `ERROR 25P02` (current transaction is aborted) + `RFQ('E')` and keeps the client alive so it can `ROLLBACK`. **Shared base; reused unchanged by this feature.** |
+| **tx_poisoned** | An existing session flag in this implementation and upstream. When a backend dies mid-transaction, the proxy synthesizes `ERROR 25P02` (current transaction is aborted) and keeps the client alive so it can `ROLLBACK`. Simple protocol emits `RFQ('E')` with that response; extended protocol defers its single `RFQ('E')` to the client's `Sync`. The shared poison state is retained, but response ownership is integrated with the extended-frame boundary. |
 | **reusable** | `is_connection_in_reusable_state()` = `!(PQTRANS_UNKNOWN || PQTRANS_ACTIVE)`. It is the **death-vs-error discriminator**: a connection **death** maps to *not reusable*; a plain **SQL error** or a **strict wait-timeout** maps to *reusable* (full implementation `lib/PgSQL_Connection.cpp:2178`). |
 | **writer-only route** | Session state set after one reader failure that forces the **rest of the transaction** onto the writer. |
 | **25P02** | The PostgreSQL SQLSTATE `ERRCODE_IN_FAILED_SQL_TRANSACTION` ("current transaction is aborted"). Used **only** by the writer-loss poison path, never by reader recovery (constant at full implementation `include/PgSQL_Error_Helper.h:506`; this implementation `include/PgSQL_Error_Helper.h:506`). |
@@ -178,7 +178,7 @@ session reset, inside `polardb_clear_txn_xid_state`.
 
 The action reason `READER_FAILURE_FORCE_WRITER` lives alongside the existing
 LSN-policy reasons (`WRITE_LSN_UNKNOWN`, `OBSERVED_LSN_UNKNOWN`, and
-`PRIMARY_LSN_UNKNOWN`) and records the writer-only-route override in traces/counters.
+`GROUP_LSN_UNKNOWN`) and records the writer-only-route override in traces/counters.
 
 ---
 
@@ -234,7 +234,7 @@ build the failure view   (polardb_reader_failure_view, Failure.cpp:185)
 not a PolarDB reader op?  -> return PASSTHROUGH         (leaves the connection LIVE for upstream)
         |
         v
-record the existing split / wait error stats           (timeout classification by raw error text)
+classify structured LSN wait evidence and record stats (exact DETAIL + source function)
         |
         v
 resolve the WRITER STATE  (LIVE / NOT_STARTED / LOST)   (polardb_resolve_writer_state, Failure.cpp:248)
@@ -340,27 +340,24 @@ non-overlapping: `split_reads_fallback` means a split read was never dispatched,
 `split_reads_forwarded` means the real reader error was forwarded, and
 `reader_terminations` means the session was closed.
 
-> **Reminder on counters in this implementation.** The current stat surface is generated from `include/PgSQL_PolarDB_Counters.h`; `polardb_active` is an internal enabled check, not an exported counter. The deferred millisecond-lag knob (`pgsql-polardb_lag_ms`) and the byte-lag stale-sample counter (`PolarDB_LSN_Stale_Count`) are unrelated to this feature; see [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md).
+> **Reminder on counters in this implementation.** The current stat surface is generated from `include/PgSQL_PolarDB_Counters.h`; `polardb_active` is an internal enabled check, not an exported counter. The deferred millisecond-lag knob (`pgsql-polardb_max_reader_lag_ms`) and the byte-lag stale-sample counter (`PolarDB_LSN_Stale_Count`) are unrelated to this feature; see [15-LIMITATIONS-AND-ROADMAP.md](15-LIMITATIONS-AND-ROADMAP.md).
 
 ### 9.4 Hooks in this implementation that this feature extends (already present in this implementation / upstream)
 
 | Existing hook | What this feature does to it |
 |---|---|
 | the `rc == -1` handler branch | adds the `polardb_capture_outcome` + `polardb_on_failure` dispatch above the upstream retry logic |
-| the `tx_poisoned` writer-loss poison (`handler_minus1_PoisonTransaction`) + recovery (`handler_poisoned_simple_query`) | **reused unchanged**, plus one protected `polardb_cleanup_txn_split_state()` call on the poison path (full implementation `lib/PgSQL_Session.cpp:3044`, inside `#if POLARDB_PROXY`) for when the writer dies while holding an open split |
+| the `tx_poisoned` writer-loss poison (`handler_minus1_PoisonTransaction`) + recovery (`handler_poisoned_simple_query`) | reuses the shared poison state and recovery, integrates extended ErrorResponse/RFQ ownership with the frame boundary, and runs protected PolarDB split cleanup when the writer dies while holding an open split |
 | the `reusable` discriminator (`is_connection_in_reusable_state`) | reused as the death-vs-error classifier |
 | the qpo handler and the PolarDB planner / `RouteActionReason` | extended with the writer-only route override and the new action reason |
 
 ---
 
-## 10. CSN note (scope boundary)
+## 10. Wait-timeout evidence and CSN boundary
 
-The reader-failure model handles **both** LSN-wait and CSN-wait timeouts in its timeout classification (it matches `"LSN wait timeout"` / `"polar_wait_lsn timeout"` and `"CSN wait timeout"` / `"polar_wait_csn timeout"` in the raw backend error text — full implementation `lib/PgSQL_PolarDB_Failure.cpp:64-67` and `:117-143`). However:
+The current model recognizes only a PolarDB LSN wait timeout carrying both pieces of structured provenance: `PG_DIAG_MESSAGE_DETAIL=polar_proxy_lsn_wait_timeout` and source function `polar_proxy_wait_for_lsn`. Human-readable error text is never sufficient. A `57014` without that marker is cancellation or `statement_timeout`; it is forwarded and is never replayed on the writer.
 
-- **CSN itself is a separate future feature, and it is incomplete and experimental.** CSN (Commit Sequence Number, a global per-commit counter) requires PolarDB backend support, applies only in global-consistency mode, and its wait behavior is **not reliably verified**. Several CSN paths in the full implementation are explicit no-ops today. See [18-FUTURE-CSN-DESIGN.md](18-FUTURE-CSN-DESIGN.md) and mark CSN experimental wherever it appears.
-- This document's reader-failure logic does not depend on CSN being complete. The CSN-timeout branch is simply already wired so that, once CSN lands, a CSN-wait timeout on a replica is recovered the same way an LSN-wait timeout is.
-
-So: the reader-failure model is **LSN-first** in practice (the only wait type this implementation produces), with CSN-timeout handling **pre-wired but inert** until the experimental CSN feature is finished.
+CSN timeout handling is not wired in this branch. CSN remains a separate, incomplete, experimental feature that needs its own structured marker, server contract, policy tests, and runtime validation before it can enter this classifier. See [18-FUTURE-CSN-DESIGN.md](18-FUTURE-CSN-DESIGN.md).
 
 ---
 
@@ -372,7 +369,7 @@ So: the reader-failure model is **LSN-first** in practice (the only wait type th
 | `rc == -1` has a common reader-failure hook for wait reads and split reads | Future policy tables can refine the current action knobs by failure class and retry budget |
 | RETRY/FORWARD/TERMINATE are implemented for the active wait/split paths | Future reader circuit-breakers can feed failure history back into reader selection |
 | `RouteActionReason` includes reader-failure and split rejection reasons | Future routing can add richer reasons only when they are visible in traces/counters |
-| `tx_poisoned` writer-loss poison + recovery exist as the shared base: the poison-set helper `handler_minus1_PoisonTransaction` (this implementation `lib/PgSQL_Session.cpp:2838`, called at `:2940` and `:3012`), the recovery helper `handler_poisoned_simple_query` (this implementation `:480`), the shared wire-write helper `write_tx_poisoned_error` (this implementation `:130`), and the reset clear (this implementation `:399`) | **reused unchanged**, plus one protected `polardb_cleanup_txn_split_state()` on the poison path |
+| `tx_poisoned` writer-loss poison + recovery remain the shared base; extended frames use the same poison transition but retain RFQ ownership until client Sync | one protected `polardb_cleanup_txn_split_state()` also runs on the PolarDB poison path |
 | Reader-failure knobs and counters are active | Future additions should keep the shared counter metadata and trace taxonomy non-overlapping |
 
 **Scope caveat for manually-routed extended-protocol reads.** The "no orphaned writer" guarantee holds only for reads routed by the **PolarDB pipeline** on the simple-query protocol (the `'Q'` message). A read manually routed to a replica by a query rule on the **extended protocol** inside a transaction **bypasses** the pipeline; the failure of its first statement is a documented follow-up, not covered by this model (design reference `doc/polardb-arch/23-READ-SIDE-FAILURE-RECOVERY.md:359` (full implementation)).
@@ -389,8 +386,8 @@ and simple-query transaction-split reads in this branch.
 
 ```
 1. client (in txn) issues a read; pipeline offloads it to a replica with a wait wrapper
-2. replica wait times out strictly -> backend ErrorResponse "LSN wait timeout"; reusable=true; rc==-1
-3. polardb_capture_outcome: reusable=true, result_started=false, err="LSN wait timeout" -> is_timeout=true
+2. replica wait times out strictly -> ErrorResponse SQLSTATE 57014 with DETAIL `polar_proxy_lsn_wait_timeout` and source `polar_proxy_wait_for_lsn`; reusable=true; rc==-1
+3. polardb_capture_outcome: reusable=true, no result started, exact structured marker present -> is_timeout=true
 4. polardb_on_failure:
       writer state = LIVE  (a connected writer holds the txn)
       knob = reader_timeout_action = RETRY (default)
@@ -436,9 +433,11 @@ RESULT: PostgreSQL rolls back the dead writer's txn on disconnect. No orphan. No
 2. polardb_on_failure is for READER failures: this is the writer, so the failure view has
    neither split_read nor wait_read -> returns PASSTHROUGH
 3. control falls through to the existing upstream rc==-1 handling
-4. tx_poisoned path: handler_minus1_PoisonTransaction synthesizes ERROR 25P02 + RFQ('E');
+4. tx_poisoned path: handler_minus1_PoisonTransaction synthesizes ERROR 25P02;
+   Simple protocol also emits RFQ('E'), while extended protocol waits for client Sync;
    one protected polardb_cleanup_txn_split_state() also runs on the PolarDB path
-RESULT: the client gets 25P02 + RFQ('E') and stays alive to ROLLBACK. This is the ONLY fabricated
+RESULT: the client gets 25P02 and exactly one RFQ('E') at its protocol boundary, and stays alive
+        to ROLLBACK. This is the ONLY fabricated
         transaction control, and it is reached only by the writer's own death.
 ```
 
@@ -462,9 +461,9 @@ RESULT: the client gets 25P02 + RFQ('E') and stays alive to ROLLBACK. This is th
 | Item | Status |
 |---|---|
 | Reader-failure recovery (RETRY / FORWARD / TERMINATE) | **Active** for autocommit wait reads and simple-query transaction-split reads. |
-| Writer-loss poison (`tx_poisoned`) | **Present** as the shared base; reused unchanged. A reader failure never reaches it. |
+| Writer-loss poison (`tx_poisoned`) | **Present** as the shared base; extended response ownership is integrated at the frame boundary. A reader failure never reaches it. |
 | Transaction split prerequisite | **Satisfied for simple-query split reads.** Extended-protocol split and CSN/global consistency remain outside this document's active scope. |
-| CSN-timeout handling inside this model | Pre-wired but **inert / experimental** until the CSN feature ([18-FUTURE-CSN-DESIGN.md](18-FUTURE-CSN-DESIGN.md)) is finished. CSN is incomplete and experimental: it needs PolarDB backend support, applies only in global-consistency mode, and its wait behavior is not reliably verified. |
+| CSN-timeout handling inside this model | **Not present.** A future CSN implementation must add its own structured marker and policy tests; raw text matching is not acceptable. |
 | Manually-routed extended-protocol carve-out | Documented open follow-up; not covered by the no-orphan guarantee. |
 
 For the full out-of-scope list and the roadmap for remaining advanced policy

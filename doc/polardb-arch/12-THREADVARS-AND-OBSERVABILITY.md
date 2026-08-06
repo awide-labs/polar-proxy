@@ -8,31 +8,35 @@ The admin variables live on `PgSQL_Threads_Handler::variables`. At runtime, `ref
 
 | Admin variable | Runtime mirror | Behavior |
 |---|---|---|
-| `pgsql-polardb_consistency_mode` | `pgsql_thread___polardb_consistency_mode` | `off`, `lsn`, or `primary`; used after session override and per-HG policy resolution. |
-| `pgsql-polardb_wait_timeout_mode` | `pgsql_thread___polardb_wait_timeout_mode` | `best_effort` or `strict`; always emitted into the wrapper as `polar_consistency_mode`. |
-| `pgsql-polardb_lag_bytes` | `pgsql_thread___polardb_lag_bytes` | Byte lag cap. `0` disables, positive values force writer when cached byte lag exceeds cap. |
-| `pgsql-polardb_lag_ms` | `pgsql_thread___polardb_lag_ms` | Reserved. Runtime accepts only `0` in this implementation; no routing effect. |
-| `pgsql-polardb_lag_wait_ms` | `pgsql_thread___polardb_lag_wait_ms` | Global default wait timeout. `1000` by default; `0` means wait indefinitely. |
-| `pgsql-polardb_lsn_freshness_ms` | `pgsql_thread___polardb_lsn_freshness_ms` | Cached-LSN freshness window for lag checks. |
+| `pgsql-polardb_profile` | committed profile bundle | Named coherent policy or `custom`; not read directly per query. |
+| `pgsql-polardb_consistency_mode` | `pgsql_thread___polardb_consistency_mode` | `off`, `eventual`, `session_lsn`, or `global_lsn`; resolved after session and per-HG tiers. |
+| `pgsql-polardb_read_target` | `pgsql_thread___polardb_read_target` | `primary` or `replica`; independent placement axis. |
+| `pgsql-polardb_action_read_fallback` | `pgsql_thread___polardb_action_read_fallback` | `primary` or `error` when replica placement cannot be served. |
+| `pgsql-polardb_action_lsn_timeout` | `pgsql_thread___polardb_action_lsn_timeout` | `warning`, `primary`, `error`, or `disconnect`; backend wire mode is derived from this complete action. |
+| `pgsql-polardb_max_reader_lsn_gap_bytes` | `pgsql_thread___polardb_max_reader_lsn_gap_bytes` | Byte lag cap. `0` disables, positive values force writer when cached byte lag exceeds cap. |
+| `pgsql-polardb_max_reader_lag_ms` | `pgsql_thread___polardb_max_reader_lag_ms` | Reserved. Runtime accepts only `0`; no millisecond-lag producer exists. |
+| `pgsql-polardb_lsn_wait_timeout_ms` | `pgsql_thread___polardb_lsn_wait_timeout_ms` | Global default wait timeout. `1000` by default; `0` means wait indefinitely. |
+| `pgsql-polardb_reader_lsn_max_age_ms` | `pgsql_thread___polardb_reader_lsn_max_age_ms` | Cached-LSN freshness window for lag checks. |
 | `pgsql-polardb_monitor_lsn_updates` | `pgsql_thread___polardb_monitor_lsn_updates` | Enables/disables monitor-side LSN cache updates. |
-| `pgsql-polardb_proxy_protocol` | `pgsql_thread___polardb_proxy_protocol` | Global startup protocol: `v15`, `legacy`, or `off`; per-HG `proxy_protocol='default'` inherits it. |
-| `pgsql-polardb_route_rfq_policy` | `pgsql_thread___polardb_route_rfq_policy` | Missing RFQ target policy: `strict` forces writer, `best_effort` allows degraded reader routing. |
-| `pgsql-polardb_session_lsn_baseline` | `pgsql_thread___polardb_session_lsn_baseline` | Empty-session baseline: `observed` uses ordinary reader routing; `primary` tries the primary LSN mirror. |
+| `pgsql-polardb_proxy_protocol` | `pgsql_thread___polardb_proxy_protocol` | `v15_wait`, `v15`, `legacy`, or `off`; per-HG `default` inherits it. |
+| `pgsql-polardb_action_missing_lsn` | `pgsql_thread___polardb_action_missing_lsn` | `primary`, `warning`, or `error` when required LSN evidence is unavailable. |
+| `pgsql-polardb_action_replica_loss` | `pgsql_thread___polardb_action_replica_loss` | Retry/fallback/terminal action after reader connection loss. |
+| `pgsql-polardb_action_replica_error` | `pgsql_thread___polardb_action_replica_error` | `primary`, `error`, or `disconnect` for reusable reader errors. |
 | `pgsql-polardb_proxy_identity_host` | `pgsql_thread___polardb_proxy_identity_host` | Fallback identity host for RFQ-requesting startup profiles; empty or non-wildcard IP literal. |
 | `pgsql-polardb_proxy_identity_port` | `pgsql_thread___polardb_proxy_identity_port` | Fallback identity port for RFQ-requesting startup profiles; `0` means unset/staging. |
 
-### Reserved `polardb_lag_ms`
+### Reserved millisecond lag cap
 
-`pgsql-polardb_lag_ms` is intentionally reserved. The runtime registration accepts only `0`, and the normal build has no PgSQL millisecond-lag producer. The source keeps a producer sketch: estimate catch-up time from byte lag divided by recent replay bytes per millisecond, then use that estimate as a time-based reader filter. Until that producer exists, use `polardb_lag_bytes` and `polardb_lsn_freshness_ms`.
+`pgsql-polardb_max_reader_lag_ms` is intentionally reserved and accepts only zero. Until a trustworthy time-lag producer exists, use `max_reader_lsn_gap_bytes`, `reader_lsn_max_age_ms`, and the backend wait timeout.
 
 ## 2. Counter Family
 
-This implementation exports **227 stat counters** (190 thread-backed + 37 global-only) through `stats_pgsql_global`, plus one `PolarDB_Warmup_Pending` gauge and one internal `polardb_active` boolean condition. The condition is not exported as a stat counter and should not be summed with the counters.
+This implementation exports **299 stat counters** (252 thread-backed + 47 global-only) through `stats_pgsql_global`, plus one `PolarDB_Warmup_Pending` gauge and one internal `polardb_active` boolean condition. The condition is not exported as a stat counter and should not be summed with the counters.
 
 The external names and values are stable, but the storage is split for hot-path
 performance:
 
-- 190 thread-backed counters use per-thread
+- 252 thread-backed counters use per-thread
   `PgSQL_Thread::polardb_status_variables.stvar[]` slots. This is a
   PolarDB-local mirror of ProxySQL's per-thread `stvar[]` pattern, but remains
   separate from the generic PgSQL `status_variables.stvar[]` path.
@@ -48,12 +52,12 @@ performance:
 - The old `PgHGM->status.polardb_*` atomics remain as global counters for rare
   calls without a worker thread. `PgSQL_Threads_Handler` exports the value as
   `global counter + sum(live per-thread slots)`.
-- `PgSQL_Thread::~PgSQL_Thread()` folds a worker's 190 thread-backed counter slots
+- `PgSQL_Thread::~PgSQL_Thread()` folds a worker's 252 thread-backed counter slots
   into the matching global counters before the worker object is freed. Runtime
   PgSQL thread resize is not supported today, so this mainly preserves
   monotonic shutdown-time scrapes and supports future use any later worker lifecycle
   changes.
-- 37 global-only counters remain `PgHGM->status` atomics because they are monitor-side,
+- 47 global-only counters remain `PgHGM->status` atomics because they are monitor-side,
   configuration/failover-side, or rare failure-path events. The seven below are a
   representative subset; the full set is the `G()`-tagged entries in
   `POLARDB_COUNTER_LIST` (for example the `wait_retry_declined_*` and
@@ -86,14 +90,14 @@ The same counters are exposed in two places:
   microsecond counter.
 
 Prometheus collection is scrape/TSDB-time work, not query-path work. Each
-collection aggregates 190 thread-backed counters across PgSQL worker threads and
-reads 37 global-only atomics. Disabling the web endpoint or TSDB sampling
+collection aggregates 252 thread-backed counters across PgSQL worker threads and
+reads 47 global-only atomics. Disabling the web endpoint or TSDB sampling
 disables that runtime collection cost; there is no PolarDB-specific Prometheus
 toggle.
 
 The table below enumerates the core LSN and consistency counters as a curated
 starting point. It is one family out of the complete always-on surface. Section 3
-is the comprehensive, family-organized catalog of all **227 always-on counters**;
+is the comprehensive, family-organized catalog of all **299 always-on counters**;
 the authoritative export order is defined by `POLARDB_COUNTER_LIST` in
 `PgSQL_PolarDB_Counters.h`. Section 4 documents the additional diagnostic counter
 families that only exist in `POLARDB_PROFILE=1` / `POLARDB_PERF_DEBUG=1` builds and
@@ -106,10 +110,10 @@ are absent from production builds.
 | 3 | `PolarDB_Monitor_Health_Invalid_Role` | `polardb_monitor_health_invalid_role` | Monitor health row reported a role ProxySQL cannot route as primary or reader. | Backend role output is not usable for routing; the row is sanitized before it can affect reader state. |
 | 4 | `PolarDB_Monitor_Health_Invalid_Values` | `polardb_monitor_health_invalid_values` | Monitor health row had invalid availability text or invalid LSN text. | Backend health values are not trustworthy. Invalid availability is not allowed to shun a server, and invalid LSN text is not fed into the cache. |
 | 5 | `PolarDB_LSN_Stale_Count` | `polardb_lsn_stale_count` | Reader candidates skipped during selection because their cached LSN was below the session target. | Normally low; a rising value means readers are lagging behind the session's consistency target. Byte-lag rejections are counted separately by the `PolarDB_Lag_Cap_*` counters. |
-| 6 | `PolarDB_Write_Missing_LSN` | `polardb_write_missing_lsn` | Writer query completed without RFQ LSN. | Deployment problem. Automatic LSN-mode reads in that session follow `route_rfq_policy` until a primary-sourced RFQ clears the flag. |
-| 7 | `PolarDB_Read_Missing_LSN` | `polardb_read_missing_lsn` | Tracked SESSION_LSN read completed without RFQ LSN. | Deployment/profile problem or backend mismatch; later reads follow `route_rfq_policy` until a primary RFQ clears the flag. |
-| 8 | `PolarDB_Primary_LSN_Unknown` | `polardb_primary_lsn_unknown` | `session_lsn_baseline=primary` needed the primary mirror but it was empty. | First-read baseline could not be enforced from primary cache. |
-| 9 | `PolarDB_RFQ_Best_Effort_Degraded_Routes` | `polardb_rfq_best_effort_degraded_routes` | `route_rfq_policy=best_effort` allowed an eligible simple-query reader route without an RFQ-derived wait target. | Degraded consistency path; expected only if deliberately configured. Clients also receive a WARNING `NoticeResponse` before the result; the proxy log is edge-limited per session. |
+| 6 | `PolarDB_Write_Missing_LSN` | `polardb_write_missing_lsn` | Writer query completed without RFQ LSN. | Deployment problem. Automatic LSN-mode reads in that session follow `action_missing_lsn` until a primary-sourced RFQ clears the flag. |
+| 7 | `PolarDB_Read_Missing_LSN` | `polardb_read_missing_lsn` | Tracked SESSION_LSN read completed without RFQ LSN. | Deployment/profile problem or backend mismatch; later reads follow `action_missing_lsn` until a primary RFQ clears the flag. |
+| 8 | `PolarDB_Group_LSN_Unknown` | `polardb_group_lsn_unknown` | GLOBAL_LSN required a current group observation but none was available. | Global consistency failed closed through the configured missing-LSN action. |
+| 9 | `PolarDB_RFQ_Best_Effort_Degraded_Routes` | `polardb_rfq_warning_degraded_routes` | `action_missing_lsn=warning` allowed an eligible simple-query reader route without an RFQ-derived wait target. | Degraded consistency path; expected only if deliberately configured. Clients also receive a WARNING `NoticeResponse` before the result; the proxy log is edge-limited per session. |
 | 10 | `PolarDB_Consistency_Writer_Fallback` | `polardb_consistency_writer_fallback` | Reader acquisition returned a consistency-safety status or strict RFQ-unavailable status, and this read was redirected to the writer. | Offload loss from consistency-safe writer fallback. Compare with reader status traces and lag/RFQ counters to identify the root cause. |
 | 11 | `PolarDB_Wait_Reads_Retried_On_Writer` | `polardb_wait_reads_retried_on_writer` | A wait-wrapped reader query was retried once on the writer after strict wait timeout or reader connection loss, before any user result reached the client. | Reader-side failure was safely recovered on the writer. Check timeout and connection-loss counters for the reason. |
 | 12 | `PolarDB_RFQ_Profile_Skipped` | `polardb_rfq_profile_skipped` | Pool acquisition skipped a pooled connection whose startup profile did not request RFQ LSN. | Old/off-profile pooled connections exist during RFQ-required reads. |
@@ -131,7 +135,7 @@ are absent from production builds.
 ## 3. Complete Counter Catalog by Family
 
 Section 2 covers the core LSN/consistency counters. This section catalogs the
-remaining always-on families so the whole 227-counter surface is documented. Every
+remaining always-on families so the whole 299-counter surface is documented. Every
 name below is byte-exact to `POLARDB_COUNTER_LIST` in `PgSQL_PolarDB_Counters.h`.
 `T`-tagged names are thread-backed; `G`-tagged names are global-only atomics. Where
 a family is large its full member list is given so no name is omitted silently.
@@ -381,7 +385,7 @@ text is in `POLARDB_COUNTER_LIST` (`PgSQL_PolarDB_Counters.h`, roughly lines
 | `PolarDB_Split_Fallback_Reader_Unavailable` | No reader online or usable. |
 | `PolarDB_Split_Fallback_Reader_Busy` | Readers at capacity or no pooled match. |
 | `PolarDB_Split_Fallback_RFQ_Unavailable` | No RFQ-LSN-capable reader backend available. |
-| `PolarDB_Split_Fallback_Primary_LSN_Unknown` | Lag-cap policy had no primary LSN sample. |
+| `PolarDB_Split_Fallback_Group_LSN_Unknown` | Lag-cap policy had no group LSN sample. |
 | `PolarDB_Split_Fallback_Reader_LSN_Unknown` | Lag-cap policy had no reader LSN sample. |
 | `PolarDB_Split_Fallback_Reader_LSN_Stale` | Reader LSN sample was stale. |
 | `PolarDB_Split_Fallback_Reader_Lag_Exceeded` | Byte lag exceeded `max_lag_bytes`. |
@@ -469,7 +473,7 @@ OFF (`lib/Makefile:63-68`):
 
 These change the exported counter count and are for latency/throughput profiling
 only. Do not assume they exist when reading a production build's
-`stats_pgsql_global`; the always-on surface is 227 (§2). All names below are
+`stats_pgsql_global`; the always-on surface is 299 (§2). All names below are
 byte-exact to `PgSQL_PolarDB_Counters.h`.
 
 ### 4.1 `POLARDB_PROFILE=1` diagnostic families
@@ -556,12 +560,12 @@ They are kept separate so future CSN or transaction-split wait families can dist
 
 ## 6. `polardb_active`
 
-`polardb_active` is an internal `atomic<bool>` on `PgHGM->status`. It is true when at least one PolarDB hostgroup pair is configured. Accessors and the routing path check it first so non-PolarDB deployments bypass the feature cheaply.
+`polardb_active` is an internal `atomic<bool>` on `PgHGM->status`. It is true when at least one PolarDB hostgroup pair is configured. HGM accessors check it directly; workers copy it during publication refresh and the query route uses the worker-local `polardb_is_active()` gate, avoiding a shared load per query.
 
 It is a condition, not a counter:
 
 - It is not exported through `stats_pgsql_global`.
-- It is not part of the 227 exported counters.
+- It is not part of the 299 exported counters.
 - It should be described as a boolean state flag.
 
 ## 7. Signals to Watch
@@ -574,7 +578,7 @@ It is a condition, not a counter:
 | `PolarDB_Write_Missing_LSN > 0` | Writer RFQ LSN was missing. Check backend support, libpq patch, startup profile, and pool reuse. |
 | `PolarDB_Read_Missing_LSN > 0` | Tracked read RFQ LSN was missing while SESSION_LSN tracking was active. |
 | `PolarDB_RFQ_Best_Effort_Degraded_Routes > 0` | The system served best-effort degraded simple-query reader routes without an RFQ wait target. Clients should also see WARNING notices on those reads. |
-| `PolarDB_Consistency_Writer_Fallback > 0` | Consistency reads are failing closed to the writer during reader acquisition. This is safe, but it means offload is being lost because readers are missing/stale/over-lagged, primary LSN is unknown under a cap, or strict RFQ requirements are not met. |
+| `PolarDB_Consistency_Writer_Fallback > 0` | Consistency reads are failing closed to the writer during reader acquisition. This is safe, but it means offload is being lost because readers are missing/stale/over-lagged, group LSN is unknown under a cap, or strict RFQ requirements are not met. |
 | `PolarDB_RFQ_Profile_Skipped > 0` | Pooled connections with non-RFQ startup profiles are present and being skipped for RFQ-required reads. |
 | `PolarDB_RFQ_Profile_Evicted > 0` | Incompatible free pooled connections are being pruned under RFQ-required read pressure. |
 | `PolarDB_Reader_Pool_Miss_Empty > 0` | Reader-pool lookups found no usable pooled reader; new reader backends are being created under read pressure. |

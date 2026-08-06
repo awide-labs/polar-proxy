@@ -199,21 +199,21 @@ SAVE PGSQL QUERY RULES TO DISK;
 Why these values matter:
 
 - `check_type='polardb'` enables the PolarDB LSN/RFQ path for this hostgroup pair.
-- `consistency_mode='lsn'` enables read-your-writes routing for this pair.
-- `proxy_protocol='v15'` requests RFQ LSN startup parameters using the current protocol form.
+- `consistency_mode='session_lsn'` enables session read-your-writes routing.
+- `proxy_protocol='v15_wait'` requests RFQ LSN metadata and negotiates extended `W`.
 - `replica_eligible=1` opts matching reads into automatic PolarDB reader routing.
 - `lsn_wait_timeout_ms=1000` gives a reader up to one second to catch up for a protected read.
 
 ## 6. Enable Session Consistency
 
-Set the global defaults. The per-hostgroup `consistency_mode='lsn'` above already enables the main pair, but setting the global default makes behavior explicit for pairs that use `consistency_mode='default'`.
+Set the coherent global policy. The per-hostgroup `session_lsn` above already enables the main pair; the global values apply to pairs using `default`.
 
 ```sql
-SET pgsql-polardb_consistency_mode = 'lsn';
-SET pgsql-polardb_wait_timeout_mode = 'best_effort';
-SET pgsql-polardb_proxy_protocol = 'v15';
-SET pgsql-polardb_route_rfq_policy = 'strict';
-SET pgsql-polardb_session_lsn_baseline = 'observed';
+SET pgsql-polardb_consistency_mode = 'session_lsn';
+SET pgsql-polardb_read_target = 'replica';
+SET pgsql-polardb_action_missing_lsn = 'primary';
+SET pgsql-polardb_action_lsn_timeout = 'primary';
+SET pgsql-polardb_proxy_protocol = 'v15_wait';
 
 LOAD PGSQL VARIABLES TO RUNTIME;
 SAVE PGSQL VARIABLES TO DISK;
@@ -221,21 +221,20 @@ SAVE PGSQL VARIABLES TO DISK;
 
 Meaning:
 
-- `pgsql-polardb_consistency_mode='lsn'`: protect eligible reads using the session LSN.
-- `pgsql-polardb_wait_timeout_mode='best_effort'`: if a reader cannot catch up before timeout, return the result with a warning instead of failing the client query.
-- `pgsql-polardb_proxy_protocol='v15'`: request the v15 PolarDB startup parameters for RFQ LSN.
-- `pgsql-polardb_route_rfq_policy='strict'`: if an RFQ-derived target is unknown, route to writer instead of silently trusting the reader.
-- `pgsql-polardb_session_lsn_baseline='observed'`: a read-only session can start on a reader and then use the observed RFQ LSN as future evidence.
+- `session_lsn`: protect eligible reads with the session target.
+- `read_target=replica`: prefer offload when safe.
+- missing evidence and timeout actions set to `primary`: preserve correctness through writer fallback.
+- `v15_wait`: request RFQ LSN and permit same-flush extended waits.
 
-For correctness-first deployments, switch timeout mode to strict:
+To fail the client rather than retry on the writer after a timeout, select `error`:
 
 ```sql
-SET pgsql-polardb_wait_timeout_mode = 'strict';
+SET pgsql-polardb_action_lsn_timeout = 'error';
 LOAD PGSQL VARIABLES TO RUNTIME;
 SAVE PGSQL VARIABLES TO DISK;
 ```
 
-In strict mode, a reader wait timeout does not return stale reader data. ProxySQL retries the original read on the writer when it is safe to do so.
+`error` uses the backend strict mode and forwards the timeout without writer execution. The default `primary` action also uses strict mode but retries safely on the writer when possible. `disconnect` closes the affected session.
 
 ## 7. Application Usage
 
@@ -256,8 +255,8 @@ A session can override the consistency mode when needed:
 
 ```sql
 SET proxysql.polardb_consistency_mode TO 'off';
-SET proxysql.polardb_consistency_mode TO 'lsn';
-SET proxysql.polardb_consistency_mode TO 'primary';
+SET proxysql.polardb_consistency_mode TO 'session_lsn';
+SET proxysql.polardb_consistency_mode TO 'global_lsn';
 RESET proxysql.polardb_consistency_mode;
 ```
 
@@ -274,7 +273,7 @@ To force one read to the writer without changing the session:
 /* route=primary */ SELECT * FROM important_table WHERE id = 1;
 ```
 
-Avoid manual rules that directly route protected reads to the reader hostgroup. Manual reader routes are authoritative and bypass the automatic wait wrapper.
+Avoid manual rules that directly route protected reads to the reader hostgroup. Manual reader routes are authoritative and bypass both the automatic simple-query SQL wrapper and extended-protocol `W`.
 
 ## 8. Validate the Setup
 
@@ -314,7 +313,7 @@ Useful first counters:
 | `PolarDB_Wait_LSN_Sent` | ProxySQL sent the LSN wait wrapper to a reader. |
 | `PolarDB_Wait_Wrap_Bypassed` | ProxySQL selected a reader already known to be caught up and skipped the wrapper. |
 | `PolarDB_Wait_Error_Timeout` | A reader timed out waiting for the target LSN. |
-| `PolarDB_Wait_Reads_Retried_On_Writer` | ProxySQL recovered a strict timeout or reader loss by retrying on the writer. |
+| `PolarDB_Wait_Reads_Retried_On_Writer` | Timeout/loss policy selected writer fallback and replay was safe. |
 
 At least one of `PolarDB_Wait_LSN_Sent` or `PolarDB_Wait_Wrap_Bypassed` should move when a write is followed by a protected read.
 
@@ -345,8 +344,8 @@ FROM runtime_pgsql_replication_hostgroups;
 Common causes:
 
 - no matching query rule with `replica_eligible=1`
-- effective `consistency_mode='primary'`
-- RFQ LSN is missing and `pgsql-polardb_route_rfq_policy='strict'` forces writer
+- effective `read_target='primary'`
+- RFQ LSN is missing and `pgsql-polardb_action_missing_lsn='primary'` forces writer
 - byte lag cap rejects the reader
 - reader health is not `ONLINE`
 
@@ -364,7 +363,7 @@ ORDER BY hostgroup_id, hostname, port;
 
 ### Reads can be stale under lag
 
-This is expected only when `pgsql-polardb_wait_timeout_mode='best_effort'` and the reader times out waiting for the target LSN. Use `strict` mode if a stale reader answer must never be returned.
+This is expected only when `pgsql-polardb_action_lsn_timeout='warning'` and the reader times out waiting for the target LSN. Use `primary`, `error`, or `disconnect` if a stale reader answer must never be returned.
 
 ### A wrapped read errors on a `polar_*` setting
 

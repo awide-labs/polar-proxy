@@ -1,18 +1,18 @@
-> Scope: how a replica wait can time out, what best_effort and strict mode do on timeout, how ProxySQL detects a real PolarDB timeout, how it counts the timeout exactly once, how it forwards the timeout warning to the client, and how a failed wait-wrapped read can be retried on the writer after strict timeout or reader connection loss. | Audience: R/M/O/C | Status: stable | Prereqs: [07-QUERY-WRAPPING.md](07-QUERY-WRAPPING.md), [06-ROUTING-PIPELINE.md](06-ROUTING-PIPELINE.md), [09-PUBLISH-AND-WRITE-TRACKING.md](09-PUBLISH-AND-WRITE-TRACKING.md), [11-CONNECTION-AND-LIBPQ.md](11-CONNECTION-AND-LIBPQ.md) | Verified against: this branch
+> Scope: backend wait modes, complete timeout actions, structured timeout evidence, exactly-once accounting, warning ownership, and safe writer retry when the configured action is `primary`. | Audience: R/M/O/C | Status: stable | Prereqs: [07-QUERY-WRAPPING.md](07-QUERY-WRAPPING.md), [06-ROUTING-PIPELINE.md](06-ROUTING-PIPELINE.md), [09-PUBLISH-AND-WRITE-TRACKING.md](09-PUBLISH-AND-WRITE-TRACKING.md), [11-CONNECTION-AND-LIBPQ.md](11-CONNECTION-AND-LIBPQ.md) | Verified against: this branch
 
 # 08 — Wait, Timeout, and Notice Handling
 
 ## 1. Scope and where this sits
 
-This document covers what happens **after** ProxySQL has wrapped a read for read-your-writes (RYW) consistency and sent it to a replica. Doc [07-QUERY-WRAPPING.md](07-QUERY-WRAPPING.md) explains how the wrapper is built and injected. This doc picks up at the point where the replica runs the wrapped read and may not have caught up to the needed write yet.
+This document covers what happens **after** ProxySQL has attached a read-your-writes (RYW) wait and sent the operation to a replica. Simple query uses the SQL wrapper from [07-QUERY-WRAPPING.md](07-QUERY-WRAPPING.md); negotiated `v15_wait` extended protocol carries the same target, timeout, and backend mode in `W` immediately before Parse or Bind/Execute. This doc picks up when the replica may still be behind the target.
 
 It explains four things:
 
-1. The **replica wait** itself, and the two ways it can end on timeout: `best_effort` (a WARNING, then stale data) and `strict` (an ERROR on the reader, then one safe retry on the writer when possible).
+1. The **replica wait** wire outcomes: `best_effort` produces a WARNING plus a result; `strict` produces an ERROR. The configured action then chooses warning, writer fallback, forwarded error, or disconnect.
 2. **Structured-marker detection** — how ProxySQL knows a backend WARNING or ERROR really came from the PolarDB wait path.
 3. The **three timeout-accounting sites** and the **de-duplication** rule that guarantees one backend timeout is counted exactly once.
 4. **Notice capture and forward-once-to-client** — how a `best_effort` timeout WARNING is captured and sent to the client ahead of the query result, even though the leading `SET` results were already dropped.
-5. **Strict timeout retry** — how a strict timeout ERROR is recognized and the original user query is retried once on the writer when no user result has started.
+5. **Primary timeout action** — how a structured strict timeout can retry once on the writer when ownership is retained and no user result has started.
 
 ### 1.1 Terms used in this document (defined on first use)
 
@@ -31,7 +31,7 @@ It explains four things:
 
 ### 1.2 Build condition
 
-Everything in this document is compiled only when the build flag `POLARDB_PROXY` is set. With `POLARDB_PROXY=0` all of this code is compiled out and ProxySQL behaves like upstream. The two source files for this doc both wrap their whole body in `#if POLARDB_PROXY` (`lib/PgSQL_PolarDB_Wrap.cpp:59`, `lib/PgSQL_PolarDB_Notices.cpp:33`).
+The PolarDB wait, timeout policy, structured markers, and notice ownership described here compile only when `POLARDB_PROXY` is set. With `POLARDB_PROXY=0`, those surfaces are absent and vanilla libpq is linked. Generic extended-protocol frame/error/RFQ ownership remains shared, so the guarantee is behavioral compatibility for ordinary PostgreSQL traffic, not byte identity with upstream.
 
 ---
 
@@ -70,42 +70,28 @@ ASCII: the wrapped read on a reader, two timeout outcomes
                                                       │                     │
                                           ProxySQL captures the      ProxySQL sees the
                                           notice, accounts the       ErrorResponse, accounts
-                                          timeout, forwards          the timeout, and
-                                          warning then rows          retries on writer
+                                          timeout, forwards          the timeout, then applies
+                                          warning then rows          primary/error/disconnect
 ```
 
-The wait loop runs **inside the PolarDB backend**. ProxySQL does not poll or time the wait itself; it only sets the GUCs and then reads whatever the backend sends back. The backend-side wait loop is documented in a long comment block in `include/PgSQL_Connection.h:738-768` (the "PolarDB backend facts used here" and "Result by case" subsections); that comment is the only record of the backend internals and was not independently verified against PolarDB server source.
+The wait loop runs **inside the PolarDB backend**. ProxySQL does not poll the wait. Simple query supplies the mode/timeout/target through three GUC SETs; extended protocol supplies the same values in `W`. ProxySQL then classifies only structured backend timeout evidence and applies the request's captured complete action.
 
 ---
 
-## 3. The wait on the replica: best_effort vs strict
+## 3. Complete timeout action and backend wire mode
 
-The wait condition (`polar_xact_split_wait_lsn`) behaves the same in both modes: the reader blocks until it has replayed past the target LSN or the timeout fires. The two modes differ **only in what the backend does on timeout**.
+`pgsql-polardb_action_lsn_timeout` defines the client-visible outcome. The backend understands only two wire modes, derived by `polardb_wait_mode_for_timeout_action()`:
 
-| Mode | GUC value (statement 1) | On timeout the backend... | What ProxySQL receives on the wire | ProxySQL handling path |
-|------|-------------------------|---------------------------|-------------------------------------|------------------------|
-| **best_effort** | `SET polar_consistency_mode = 'best_effort'` | emits a **WARNING/NOTICE**, then serves **stale** data — the user query still returns rows | a NoticeResponse, then the normal result | the notice path (`lib/PgSQL_PolarDB_Notices.cpp`) |
-| **strict** | `SET polar_consistency_mode = 'strict'` | raises an **ERROR** and aborts the statement on the reader (the wrapper SETs roll back) | an ErrorResponse | the result-error path marks the timeout, then the session retries the original read once on the writer when safe |
+| Configured action | Backend mode | ProxySQL outcome |
+|---|---|---|
+| `warning` | `best_effort` | return the reader result and forward the structured timeout warning |
+| `primary` | `strict` | retry once on the writer when ownership and result state make that safe; otherwise forward the timeout error |
+| `error` | `strict` | forward the timeout error; do not execute on the writer |
+| `disconnect` | `strict` | terminate the affected client session |
 
-Plain-language summary:
+The default `session_fallback` profile selects `primary`. The complete action is captured in `route_ctx.lsn_wait_timeout_action` and the reader plan. The derived `PolarDB_WaitMode` travels in `PolarDB_WaitSpec` and becomes either `SET polar_consistency_mode` for simple query or the mode byte in extended-protocol `W`.
 
-- **best_effort** = "answer anyway." The client gets possibly-stale rows plus a warning telling it the wait did not finish. RYW is not guaranteed for that one read, but the client is told.
-- **strict** = "do not answer stale from a reader." The reader returns an ERROR on timeout. If no user result has started, ProxySQL retries the original read once on the writer. If that retry is not safe or the writer also fails, the existing error path handles the statement.
-
-### 3.1 Which mode is in effect
-
-The wait-timeout mode is read from the per-thread setting `pgsql_thread___polardb_wait_timeout_mode` during the collect stage (`lib/PgSQL_PolarDB_Flow.cpp:269`, inside `PgSQL_Session::polardb_collect()`: `route_ctx.wait_timeout_mode = pgsql_thread___polardb_wait_timeout_mode;`) and carried on the route context / wait spec. The resolved mode is later mapped to a GUC by `build_polar_consistency_mode_set()` (`lib/PgSQL_PolarDB_Wrap.cpp:157`), which receives the mode as a `PolarDB_WaitMode` parameter. The integer-to-mode mapping is:
-
-| `pgsql_thread___polardb_wait_timeout_mode` | `PolarDB_WaitMode` | GUC emitted |
-|--------------------------------------------|--------------------|-------------|
-| `1` | `BEST_EFFORT` | `SET polar_consistency_mode = 'best_effort';` |
-| `2` | `STRICT` | `SET polar_consistency_mode = 'strict';` |
-
-The `STRICT` branch is at `lib/PgSQL_PolarDB_Wrap.cpp:168-171`; the `best_effort` branch (the default, used for any value that is not `STRICT`) is at `lib/PgSQL_PolarDB_Wrap.cpp:173-174`. The function returns a reference to one of two `static const std::string` literals (`lib/PgSQL_PolarDB_Wrap.cpp:163-166`) — there is no per-session cache. The `PolarDB_WaitMode` enum values are at `include/PgSQL_PolarDB.h:309-311`. The resolved mode is passed in from the wait spec at the call site `lib/PgSQL_PolarDB_Wrap.cpp:326` (`build_polar_consistency_mode_set(polardb_query.wait.spec.mode)`).
-
-> Note on `polar_proxy_wait_timeout_ms = 0`: a zero timeout disables **only** the PolarDB wait-timeout branch. The wait condition can still be interrupted by ordinary PostgreSQL `statement_timeout`, query cancel, or session terminate. This is documented at the helper that emits the timeout SET, `PolarDB_Protocol::append_polar_timeout_set()` (definition `include/PgSQL_PolarDB.h:691`, doc comment `:683-690`). When the timeout is `0`, a PolarDB wait timeout simply never fires, so none of the timeout handling in this doc runs.
-
----
+`GLOBAL_LSN` rejects `warning` during configuration validation because returning stale reader data cannot satisfy a shared group target. Transaction-split reads likewise cannot return a stale result while the primary transaction remains open; their warning request is resolved through `action_read_fallback` to primary or error.
 
 ## 4. Structured-marker detection
 
@@ -367,7 +353,7 @@ The comment at `lib/PgSQL_Connection.cpp:63-68` explains the marker check for th
 
 The third connection-level error spot (`lib/PgSQL_Connection.cpp:522`) also calls `polardb_account_wrapper_set_error(this, nullptr, ...)` with a `nullptr` result; because the result is null, `polardb_is_lsn_wait_timeout_result()` returns false (`:167`), so that spot never counts a timeout — it only marks the wrapper failed if appropriate.
 
-After a strict timeout or reader connection loss, the session `rc == -1` branch captures the failed wait-wrapped reader query before generic error handling mutates the reader stream. It retries only if the captured state shows a wait-wrapped read, either the timeout marker was seen or the reader connection was lost, no user result started, the writer hostgroup is known, and the original query text was saved. The retry releases the reader according to connection state, installs a fresh simple-query packet on the writer data stream, and re-enters writer acquisition. Ordinary SQL errors do not use this path.
+After a strict timeout or reader connection loss, the session captures the failed reader request before generic error handling mutates the stream. Writer retry occurs only when the captured policy selects `primary`, no user result started, backend/frame ownership permits replay, the writer scope is known, and the original request can be reconstructed. `error` forwards the failure, `disconnect` closes the session, and cancellation or marker-less `57014` is never retried. Ordinary SQL errors follow `action_replica_error` rather than being reclassified as wait timeouts.
 
 The strict-timeout retry, reader connection-loss accounting, and writer fallback are implemented in `lib/PgSQL_PolarDB_Failure.cpp`: `polardb_capture_wait_read_failure()` (`lib/PgSQL_PolarDB_Failure.cpp:1124`), the failure dispatcher `polardb_on_failure()` (`:184`) and its writer-retry `polardb_handle_failed_wait_read()` (`:1178`, retry counter at `:1410`), `polardb_redirect_to_writer()` (`:1421`), and `build_simple_query_packet()` (`:1100`). The whole file is enabled when `#if POLARDB_PROXY` (`lib/PgSQL_PolarDB_Failure.cpp:39`). The `PolarDB_ReaderFailure` struct these use is declared in `include/PgSQL_Session.h:1297`. The session `rc == -1` branch in `PgSQL_Session.cpp` only invokes them — `polardb_capture_outcome()` + `polardb_on_failure()` at `lib/PgSQL_Session.cpp:3886-3910`, with `polardb_redirect_to_writer()` called from the reader-acquisition fallback at `:6248`.
 
@@ -375,7 +361,7 @@ The strict-timeout retry, reader connection-loss accounting, and writer fallback
 
 ## 8. Counters: the two timeout counters and their lockstep
 
-This doc owns two timeout counters, one reader-connection-loss counter, and one retry counter. (The full counter catalogue is in doc [12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md). There are 227 exported stat counters (190 thread-backed + 37 global-only) plus one `PolarDB_Warmup_Pending` gauge and the internal `polardb_active` condition; neither the gauge nor the condition is a stat counter.)
+This doc owns timeout, reader-loss, and retry counters. The full generated catalogue is in [12-THREADVARS-AND-OBSERVABILITY.md](12-THREADVARS-AND-OBSERVABILITY.md): 252 thread-backed plus 47 global-only counters, 299 total. `PolarDB_Warmup_Pending` is a gauge and `polardb_active` is an internal condition, not counters.
 
 | Counter (display name in `stats_pgsql_global`) | Increment site | Meaning | Lockstep partner |
 |------------------------------------------------|----------------|---------|------------------|
@@ -405,12 +391,12 @@ for the full export path.
 
 | Observation | What it means | What to check |
 |-------------|---------------|---------------|
-| `PolarDB_Wait_Error_Timeout` rising | RYW waits are timing out: readers cannot catch up within `pgsql-polardb_lag_wait_ms` | replica replication lag; or the timeout is too tight |
+| `PolarDB_Wait_Error_Timeout` rising | RYW waits are timing out: readers cannot catch up within `pgsql-polardb_lsn_wait_timeout_ms` | replica replication lag; or the timeout is too tight |
 | `PolarDB_Wait_Error_Connection_Lost` rising | readers are losing connections while serving protected reads | backend restarts, network errors, or pool/server instability |
-| in **strict** mode, timeouts rising while retry counter also rises | readers are timing out but affected reads are being recovered on the writer | reduce lag, raise the timeout, or accept temporary writer load |
+| timeout action **primary**, timeouts rising with retry counter | affected reads are being recovered on the writer | reduce lag, raise the timeout, or accept temporary writer load |
 | connection-loss counter rising while retry counter also rises | readers are failing but affected reads are being recovered on the writer | investigate reader health and watch writer load |
-| in **strict** mode, timeouts rising without matching retries | strict timeout happened but retry was unsafe or unavailable | check whether user results started, writer hostgroup was known, and writer acquisition was possible |
-| in **best_effort** mode, timeouts rising | clients are getting WARNINGs and stale data | same causes; the read still succeeds but is stale |
+| strict backend timeouts without matching retries | policy selected error/disconnect, cancellation was detected, or replay preconditions were unavailable | inspect the captured action, cancellation, result-start state, and writer availability |
+| timeout action **warning**, timeouts rising | clients receive WARNINGs and potentially stale data | same causes; the read still succeeds but is explicitly degraded |
 | the two counters **diverge** | only possible if a non-LSN wait family was added (not in this feature) | confirm what feature added the divergence |
 
 ---
@@ -421,7 +407,7 @@ The two traces below show the same wrapped read finishing two different ways.
 
 ### 9.1 best_effort timeout (trace T2)
 
-Setup: the session has written before, so `polardb_session_consistency.write_lsn > 0`. The next read is replica-eligible. `pgsql-polardb_wait_timeout_mode = best_effort`. The chosen reader is lagging and cannot catch up in time.
+Setup: the session has written before, so `polardb_session_consistency.write_lsn > 0`. The next read is replica-eligible. `pgsql-polardb_action_lsn_timeout = warning`. The chosen reader is lagging and cannot catch up in time.
 
 | Step | What happens | State / counter change |
 |------|--------------|------------------------|
@@ -439,7 +425,7 @@ Client outcome: one WARNING, then (possibly stale) rows. Counters: `Wait_Error_T
 
 ### 9.2 strict timeout (trace T3)
 
-Setup: identical, except `pgsql-polardb_wait_timeout_mode = strict`.
+Setup: identical, except `pgsql-polardb_action_lsn_timeout = error`.
 
 | Step | What happens | State / counter change |
 |------|--------------|------------------------|
@@ -481,7 +467,7 @@ The following describes the **full implementation**, not this LSN-only branch. I
 | Item | Status in this feature (this branch) |
 |------|----------------------------|
 | best_effort timeout: WARNING + serve stale | **Implemented** (`Notices.cpp`) |
-| strict timeout: ERROR on reader, then writer retry when safe | **Implemented** (`Connection.cpp:69-71`, session `rc == -1` retry path) |
+| timeout action `primary`: strict ERROR on reader, then writer retry when safe | **Implemented** in the central reader-failure policy |
 | structured-marker detection (no text matching) | **Implemented** (`PgSQL_PolarDB.h:186`; checks at `Connection.cpp:166-168`, `Notices.cpp:235-237`) |
 | three accounting sites + de-dup | **Implemented** (`Wrap.cpp:481`, de-dup at `Wrap.cpp:413,487`) |
 | notice capture + forward-once | **Implemented** (`Notices.cpp`: capture and flush helper; `Session.cpp`: normal result and first streamed-chunk call sites) |

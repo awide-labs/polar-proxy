@@ -64,7 +64,7 @@ First, the terms this document uses. Each is defined once here and used the same
 
 **The one-sentence definition.** CSN consistency makes a read wait until the chosen replica has applied *at least N commits*, where N is a commit-sequence-number target the proxy supplies, instead of waiting until the replica has applied *up to byte offset X in the WAL* (which is what LSN consistency does).
 
-**Why anyone would want CSN over LSN.** CSN's value over LSN is **commit-counting semantics**, not the cross-session ("global") mode by itself — this implementation already offers global consistency over LSN via `GLOBAL_LSN` (`max(session, writer-mirror LSN)`). This implementation's `SESSION_LSN` mode is per-session: it guarantees that *your* session sees *your own* writes, while `GLOBAL_LSN` extends that across sessions. Global CSN consistency guarantees that *any* session's read sees *all* commits that have happened cluster-wide up to now, not just its own — the same cross-session guarantee `GLOBAL_LSN` gives, but counted in commits rather than WAL bytes, useful when one client writes and a *different* client must immediately read that write.
+**Why anyone would want CSN over LSN.** CSN's value over LSN is **commit-counting semantics**, not the cross-session ("global") mode by itself — this implementation already offers global consistency over LSN via `GLOBAL_LSN` (`max(session target, group LSN)`). This implementation's `SESSION_LSN` mode is per-session: it guarantees that *your* session sees *your own* writes, while `GLOBAL_LSN` extends that across sessions. Global CSN consistency guarantees that *any* session's read sees *all* commits that have happened cluster-wide up to now, not just its own — the same cross-session guarantee `GLOBAL_LSN` gives, but counted in commits rather than WAL bytes, useful when one client writes and a *different* client must immediately read that write.
 
 **Two CSN modes.** The full implementation defines two CSN consistency modes, on top of this implementation's single `SESSION_LSN` mode:
 
@@ -90,11 +90,14 @@ This table is the main part of the delta. It compares what this implementation d
 | Wire delivery | 8 bytes in RFQ, after the message type byte | 8 bytes in RFQ, **immediately after the LSN bytes** (`deps/postgresql/polardb_libpq.patch:341-354` (full implementation)) |
 | libpq getter | `PQgetLSN` / `PQhasLSN` | `PQgetCSN` / `PQhasCSN` (`deps/postgresql/polardb_libpq.patch:191-192` (full implementation)) |
 | Server-side wait command (GUC) | `SET polar_xact_split_wait_lsn = '<target>'` | `SET polar_wait_csn = '<target>'` (`include/PgSQL_PolarDB.h:457` (full implementation)) |
-| Cross-session ("global") mode | **used** — `GLOBAL_LSN` = `max(session, writer-mirror LSN)` | `GLOBAL_CSN` = `max(session, cluster)` |
+| Cross-session ("global") mode | **used** — `GLOBAL_LSN` = `max(session target, group LSN)` | `GLOBAL_CSN` = `max(session, cluster)` |
 | Advances mid-transaction? | yes (each write moves the LSN) | **no** — CSN only moves at commit |
-| Session fallback to a global value | yes: session LSN falls back to global LSN when the session has not written | **no for `SESSION_CSN`**: if the session has not committed, there is no wait at all; `GLOBAL_CSN` uses the cluster CSN directly |
+| Session fallback to a global value | no: target-free `SESSION_LSN` may read a replica and learns its first positioned RFQ; `GLOBAL_LSN` is the separate cross-session mode | **no for `SESSION_CSN`**: if the session has not committed, there is no wait at all; `GLOBAL_CSN` uses the cluster CSN directly |
 
-**The asymmetry is deliberate.** LSN's session mode falls back to a global LSN, but CSN's session mode does **not** fall back. The reasoning is documented in the planner's doc comment (`lib/PgSQL_PolarDB_Consistency.cpp:88-92` (full implementation)): `SESSION_CSN` "uses session CSN only; if no writes yet, no wait", while `SESSION_LSN` "falls back to global LSN if session has no writes". If you re-add CSN, keep this difference; do not "fix" it to match LSN.
+The reference full implementation made `SESSION_LSN` fall back to a global LSN,
+but the current branch deliberately does not: target-free `SESSION_LSN` and
+cross-session `GLOBAL_LSN` are separate policies. A CSN merge must follow the
+current branch's separation rather than copying that historical asymmetry.
 
 **The mid-transaction rule matters for transaction-split.** Because CSN only moves at commit, a read that runs *inside* an open transaction has no meaningful committed CSN to wait on. The full implementation's transaction-split path (see [19-FUTURE-TXN-SPLIT-DESIGN.md](19-FUTURE-TXN-SPLIT-DESIGN.md)) deliberately uses the transaction's LSN and sets the CSN target to 0 for split reads (`lib/PgSQL_PolarDB_Flow.cpp:410-413` (full implementation)). So CSN and transaction-split affect each other; a CSN re-add must keep this special case for split reads.
 
@@ -124,7 +127,11 @@ wait type; it should not add a second planning pipeline.
 
 ### 5c. Cluster-wide ("global") CSN (inside `status` in `include/PgSQL_HostGroups_Manager.h` (full implementation))
 
-This is the state that makes the *global* mode possible. This implementation already has a global write-LSN equivalent: the `GLOBAL_LSN` mode waits on `max(session target, writer-mirror primary LSN)`, read via `get_polardb_primary_lsn()` (`include/PgSQL_HostGroups_Manager.h:1620` (this implementation)) and combined by `polardb_target_with_global_lsn()` (`include/PgSQL_PolarDB.h:1237` (this implementation)). CSN's cluster state doubles this existing global concept rather than introducing the first one.
+This is the state that makes the *global* mode possible. This implementation
+already has the LSN equivalent: `GLOBAL_LSN` waits on `max(session target,
+group LSN)`, reads the group observation through `get_polardb_group_lsn()`, and
+combines it with `polardb_target_with_global_lsn()`. CSN's cluster state doubles
+this existing global concept rather than introducing the first one.
 
 | Field | Line (full implementation) | Purpose |
 |---|---|---|
@@ -255,14 +262,24 @@ The proxy makes a replica wait by prepending one or more `SET` statements in fro
 | `polar_proxy_wait_timeout_ms` | proxy, optional prefix | caps how long the server waits; the proxy probes whether the backend supports it first | `include/PgSQL_PolarDB.h:474-480`; probe `lib/PgSQL_Session.cpp:1579` |
 | `_polar_send_csn=true` | proxy, in the connection startup string | asks PolarDB to append the CSN to every RFQ message | `lib/PgSQL_Connection.cpp:1288`; monitor variant `lib/PgSQL_HostGroups_Manager.cpp:3419` |
 
-The startup-string request is worth highlighting: in the full implementation, the connect path appends `conninfo << " _polar_send_csn=true";` right after the existing transaction/LSN request parameters (`lib/PgSQL_Connection.cpp:1287-1288` (full implementation)). This implementation has the LSN equivalent only: `proxy_protocol=v15` emits `_polar_proxy_send_lsn=true`, `proxy_protocol=legacy` emits `_polar_send_lsn=true`, and `off` emits no PolarDB startup request (`PgSQL_Connection::append_polardb_startup_params`, `lib/PgSQL_Connection.cpp:1398-1436`). CSN would add `REQUEST_RFQ_CSN` and the matching startup parameter in a future post-V3_0_5 feature.
+The startup-string request is worth highlighting: in the full implementation,
+the connect path appends `_polar_send_csn=true` after the transaction/LSN request
+parameters. This implementation has the LSN equivalent only: `v15_wait` and
+`v15` emit `_polar_proxy_send_lsn=true`, `legacy` emits `_polar_send_lsn=true`,
+and `off` emits no PolarDB startup request. `v15_wait` additionally emits
+`_pq_.polar_proxy_wait_v1=1` to negotiate `W`. CSN would add `REQUEST_RFQ_CSN`
+and the matching startup parameter in a future post-`V3_0_9_V15_WAIT` feature.
 
 **Wait behavior on timeout** is one of three modes (`PolarDB_WaitMode`, `include/PgSQL_PolarDB.h:62-66` (full implementation)):
 - `SERVER_DEFAULT` — let the backend decide.
 - `BEST_EFFORT` — after the timeout, return possibly-stale data with a WARNING/NOTICE.
 - `STRICT` — after the timeout, raise an ERROR.
 
-This is the same best-effort-versus-strict choice this implementation makes for LSN; see [08-WAIT-TIMEOUT-AND-NOTICES.md](08-WAIT-TIMEOUT-AND-NOTICES.md).
+For LSN, this implementation exposes the complete `action_lsn_timeout` outcome
+(`warning`, `primary`, `error`, or `disconnect`) and derives best-effort only
+for `warning`; the other outcomes use strict backend mode. A CSN addition should
+fit that complete policy rather than expose a second mode knob. See
+[08-WAIT-TIMEOUT-AND-NOTICES.md](08-WAIT-TIMEOUT-AND-NOTICES.md).
 
 **No RESET needed.** PolarDB automatically clears `polar_wait_csn` (and `polar_wait_lsn`, and the split XID list) at COMMIT or ABORT, so the proxy does not have to send a RESET to undo the wait (`lib/PgSQL_PolarDB_Split.cpp:274-287` (full implementation)).
 
@@ -274,9 +291,17 @@ This is the same best-effort-versus-strict choice this implementation makes for 
 
 CSN widens one column in the admin table `pgsql_replication_hostgroups`: `consistency_mode`.
 
-This is a future migration, not part of this implementation's contract. This implementation ratifies V3_0_5 as the LSN schema with `proxy_protocol` plus a `txn_split_enabled` switch that requests/observes RFQ XID data for transaction split reads; CSN-related schema values require a later coordinated schema version and migration. `REQUEST_RFQ_CSN` remains named startup-profile vocabulary until a future CSN feature requests it.
+This is a future migration, not part of this implementation's contract. The
+current implementation uses `V3_0_9_V15_WAIT`, with `proxy_protocol` plus a
+`txn_split_enabled` switch that requests/observes RFQ XID data for transaction
+split reads. CSN-related schema values require a later coordinated schema
+version and migration. `REQUEST_RFQ_CSN` remains named startup-profile
+vocabulary until a future CSN feature requests it.
 
-**This implementation (shipped)** restricts the column to seven words. We read this implementation's schema: `consistency_mode VARCHAR CHECK (LOWER(consistency_mode) IN ('default', 'off', 'lsn', 'global_lsn', 'lsn_global', 'global', 'primary')) NOT NULL DEFAULT 'default'` (`include/PgSQL_HostGroups_Manager.h:61` (this implementation)) — it already carries the global-LSN aliases; only `csn`/`session` remain for a CSN merge to add.
+**This implementation (shipped)** restricts the column to five words:
+`default`, `off`, `eventual`, `session_lsn`, and `global_lsn`, in
+`ADMIN_SQLITE_TABLE_PGSQL_REPLICATION_HOSTGROUPS_V3_0_9_V15_WAIT`. A CSN merge
+must add explicit CSN words without reusing these current meanings.
 
 **full implementation (experimental)** adds `csn`, `session`, and `global` to the same CHECK:
 ```
@@ -291,7 +316,7 @@ The string-to-enum mapping is done at config-commit time (`lib/PgSQL_HostGroups_
 |---|---|
 | `csn` | `POLARDB_CONSISTENCY_CSN` (2) |
 | `session` | `POLARDB_CONSISTENCY_LSN` (1) — **aliases to LSN, not CSN** |
-| `global` (also `global_lsn`/`lsn_global`) | `POLARDB_CONSISTENCY_GLOBAL_LSN` (2) in this implementation — the word `global` is already taken, so a CSN re-add cannot reuse it for `CSN_GLOBAL` (`include/PgSQL_PolarDB.h:1200-1203` (this implementation)) |
+| `global_lsn` (current implementation) | `PolarDB_ConsistencyMode::GLOBAL_LSN` (2); a CSN mode needs a distinct word and enum value |
 
 **Operator-confusion warning (carry this verbatim).** The word `session` in the schema maps to **LSN** (value 1), not to `SESSION_CSN` (value 2). We verified the mapping at `lib/PgSQL_HostGroups_Manager.cpp:1854` (full implementation). An operator who writes `consistency_mode = 'session'` expecting per-session *CSN* will get per-session *LSN* instead. A future CSN PR must decide whether `session` should keep meaning LSN or be changed to mean CSN, and document it loudly either way.
 
@@ -299,7 +324,10 @@ The string-to-enum mapping is done at config-commit time (`lib/PgSQL_HostGroups_
 - `:641` — the comment that marks this PolarDB upgrade step (`PolarDB upgrade: V3_0_2 → V3_0_3 (add txn_split_enabled, consistency_mode, etc.)`).
 - `:657` — the `INSERT INTO pgsql_replication_hostgroups(... consistency_mode ...) SELECT ... 'default' ... FROM pgsql_replication_hostgroups_v302`. This INSERT does **not** itself list the allowed words; it only copies a literal `'default'` into the new column. The set of allowed words (`csn`, `global`, …) lives in the **table-definition macro** that `build_table` uses one step earlier, i.e. the CHECK shown above (`include/PgSQL_HostGroups_Manager.h:52` (full implementation)).
 
-So a CSN re-add must (a) add `csn` (and the `session` alias) to the table CHECK in a new post-V3_0_5 macro — `global`/`global_lsn`/`lsn_global` are already present in this implementation, mapping to `GLOBAL_LSN` — and (b) add the matching disk-upgrade step so an old on-disk table is rebuilt with the wider CHECK; the INSERT statement itself needs no such literal.
+So a CSN re-add must (a) add `csn` and settle the `session` alias in a new
+post-`V3_0_9_V15_WAIT` table-definition macro and (b) add the matching
+disk-upgrade step so an old on-disk table is rebuilt with the wider CHECK; the
+INSERT statement itself needs no such literal.
 
 ---
 
@@ -309,9 +337,9 @@ CSN does not add many knobs; it mostly raises the range of one and reuses two ex
 
 | Variable | This implementation (shipped) | full implementation (CSN) | File:line |
 |---|---|---|---|
-| `polardb_consistency_mode` (the global default mode) | **string**, values `off`/`lsn`/`primary`; range stops at `PRIMARY` (3) | **int**, registered with maximum value `POLARDB_CONSISTENCY_CSN_GLOBAL` (4) | full: `lib/PgSQL_Thread.cpp:426`, `:2366`, `:4137`; this implementation (string): `lib/PgSQL_Thread.cpp:1123` (this implementation) |
-| `polardb_lsn_freshness_ms` | exists (controls LSN freshness) | **shared** — the same freshness window also controls `csn_updated_at` | `lib/PgSQL_HostGroups_Manager.cpp:2794`, `:2826` (full implementation) |
-| `polardb_lag_wait_ms` | exists | unchanged; feeds `resolve_wait_timeout_ms` for both LSN and CSN | `lib/PgSQL_PolarDB_Consistency.cpp:32` (full implementation) |
+| `polardb_consistency_mode` (the global default mode) | **string**: `off`, `eventual`, `session_lsn`, or `global_lsn` | **int**, registered with maximum value `POLARDB_CONSISTENCY_CSN_GLOBAL` (4) | merge must retain the current string API or migrate it deliberately |
+| `polardb_reader_lsn_max_age_ms` | controls reader LSN freshness | could also bound `csn_updated_at`, if that sharing is intentional | current `PgSQL_Thread.cpp`; full implementation HGM freshness checks |
+| `polardb_lsn_wait_timeout_ms` | complete LSN wait deadline input | can feed the common wait timeout for CSN too | current flow timeout resolution |
 
 **Representation mismatch to resolve at merge time.** This implementation stores `polardb_consistency_mode` as a **string** (`lib/PgSQL_Thread.cpp:1123` (this implementation)); the full implementation stores it as an **int** clamped to the range `[0,4]` (`lib/PgSQL_Thread.cpp:2366` (full implementation)). The full implementation's CSN routing code assumes the int form. A merge must pick one representation; if it picks the int form, it must also migrate the existing string-based admin variable.
 
@@ -414,13 +442,13 @@ The practical effect: between queries, the cluster CSN is only refreshed by **wr
 
 A future contributor bringing CSN back on top of this implementation needs to do this much. Each item names the hook it touches.
 
-1. **Schema.** Add `csn` and the `session` alias back to the `consistency_mode` CHECK in a new post-V3_0_5 table-definition macro (`include/PgSQL_HostGroups_Manager.h:52` (full implementation) form) — this implementation already carries `global`/`global_lsn`/`lsn_global`, mapping to `GLOBAL_LSN` — and add the disk-upgrade step that rebuilds an old on-disk table with that wider CHECK (`lib/ProxySQL_Admin_Disk_Upgrade.cpp:657` (full implementation); the INSERT there copies a literal `'default'` and needs no `csn`/`session` text of its own).
+1. **Schema.** Add explicit CSN words to the `consistency_mode` CHECK in a new post-`V3_0_9_V15_WAIT` table-definition macro without changing the current meanings of `session_lsn` or `global_lsn`, and add the disk-upgrade step that rebuilds an old on-disk table with that wider CHECK.
 2. **Enum.** The CSN modes can no longer take 2/4 unchanged: this implementation's enum body (`include/PgSQL_PolarDB.h:1162-1167` (this implementation)) already uses 2 = `GLOBAL_LSN`, and the integer-to-enum function `polardb_consistency_from_int` (`include/PgSQL_PolarDB.h:1172-1184` (this implementation)) already accepts 0/1/2/3. Assign the new CSN modes to free values and extend that function accordingly.
 3. **State.** Re-add the 7 CSN fields from Section 5 (2 session, 2 per-server, 2 cluster, plus the `CSN` wait-type value). This implementation already has the merge-point comments at each spot (`include/PgSQL_PolarDB.h:290-293`, `:318-319`, `:334` (this implementation)).
 4. **libpq.** Enable CSN RFQ parsing and `_polar_send_csn=true`; the patch block already exists (`deps/postgresql/polardb_libpq.patch:341-354` (full implementation)). Add the `PQgetCSN()`/`PQhasCSN()` accessors back.
 5. **Flow.** Re-add the CSN reads/writes in collect, plan, execute, and process_result (the snapshot fills, the wait-spec CSN branches, the required-CSN handoff to dispatch, and the result-processing updates).
 6. **Wrap.** Nothing new — `append_polar_wait_set` already emits `polar_wait_csn` (`include/PgSQL_PolarDB.h:456-457` (full implementation)).
-7. **Knobs.** Raise the `polardb_consistency_mode` range to 4; reuse `polardb_lsn_freshness_ms` and `polardb_lag_wait_ms`. Reconcile the string-versus-int representation (R7).
+7. **Knobs.** Extend the string-valued `polardb_consistency_mode`; decide whether CSN intentionally reuses `polardb_reader_lsn_max_age_ms` and `polardb_lsn_wait_timeout_ms` or receives clearly named CSN settings. Do not silently replace the current string API with the reference tree's integer representation.
 8. **Counters.** Re-add the 7 CSN counters from Section 11.
 9. **Finish the stubs (not just copy).** Implement the monitor CSN feed (Section 13b) so the cluster CSN refreshes between queries; decide the fate of the two dead helpers (Section 13c); give CSN timeouts a structured marker like LSN has (R5).
 

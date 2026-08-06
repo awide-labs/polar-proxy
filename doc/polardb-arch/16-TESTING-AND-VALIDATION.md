@@ -6,7 +6,7 @@
 
 | Test asset | Purpose | Backend needed? | ProxySQL needed? |
 |---|---|---:|---:|
-| `scripts/verify-polardb-libpq-lsn-patch.sh` | Verifies the PolarDB LSN/Xact libpq patch applies cleanly after the upstream libpq patches and rejects CSN symbols. | no | no |
+| `scripts/verify-polardb-libpq-lsn-patch.sh` | Verifies the PolarDB LSN/Xact and `v15_wait` libpq patch applies cleanly after upstream patches, requires the W APIs/startup token, and rejects CSN symbols. | no | no |
 | `test/polardb/Makefile` | Discoverable entry point for C helpers, TAP tests, committed benchmarks, cleanup, and trace analysis. | target-dependent | target-dependent |
 | `test/polardb/test-c/libpq_lsn_test.c` | Standalone C smoke test for patched libpq RFQ-LSN API and the backend timeout detail marker. | optional; skips gracefully when no backend is reachable | no |
 | `test/polardb/test-c/libpq_xact_test.c` | Standalone C smoke test for staged RFQ transaction-split libpq accessors, plus strict probes for backend `w` RFQ marker and isolation `ParameterStatus` support; it does not enable ProxySQL split routing. | optional; strict probes require matching backend support | no |
@@ -21,7 +21,7 @@
 | `test/polardb/test-tap/rfq_lsn_lifecycle_tap.sh` | Focused RFQ-LSN capture lifecycle TAP: an RFQ payload of value 0 on setup statements is not collapsed into "payload absent", so the session is not poisoned as missing-LSN and later reads still offload. | yes | yes |
 | `test/polardb/test-tap/txn_split_tap.sh` | Transaction-split read routing TAP; a thin adapter over `lib/scenario_harness.sh`, which owns ProxySQL lifecycle, split SQL/WAL generation, pgbench execution, and routing evidence. | yes | yes |
 | `test/polardb/test-tap/txn_split_failure_policy_tap.sh` | Split reader-failure policy TAP driven by DEBUG-only fault injection: retry/forward/terminate classification, retry-decline cleanup, writer-state loss, and the writer route overriding a later manual reader route. | yes | yes |
-| `test/polardb/test-unit/polardb_routing_lsn_unit-t.cpp` | Monotonic-LSN routing core: SESSION_LSN monotonic target and wait-plan construction, first-read baseline seeding, RFQ-unavailable route policy, query-shape checks, and the positioned-RFQ source / writer-scope match matrix. | no | no |
+| `test/polardb/test-unit/polardb_routing_lsn_unit-t.cpp` | Monotonic-LSN routing core: SESSION_LSN monotonic target and wait-plan construction, target-free first-read behavior, GLOBAL_LSN group-target handling, RFQ-unavailable route policy, query-shape checks, and the positioned-RFQ source / writer-scope match matrix. | no | no |
 | `test/polardb/test-unit/polardb_protocol_parse_unit-t.cpp` | PolarDB protocol/string parsing helpers: node-type name mapping and writer/reader classification, monitor-health parse helpers, and simple-query multi-statement detection. | no | no |
 | `test/polardb/test-unit/polardb_query_state_unit-t.cpp` | `PolarDB_QueryState` named-reset semantics: scoped per-query reset helpers (reset_reader_target, reset_wait, reset_dispatch_wrapper, reset_for_new_query) and which fields each clears versus preserves. | no | no |
 | `test/polardb/test-unit/polardb_status_policy_unit-t.cpp` | Status-name and policy helpers: route-action-reason names and NoticeResponse helpers, reader-status names and writer-redirect policy, wrapper-error accounting policy, and server-LSN cache reset. | no | no |
@@ -119,7 +119,10 @@ make -C test/polardb run-c-extended-protocol QUERY="SELECT 1"
 ```
 
 `run-c-extended-protocol` expects an already running and configured ProxySQL
-frontend. The normal end-to-end coverage for that helper is the main LSN TAP,
+frontend. A real extended-wait run additionally requires a PolarDB backend that
+accepts `_pq_.polar_proxy_wait_v1=1` during startup and implements frontend `W`;
+ordinary PostgreSQL or an older PolarDB server does not confirm runtime behavior. The normal
+end-to-end coverage for that helper is the main LSN TAP,
 which starts ProxySQL, configures writer/reader hostgroups, then calls the
 helper to force the final query through extended protocol.
 
@@ -136,7 +139,8 @@ verifies:
 4. `PQsetPolarSendLSN()` is callable.
 5. A replica accepts `SET polar_xact_split_wait_lsn = '<lsn>'` when reachable.
 6. A strict wait timeout exposes
-   `PG_DIAG_MESSAGE_DETAIL = polar_proxy_lsn_wait_timeout`.
+   `PG_DIAG_MESSAGE_DETAIL = polar_proxy_lsn_wait_timeout`; ProxySQL unit
+   coverage additionally requires source function `polar_proxy_wait_for_lsn`.
 
 Missing backend/replica cases are skipped rather than hard-failed.
 
@@ -177,9 +181,29 @@ Validates the main runtime data path:
 - debug monitor-health injection covers invalid-role (unroutable node_type) and
   invalid availability/LSN-value handling, valid unavailable-row shunning, and
   route restoration after shun;
-- extended protocol follows this feature's policy: manual reader route is honored, automatic
-  no-write extended read may use reader, automatic after-write extended read
-  uses writer without wrapper.
+- extended protocol follows this feature's policy: a manual reader route remains
+  authoritative and receives no automatic wait; automatic target-free reads may
+  use a reader; automatic after-write autocommit reads use a `v15_wait` reader
+  connection and send `W` when its confirmed LSN cache is behind the target;
+- pipeline-mode coverage sends both successful and erroring Execute+Flush
+  sequences followed by Sync. The success case verifies that the eventual RFQ
+  positions the flushed writer result before a protected reader query after
+  waiting beyond delayed-multiplex expiry; the error case verifies exact
+  `T -> E -> I` transaction status and same-session recovery. A successful
+  write Flush followed by a proxy-local RESET Flush proves that statement reset
+  cannot erase frame-owned write attribution or requested RFQ LSN publication.
+  A read/write pair in one Sync frame verifies writer pinning before the first
+  backend command;
+- the C pipeline drain accepts exactly one `PGRES_PIPELINE_SYNC` after a
+  synchronization-only operation. Unexpected command, tuple, aborted, or error
+  results fail the test instead of being silently consumed;
+- focused frame tests verify that a later conflicting Flush route returns
+  `P0001`, sends no later backend operation, emits ErrorResponse without RFQ,
+  discards through client Sync, and emits exactly one RFQ at Sync. They also
+  inject candidate and owner-accounting drift to prove containment without a
+  process-fatal assertion;
+- the managed replay-lag group proves a real extended `W` timeout, structured
+  timeout accounting, and safe writer retry.
 
 Timeout-edge checks are opt-in with `POLARDB_TIMEOUT_EDGE_TESTS=1` because they
 mutate replay lag.
@@ -330,8 +354,8 @@ additional evidence in debug builds.
    Induce status outcomes with configuration rather than timing races. The suite
    covers:
    - `RFQ_UNAVAILABLE`: reader lacks usable RFQ LSN support.
-   - `PRIMARY_LSN_UNKNOWN`: primary baseline is requested but no primary LSN
-     sample exists.
+   - `GROUP_LSN_UNKNOWN`: `GLOBAL_LSN` requires a group target but no current
+     group LSN sample exists.
    - `READER_LSN_STALE`: reader sample is older than the freshness window.
    - `READER_LAG_EXCEEDED`: `max_lag_bytes` is lower than the measured byte lag.
 
@@ -339,7 +363,7 @@ additional evidence in debug builds.
    reader acquisition reports busy, the query stays in ProxySQL's normal
    no-connection retry path, and a later acquisition succeeds. Another
    debug-injection test covers `READER_LSN_UNKNOWN`: the selector reports an
-   unknown reader position, the read is redirected to the writer, no wait wrapper
+   unknown reader position, the read is redirected to the writer, no backend wait
    is sent, and the writer-fallback counter increments once. True capacity
    contention remains a stress/manual case.
 
@@ -348,16 +372,16 @@ additional evidence in debug builds.
    RFQ LSN and asserts:
    - `PolarDB_Write_Missing_LSN` or `PolarDB_Read_Missing_LSN` increments.
    - the session missing-LSN flag changes the next automatic protected read
-     according to `pgsql-polardb_route_rfq_policy`.
+     according to `pgsql-polardb_action_missing_lsn`.
 
    A focused check that a later positioned primary RFQ clears the missing-LSN
    flag is still a useful extension.
 
 4. **Route-transition reasons.**
    The suite covers:
-   - multi-statement read -> writer, no wait wrapper;
-   - `/* route=primary */` hint -> writer, no wait wrapper;
-   - explicit transaction read -> writer, no wait wrapper;
+   - multi-statement read -> writer, no SQL wrapper or protocol `W`;
+   - `/* route=primary */` hint -> writer, no SQL wrapper or protocol `W`;
+   - explicit transaction read -> writer, no SQL wrapper or protocol `W`;
    - write-LSN-unknown and observed-LSN-unknown -> policy-controlled route.
 
 5. **Session LSN lifetime across RESET.**
@@ -426,12 +450,12 @@ repeatable without timing dependence.
 Use unit tests for pure helpers so TAP scripts do not have to manufacture every
 policy state through a live cluster:
 
-- `PolarDB_SessionConsistency::target_with_baseline()`: observed baseline,
-  primary baseline, and unknown primary.
-- `PolarDB_Query_WaitPlan::build_consistency()`: off, primary-only,
-  session-LSN with target, and session-LSN with zero target.
-- `PolarDB_Query_RoutePlan::rfq_unavailable()`: strict, best-effort, and
-  best-effort disabled for extended protocol.
+- `polardb_effective_consistency_target()`: SESSION_LSN target, GLOBAL_LSN group
+  target, and unknown-group signaling.
+- `PolarDB_Query_RoutePlan` policy cases: independent read target, missing-LSN
+  primary/warning/error, timeout action mapping, and SESSION_LSN zero-target first read.
+- RFQ-unavailable acquisition: complete missing-LSN actions, including the
+  extended path's conservative writer/error handling when no target exists for `W`.
 - `PolarDB_HG_Policy::parse_node_type()`: primary, master, replica, standby,
   null, and unknown strings.
 - monitor health parsing helpers: availability parsing, LSN parsing, and the

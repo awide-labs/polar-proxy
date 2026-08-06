@@ -27,7 +27,7 @@ The deeper "why" of routing, wrapping, waiting, and result processing lives in t
 - **Session-confined**: state that is touched by only one OS thread at a time (the thread currently driving this `PgSQL_Session`), so it needs **no locks and no atomics**. ProxySQL drives one session from one thread at a time. All PolarDB session fields are session-confined.
 - **Pooled / pooled connection**: a backend connection that ProxySQL reuses for a later query instead of opening a new one. A pooled connection skips the connect path.
 
-All of the code in this document compiles only when the build flag `POLARDB_PROXY` is set (`include/PgSQL_Session.h:476`, `:534`). With `POLARDB_PROXY=0` every field and every hook compiles out and the session behaves exactly like upstream ProxySQL.
+PolarDB routing state and hooks in this document compile only when `POLARDB_PROXY` is set. Generic extended-frame ownership, implicit-prepare lifecycle, and error/RFQ boundaries remain shared by both builds. Off mode has no PolarDB routing or `W` behavior; its compatibility contract is behavioral rather than byte identity.
 
 ---
 
@@ -39,13 +39,12 @@ The PolarDB pipeline has four logical stages — collect, plan, execute, process
   client query 'Q' arrives
         |
         v
-  get_pkts_from_client()  ── HOOK 2: route block ───────────────┐
-        |  collect -> plan -> execute  (Session.cpp:2660-2694)   |
+  get_pkts_from_client()  ── HOOK 1: route + activate ──────────┐
+        |  collect -> activate -> plan -> execute                 |
         |  result overwrites current_hostgroup                    |
         v                                                         |
   find_or_create_backend(current_hostgroup)                       |
-        |  (pooled or fresh) ── HOOK 1b: enable flag ────────────┤
-        |  (Session.cpp:6301-6302 pooled / 6315-6316 fresh)       |
+        |  pooled/fresh attach keeps fallback activation ─────────┤
         v                                                         |
   reader acquisition consumes polardb_query.reader_plan           |
         |  (get_MyConn_polardb_reader returns PolarDB_ReaderResult) |
@@ -66,7 +65,9 @@ The PolarDB pipeline has four logical stages — collect, plan, execute, process
            record_wait_latency() then reset (Session.cpp:6746)
 ```
 
-The connect-time enable (`HOOK 1`) lives in `lib/PgSQL_Connection.cpp` and is documented in [11-CONNECTION-AND-LIBPQ.md](11-CONNECTION-AND-LIBPQ.md); the session-side enable for pooled and fresh backends (`HOOK 1b` above) is covered here because it is a session method call. The four numbered hooks A/1–4 are listed in [POLARDB_ARCHITECTURE.md](POLARDB_ARCHITECTURE.md).
+Connection setup and backend attach retain fallback activation sites documented
+in [11-CONNECTION-AND-LIBPQ.md](11-CONNECTION-AND-LIBPQ.md). Normal query
+routing owns the primary activation boundary shown above.
 
 ---
 
@@ -88,7 +89,7 @@ These fields say "is PolarDB on for this session, which mode did the client ask 
 
 | Field | Type (default) | Role | Set by | Read by | Cleared |
 |-------|----------------|------|--------|---------|---------|
-| `polardb_config.is_polardb_enabled` | bool (`false`) | True once the session is bound to a PolarDB hostgroup. controls the result-processing hook. | Fresh connect (`lib/PgSQL_Connection.cpp:1219`); pooled attach (`lib/PgSQL_Session.cpp:6302`); fresh-create attach (`:6316`) | result-processing check in `RequestEnd`; `polardb_process_result` | **Never reset to false.** Once on, it stays on for the life of the session object. |
+| `polardb_config.is_polardb_enabled` | bool (`false`) | True once routing identifies a PolarDB request. Controls result processing without another global hot-path lookup. | `polardb_activate_session_for_request()` in automatic or manual PolarDB routing; fresh-connect and backend-attach paths remain fallback sites | result-processing check in `RequestEnd`; `polardb_process_result` | **Never reset to false.** Once on, it stays on for the life of the session object. |
 | `polardb_config.session_consistency_mode` | int (`-1`) | Per-session consistency-mode override; `-1` means "inherit per-HG / global". Tier 1 of the 3-tier mode resolution. | `polardb_set_session_override()` from a client `SET proxysql.polardb_consistency_mode` (`lib/PgSQL_PolarDB_Consistency.cpp:49`, called at `lib/PgSQL_Session.cpp:4707`) | collect, via the mode resolver (`lib/PgSQL_PolarDB_Flow.cpp:67`) | Reset to `-1` on `RESET`/`DISCARD ALL`/`RESET CONNECTION` via `polardb_clear_staged_wait_state_for_reset(reset_override=true)` (`lib/PgSQL_PolarDB_Wrap.cpp:332`) |
 
 This implementation deliberately has no session-id/cancel-key fields in `polardb_config`.
@@ -124,7 +125,7 @@ These fields describe the wait for **one** query. They are reset before each que
 
 | Field | Type (default) | Role | Set by | Read by | Cleared |
 |-------|----------------|------|--------|---------|---------|
-| `polardb_query.reader_plan` | `PolarDB_Query_ReaderPlan` | Per-query reader acquisition requirements: consistency target LSN, primary LSN mirror for lag-cap checks, max lag, fallback writer HG, and RFQ fallback policy. The `has_consistency_target_lsn()` predicate is the hot-path condition. | execute from the route plan | `get_MyConn_polardb_reader()` through `PolarDB_ReaderResult` | `reset_reader_target()` at query intake, after reader acquisition handling, query-end cleanup, and RESET. |
+| `polardb_query.reader_plan` | `PolarDB_Query_ReaderPlan` | Per-query reader acquisition requirements: group LSN for lag-cap checks, max lag, fallback writer HG, read/missing/timeout/loss/error actions, consistency mode, and reader flags. | execute from the route plan | `get_MyConn_polardb_reader()` through `PolarDB_ReaderResult` | `reset_reader_target()` at query intake, after reader acquisition handling, query-end cleanup, and RESET. |
 | `polardb_query.wait` | `PolarDB_Query_WaitState` | In-flight wait state for the current wrapped read. Drives wrap-state filtering and latency accounting. | `prepare_from_spec(plan.wait_spec)` then `wait_stage=WAITING`, `wait_started_at_us`, `original_query` | `polardb_wait_active()` checks `wait_stage`; the wrap step reads `original_query` and `spec.mode` | `reset_wait()` on session reset, query-end, wrapper-set-failure, and RESET. |
 | `polardb_query.reader_retry_attempts` | uint8_t (`0`) | Per-query count of reader-failure retry attempts, used to cap writer retries after a wrapped reader read fails. | reader-failure retry path (`lib/PgSQL_PolarDB_Failure.cpp`) | the reader-retry limit condition (`Failure.cpp`) | `reset_for_new_query()` at query intake, query-end, and RESET. |
 
@@ -164,8 +165,8 @@ There are six PolarDB hook points inside `lib/PgSQL_Session.cpp`. Each one is pr
 
 | # | Hook | What it does | Method / state | file:line |
 |---|------|--------------|----------------|-----------|
-| 1 | Route block | Reset the per-query reader target and request writer scope, then (if any PolarDB HG is active and the user did not do manual routing) run collect -> plan -> execute and overwrite `current_hostgroup`. Manual destination mode only stages the writer scope for result processing. | `polardb_collect`, `polardb_plan`, `polardb_execute` | `lib/PgSQL_Session.cpp` route block |
-| 2 | Enable flag (pooled / fresh) | When attaching a backend for a PolarDB HG, set `is_polardb_enabled=true` if it is not already, so result processing and waits work on a reused connection. | `polardb_config.is_polardb_enabled` | backend attach path |
+| 1 | Route and activate | Reset per-query routing state, capture/rebind the writer scope, activate the session, then run collect -> plan -> execute and overwrite `current_hostgroup`. Manual PolarDB routing captures the same scope and activates without overriding its destination. | `polardb_collect`, `polardb_activate_session_for_request`, `polardb_plan`, `polardb_execute` | route block |
+| 2 | Attach fallback | Pooled and fresh backend attach paths set the one-way enable flag if an unusual lifecycle path reached a PolarDB HG without route-time activation. | `polardb_config.is_polardb_enabled` | backend attach path |
 | 3 | Reader acquisition | When `polardb_query.reader_plan.has_consistency_target_lsn()` is true, acquire a reader through `get_MyConn_polardb_reader(..., polardb_query.reader_plan, ...)`. The typed `PolarDB_ReaderResult` either returns a connection, returns a connection with `wait_bypass_allowed`, degrades RFQ under best_effort, redirects this query to the writer for safety statuses, or leaves normal retry/wait behavior for transient pool statuses. | `polardb_query.reader_plan` | backend acquisition path |
 | 4 | Wrap finalize | At `ASYNC_IDLE`, build and inject the wait wrapper exactly once; on failure send a clean error and end the query instead of sending it unwrapped to a replica. | `finalize_wait_timeout_injection` | `lib/PgSQL_Session.cpp:3807-3825` |
 | 5 | Wait-read retry | In the `rc == -1` branch, retry one wait-wrapped reader query on the writer when either the strict timeout marker was seen or the reader connection was lost, and no user result started. | `PolarDB_WaitReadFailure`, `polardb_retry_wait_read_on_writer` | backend error path |
@@ -181,7 +182,7 @@ The route block sits inside the simple-query (`'Q'`) handler in `get_pkts_from_c
 The block does three things in order:
 
 1. **Unconditional per-query reset** of the reader target and request writer scope, so a stale LSN can never leak into a passthrough read: `polardb_query.reset_reader_target(); polardb_query.request_writer_scope.reset();`. This runs whether or not PolarDB is active.
-2. **The active condition**: the rest runs only if `PgHGM->status.polardb_active` is true (`:2635`). This is the cheap atomic master condition that is false when no PolarDB hostgroup is configured, so the pipeline costs nothing on a non-PolarDB deployment.
+2. **The active condition**: the rest runs only if the worker-local `thread->polardb_is_active()` snapshot is true. HGM publishes the shared atomic condition on topology changes; query intake pays only a predictable local branch on a non-PolarDB deployment.
 3. **The manual-mode bypass**: it reads the query-rule output `qpo->replica_eligible` (tri-state: `1`=auto, `0`=force primary, `-1`=unset) and `qpo->destination_hostgroup`. When `replica_eligible` is unset (`-1`) and a `destination_hostgroup` is explicitly set by a query rule, the user is doing manual routing and the pipeline does not override it. The request RFQ scope is still staged for result processing: normally from `destination_hostgroup`, but from the transaction-persistent `current_hostgroup` when ProxySQL is already fixed to that hostgroup and will ignore the query-rule destination.
 
 If not in manual mode, it runs collect (`:2660`), and only when the collected context says this really is a PolarDB HG (`polardb_route_ctx.is_polar_hg` at `:2662`) does it run plan (`:2688`). The result is applied two ways:
@@ -191,14 +192,26 @@ If not in manual mode, it runs collect (`:2660`), and only when the collected co
 
 The decision logic itself is in [06-ROUTING-PIPELINE.md](06-ROUTING-PIPELINE.md).
 
-### 4.2 Hook 2 — the enable flag on pooled and fresh backends
+### 4.2 Hook 2 — route-time activation, with attach fallbacks
 
-`is_polardb_enabled` is the condition that lets result processing run at all (HOOK 5b checks it). On a fresh connect it is set in the connection layer when the startup conninfo is built (`lib/PgSQL_Connection.cpp:1219`). But a **pooled** connection is reused without running connect, so that site never fires for it. To cover the pooled case, the session also sets the flag when it gets or creates a backend for a PolarDB HG:
+`is_polardb_enabled` is the session-local condition that lets result processing
+run without another shared topology lookup. The primary activation point is
+`polardb_activate_session_for_request()`: automatic routing calls it after
+capturing and rebinding the request writer scope, and manual PolarDB routing
+does the same before backend dispatch.
 
-- Pooled path (`lib/PgSQL_Session.cpp:6301-6302`): `if (!polardb_config.is_polardb_enabled && PgHGM->is_polardb_hostgroup(mybe->hostgroup_id)) polardb_config.is_polardb_enabled = true;`
-- Fresh-create path (`lib/PgSQL_Session.cpp:6315-6316`): the same check, set up front so the pipeline is active even before connect completes.
+First activation also sets `polardb_session_consistency.write_unknown=true`.
+This is deliberate. A writer request can already be in flight when the worker
+first observes that PolarDB routing became active. ProxySQL cannot prove the
+LSN of that earlier request, so the next automatic consistency read must use
+the configured unknown-target policy instead of trusting a potentially stale
+reader.
 
-Without this hook, result processing and the wait pipeline would never activate on a reused connection. The flag is only ever turned **on**; it is never turned off, because a session that has ever talked to a PolarDB backend should keep capturing LSNs.
+Fresh-connect, pooled-attach, and fresh-create paths still set the flag as
+fallbacks. They cover connection lifecycle entry points that do not pass
+through normal query routing, but they are not the correctness boundary for
+first activation. The flag only ever turns **on** and remains session-local for
+the life of the session object.
 
 ### 4.3 Hook 3 — reader acquisition consumes the per-query plan
 
@@ -215,7 +228,7 @@ if (polardb_query.reader_plan.has_consistency_target_lsn()) {
             polardb_query.reset_wait();
         polardb_query.reset_reader_target();
     } else if (reader_result.status == PolarDB_ReaderStatus::RFQ_UNAVAILABLE &&
-               route_rfq_policy == BEST_EFFORT) {
+               action_missing_lsn == WARNING) {
         polardb_enqueue_degraded_rfq_notice(...);
         polardb_query.reset_reader_target();
         polardb_query.reset_wait();
@@ -428,16 +441,22 @@ if (reset_override) {
 ```
 
 It deliberately does **not** clear `polardb_session_consistency.write_lsn`
-(section 6.4) and does not dispose backend connections (comment at `:313-314`).
-The `reset_override` flag controls whether the per-session consistency-mode
-override is also cleared.
+(section 6.4), dispose backend connections, or clear
+`polardb_extended_rfq` while a still-open extended frame owns it: results
+exposed by Flush remain unattributed until the frame's Sync RFQ. If no frame is
+active, staged reset treats that record as orphaned and abandons it; an exposed
+write then marks the session write position unknown. Full session recycle also
+clears the record, and terminal frame failure abandons it. The
+`reset_override` flag controls whether the per-session consistency-mode and
+transaction-split warmup overrides are also cleared.
 
 ### 7.2 The four reset call sites
 
 | Command (client side) | Handler | `reset_override` | Effect |
 |-----------------------|---------|------------------|--------|
-| `RESET proxysql.polardb_consistency_mode` | inline in the RESET handler (`lib/PgSQL_Session.cpp:4893-4894`) | `true` | Clears staged wait state and the per-session mode override. |
-| Generic `RESET` / `RESET ALL` | RESET handler (`lib/PgSQL_Session.cpp:5026-5030`) | passed in (`reset_override`) | The handler decides: only `RESET ALL` and `RESET proxysql.polardb_consistency_mode` clear the override; a plain `RESET <var>` clears staged state but leaves the override (comment at `:5027-5029`). |
+| `RESET proxysql.polardb_consistency_mode` | inline in the RESET handler | `false`, then clears the named override | Clears current-statement staging while preserving deferred RFQ ownership only when an open frame owns it. |
+| `RESET proxysql.polardb_txn_split_warmup` | inline in the RESET handler | `false`, then clears the named override | Same active-frame ownership rule for the warmup override. |
+| Generic `RESET` / `RESET ALL` | RESET handler (`lib/PgSQL_Session.cpp:5026-5030`) | passed in (`reset_override`) | The handler decides: only `RESET ALL` and `RESET proxysql.polardb_consistency_mode` clear the override; a plain `RESET <var>` clears staged state but leaves the override. Deferred RFQ state without an active frame is abandoned. |
 | `DISCARD ALL` | DISCARD handler (`lib/PgSQL_Session.cpp:5082-5086`), runs **before** `reset()` + `init()` | `true` | Full session reset; frees `pending_notices` before re-init so a later re-init cannot leak an allocated queue (comment at `:5083-5085`). |
 | `RESET CONNECTION` (`_MYSQL_COM_RESET_CONNECTION`) | reset-connection handler (`lib/PgSQL_Session.cpp:5556-5560`), runs **before** `reset()` + `init()` | `true` | Same full-reset shape as `DISCARD ALL`. |
 
@@ -529,7 +548,7 @@ This table summarizes every PolarDB session field's scope and clearing, for quic
 | Item | Status in this branch |
 |------|------------------------------|
 | Flat session fields for config, LSN target, per-query wait, dispatch handoff, notices | Implemented |
-| Five hot-path hooks (route, enable, reader-acquisition, wrap-finalize, notice-flush + process-result) | Implemented |
+| Hot-path hooks (route/activate, reader acquisition, wrap finalize, notice flush, result processing) | Implemented |
 | Per-query reset (two sites + wrapper-set-failure teardown) | Implemented |
 | RESET / RESET ALL / DISCARD ALL / RESET CONNECTION clearing via one helper | Implemented |
 | `polardb_session_consistency.write_lsn` survives RESET (RYW across RESET) | Implemented |
@@ -546,8 +565,8 @@ This table summarizes every PolarDB session field's scope and clearing, for quic
 
 ```mermaid
 flowchart TD
-    A["client 'Q' arrives"] --> B["get_pkts_from_client()<br/>HOOK 1: route block<br/>reset reader target + request scope<br/>collect→plan→execute"]
-    B --> C["find_or_create_backend()<br/>HOOK 2: enable flag<br/>Session.cpp:6302/6316"]
+    A["client 'Q' arrives"] --> B["get_pkts_from_client()<br/>HOOK 1: route + activate<br/>capture writer scope<br/>collect→plan→execute"]
+    B --> C["find_or_create_backend()<br/>attach activation is fallback only"]
     C --> D["reader acquisition<br/>HOOK 3: consume reader plan"]
     D --> E["handler() ASYNC_IDLE<br/>HOOK 4: wrap finalize<br/>Session.cpp:3807"]
     E -->|FAILED| F["error packet + RequestEnd(fail)<br/>Session.cpp:3818-3825"]

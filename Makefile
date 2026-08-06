@@ -144,8 +144,9 @@ DEBUG := $(ALL_DEBUG)
 #export EXTRALINK
 export MAKE
 
-# PolarDB proxy support. Default ON; build with POLARDB_PROXY=0 to compile the
-# PolarDB compilation units to no-op stubs (no behavior change vs upstream).
+# PolarDB proxy support. Default ON; build with POLARDB_PROXY=0 to remove the
+# PolarDB runtime/configuration surface and link vanilla libpq. Generic protocol
+# correctness fixes remain shared with the off build.
 POLARDB_PROXY ?= 1
 # Optional PolarDB profiling counters. Default OFF so production builds avoid
 # per-query timing probes; build with POLARDB_PROFILE=1 when collecting latency

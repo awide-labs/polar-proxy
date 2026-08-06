@@ -708,18 +708,19 @@ EVENT ──▶ not a recognized PolarDB reader failure → existing ProxySQL lo
 ### 6.4 Timeout and RFQ-unavailable types
 
 "Timeout" and "best-effort" are not one thing. Six distinct events have different owners, and
-the **two `best_effort` controls are separate policies**: `wait_timeout_mode` decides what a reader
-does when a wait *times out*, while `route_rfq_policy` decides what routing does when a target
-*cannot be enforced at all*.
+timeout and missing-target handling are separate policies:
+`action_lsn_timeout` decides the client-visible outcome when a wait reaches its
+deadline, while `action_missing_lsn` decides what routing does when a target
+cannot be enforced at all.
 
 | Event | Owner and action |
 |---|---|
 | Backend connect timeout | core async-connect retry / failure |
 | Ordinary query timeout | core cancel / kill machinery |
-| Strict PolarDB LSN wait timeout | PolarDB reader-failure policy, *before* any visible result (§6.1) |
-| Best-effort wait timeout | WARNING/notice + possibly stale result (`wait_timeout_mode = best_effort`) |
-| RFQ unavailable, `route_rfq_policy = strict` | writer redirect *before* dispatch |
-| RFQ unavailable, `route_rfq_policy = best_effort` | reader without a wait + a degradation notice |
+| PolarDB LSN wait timeout, `action_lsn_timeout=warning` | backend best-effort mode; WARNING/notice + possibly stale result |
+| PolarDB LSN wait timeout, `action_lsn_timeout=primary/error/disconnect` | backend strict mode; ProxySQL applies the configured fallback, error, or disconnect before any visible query result (§6.1) |
+| RFQ unavailable, `action_missing_lsn = primary` | writer redirect *before* dispatch |
+| RFQ unavailable, `action_missing_lsn = warning` | reader without a wait + a degradation notice |
 
 ---
 

@@ -14,11 +14,28 @@ Result processing never chooses routing, never wraps SQL, and never issues a que
 
 ## 2. Call Site and checks
 
-`PgSQL_Session::polardb_process_result()` is defined in `lib/PgSQL_PolarDB_Flow.cpp`. It is called from `PgSQL_Session::RequestEnd()` on the success path only, and only when `polardb_config.is_polardb_enabled` is true.
+`PgSQL_Session::polardb_process_result()` is defined in
+`lib/PgSQL_PolarDB_Flow.cpp`. A normal request calls it from the successful
+`PgSQL_Session::RequestEnd()` path when `polardb_config.is_polardb_enabled` is
+true. Extended Execute+Flush is different: the semantic result arrives before
+the final backend RFQ, so `RequestEnd()` records its attribution in
+`polardb_extended_rfq`. Sync later applies the one positioning RFQ to all
+successful deferred Execute results through
+`polardb_process_deferred_extended_rfq()`. Result attribution (`pending`) and
+frontend RFQ publication (`publication_pending`) have separate lifetimes. A
+normal backend-owned Sync generates its RFQ before `RequestEnd()`, so that RFQ
+uses the deferred policy and `RequestEnd()` closes publication only after it
+has consumed the final result attribution.
 
 The function returns immediately when PolarDB is disabled, the data stream is missing, or the backend connection is missing. That keeps non-PolarDB and failed-query paths out of the result-processing logic.
 
 Before dispatch, the routing path captures the replication group's current writer hostgroup and writer epoch in `polardb_query.request_writer_scope`. LSN-bearing RFQs are accepted only by the direct HGM update path, which repeats the group+epoch check through the topology snapshot and updates only atomic per-server/primary-LSN cells. If that update path rejects the RFQ, `polardb_process_result()` skips all session LSN side effects. Missing-LSN RFQs repeat a current group+epoch check immediately before setting missing-LSN flags. Any accepted positioned or missing-LSN result first scopes the session LSN state to the request writer group+epoch, clearing old write/observed LSNs and unknown flags if the session was unscoped, belonged to another replication group, or belonged to an older writer epoch. These skips are trace-observable and deliberately do not add a new counter.
+
+The immutable worker snapshot provides the hostgroup policy and shared-state
+pointers, but `get_thread_cached_polardb_hg_config()` reads `writer_epoch` from
+the shared atomic with acquire ordering on every active PolarDB lookup. A
+failover epoch change therefore becomes visible immediately; correctness does
+not depend on a publication wake or the periodic worker snapshot refresh.
 
 ## 3. RFQ LSN Read
 
@@ -60,7 +77,7 @@ The planner uses `replica_eligible`; result processing uses the digest classifie
 
 Writes are observations, but `polardb_session_consistency.write_lsn` is kept separately for diagnostics and future policy. The wait target for SESSION_LSN reads is `max(polardb_session_consistency.write_lsn, polardb_session_consistency.observed_lsn)`.
 
-ProxySQL does not guess an LSN from monitor/global state. If a query that should preserve SESSION_LSN monotonicity completes without RFQ LSN, the matching unknown flag is set and later automatic LSN-mode reads route through `pgsql-polardb_route_rfq_policy`.
+ProxySQL does not guess an LSN from monitor/global state. If a query that should preserve SESSION_LSN monotonicity completes without RFQ LSN, the matching unknown flag is set and later automatic LSN-mode reads route through `pgsql-polardb_action_missing_lsn`.
 
 ## 6. Client-Visible RFQ LSN — Raise to a Confirmed Target
 
@@ -94,10 +111,10 @@ Current code handles it as follows:
 2. In result processing, if a tracked SESSION_LSN read has no RFQ LSN, set `polardb_session_consistency.observed_unknown=true`.
 3. Increment `PolarDB_Write_Missing_LSN` or `PolarDB_Read_Missing_LSN` respectively.
 4. Emit a `proxy_warning` only on the first transition from known to unknown, so logs are useful but not spammed per query.
-5. In planning, if either flag is true, return the matching action reason (`WRITE_LSN_UNKNOWN` or `OBSERVED_LSN_UNKNOWN`) through `pgsql-polardb_route_rfq_policy`.
+5. In planning, if either flag is true, return the matching action reason (`WRITE_LSN_UNKNOWN` or `OBSERVED_LSN_UNKNOWN`) through `pgsql-polardb_action_missing_lsn`.
 6. A later primary-sourced positioned RFQ clears both unknown flags. A replica-sourced RFQ advances observed/cache state but does not clear them.
 
-Under `strict`, the policy preserves RYW by avoiding automatic replica reads when the exact wait target is unknown. Under `best_effort`, eligible simple-query reads can proceed without a wait, are accounted as degraded routes, and receive a WARNING `NoticeResponse` before the result. The proxy log for degraded routing is edge-limited per session while the degradation remains active, but the degraded-route counter and simple-query client notice are per route. Extended-protocol unknown-target reads force the writer in this implementation because there is no safe wait/notice wrapper for local Parse/Bind completions.
+Under `strict`, the policy preserves RYW by avoiding automatic replica reads when the exact wait target is unknown. Under `best_effort`, eligible simple-query reads can proceed without a wait, are accounted as degraded routes, and receive a WARNING `NoticeResponse` before the result. The proxy log for degraded routing is edge-limited per session while the degradation remains active, but the degraded-route counter and simple-query client notice are per route. Extended-protocol unknown-target reads conservatively use the writer because there is no target for `W`; this is separate from timeout notices on a real extended wait, which are preserved through implicit Parse ownership.
 
 ## 8. Per-Server Cache Update
 
@@ -120,8 +137,8 @@ This is intentionally broader than write tracking. A reader RFQ LSN tells ProxyS
 | Counter | Meaning |
 |---|---|
 | `PolarDB_Server_LSN_Updates_From_RFQ` | An RFQ carried an LSN and the direct HGM update path accepted it for the current writer group+epoch. Counts reads and writes, including accepted RFQs whose LSN did not strictly advance the cache. |
-| `PolarDB_Write_Missing_LSN` | A writer query completed but RFQ carried no LSN. Later automatic LSN-mode reads in that session follow `route_rfq_policy` until a primary-sourced RFQ clears the flag. |
-| `PolarDB_Read_Missing_LSN` | A tracked SESSION_LSN read completed but RFQ carried no LSN. Later automatic LSN-mode reads follow `route_rfq_policy` until a primary-sourced RFQ clears the flag. |
+| `PolarDB_Write_Missing_LSN` | A writer query completed but RFQ carried no LSN. Later automatic LSN-mode reads in that session follow `action_missing_lsn` until a primary-sourced RFQ clears the flag. |
+| `PolarDB_Read_Missing_LSN` | A tracked SESSION_LSN read completed but RFQ carried no LSN. Later automatic LSN-mode reads follow `action_missing_lsn` until a primary-sourced RFQ clears the flag. |
 | `PolarDB_Client_RFQ_LSN_Raised_To_Target` | The client-visible RFQ LSN was raised above the backend's reported LSN to a confirmed session or wait target so the client's LSN stream does not move backwards across backend reuse (see §6). |
 | `PolarDB_Client_RFQ_LSN_Raised_By_Writer` | A raise (above) used the session's committed target on a writer response. |
 | `PolarDB_Client_RFQ_LSN_Raised_By_Wait` | A raise (above) used a finalized, non-timed-out LSN wait target on a reader response. |
@@ -131,11 +148,31 @@ This is intentionally broader than write tracking. A reader RFQ LSN tells ProxyS
 ## 10. Reviewer Notes
 
 - Result processing is success-only. A failed or aborted write must not advance the session RYW target.
+- Successful Flush-delimited Execute results are not positioned until Sync
+  supplies the backend RFQ. If that RFQ can no longer arrive, a deferred write
+  marks the session write position unknown rather than reusing an older RFQ.
+- A proxy-local single-variable RESET inside that open frame clears only the
+  RESET statement's staged wait state. The deferred result/RFQ record remains
+  frame-owned until Sync processes it or terminal failure abandons it.
+- RESET cleanup preserves deferred RFQ state only while an active extended
+  frame owns it. If no frame is active, deferred state is orphaned and is
+  abandoned; an orphaned successful write makes the session write position
+  unknown rather than allowing attribution to cross a later RESET boundary.
+- Error resynchronization while the session remains in a
+  `PROCESSING_STMT_*` state keeps semantic ErrorResponse ownership in the
+  statement path. Standalone `RESYNCHRONIZING_CONNECTION` consumes only the
+  backend synchronization result and leaves frontend RFQ publication to the
+  session frame boundary. Mixing those roles can publish an early or duplicate
+  RFQ.
 - The session write and observed LSNs advance with `max()`, so they never regress.
 - The session write and observed LSNs intentionally survive per-query cleanup and RESET-style operations; monotonic session reads are a client-session property, not a single-query property.
 - A writer group or epoch mismatch makes the whole RFQ result cross-group or old-timeline data. Result processing must skip both session state and HGM cache publication from that result.
+- Deferred confirmed-read targets are owned by the same writer group and epoch
+  as their result attribution. If one Flush cycle spans different scopes, the
+  aggregate target is discarded and the client RFQ uses only the current
+  backend payload; numeric LSN maxima are never compared across timelines.
 - Accepted result processing scopes the session LSN state to the request writer group+epoch before attaching new state. If the session already carried unscoped, cross-group, or old-epoch targets/flags, `polardb_process_result()` clears them immediately and increments `PolarDB_Session_Target_Epoch_Reset` only when it discarded real state.
 - Missing RFQ LSN is handled at query/result-processing/policy level. Startup parameter acceptance alone does not show whether the backend will return an RFQ LSN.
-- The wait target is derived from this session's write/observed RFQs, or from the primary mirror only when `pgsql-polardb_session_lsn_baseline=primary` is configured for an empty session. The result-processing path does not substitute monitor LSN or global LSN after a missing RFQ.
+- `SESSION_LSN` derives its target only from this session's positioned write and observed RFQs; an empty session has no target and its first positioned reader RFQ establishes one. `GLOBAL_LSN` independently raises that target to the current group LSN. Missing request-attributed RFQ evidence sets the corresponding unknown flag; result processing does not invent a replacement target.
 
 Verified against this branch.

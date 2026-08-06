@@ -1,6 +1,6 @@
 # 07 — Query Wrapping and Wait-LSN Injection
 
-> Scope: how ProxySQL turns a replica-eligible read into a "wrapped read" — three `SET` statements glued in front of the user query so the replica waits for the client's last write LSN before answering; the single wrapping point; the `dispatch_state` handoff; the leading-skip consume loop; the safety path that stops unprotected replica reads; and the missing capability probe. | Audience: R/M/O/C | Status: stable | Prereqs: [06-ROUTING-PIPELINE.md](06-ROUTING-PIPELINE.md), [03-TYPES-AND-ENUMS.md](03-TYPES-AND-ENUMS.md), [01-BACKGROUND-AND-DESIGN.md](01-BACKGROUND-AND-DESIGN.md) | Verified against: this branch
+> Scope: how ProxySQL enforces a replica wait — three `SET` statements for a simple query or an in-band `W` before an extended Parse or Execute; the single SQL wrapping point; extended compound-send rollback; result ownership; the `dispatch_state` handoff; the leading-skip consume loop; and safety paths that stop unprotected replica reads. | Audience: R/M/O/C | Status: stable | Prereqs: [06-ROUTING-PIPELINE.md](06-ROUTING-PIPELINE.md), [03-TYPES-AND-ENUMS.md](03-TYPES-AND-ENUMS.md), [01-BACKGROUND-AND-DESIGN.md](01-BACKGROUND-AND-DESIGN.md) | Verified against: this branch
 
 ---
 
@@ -27,11 +27,11 @@ This document explains, at full depth:
 | **reader / replica** | A read-only backend that replays the writer's WAL and may lag behind it. Used interchangeably. |
 | **GUC** | A PostgreSQL runtime setting changed with `SET name = value`. PolarDB adds the three GUCs used here. |
 | **wrapped read / wait wrapper** | The user's read with three `SET` statements glued in front of it, sent as one simple-query packet so the replica blocks until it has replayed past the client's last write before answering. |
-| **simple query** | PostgreSQL's `'Q'` protocol message: one text string the backend parses, plans, and runs. The opposite is the **extended protocol** (`Parse`/`Bind`/`Execute`), which is not wrapped — see doc 06. |
+| **simple query** | PostgreSQL's `'Q'` protocol message: one text string the backend parses, plans, and runs. The **extended protocol** uses Parse/Bind/Execute; it never receives the SQL text wrapper, but `v15_wait` can prepend an in-band `W` in the same flush. |
 | **RFQ** (ReadyForQuery) | The PostgreSQL message a backend sends after each command. With the PolarDB libpq patch it carries the backend's current LSN. Used by result processing (doc 09), not by wrapping. |
 | **session-confined / connection-confined** | State touched by only one thread at a time (the thread driving that session or connection), so it needs no locks. |
 
-The single most important nuance: the wait `SET` is the **correctness enforcement** for RYW. The lag cap (doc 05) is a separate safety bound, not the condition. This document is about building and delivering that condition correctly.
+For the simple-query path described in this document, the wait `SET` is the **correctness enforcement** for RYW. The extended `v15_wait` path carries the same target, timeout, and mode in binary `W` instead of a SQL wrapper. The lag cap (doc 05) is a separate safety bound, not the condition. This document is about building and delivering the simple-query encoding correctly.
 
 ---
 
@@ -126,12 +126,17 @@ Likewise, `build_wrapped_wait_query()` returns early and produces an empty buffe
 
 Statement 1's text never varies, so `build_polar_consistency_mode_set()` returns a reference to one of two `static const std::string` literals (`Wrap.cpp:169-172`); there is no per-session cache. The mapping is:
 
-| `pgsql-polardb_wait_timeout_mode` | Statement |
-|-----------------------------------|-----------|
-| `2` = strict | `SET polar_consistency_mode = 'strict'; ` |
-| anything else (`1` = best_effort) | `SET polar_consistency_mode = 'best_effort'; ` |
+| `pgsql-polardb_action_lsn_timeout` | Derived backend mode | Statement |
+|------------------------------------|----------------------|-----------|
+| `warning` | `best_effort` | `SET polar_consistency_mode = 'best_effort'; ` |
+| `primary`, `error`, or `disconnect` | `strict` | `SET polar_consistency_mode = 'strict'; ` |
 
-Note this is the **wait timeout mode** knob, not the consistency mode knob. The consistency mode (off/lsn/primary) decides routing in doc 06; the wait timeout mode (best_effort/strict) decides what the replica does when the wait times out. Behavior on timeout is covered in doc 08.
+`action_lsn_timeout` is the complete client-visible timeout policy, not a
+best-effort/strict mode knob. ProxySQL derives the backend wire mode from that
+policy: only `warning` permits a stale result; every other action requires a
+strict backend timeout and is then completed by ProxySQL. The routing
+consistency mode (`off`, `eventual`, `session_lsn`, or `global_lsn`) is a separate
+setting described in doc 06. Timeout outcomes are covered in doc 08.
 
 ---
 
@@ -222,7 +227,7 @@ if (!extended_query_info && myds && myds->sess &&
 
 Two things to note:
 
-- The snapshot is **skipped when `extended_query_info` is set** — only simple queries are wrapped. The extended protocol is never wrapped (doc 06 forces extended-protocol reads to the writer), so it never carries a wrapper count.
+- The SQL-wrapper snapshot is **skipped when `extended_query_info` is set**. Extended waits use connection-local protocol state and `PQsendPreparePolarWait`, `PQsendQueryParamsPolarWait`, or `PQsendQueryPreparedPolarWait`; they produce no leading `SET` results and therefore carry no wrapper count.
 - `dispatch_state` is a small struct `PolarDB_Query_DispatchState { uint32_t wrapper_stmts; PolarDB_Query_WrapperKind wrapper_kind; bool txn_split_xids_reset; }` on `PgSQL_Connection` (`include/PgSQL_Connection.h:691-700`). It exists precisely to decouple the connection's result-skipping from session state.
 
 ### 5.3 Hop 3 — `query_start()` begins the per-query consumer
@@ -413,7 +418,7 @@ This is recorded as a **recommended follow-up** in the PR-readiness review and i
 - **Idempotency comes from `wrapper_finalized`.** Re-entering `ASYNC_IDLE` is safe (`Wrap.cpp:325-328`). Do not remove that check.
 - **`dispatch_state` is zeroed twice on purpose** — at dispatch (`Connection.cpp:2362` via `reset_dispatch_wrapper()` zeroes the session fields) and again after `query_start()` consumes it (`Connection.cpp:2041`). This prevents a stale wrapper count from a previous query bleeding into a non-wrapped query.
 - **Wrapper errors are accounted on the connection, in the loop.** The strict-mode timeout is charged from `polardb_account_wrapper_set_error()` at `Connection.cpp:250` — not from the session handler. The full accounting and de-dup story is in doc 08; here it matters only that the consume loop stops on a wrapper error so the ERROR reaches the client.
-- **Extended protocol is never wrapped.** The dispatch snapshot is skipped when `extended_query_info` is set (`Connection.cpp:2358`). Doc 06 already forces extended-protocol reads to the writer; this is the second check that keeps the text-only wrapper off the extended path.
+- **Extended protocol never uses the SQL wrapper.** The dispatch snapshot is skipped when `extended_query_info` is set. A negotiated extended wait instead checkpoints libpq's output buffer, appends `W` before the semantic Parse or Execute, and restores the checkpoint if the compound send fails, so stale partial protocol data cannot leak into the next command.
 - **The `Wait_LSN_Sent` counter is bumped only on a successful install** (`Wrap.cpp:377-381`), inside the `wait_type == LSN` branch. The neighboring comment at `Wrap.cpp:382` ("Only the LSN wait type has a per-type sent counter today.") marks where a CSN wait (a future feature) would add its own sent counter — CSN is not present in this implementation.
 
 ---

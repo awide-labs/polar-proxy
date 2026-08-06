@@ -67,7 +67,7 @@ Manager) plus **one request-stack-scoped pipeline**. Two leaf value types
 ║                            │             ║   ║ StartupIdentity ◆─[IdSource]  ║   ║   ◆─ map<hg,HG_Config      ║
 ║ SessionConsistency ◆─WriterScope(writer) ║   ║ DispatchState ◆─[WrapperKind] ║   ║         ◆─ HG_Policy>     ║
 ║   {write_lsn,observed_lsn,               ║   ║ WrapState     ◆─[WrapperKind] ║   ║ PgSQL_SrvC.polardb_*_lsn  ║
-║    write_unknown,observed_unknown}       ║   ╚═══════════════════════════════╝   ║ status.* (227 counters)  ║
+║    write_unknown,observed_unknown}       ║   ╚═══════════════════════════════╝   ║ status.* (299 counters)  ║
 ║                                          ║                                       ╚═══════════════════════════╝
 ║ QueryState ◆──WriterScope(request_scope) ║
 ║   ◆──ReaderPlan  ◆──WaitState◆WaitSpec   ║          PER-QUERY PIPELINE (transient, request-stack only)
@@ -111,7 +111,7 @@ PgSQL_Session
  ├─ polardb_config            {hg_min_* tri-states; session_consistency_mode}      (config override)
  ├─ PolarDB_SessionConsistency        ◆──▶ WriterScope (writer_scope)              (LIVES for the session)
  │     {write_lsn, observed_lsn, write_unknown, observed_unknown}
- │     target()=max(write,observed)   target_with_baseline(baseline,primary,&unk)
+ │     target()=max(write,observed)   target_with_global_lsn(group_lsn,&unknown)
  │     reset_lsn_state()   has_lsn_state()
  └─ PolarDB_QueryState                                                            (RESET each query)
        ├─ WriterScope request_writer_scope        ◆──▶ WriterScope
@@ -133,7 +133,7 @@ HostGroups Manager    │                              │                      
    RouteCtx {                          RoutePlan {
      ◆ WriterScope writer_scope          ◆ WaitSpec  wait_spec       ─┐ same LSN as
      ┄ SessionConsistency session        ◆ ReaderPlan reader  ───────┘ reader.consistency_target_lsn (§5.3)
-     7×int (timeouts/modes/baseline/      int target_hg
+     policy ints (timeouts/actions/          int target_hg
             reader_hg/lag/mode)           [RouteAction] action          PASSTHROUGH|REPLICA_WITH_WAIT|FORCE_PRIMARY
      6×bool (hg/eligible/txn/             [RouteActionReason] action_reason
             multistmt/extended/hint)      bool degraded_rfq_route
@@ -174,10 +174,9 @@ consistency-helper's return contract.
 
 ### 2.5 Reader sub-domain (freshness/lag selection)
 ```
-PolarDB_Query_ReaderPlan  {consistency_target_lsn, primary_lsn, max_lag_bytes,
-                           fallback_writer_hg, route_rfq_policy, allow_best_effort_degrade}
-   has_consistency_target_lsn()  lag_cap_enabled()
-   reader_lsn_reaches_consistency_target(reader_lsn)  within_byte_cap(reader_lsn)
+PolarDB_Query_ReaderPlan  {group_lsn, max_lag_bytes, fallback_writer_hg,
+                           missing/timeout/loss/error actions, consistency mode}
+   lag_cap_enabled()  within_byte_cap(reader_lsn)
    │ embedded in (2): QueryState.reader_plan  (persisted)  +  RoutePlan.reader  (decision)
    ▼ consumed by
 PgSQL_HostGroups_Manager::get_MyConn_polardb_reader(hid, sess, ReaderPlan, WaitSpec, only_pooled)
@@ -220,12 +219,12 @@ PgSQL_HostGroups_Manager
  ├─ std::shared_ptr<const PolarDB_TopologySnapshot>   (generation-versioned, lock-free read)
  │     PolarDB_TopologySnapshot {uint64 generation; unordered_map<hg, HG_Config>}
  │       PolarDB_HG_Config {is_polardb_hostgroup, writer_hg, reader_hg,
- │                          policy:◆HG_Policy, primary_lsn:shared_ptr<atomic<u64>>,
+ │                          policy:◆HG_Policy, group_lsn:shared_ptr<atomic<u64>>,
  │                          writer_epoch:shared_ptr<atomic<u64>>}
  │         PolarDB_HG_Policy {consistency_mode, lsn_wait_timeout_ms, max_lag_bytes, proxy_protocol}
  ├─ PgSQL_SrvC.polardb_current_lsn : atomic<u64>          (per-server replica LSN)
- │   PgSQL_HGC.repl_config {polardb_primary_lsn, polardb_writer_epoch, polardb_writer_identity}  (writer-HGC policy snapshot)
- └─ status.* : 227 exported counters (PolarDB_* — the external metrics contract)
+ │   PgSQL_HGC.repl_config {polardb_group_lsn, polardb_writer_epoch, polardb_writer_identity}  (writer-HGC policy snapshot)
+ └─ status.* : 299 exported counters (PolarDB_* — the external metrics contract)
 ```
 `HG_Policy` (raw tri-state config) ◆ inside `HG_Config` (resolved topology) ◆ inside
 `TopologySnapshot` (the versioned bundle) is a clean 3-level nesting matching
@@ -272,7 +271,7 @@ normalization, not duplication.
                                                     HostGroups Manager snapshot    ints/bools)
  ───────────────  ───────────────────────────────  ────────────────────────────  ───────────────────────────
  2 plan           polardb_plan(RouteCtx)           RouteCtx.session.target*()    RoutePlan (◆WaitSpec ◆ReaderPlan
-                  ├ WaitPlan::build_consistency()  HostGroups Manager primary LSN action/reason/target_hg)
+                  ├ WaitPlan::build_consistency()  HostGroups Manager group LSN action/reason/target_hg)
                   ├ ReaderPlan lag methods         RouteCtx.* policy
                   └ force_primary()/rfq_unavailable()
  ───────────────  ───────────────────────────────  ────────────────────────────  ───────────────────────────
@@ -329,7 +328,7 @@ stages, so one shared value with two views is the right shape. The invariant is:
 | `ReaderPlan` in both `RoutePlan.reader` and `QueryState.reader_plan` | output vs persisted copy across the plan→state boundary (different lifecycles) |
 | `WaitSpec` in WaitPlan / WaitState / RoutePlan | one shared shape at three stages; merging would re-scatter the wait fields |
 | Two `WriterScope` in `RouteCtx` (`session.writer_scope` + `writer_scope`) | the failover signal: "what the LSN is bound to" vs "current group" — their mismatch is load-bearing |
-| `route_rfq_policy`/`max_lag_bytes` in `RouteCtx` and `ReaderPlan` | resolved config flowing input→plan; the plan must be self-contained at acquisition time |
+| `action_missing_lsn`/`max_lag_bytes` in `RouteCtx` and `ReaderPlan` | resolved config flowing input→plan; the plan must be self-contained at acquisition time |
 | `DispatchState` (Connection) vs `WrapState` (Connection) | handoff vs consumer: dispatch state transfers count/kind from Session; WrapState counts down backend results |
 | `WrapState` (Connection) vs `WaitState` (Session) | two sides of the wire: Session *prepares* the wrap, Connection *consumes* the result sets |
 | `wrapper_stmts` in WaitState and `dispatch_wrapper_stmts` in QueryState | Session→Connection hand-off copy at send time (layer boundary) |
