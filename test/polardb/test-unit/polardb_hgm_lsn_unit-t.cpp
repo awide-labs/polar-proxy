@@ -54,6 +54,10 @@ int main() {
 #include "polardb_unit_domains.h"
 
 int main() {
+	if (getenv("POLARDB_LIBPQ_PREPARE_OOM_CHILD")) {
+		return run_polardb_libpq_prepare_oom_child();
+	}
+
 	plan(NO_PLAN);
 
 	int rc = test_init_minimal();

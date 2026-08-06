@@ -207,8 +207,9 @@ static void test_core_match_pool_index_and_transfer() {
 	ok(denied.conn == nullptr && denied.source == PgSQL_PoolGetSource::NONE,
 		"PostgreSQL core match pool: NONE performs no pool action");
 
+	PgSQL_Thread reset_worker;
 	PgSQL_Session reset_sess;
-	attach_test_frontend(reset_sess);
+	attach_test_frontend(reset_sess, &reset_worker);
 	PgSQL_PoolMatchKey reset_request_key;
 	reset_request_key.words[0] = 0x303;
 	conn_a->polardb_startup_config_generation++;
@@ -2103,6 +2104,34 @@ static void test_classic_worker_local_cache_policy() {
 	delete local_first;
 	delete local_second;
 
+	PgSQL_Connection* boundary_conn = make_cached_reader_connection(writer);
+	boundary_conn->polardb_pool_key = PolarDB_PoolKey{};
+	writer->ConnectionsUsed->add(boundary_conn);
+	PgSQL_Session boundary_session;
+	attach_test_frontend(boundary_session, &unbounded_worker);
+	PgSQL_Data_Stream boundary_stream;
+	boundary_stream.init(MYDS_BACKEND, &boundary_session, 0);
+	boundary_stream.attach_connection(boundary_conn);
+	boundary_conn->dispatch_state.wrapper_stmts = 1;
+	boundary_conn->dispatch_state.wrapper_kind =
+		PolarDB_Query_WrapperKind::EXTENDED_WAIT;
+	boundary_conn->polardb_query_wrap_state.begin_extended_wait(
+		PolarDB_ExtendedWaitNoticeOwner::SESSION_QUEUE);
+	boundary_stream.return_MySQL_Connection_To_Pool();
+	PgSQL_Connection* reacquired = unbounded_worker.get_MyConn_local(
+		writer_hg, &boundary_session, nullptr, 0, -1);
+	ok(reacquired == boundary_conn &&
+			boundary_conn->dispatch_state.wrapper_stmts == 0 &&
+			boundary_conn->dispatch_state.wrapper_kind ==
+				PolarDB_Query_WrapperKind::NONE &&
+			!boundary_conn->polardb_query_wrap_state.was_wrapped &&
+			!boundary_conn->polardb_query_wrap_state.is_extended_wait(),
+		"PostgreSQL pool boundary: reusable return clears request state before the next owner reacquires the backend");
+	if (reacquired) {
+		writer->ConnectionsUsed->remove(reacquired);
+		delete reacquired;
+	}
+
 	PgSQL_Connection* bounded_first = make_cached_reader_connection(writer);
 	PgSQL_Connection* bounded_second = make_cached_reader_connection(writer);
 	bounded_first->polardb_pool_key = PolarDB_PoolKey{};
@@ -2137,11 +2166,17 @@ static void test_classic_worker_local_cache_policy() {
 	const bool polardb_active_before =
 		PgHGM->status.polardb_active.load(std::memory_order_relaxed);
 	PgHGM->status.polardb_active.store(false, std::memory_order_relaxed);
+	__sync_add_and_fetch(&PgHGM->status.servers_table_version, 1);
+	removed_mapping_worker.on_pipe_wakeup(
+		PgSQL_Thread::TOPOLOGY_PUBLICATION_WAKE);
 	ok(removed_mapping_worker.get_MyConn_local(
 			writer_hg, &removed_mapping_session, nullptr, 0, -1) == nullptr,
 		"PostgreSQL worker-local cache policy: removed PolarDB mapping does not expose an RFQ-started backend");
 	PgHGM->status.polardb_active.store(
 		polardb_active_before, std::memory_order_relaxed);
+	__sync_add_and_fetch(&PgHGM->status.servers_table_version, 1);
+	removed_mapping_worker.on_pipe_wakeup(
+		PgSQL_Thread::TOPOLOGY_PUBLICATION_WAKE);
 	removed_mapping_worker.return_local_connections();
 	ok(writer->pool_used_count_value() == 0 &&
 			writer->pool_free_count_value() == 1,

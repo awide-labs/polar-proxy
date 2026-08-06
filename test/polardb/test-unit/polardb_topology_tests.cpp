@@ -53,6 +53,9 @@ static void test_writer_epoch_change_resets_lsn_caches() {
 
 	const auto writer_cfg = PgHGM->get_polardb_hg_config(writer_hg);
 	const auto reader_cfg = PgHGM->get_polardb_hg_config(reader_hg);
+	PgHGM->polardb_refresh_thread_snapshots();
+	const auto worker_cached_writer_cfg =
+		PgHGM->get_thread_cached_polardb_hg_config(writer_hg);
 	const PolarDB_WriterScope old_scope{
 		writer_cfg.writer_hostgroup, writer_cfg.writer_epoch};
 	ok(writer_cfg.is_polardb_hostgroup,
@@ -64,6 +67,8 @@ static void test_writer_epoch_change_resets_lsn_caches() {
 	ok(reader_cfg.is_polardb_hostgroup &&
 			reader_cfg.writer_epoch == writer_cfg.writer_epoch,
 		"PolarDB HGM: reader and writer configs use the same writer epoch");
+	ok(worker_cached_writer_cfg.writer_epoch == writer_cfg.writer_epoch,
+		"PolarDB HGM: publication refresh materializes the writer epoch in the worker cache");
 	const auto writer_policy = PgHGM->get_polardb_hg_policy(writer_hg);
 	ok(writer_policy.txn_split_enabled == writer_cfg.policy.txn_split_enabled,
 		"PolarDB HGM: policy accessor reads from snapshot config");
@@ -112,6 +117,11 @@ static void test_writer_epoch_change_resets_lsn_caches() {
 		"PolarDB HGM: writer change clears the replica replay maximum");
 	ok(writer_hgc->repl_config.polardb_writer_epoch->load(std::memory_order_relaxed) == 1,
 		"PolarDB HGM: writer epoch increments after writer identity changes");
+	ok(PgHGM->get_thread_cached_polardb_hg_config(writer_hg).writer_epoch == 1,
+		"PolarDB HGM: request lookup observes an epoch-only failover before the publication wake");
+	PgHGM->polardb_refresh_thread_snapshots();
+	ok(PgHGM->get_thread_cached_polardb_hg_config(writer_hg).writer_epoch == 1,
+		"PolarDB HGM: publication refresh preserves the live epoch without rebuilding policy configs");
 	// Old writer + paired reader LSN caches are cleared: assert the cached LSN and
 	// its freshness timestamp as separate invariants for each server.
 	ok(old_writer->polardb_current_lsn.load(std::memory_order_relaxed) == 0,

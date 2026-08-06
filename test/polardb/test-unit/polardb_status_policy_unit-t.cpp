@@ -109,6 +109,7 @@ static void test_reader_action_policy_mapping() {
 		{PolarDB_ReaderFailureKind::CONNECTION_LOST, "connection_lost"},
 		{PolarDB_ReaderFailureKind::WAIT_TIMEOUT, "wait_timeout"},
 		{PolarDB_ReaderFailureKind::REUSABLE_ERROR, "reusable_error"},
+		{PolarDB_ReaderFailureKind::QUERY_CANCELED, "query_canceled"},
 	};
 	check_name_cases(
 		failure_cases, polardb_reader_failure_kind_name, "reader failure kind");
@@ -299,19 +300,16 @@ static void test_query_result_error_policy() {
 
 static void test_extended_wait_retry_packet_policy() {
 	ok(polardb_extended_wait_retry_packet_ready(
-			true, true, true, true),
-		"extended wait retry packet is captured before libpq accepts W");
+			true, true, true),
+		"extended wait retry packet preserves a durable route wait requirement");
 	ok(!polardb_extended_wait_retry_packet_ready(
-			false, true, true, true),
+			false, true, true),
 		"extended wait retry packet requires an extended request");
 	ok(!polardb_extended_wait_retry_packet_ready(
-			true, false, true, true),
-		"extended wait retry packet requires active wait state");
+			true, false, true),
+		"extended wait retry packet requires a wait specification");
 	ok(!polardb_extended_wait_retry_packet_ready(
-			true, true, false, true),
-		"extended wait retry packet requires a complete wait specification");
-	ok(!polardb_extended_wait_retry_packet_ready(
-			true, true, true, false),
+			true, true, false),
 		"extended wait retry packet requires ownership of the Execute packet");
 }
 

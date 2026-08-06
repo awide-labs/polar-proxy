@@ -34,11 +34,17 @@ extern "C" {
 #include <vector>
 #include <fcntl.h>
 #include <poll.h>
+#include <spawn.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+extern char** environ;
 
 extern PgSQL_HostGroups_Manager* PgHGM;
 extern PgSQL_Threads_Handler* GloPTH;
+extern bool polardb_is_lsn_wait_timeout_result(const PGresult* result);
 
 #if POLARDB_PROXY
 
@@ -97,6 +103,12 @@ static PolarDB_WireCapture capture_libpq_wire(Sender sender) {
 	}
 	pqDropConnection(conn, true);
 	conn->sock = sockets[0];
+	// The fixture models a network backend. AF_UNIX makes libpq coalesce writes
+	// into 8 KiB chunks and can retain a valid short protocol frame after PQflush.
+	conn->raddr.addr.ss_family = AF_INET;
+	conn->write_failed = false;
+	free(conn->write_err_msg);
+	conn->write_err_msg = nullptr;
 	conn->status = CONNECTION_OK;
 	conn->asyncStatus = PGASYNC_IDLE;
 	conn->pipelineStatus = PQ_PIPELINE_OFF;
@@ -223,6 +235,149 @@ static bool polardb_wait_wire_matches(
 	return matches;
 }
 
+static rlim_t polardb_current_virtual_bytes() {
+	FILE* statm = fopen("/proc/self/statm", "r");
+	unsigned long pages = 0;
+	if (!statm || fscanf(statm, "%lu", &pages) != 1) {
+		if (statm) {
+			fclose(statm);
+		}
+		return 0;
+	}
+	fclose(statm);
+	const long page_size = sysconf(_SC_PAGESIZE);
+	return page_size > 0
+		? static_cast<rlim_t>(pages) * static_cast<rlim_t>(page_size)
+		: 0;
+}
+
+struct PolarDB_PrepareOomChildResult {
+	bool launched{false};
+	bool checkpoint_restored{false};
+	bool clean_resend{false};
+};
+
+enum PolarDB_PrepareOomChildFailure : int {
+	POLARDB_PREPARE_OOM_CHILD_OK = 0,
+	POLARDB_PREPARE_OOM_CHILD_CHECKPOINT_FAILED = 1 << 0,
+	POLARDB_PREPARE_OOM_CHILD_CLEAN_RESEND_FAILED = 1 << 1,
+};
+
+static PolarDB_PrepareOomChildResult run_prepare_oom_child_process() {
+	char executable[4096];
+	const ssize_t executable_len = readlink(
+		"/proc/self/exe", executable, sizeof(executable) - 1);
+	if (executable_len <= 0) {
+		return {};
+	}
+	executable[executable_len] = '\0';
+
+	std::vector<std::string> environment_storage;
+	for (char** entry = environ; entry && *entry; ++entry) {
+		if (strncmp(*entry, "MALLOC_CONF=", 12) != 0 &&
+				strncmp(*entry, "POLARDB_LIBPQ_PREPARE_OOM_CHILD=",
+					sizeof("POLARDB_LIBPQ_PREPARE_OOM_CHILD=") - 1) != 0) {
+			environment_storage.emplace_back(*entry);
+		}
+	}
+	environment_storage.emplace_back("MALLOC_CONF=xmalloc:false");
+	environment_storage.emplace_back("POLARDB_LIBPQ_PREPARE_OOM_CHILD=1");
+
+	std::vector<char*> child_environment;
+	child_environment.reserve(environment_storage.size() + 1);
+	for (std::string& entry : environment_storage) {
+		child_environment.push_back(entry.data());
+	}
+	child_environment.push_back(nullptr);
+	char* const child_argv[] = {executable, nullptr};
+
+	pid_t child_pid = -1;
+	if (posix_spawn(
+			&child_pid, executable, nullptr, nullptr, child_argv,
+			child_environment.data()) != 0) {
+		return {};
+	}
+	int child_status = 0;
+	while (waitpid(child_pid, &child_status, 0) < 0) {
+		if (errno != EINTR) {
+			return {};
+		}
+	}
+	if (!WIFEXITED(child_status)) {
+		return {};
+	}
+	const int failures = WEXITSTATUS(child_status);
+	return {
+		true,
+		(failures & POLARDB_PREPARE_OOM_CHILD_CHECKPOINT_FAILED) == 0,
+		(failures & POLARDB_PREPARE_OOM_CHILD_CLEAN_RESEND_FAILED) == 0};
+}
+
+int run_polardb_libpq_prepare_oom_child() {
+	const uint64_t failed_target = UINT64_C(0x1111111122222222);
+	const uint64_t valid_target = UINT64_C(0x3333333344444444);
+	int failed_send_rc = -1;
+	bool fault_ready = false;
+	bool checkpoint_restored = false;
+	const PolarDB_WireCapture recovered = capture_libpq_wire(
+		[&](PGconn* conn) {
+			// The child starts with xmalloc:false, so this deliberate realloc OOM
+			// follows libpq's recoverable error path instead of aborting ProxySQL.
+			std::string large_query(64U * 1024U * 1024U, 'x');
+			struct rlimit saved_limit;
+			const rlim_t virtual_bytes = polardb_current_virtual_bytes();
+			if (virtual_bytes == 0 ||
+					getrlimit(RLIMIT_AS, &saved_limit) != 0) {
+				return 0;
+			}
+			struct rlimit fault_limit = saved_limit;
+			const rlim_t headroom = 8U * 1024U * 1024U;
+			if (virtual_bytes > RLIM_INFINITY - headroom) {
+				return 0;
+			}
+			fault_limit.rlim_cur = virtual_bytes + headroom;
+			if (saved_limit.rlim_max != RLIM_INFINITY &&
+					fault_limit.rlim_cur > saved_limit.rlim_max) {
+				return 0;
+			}
+			if (setrlimit(RLIMIT_AS, &fault_limit) != 0) {
+				return 0;
+			}
+			fault_ready = true;
+			const int saved_count = conn->outCount;
+			const int saved_msg_start = conn->outMsgStart;
+			const int saved_msg_end = conn->outMsgEnd;
+			failed_send_rc = PQsendPreparePolarWait(
+				conn, "large_stmt", large_query.c_str(), 0, nullptr,
+				failed_target, 1000, PQ_POLAR_CONSISTENCY_STRICT);
+			const int restore_rc = setrlimit(RLIMIT_AS, &saved_limit);
+			checkpoint_restored = restore_rc == 0 &&
+				conn->outCount == saved_count &&
+				conn->outMsgStart == saved_msg_start &&
+				conn->outMsgEnd == saved_msg_end;
+			if (failed_send_rc != 0 || restore_rc != 0) {
+				return 0;
+			}
+			return PQsendPreparePolarWait(
+				conn, "stmt", "SELECT 1", 0, nullptr,
+				valid_target, 1000, PQ_POLAR_CONSISTENCY_STRICT);
+		});
+
+	int failures = POLARDB_PREPARE_OOM_CHILD_OK;
+	if (!recovered.fixture_ready || !fault_ready || failed_send_rc != 0 ||
+			!checkpoint_restored || recovered.send_rc != 1 ||
+			recovered.flush_rc != 0) {
+		failures |= POLARDB_PREPARE_OOM_CHILD_CHECKPOINT_FAILED;
+	}
+	if (!polardb_wait_frame_matches(
+			recovered.bytes, valid_target, 1000,
+			PQ_POLAR_CONSISTENCY_STRICT) ||
+			polardb_wire_message_types(recovered.bytes) != "WPS") {
+		failures |= POLARDB_PREPARE_OOM_CHILD_CLEAN_RESEND_FAILED;
+	}
+	return failures;
+}
+
 static void test_extended_wait_libpq_wire_order() {
 	const uint64_t target_lsn = UINT64_C(0x0102030405060708);
 	const uint32_t timeout_ms = 0x00010203;
@@ -292,6 +447,35 @@ static void test_extended_wait_libpq_send_rollback() {
 	const int binary_formats[] = {1};
 	const int binary_lengths[] = {5};
 	int failed_send_rc = -1;
+	int invalid_target_rc = -1;
+	int invalid_mode_rc = -1;
+
+	const PolarDB_WireCapture rejected_spec = capture_libpq_wire(
+		[&](PGconn* conn) {
+			invalid_target_rc = PQsendQueryPreparedPolarWait(
+				conn, "stmt", 0, nullptr, nullptr, nullptr, 0,
+				0, 1000, PQ_POLAR_CONSISTENCY_STRICT);
+			invalid_mode_rc = PQsendQueryPreparedPolarWait(
+				conn, "stmt", 0, nullptr, nullptr, nullptr, 0,
+				failed_target, 1000, 99);
+			if (invalid_target_rc != 0 || invalid_mode_rc != 0) {
+				return 0;
+			}
+			return PQsendQueryPreparedPolarWait(
+				conn, "stmt", 0, nullptr, nullptr, nullptr, 0,
+				valid_target, 1000, PQ_POLAR_CONSISTENCY_STRICT);
+		});
+	ok(rejected_spec.fixture_ready && invalid_target_rc == 0 &&
+			invalid_mode_rc == 0 && rejected_spec.send_rc == 1 &&
+			rejected_spec.flush_rc == 0,
+		"v15_wait libpq validation: malformed wait specs leave the connection reusable");
+	ok(polardb_wait_wire_matches(
+			"rejected-spec", rejected_spec, "WBDES", valid_target, 1000,
+			PQ_POLAR_CONSISTENCY_STRICT) &&
+			rejected_spec.trace.find("PolarWait") != std::string::npos &&
+			rejected_spec.trace.find("PolarWait",
+				rejected_spec.trace.find("PolarWait") + 1) == std::string::npos,
+		"v15_wait libpq validation: rejected specs stage no W before a valid send");
 
 	const PolarDB_WireCapture recovered = capture_libpq_wire(
 		[&](PGconn* conn) {
@@ -312,6 +496,12 @@ static void test_extended_wait_libpq_send_rollback() {
 			"rollback", recovered, "WBDES", valid_target, 1000,
 			PQ_POLAR_CONSISTENCY_STRICT),
 		"v15_wait libpq rollback: next send contains only its own W and Execute");
+	const size_t trace_wait = recovered.trace.find("PolarWait");
+	ok(trace_wait != std::string::npos &&
+			recovered.trace.find("PolarWait", trace_wait + 1) == std::string::npos &&
+			recovered.trace.find(std::to_string(failed_target)) == std::string::npos &&
+			recovered.trace.find(std::to_string(valid_target)) != std::string::npos,
+		"v15_wait libpq rollback: trace contains only the committed wait");
 
 	constexpr int prefix_size = 8192 - 21;
 	ssize_t premature_bytes = -1;
@@ -361,6 +551,13 @@ static void test_extended_wait_libpq_send_rollback() {
 			"rollback-threshold", threshold, "WBDES", valid_target, 1000,
 			PQ_POLAR_CONSISTENCY_STRICT),
 		"v15_wait libpq rollback: threshold failure is followed by a clean valid send");
+
+	const PolarDB_PrepareOomChildResult prepare_oom =
+		run_prepare_oom_child_process();
+	ok(prepare_oom.launched && prepare_oom.checkpoint_restored,
+		"v15_wait libpq rollback: failed Parse restores the staged W checkpoint");
+	ok(prepare_oom.launched && prepare_oom.clean_resend,
+		"v15_wait libpq rollback: Prepare failure is followed by a clean W and Parse");
 }
 
 static void test_extended_wait_notice_owner_contract() {
@@ -370,9 +567,24 @@ static void test_extended_wait_notice_owner_contract() {
 		PolarDB_ExtendedWaitNoticeOwner::SESSION_QUEUE);
 	ok(state.wait_notice_uses_session_queue(),
 		"v15_wait notice owner: implicit backend Parse keeps W notices in session queue");
-	state.mark_extended_wait_result_received();
+	state.observe_extended_wait_completion(true);
 	ok(!state.wait_notice_uses_session_queue(),
 		"v15_wait notice owner: owner returns to query result after Parse result arrives");
+	ok(state.wrapper_set_succeeded(),
+		"v15_wait result: semantic Parse success confirms the preceding W");
+
+	state.begin_extended_wait(
+		PolarDB_ExtendedWaitNoticeOwner::SESSION_QUEUE);
+	state.observe_extended_wait_completion(false);
+	ok(!state.wrapper_set_succeeded(),
+		"v15_wait result: ErrorResponse followed by pipeline sync cannot confirm W");
+	ok(!state.wait_notice_uses_session_queue(),
+		"v15_wait notice owner: semantic error ends temporary Parse-result ownership");
+
+	state.begin_extended_wait(
+		PolarDB_ExtendedWaitNoticeOwner::SESSION_QUEUE);
+	ok(!state.wrapper_set_succeeded() && state.wait_notice_uses_session_queue(),
+		"v15_wait result: no semantic completion changes neither success nor notice ownership");
 
 	state.begin_extended_wait(
 		PolarDB_ExtendedWaitNoticeOwner::QUERY_RESULT);
@@ -427,6 +639,301 @@ static void test_extended_wait_cleanup_boundaries() {
 	PolarDB_SessionUnitAccess::set_extended_request_boundary(
 		&sess, EXTQ_PHASE_IDLE, false);
 	backend_myds.detach_connection();
+}
+
+static void test_query_cancellation_is_not_retried() {
+	PgSQL_Session sess;
+	ok(!PolarDB_SessionUnitAccess::request_has_wait_timeout_evidence(false),
+		"PolarDB reader failure: marker-less 57014 ignores legacy timeout text");
+	ok(PolarDB_SessionUnitAccess::request_has_wait_timeout_evidence(true),
+		"PolarDB reader failure: structured timeout marker owns 57014 classification");
+	ok(!PolarDB_SessionUnitAccess::request_has_wait_timeout_evidence(false),
+		"PolarDB reader failure: unstructured timeout text cannot authorize fallback");
+
+	const auto canceled = PolarDB_SessionUnitAccess::reader_failure_decision(
+		&sess, /*timeout=*/false, /*reusable=*/true,
+		PGSQL_ERROR_CODES::ERRCODE_QUERY_CANCELED,
+		PolarDB_LsnWaitTimeoutAction::PRIMARY,
+		PolarDB_ReplicaErrorAction::PRIMARY);
+	ok(canceled.kind == PolarDB_ReaderFailureKind::QUERY_CANCELED &&
+			canceled.action == PolarDB_ReaderAction::RETURN_ERROR,
+		"PolarDB reader failure: non-marker 57014 is returned as cancellation");
+	ok(!canceled.allow_writer_retry &&
+			canceled.reader_failure_route == PolarDB_ReaderFailureRoute::NONE,
+		"PolarDB reader failure: cancellation cannot install a writer retry route");
+
+	const auto wait_timeout =
+		PolarDB_SessionUnitAccess::reader_failure_decision(
+			&sess, /*timeout=*/true, /*reusable=*/true,
+			PGSQL_ERROR_CODES::ERRCODE_QUERY_CANCELED,
+			PolarDB_LsnWaitTimeoutAction::PRIMARY,
+			PolarDB_ReplicaErrorAction::ERROR);
+	ok(wait_timeout.kind == PolarDB_ReaderFailureKind::WAIT_TIMEOUT &&
+			wait_timeout.action == PolarDB_ReaderAction::RETRY,
+		"PolarDB reader failure: structured 57014 remains a wait timeout");
+	ok(wait_timeout.allow_writer_retry &&
+			wait_timeout.reader_failure_route ==
+				PolarDB_ReaderFailureRoute::FORCE_WRITER,
+		"PolarDB reader failure: structured timeout retains configured primary fallback");
+
+	const auto preserved =
+		PolarDB_SessionUnitAccess::preserve_captured_wait_failure_evidence(&sess);
+	ok(preserved.timeout && preserved.reusable && preserved.connected &&
+			preserved.has_backend_error &&
+			preserved.backend_error_code ==
+				PGSQL_ERROR_CODES::ERRCODE_QUERY_CANCELED,
+		"PolarDB reader failure: cleanup enrichment preserves the immutable timeout outcome");
+
+	const auto released_packet =
+		PolarDB_SessionUnitAccess::finish_reusable_wait_error(
+			&sess, /*query_aliases_packet=*/false);
+	ok(released_packet.action == PolarDB_FailureAction::PASSTHROUGH &&
+			!released_packet.failure_owns_packet &&
+			!released_packet.request_stream_owns_packet &&
+			released_packet.retry_counters_unchanged,
+		"PolarDB reader failure: reusable cancellation releases a detached packet without retry accounting");
+
+	const auto restored_packet =
+		PolarDB_SessionUnitAccess::finish_reusable_wait_error(
+			&sess, /*query_aliases_packet=*/true);
+	ok(restored_packet.action == PolarDB_FailureAction::PASSTHROUGH &&
+			!restored_packet.failure_owns_packet &&
+			restored_packet.request_stream_owns_packet &&
+			restored_packet.retry_counters_unchanged,
+		"PolarDB reader failure: cancellation restores a borrowed packet without retry accounting");
+}
+
+static void test_extended_frame_local_error_contract() {
+	std::unique_ptr<PgSQL_Thread> worker(new PgSQL_Thread());
+	ok(PolarDB_SessionUnitAccess::exercise_worker_polardb_publication(
+			worker.get()),
+		"PolarDB publication: worker wake refreshes PolarDB state without consuming the generic server-version delta");
+	PgSQL_Session qpo_sess;
+	attach_test_frontend(qpo_sess, worker.get());
+	ok(PolarDB_SessionUnitAccess::execute_qpo_error_is_terminal(&qpo_sess),
+		"Extended Execute QPO: a local query-rule error is terminal for the Sync frame");
+
+	PgSQL_Session dispatch_sess;
+	attach_test_frontend(dispatch_sess, worker.get());
+	ok(PolarDB_SessionUnitAccess::extended_dispatch_error_clears_frame(
+			&dispatch_sess),
+		"Extended dispatcher: a local Execute error discards later messages through Sync");
+	ok(PolarDB_SessionUnitAccess::extended_local_flush_error_waits_for_sync(
+			&dispatch_sess),
+		"Extended ErrorResponse: local Flush errors retain discard-until-Sync state");
+
+	PolarDB_SessionUnitAccess::set_worker_polardb_active(worker.get(), false);
+	ok(PolarDB_SessionUnitAccess::ordinary_sync_frame_uses_lazy_state(
+			&dispatch_sess),
+		"Extended inactive path: ordinary Sync frames use only O(1) candidate state");
+	const auto activated =
+		PolarDB_SessionUnitAccess::exercise_extended_frame_activity_transition(
+			&dispatch_sess, false, true);
+	ok(activated.backend_route_pending && activated.backend_candidates == 1 &&
+			activated.writer_required,
+		"Extended classifier: inactive-to-active batch transition stays balanced and requires writer");
+	const auto deactivated =
+		PolarDB_SessionUnitAccess::exercise_extended_frame_activity_transition(
+			&dispatch_sess, true, false);
+	ok(deactivated.backend_route_pending &&
+			deactivated.backend_candidates == 1 &&
+			deactivated.writer_required,
+		"Extended classifier: active-to-inactive batch transition stays balanced and pinned conservatively");
+	PolarDB_SessionUnitAccess::set_worker_polardb_active(worker.get(), true);
+	const auto reordered =
+		PolarDB_SessionUnitAccess::classify_bind_parse_execute(
+			&dispatch_sess, 10);
+	ok(reordered.backend_route_pending && reordered.backend_candidates == 2 &&
+			reordered.writer_required,
+		"Extended classifier: Bind followed by replacement Parse cannot be reader-eligible");
+
+	PgSQL_Session owner_sess;
+	const auto owner =
+		PolarDB_SessionUnitAccess::exercise_extended_frame_owner(
+			&owner_sess, 10, 20, 30);
+	ok(owner.selected && owner.carried_across_previous_hostgroup_change &&
+			owner.ownership_deferred_until_send,
+		"Extended frame owner: selected hostgroup survives until dispatch");
+	ok(owner.backend_claimed && owner.backend_switch_rejected &&
+			owner.selected_hostgroup == 20 && owner.backend_hostgroup == 20,
+		"Extended frame owner: a dispatched Sync frame cannot switch backend hostgroups");
+	ok(owner.cleared,
+		"Extended frame owner: Sync completion clears route and backend ownership");
+	const auto transfer =
+		PolarDB_SessionUnitAccess::exercise_extended_frame_transfer(
+			&owner_sess, 20, 30);
+	ok(transfer.backend_claimed && transfer.backend_sync_reset &&
+			transfer.selected_hostgroup == 30 &&
+			transfer.backend_hostgroup == 30,
+		"Extended frame owner: controlled retry transfers ownership and clears prior backend Sync evidence");
+	const auto qpo_hostgroups =
+		PolarDB_SessionUnitAccess::exercise_extended_qpo_hostgroups(
+			&owner_sess, 10, 20, 30);
+	ok(qpo_hostgroups.first_destination_selected &&
+			qpo_hostgroups.first_destination_claimed &&
+			qpo_hostgroups.later_destination_rejected &&
+			qpo_hostgroups.selected_hostgroup == 20 &&
+			qpo_hostgroups.backend_hostgroup == 20,
+		"Extended QPO routing: the first destination owns the frame and a later conflicting destination is rejected");
+	ok(qpo_hostgroups.missing_previous_uses_default,
+		"Extended QPO routing: a query-cache hit without previous placement falls back to the configured default hostgroup");
+	const auto frame_invariants =
+		PolarDB_SessionUnitAccess::exercise_extended_frame_invariants(
+			&owner_sess, 20);
+	ok(frame_invariants.candidate_underflow_rejected &&
+			frame_invariants.queue_shape_failed_closed &&
+			frame_invariants.candidate_balance_repaired,
+		"Extended frame invariants: accounting drift is checked and ambiguous queue shape fails closed to writer");
+	ok(frame_invariants.command_owner_mismatch_rejected &&
+			frame_invariants.sync_owner_mismatch_rejected,
+		"Extended frame invariants: command and Sync ownership mismatches are rejected without aborting the proxy");
+	const auto pinned_conflict =
+		PolarDB_SessionUnitAccess::exercise_pinned_frame_conflict(
+			&dispatch_sess, 20);
+	ok(pinned_conflict.operation_rejected &&
+			pinned_conflict.sqlstate_is_p0001 &&
+			pinned_conflict.flush_emits_error_only,
+		"Extended pinned frame: a conflicting later Flush operation returns one P0001 ErrorResponse and is not dispatched");
+	ok(pinned_conflict.waits_for_client_sync &&
+			pinned_conflict.sync_emits_only_rfq,
+		"Extended pinned frame: recovery discards through client Sync and emits ReadyForQuery only at that boundary");
+	ok(PolarDB_SessionUnitAccess::implicit_prepare_retry_lifecycle(&owner_sess),
+		"Extended implicit prepare: retry preserves the logical continuation and terminal cleanup consumes it once");
+	ok(PolarDB_SessionUnitAccess::activation_transition_is_conservative(
+			&dispatch_sess),
+		"PolarDB activation: only sessions crossing a topology activation start with unknown write state");
+	ok(PolarDB_SessionUnitAccess::local_frame_requires_implicit_sync(
+			&owner_sess),
+		"Extended local frame: Simple Query requires the central implicit-Sync boundary and completion clears its portal");
+	const auto error_packets =
+		PolarDB_SessionUnitAccess::exercise_error_packet_ownership(
+			&dispatch_sess);
+	ok(error_packets.nonfatal_without_ready_is_error_only &&
+			error_packets.nonfatal_with_ready_has_one_rfq &&
+			error_packets.fatal_without_ready_is_error_only &&
+			error_packets.fatal_with_ready_is_error_only,
+		"PostgreSQL errors: nonfatal callers own RFQ placement and fatal errors never emit RFQ");
+	const auto forwarded_error =
+		PolarDB_SessionUnitAccess::exercise_forwarded_error_ownership(
+			&dispatch_sess, 20);
+	ok(forwarded_error.flush_error_is_error_only &&
+			forwarded_error.queued_messages_discarded &&
+			forwarded_error.waits_for_client_sync &&
+			forwarded_error.sync_adds_one_rfq,
+		"PolarDB forwarded Flush error: queued operations are discarded and client Sync owns the only RFQ");
+	ok(forwarded_error.transaction_rfq_preserved &&
+			forwarded_error.frame_completed,
+		"PolarDB forwarded Sync error: the exact transaction byte is preserved and the frame completes once");
+	ok(PolarDB_SessionUnitAccess::automatic_reader_route_preserves_writer_lock(
+			&dispatch_sess, 10, 20),
+		"Extended hostgroup lock: automatic reader placement cannot replace the QPO-selected writer lock");
+	const auto portal_identity =
+		PolarDB_SessionUnitAccess::exercise_bound_portal_identity(&owner_sess);
+	ok(portal_identity.bound_statement_id !=
+			portal_identity.replacement_statement_id &&
+			portal_identity.execute_statement_id ==
+				portal_identity.bound_statement_id &&
+			portal_identity.bind_did_not_copy_shared_owner &&
+			portal_identity.replacement_transferred_existing_owner &&
+			portal_identity.close_transferred_existing_owner,
+		"Extended Bind ownership: the hot path avoids shared-owner RMWs and replacement/Close preserve portal identity");
+	const auto poisoned =
+		PolarDB_SessionUnitAccess::exercise_poisoned_extended_frame(
+			&dispatch_sess, 20);
+	ok(poisoned.flush_emits_error_without_ready &&
+			poisoned.flush_waits_for_client_sync &&
+			poisoned.sync_emits_ready_in_error &&
+			poisoned.sync_completes_frame &&
+			poisoned.consumed_sync_emits_one_ready_in_error,
+		"Extended backend death: transaction poison preserves Sync-owned Z(E) and completes once");
+	const auto sync =
+		PolarDB_SessionUnitAccess::exercise_extended_frame_sync(
+			&owner_sess, 20);
+	ok(sync.ready_before_backend && !sync.ready_after_flush &&
+			sync.ready_after_sync && sync.rfq_pending_after_flush &&
+			!sync.rfq_pending_after_sync,
+		"Extended frame owner: ReadyForQuery waits for an actual backend Sync");
+	const auto deferred_rfq =
+		PolarDB_SessionUnitAccess::exercise_deferred_extended_rfq(
+			&dispatch_sess, 10, 7);
+	ok(deferred_rfq.pending_after_first_execute &&
+			deferred_rfq.publication_pending_after_first_execute &&
+			deferred_rfq.write_attribution_preserved &&
+			deferred_rfq.writer_scope_preserved &&
+			deferred_rfq.wait_target_preserved &&
+			deferred_rfq.staged_reset_preserved_frame_state &&
+			deferred_rfq.direct_publication_cleared_after_result &&
+			deferred_rfq.unknown_after_abandon &&
+			deferred_rfq.state_reset_after_abandon &&
+			deferred_rfq.inactive_reset_abandoned_orphan &&
+				deferred_rfq.error_publication_policy_preserved &&
+				deferred_rfq.error_publication_cleared_after_emit &&
+				deferred_rfq.error_publication_abandoned_on_failure &&
+				deferred_rfq.error_sync_publication_preserved &&
+				deferred_rfq.error_sync_result_attribution_discarded,
+		"Extended Flush RFQ: result attribution and frontend publication retain their independent policy lifetimes");
+	PgSQL_Session multiplex_sess;
+	attach_test_frontend(multiplex_sess, worker.get());
+	ok(PolarDB_SessionUnitAccess::sticky_frame_outranks_delayed_multiplex(
+			&multiplex_sess),
+		"Extended frame owner: delayed multiplexing cannot release a sticky Execute+Flush backend");
+	const auto batches =
+		PolarDB_SessionUnitAccess::exercise_extended_frame_batch_pinning(
+			&owner_sess, 20);
+	ok(batches.reroute_required_after_backend_claim &&
+			batches.backend_stays_pinned &&
+			batches.backend_switch_rejected,
+		"Extended frame owner: later Flush batches reroute but cannot switch an open backend pipeline");
+	ok(batches.local_batch_can_be_reclassified,
+		"Extended frame owner: a local-only Flush batch does not pin later backend work");
+	PgSQL_Session error_sess;
+	attach_test_frontend(error_sess, worker.get());
+	const auto error =
+		PolarDB_SessionUnitAccess::exercise_extended_frame_error_recovery(
+			&error_sess);
+	ok(error.waits_for_client_sync && error.discards_parse &&
+			error.discards_flush && error.accepts_sync &&
+			error.accepts_terminate,
+		"Extended frame error: messages are discarded until Sync while Terminate remains valid");
+	ok(!error.ready_before_sync && error.ready_after_sync &&
+			error.state_cleared,
+		"Extended frame error: ReadyForQuery is emitted only at Sync and recovery clears frame state");
+	const auto ready =
+		PolarDB_SessionUnitAccess::exercise_extended_ready_ownership(
+			&error_sess, 20);
+	ok(ready.backend_error_deferred && ready.backend_ready_once &&
+			ready.backend_ready_not_duplicated,
+		"Extended backend error: RFQ waits for resync and is emitted exactly once");
+	ok(ready.control_resync_deferred && ready.control_resync_ready_once,
+		"Extended control resync: discarded backend result leaves one RFQ for the session boundary");
+	ok(ready.local_ready_once && ready.local_ready_not_duplicated,
+		"Extended local error: lazy Sync frame emits exactly one RFQ");
+	ok(ready.idle_local_ready_each_time &&
+			ready.idle_local_does_not_claim_frame,
+		"Idle local result: each request emits RFQ without latching extended ownership");
+	ok(ready.describe_does_not_stage_wait,
+		"Extended Describe: backend ownership is tracked without staging W");
+}
+
+static void test_wait_timeout_provenance() {
+	PGresult* result = PQmakeEmptyPGresult(nullptr, PGRES_FATAL_ERROR);
+	ok(result != nullptr, "PolarDB timeout provenance: result fixture created");
+	if (!result) {
+		return;
+	}
+	pqSaveMessageField(result, PG_DIAG_MESSAGE_DETAIL,
+		POLARDB_LSN_WAIT_TIMEOUT_DETAIL);
+	ok(!polardb_is_lsn_wait_timeout_result(result),
+		"PolarDB timeout provenance: DETAIL alone is not trusted");
+	pqSaveMessageField(result, PG_DIAG_SOURCE_FUNCTION,
+		"client_controlled_function");
+	ok(!polardb_is_lsn_wait_timeout_result(result),
+		"PolarDB timeout provenance: forged source function is rejected");
+	pqSaveMessageField(result, PG_DIAG_SOURCE_FUNCTION,
+		POLARDB_LSN_WAIT_TIMEOUT_SOURCE_FUNCTION);
+	ok(polardb_is_lsn_wait_timeout_result(result),
+		"PolarDB timeout provenance: exact DETAIL and source function are accepted");
+	PQclear(result);
 }
 
 static void test_reader_target_selection_counter_contract() {
@@ -810,6 +1317,95 @@ static void test_reader_wait_selection_activates_only_when_needed() {
 		"PolarDB wait reader: only the behind-target selection counts wrapper preparation");
 }
 
+static void test_extended_wait_binds_before_first_backend_send() {
+	const int writer_hg = 952;
+	const int reader_hg = 953;
+	const uint64_t target_lsn = 0xB090;
+	stage_polardb_topology(PgHGM, "PolarDB extended pre-send wait",
+		writer_hg, "polardb-pre-send-writer", 19434,
+		reader_hg, "polardb-pre-send-reader", 19435);
+
+	PgSQL_HGC* reader_hgc = PgHGM->MyHGC_lookup(reader_hg);
+	PgSQL_SrvC* reader = find_pgsql_server(
+		reader_hgc, "polardb-pre-send-reader", 19435);
+	ok(reader != nullptr,
+		"PolarDB extended pre-send: concrete reader is available");
+	if (!reader) {
+		return;
+	}
+
+	std::unique_ptr<PgSQL_Thread> worker(new PgSQL_Thread());
+	PgSQL_Session sess;
+	attach_test_frontend(sess, worker.get());
+	PgSQL_Connection conn(false);
+	conn.parent = reader;
+	const PolarDB_WaitSpec wait = PolarDB_WaitSpec::from_lsn(
+		target_lsn, POLARDB_DEFAULT_WAIT_TIMEOUT_MS,
+		PolarDB_WaitMode::BEST_EFFORT);
+	auto prepare_frame = [&]() {
+		sess.current_hostgroup = reader_hg;
+		sess.previous_hostgroup = writer_hg;
+		sess.polardb_query.reader_plan.fallback_writer_hg = writer_hg;
+		sess.polardb_query.reader_wait_spec = wait;
+	};
+
+	reader->polardb_current_lsn.store(target_lsn, std::memory_order_relaxed);
+	reader->lsn_updated_at.store(monotonic_time(), std::memory_order_relaxed);
+	prepare_frame();
+	const PolarDB_ThreadCounterSnapshot bypassed(
+		worker.get(), polardb_st_var_wait_wrap_bypassed);
+	const bool ready_first = sess.polardb_prepare_extended_wait(&conn);
+	const bool ready_second = sess.polardb_prepare_extended_wait(&conn);
+	ok(ready_first && ready_second && !sess.polardb_wait_active() &&
+			sess.polardb_query.wait_bypass_target == target_lsn &&
+			bypassed.delta() == 1,
+		"PolarDB extended pre-send: attached target-ready reader is sampled once");
+
+	sess.polardb_query.clear_reader_route();
+	reader->polardb_current_lsn.store(target_lsn - 1,
+		std::memory_order_relaxed);
+	reader->lsn_updated_at.store(monotonic_time(), std::memory_order_relaxed);
+	prepare_frame();
+	const PolarDB_ThreadCounterSnapshot prepared(
+		worker.get(), polardb_st_var_wait_wrap_prepared);
+	const bool behind_first = sess.polardb_prepare_extended_wait(&conn);
+	const bool behind_second = sess.polardb_prepare_extended_wait(&conn);
+	ok(behind_first && behind_second && sess.polardb_wait_active() &&
+			sess.polardb_query.wait.spec.target == target_lsn &&
+			prepared.delta() == 1,
+		"PolarDB extended pre-send: newly selected behind reader activates one W wait");
+
+	// A failed request may return this backend before a semantic result clears
+	// its connection-local W marker. The pool boundary must remove that marker
+	// so a later session cannot mistake the old W for its own prepared wait.
+	conn.dispatch_state.wrapper_stmts = 1;
+	conn.dispatch_state.wrapper_kind = PolarDB_Query_WrapperKind::EXTENDED_WAIT;
+	conn.polardb_query_wrap_state.begin_extended_wait(
+		PolarDB_ExtendedWaitNoticeOwner::SESSION_QUEUE);
+	conn.polardb_clear_request_state_for_release();
+	ok(conn.dispatch_state.wrapper_stmts == 0 &&
+			conn.dispatch_state.wrapper_kind == PolarDB_Query_WrapperKind::NONE &&
+			!conn.polardb_query_wrap_state.was_wrapped &&
+			!conn.polardb_query_wrap_state.is_extended_wait(),
+		"PolarDB extended pool release: request-owned W and dispatch state are cleared");
+
+	PgSQL_Session next_sess;
+	attach_test_frontend(next_sess, worker.get());
+	next_sess.current_hostgroup = reader_hg;
+	next_sess.previous_hostgroup = writer_hg;
+	next_sess.polardb_query.reader_plan.fallback_writer_hg = writer_hg;
+	next_sess.polardb_query.reader_wait_spec = wait;
+	const PolarDB_ThreadCounterSnapshot next_prepared(
+		worker.get(), polardb_st_var_wait_wrap_prepared);
+	const bool next_owner_prepared =
+		next_sess.polardb_prepare_extended_wait(&conn);
+	ok(next_owner_prepared && next_sess.polardb_wait_active() &&
+			next_sess.polardb_query.wait.spec.target == target_lsn &&
+			next_prepared.delta() == 1,
+		"PolarDB extended pool release: next owner prepares a fresh W on the reused backend");
+	sess.polardb_query.clear_reader_route();
+}
+
 static void test_successful_wait_cache_advance_requires_active_wait() {
 	const int writer_hg = 950;
 	const int reader_hg = 951;
@@ -872,6 +1468,15 @@ static void test_successful_wait_cache_advance_requires_active_wait() {
 	sess.polardb_finish_wait(nullptr);
 	ok(reader->polardb_current_lsn.load(std::memory_order_relaxed) == 0,
 		"PolarDB wait cache advance: failure cleanup does not advance reader LSN cache");
+
+	backend_conn->polardb_query_wrap_state.begin_extended_wait(
+		PolarDB_ExtendedWaitNoticeOwner::QUERY_RESULT);
+	backend_conn->polardb_query_wrap_state.observe_extended_wait_completion(
+		false);
+	sess.polardb_query.wait.wait_started_at_us = monotonic_time();
+	sess.polardb_finish_wait(&backend_myds);
+	ok(reader->polardb_current_lsn.load(std::memory_order_relaxed) == 0,
+		"PolarDB wait cache advance: failed W plus pipeline sync leaves reader LSN unchanged");
 
 	backend_myds.myconn = nullptr;
 	delete backend_conn;
@@ -1116,6 +1721,29 @@ static void test_notice_queue_state_contract() {
 	sess.discard_pending_notices();
 	ok(notices.empty() && notices.pending == nullptr,
 		"PolarDB notice queue: repeated discard is safe");
+
+	PGresult* result = PQmakeEmptyPGresult(nullptr, PGRES_NONFATAL_ERROR);
+	pqSaveMessageField(result, PG_DIAG_SEVERITY, "WARNING");
+	pqSaveMessageField(result, PG_DIAG_SQLSTATE, "01000");
+	pqSaveMessageField(result, PG_DIAG_MESSAGE_PRIMARY, "wait warning");
+	pqSaveMessageField(result, PG_DIAG_MESSAGE_HINT, "retry later");
+	pqSaveMessageField(result, PG_DIAG_CONTEXT, "while waiting for replay");
+	pqSaveMessageField(result, PG_DIAG_SCHEMA_NAME, "public");
+	const unsigned int notice_size = sess.polardb_enqueue_notice_packet(result);
+	const PtrSize_t queued = notices.pending && notices.pending->len == 1
+		? notices.pending->pdata[0] : PtrSize_t{0, nullptr};
+	ok(notice_size == queued.size && notice_size != 0,
+		"PolarDB notice queue: backend result serializes into one packet");
+	ok(notice_packet_has_field(
+			(const unsigned char*)queued.ptr, queued.size, 'H', "retry later") &&
+			notice_packet_has_field(
+				(const unsigned char*)queued.ptr, queued.size, 'W',
+				"while waiting for replay") &&
+			notice_packet_has_field(
+				(const unsigned char*)queued.ptr, queued.size, 's', "public"),
+		"PolarDB notice queue: queued warning preserves optional backend fields");
+	PQclear(result);
+	sess.discard_pending_notices();
 }
 
 static void test_user_attributes_are_reapplied_after_reset() {
@@ -1169,6 +1797,7 @@ static void test_collect_is_const_stable_snapshot() {
 	}
 
 	std::unique_ptr<PgSQL_Thread> worker(new PgSQL_Thread());
+	PolarDB_SessionUnitAccess::set_worker_polardb_active(worker.get(), true);
 	PgSQL_Session sess;
 	attach_test_frontend(sess, worker.get());
 	pgsql_thread___polardb_read_target = static_cast<int>(
@@ -1653,8 +2282,10 @@ static void test_collect_is_const_stable_snapshot() {
 	const unsigned long long planner_before =
 		worker->polardb_status_variables.stvar[
 			polardb_st_var_route_planner_total];
-	const bool extended_handled = sess.polardb_apply_extended_route(
-		PGSQL_EXTENDED_QUERY_TYPE_EXECUTE);
+	PolarDB_SessionUnitAccess::set_extended_route_state(
+		&sess, 1, false, EXTQ_PHASE_PROCESSING_EXECUTE);
+	PtrSize_t extended_pkt{0, nullptr};
+	const bool extended_handled = sess.polardb_route_query(extended_pkt);
 	ok(!extended_handled &&
 			sess.current_hostgroup == writer_hg &&
 			sess.polardb_query.reader_plan.read_target ==
@@ -1732,10 +2363,9 @@ static void test_extended_wait_routes_only_execute_to_reader() {
 	}
 
 	std::unique_ptr<PgSQL_Thread> worker(new PgSQL_Thread());
+	PolarDB_SessionUnitAccess::set_worker_polardb_active(worker.get(), true);
 	PgSQL_Session sess;
 	attach_test_frontend(sess, worker.get());
-	PolarDB_SessionUnitAccess::set_extended_route_state(
-		&sess, 1, false, EXTQ_PHASE_IDLE);
 	sess.polardb_config.session_consistency_mode =
 		static_cast<int>(PolarDB_ConsistencyMode::SESSION_LSN);
 	sess.polardb_session_consistency.writer_scope = PolarDB_WriterScope{
@@ -1753,54 +2383,124 @@ static void test_extended_wait_routes_only_execute_to_reader() {
 		static_cast<int>(PolarDB_ReadTarget::REPLICA);
 	pgsql_thread___polardb_profile_off = false;
 
-	struct PhaseCase {
-		PgSQL_Extended_Query_Type type;
-		uint8_t phase;
-		const char* name;
-	};
-	const PhaseCase metadata_phases[] = {
-		{PGSQL_EXTENDED_QUERY_TYPE_PARSE,
-			EXTQ_PHASE_PROCESSING_PARSE, "Parse"},
-		{PGSQL_EXTENDED_QUERY_TYPE_BIND,
-			EXTQ_PHASE_PROCESSING_BIND, "Bind"},
-		{PGSQL_EXTENDED_QUERY_TYPE_DESCRIBE,
-			EXTQ_PHASE_PROCESSING_DESCRIBE, "Describe"},
-	};
-	for (const PhaseCase& phase : metadata_phases) {
-		PolarDB_SessionUnitAccess::reset_extended_route_state(&sess);
-		sess.current_hostgroup = writer_hg;
+	auto prepare_route = [&](int hostgroup, uint8_t phase) {
+		sess.polardb_query.reset_for_new_query();
+		sess.current_hostgroup = hostgroup;
 		PolarDB_SessionUnitAccess::set_extended_route_state(
-			&sess, 1, false, phase.phase);
-		const bool handled = sess.polardb_apply_extended_route(phase.type);
-		ok(!handled && sess.current_hostgroup == writer_hg &&
-				!sess.polardb_query.reader_wait_spec.has_wait() &&
-				PolarDB_SessionUnitAccess::extended_execute_route_pending(
-					&sess),
-			"PolarDB v15_wait route: %s stays on writer and arms Execute routing",
-			phase.name);
-	}
+			&sess, 1, false, phase);
+	};
+	auto route_extended = [&](bool writer_required) {
+		PtrSize_t pkt{0, nullptr};
+		return sess.polardb_route_query(pkt, writer_required);
+	};
 
-	/* Normal prepared execution reaches Execute through a preceding Bind. */
-	PolarDB_SessionUnitAccess::reset_extended_route_state(&sess);
-	sess.current_hostgroup = writer_hg;
-	PolarDB_SessionUnitAccess::set_extended_route_state(
-		&sess, 1, false, EXTQ_PHASE_PROCESSING_BIND);
-	const bool bind_handled = sess.polardb_apply_extended_route(
-		PGSQL_EXTENDED_QUERY_TYPE_BIND);
-	ok(!bind_handled && sess.current_hostgroup == writer_hg &&
-			PolarDB_SessionUnitAccess::extended_execute_route_pending(&sess),
-		"PolarDB v15_wait route: Bind hands routing to Execute");
+	prepare_route(writer_hg, EXTQ_PHASE_PROCESSING_EXECUTE);
+	const bool activation_error = route_extended(false);
+	ok(!activation_error && sess.polardb_config.is_polardb_enabled &&
+			!sess.polardb_session_consistency.write_unknown &&
+			sess.current_hostgroup == reader_hg &&
+			sess.polardb_query.reader_wait_spec.has_wait() &&
+			sess.polardb_query.reader_wait_spec.target == target_lsn,
+		"PolarDB activation: a session born under the active topology routes its first request normally");
 
-	sess.current_hostgroup = writer_hg;
-	PolarDB_SessionUnitAccess::set_extended_route_state(
-		&sess, 1, false, EXTQ_PHASE_PROCESSING_EXECUTE);
-	const bool execute_handled = sess.polardb_apply_extended_route(
-		PGSQL_EXTENDED_QUERY_TYPE_EXECUTE);
-	ok(!execute_handled && sess.current_hostgroup == reader_hg &&
+	const auto one_shot =
+		PolarDB_SessionUnitAccess::classify_extended_frame(
+			&sess, writer_hg, 1, 1, false);
+	ok(one_shot.backend_route_pending &&
+			one_shot.backend_candidates == 2 &&
+			!one_shot.writer_required,
+		"PolarDB extended frame: one-shot Parse/Bind/Execute routes at its first actual backend operation");
+	prepare_route(writer_hg, EXTQ_PHASE_PROCESSING_PARSE);
+	const bool one_shot_error = route_extended(one_shot.writer_required);
+	ok(!one_shot_error && sess.current_hostgroup == reader_hg &&
 			sess.polardb_query.reader_wait_spec.has_wait() &&
 			sess.polardb_query.reader_wait_spec.target == target_lsn &&
-			!PolarDB_SessionUnitAccess::extended_execute_route_pending(&sess),
-		"PolarDB v15_wait route: Execute consumes Bind handoff and selects reader with the session LSN target");
+			sess.polardb_query.request_writer_scope.matches(
+				PolarDB_WriterScope{writer_hg, writer_cfg.writer_epoch}),
+		"PolarDB extended route: one-shot Parse selects the reader and W target");
+
+	const auto reusable =
+		PolarDB_SessionUnitAccess::classify_extended_frame(
+			&sess, writer_hg, 0, 1, false, true);
+	ok(reusable.backend_route_pending &&
+			reusable.backend_candidates == 1 &&
+			!reusable.writer_required,
+		"PolarDB extended frame: reusable Bind/Execute routes at Execute");
+	prepare_route(writer_hg, EXTQ_PHASE_PROCESSING_EXECUTE);
+	const bool reusable_error = route_extended(reusable.writer_required);
+	ok(!reusable_error && sess.current_hostgroup == reader_hg &&
+			sess.polardb_query.reader_wait_spec.target == target_lsn,
+		"PolarDB extended route: reusable Execute uses the shared reader plan");
+
+	const auto metadata =
+		PolarDB_SessionUnitAccess::classify_extended_frame(
+			&sess, writer_hg, 1, 1, true);
+	ok(metadata.backend_route_pending &&
+			metadata.backend_candidates == 3 &&
+			metadata.writer_required,
+		"PolarDB extended frame: backend metadata pins the frame to writer");
+	prepare_route(writer_hg, EXTQ_PHASE_PROCESSING_PARSE);
+	const bool metadata_error = route_extended(metadata.writer_required);
+	ok(!metadata_error && sess.current_hostgroup == writer_hg &&
+			!sess.polardb_query.reader_wait_spec.has_wait(),
+		"PolarDB extended route: metadata frame cannot open a reader pipeline");
+
+	const auto multi_execute =
+		PolarDB_SessionUnitAccess::classify_extended_frame(
+			&sess, writer_hg, 0, 2, false);
+	ok(multi_execute.backend_route_pending &&
+			multi_execute.backend_candidates == 2 &&
+			multi_execute.writer_required,
+		"PolarDB extended frame: multiple Execute operations require writer");
+	prepare_route(writer_hg, EXTQ_PHASE_PROCESSING_EXECUTE);
+	const bool multi_error = route_extended(multi_execute.writer_required);
+	ok(!multi_error && sess.current_hostgroup == writer_hg &&
+			!sess.polardb_query.reader_wait_spec.has_wait(),
+		"PolarDB extended route: one Sync frame never splits across readers");
+
+	const auto parse_only =
+		PolarDB_SessionUnitAccess::classify_extended_frame(
+			&sess, writer_hg, 1, 0, false);
+	ok(parse_only.backend_route_pending &&
+			parse_only.backend_candidates == 1 &&
+			parse_only.writer_required,
+		"PolarDB extended frame: Parse-only metadata stays on writer");
+
+	constexpr int non_polardb_hg = 1999;
+	sess.polardb_query.reader_wait_spec = PolarDB_WaitSpec::from_lsn(
+		target_lsn, POLARDB_DEFAULT_WAIT_TIMEOUT_MS,
+		PolarDB_WaitMode::BEST_EFFORT);
+	const auto mixed = PolarDB_SessionUnitAccess::classify_extended_frame(
+		&sess, non_polardb_hg, 0, 1, false, true);
+	prepare_route(non_polardb_hg, EXTQ_PHASE_PROCESSING_EXECUTE);
+	const auto mixed_route =
+		PolarDB_SessionUnitAccess::apply_extended_backend_route(&sess);
+	ok(mixed.backend_route_pending && mixed_route.continued &&
+			mixed_route.route_consumed &&
+			sess.current_hostgroup == non_polardb_hg &&
+			!sess.polardb_query.reader_wait_spec.has_wait(),
+		"PolarDB extended route: ordinary hostgroup skips routing and clears the prior W target");
+	ok(PolarDB_SessionUnitAccess::locked_non_polardb_route_clears_stale_scope(
+			&sess, non_polardb_hg),
+		"PolarDB extended route: ordinary locked hostgroup clears stale scope without accounting");
+	const auto simple_manual =
+		PolarDB_SessionUnitAccess::exercise_manual_non_polardb_route(
+			&sess, non_polardb_hg, false);
+	ok(simple_manual.route_left_unchanged && simple_manual.scope_reset &&
+			simple_manual.reader_plan_reset &&
+			simple_manual.txn_reader_reconciled &&
+			simple_manual.manual_total_delta == 1 &&
+			simple_manual.manual_other_delta == 1,
+		"PolarDB simple manual route: ordinary hostgroup resets stale request state and accounts manual-other once");
+	const auto extended_manual =
+		PolarDB_SessionUnitAccess::exercise_manual_non_polardb_route(
+			&sess, non_polardb_hg, true);
+	ok(extended_manual.route_left_unchanged && extended_manual.scope_reset &&
+			extended_manual.reader_plan_reset &&
+			extended_manual.txn_reader_reconciled &&
+			extended_manual.manual_total_delta == 1 &&
+			extended_manual.manual_other_delta == 1,
+		"PolarDB extended manual route: ordinary hostgroup resets stale request state and accounts manual-other once");
 
 	const int v15_writer_hg = 984;
 	const int v15_reader_hg = 985;
@@ -1818,18 +2518,13 @@ static void test_extended_wait_routes_only_execute_to_reader() {
 	sess.polardb_session_consistency.writer_scope = PolarDB_WriterScope{
 		v15_writer_cfg.writer_hostgroup, v15_writer_cfg.writer_epoch};
 	sess.polardb_session_consistency.write_lsn = target_lsn;
-	sess.current_hostgroup = v15_writer_hg;
-	PolarDB_SessionUnitAccess::set_extended_route_state(
-		&sess, 1, false, EXTQ_PHASE_PROCESSING_EXECUTE);
-	const bool v15_execute_handled = sess.polardb_apply_extended_route(
-		PGSQL_EXTENDED_QUERY_TYPE_EXECUTE);
-	ok(!v15_execute_handled && sess.current_hostgroup == v15_writer_hg &&
+	prepare_route(v15_writer_hg, EXTQ_PHASE_PROCESSING_EXECUTE);
+	const bool v15_error = route_extended(false);
+	ok(!v15_error && sess.current_hostgroup == v15_writer_hg &&
 			!sess.polardb_query.reader_wait_spec.has_wait(),
-		"PolarDB v15 route: Execute with a target falls back to writer");
+		"PolarDB v15 route: extended wait requirement falls back to writer");
 
-	PolarDB_SessionUnitAccess::set_extended_route_state(
-		&sess, 1, false, EXTQ_PHASE_IDLE);
-	PolarDB_SessionUnitAccess::reset_extended_route_state(&sess);
+	PolarDB_SessionUnitAccess::reset_extended_frame_state(&sess);
 	pgsql_thread___polardb_read_target = saved_read_target;
 	pgsql_thread___polardb_profile_off = saved_profile_off;
 }
@@ -1849,6 +2544,7 @@ void run_polardb_consistency_profile_tests() {
 void run_polardb_consistency_target_tests() {
 	test_v2_target_reader_keeps_wait_until_lsn_is_reached();
 	test_reader_wait_selection_activates_only_when_needed();
+	test_extended_wait_binds_before_first_backend_send();
 }
 
 void run_polardb_consistency_wait_cache_tests() {
@@ -1860,8 +2556,11 @@ void run_polardb_consistency_wait_cache_tests() {
 }
 
 void run_polardb_session_state_tests() {
+	test_wait_timeout_provenance();
 	test_extended_wait_notice_owner_contract();
 	test_extended_wait_cleanup_boundaries();
+	test_query_cancellation_is_not_retried();
+	test_extended_frame_local_error_contract();
 	test_session_route_state_clear_tiers();
 	test_notice_queue_state_contract();
 	test_user_attributes_are_reapplied_after_reset();

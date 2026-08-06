@@ -191,8 +191,8 @@ static void test_query_state_extended_message_reset() {
 	ok(!query.wait.spec.has_wait() && query.original_query.empty() &&
 			query.wrapped_query_buf.empty(),
 		"extended-message reset clears wait and query buffers");
-	ok(!query.keep_session_lsn && query.wait_bypass_target == 0,
-		"extended-message reset clears response-only state");
+	ok(!query.keep_session_lsn && query.wait_bypass_target == 500,
+		"extended-message reset clears response state but preserves reader selection");
 }
 
 static void test_query_wait_transitions() {

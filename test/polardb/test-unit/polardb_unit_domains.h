@@ -57,4 +57,7 @@ void run_polardb_consistency_target_tests();
 void run_polardb_consistency_wait_cache_tests();
 void run_polardb_session_state_tests();
 
+// Re-executed before ProxySQL initialization with recoverable jemalloc OOM.
+int run_polardb_libpq_prepare_oom_child();
+
 #endif // POLARDB_UNIT_DOMAINS_H

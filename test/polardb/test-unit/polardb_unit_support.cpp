@@ -548,6 +548,16 @@ void attach_test_frontend(
 		PgSQL_Session& session, PgSQL_Thread* worker) {
 	if (worker) {
 		session.thread = worker;
+		// Production workers snapshot this state in PgSQL_Thread::init() and
+		// register_session() records its activation generation on the session.
+		// Unit workers intentionally skip both paths, so mirror them here.
+		if (PgHGM) {
+			PgHGM->polardb_refresh_thread_snapshots();
+		}
+		PolarDB_SessionUnitAccess::set_worker_polardb_active(
+			worker, PgHGM && PgHGM->status.polardb_active.load(
+				std::memory_order_acquire));
+		session.polardb_note_worker_activation_generation();
 	}
 	session.connections_handler = true;
 	session.client_myds = new PgSQL_Data_Stream();
@@ -582,6 +592,33 @@ PGconn* unit_connected_pgconn() {
 		conn->status = CONNECTION_OK;
 	}
 	return conn;
+}
+
+void unit_parse_rfq_lsn(PGconn* conn, uint64_t lsn,
+		char transaction_status) {
+	const size_t payload_len = 1 + sizeof(uint64_t);
+	const size_t frame_len = 1 + sizeof(uint32_t) + payload_len;
+	assert(conn != nullptr && frame_len <= static_cast<size_t>(conn->inBufSize));
+
+	char* p = conn->inBuffer;
+	*p++ = 'Z';
+	const uint32_t wire_len = static_cast<uint32_t>(
+		sizeof(uint32_t) + payload_len);
+	for (int shift = 24; shift >= 0; shift -= 8) {
+		*p++ = static_cast<char>((wire_len >> shift) & 0xff);
+	}
+	*p++ = transaction_status;
+	for (int shift = 56; shift >= 0; shift -= 8) {
+		*p++ = static_cast<char>((lsn >> shift) & 0xff);
+	}
+
+	conn->inStart = 0;
+	conn->inCursor = 0;
+	conn->inEnd = static_cast<int>(frame_len);
+	conn->asyncStatus = PGASYNC_BUSY;
+	conn->pipelineStatus = PQ_PIPELINE_OFF;
+	conn->polar_proxy_send_lsn = true;
+	pqParseInput3(conn);
 }
 
 PtrSize_t unit_simple_query_packet(const char* query) {

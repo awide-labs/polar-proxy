@@ -644,11 +644,14 @@ static void test_wait_bypass_target_reaches_client_rfq() {
 	PgSQL_SrvC* reader = find_pgsql_server(
 		PgHGM->MyHGC_lookup(READER_HG),
 		"polardb-bypass-reader", 19563);
-	ok(reader != nullptr,
+	const auto writer_cfg = PgHGM->get_polardb_hg_config(WRITER_HG);
+	ok(reader != nullptr && writer_cfg.is_polardb_hostgroup,
 		"PolarDB wait bypass client RFQ: reader fixture is available");
-	if (!reader) {
+	if (!reader || !writer_cfg.is_polardb_hostgroup) {
 		return;
 	}
+	const PolarDB_WriterScope writer_scope{
+		writer_cfg.writer_hostgroup, writer_cfg.writer_epoch};
 
 	PgSQL_Thread worker;
 	PgSQL_Session sess;
@@ -657,6 +660,7 @@ static void test_wait_bypass_target_reaches_client_rfq() {
 	sess.status = PROCESSING_QUERY;
 	sess.polardb_route_state.client_rfq_lsn_requested = true;
 	sess.polardb_query.profile_enabled = true;
+	sess.polardb_query.request_writer_scope = writer_scope;
 	sess.polardb_query.wait_bypass_target = TARGET_LSN;
 
 	PgSQL_Data_Stream backend_myds;
@@ -674,11 +678,25 @@ static void test_wait_bypass_target_reaches_client_rfq() {
 
 	sess.polardb_query.reset_for_new_query();
 	sess.polardb_query.profile_enabled = true;
+	sess.polardb_query.request_writer_scope = writer_scope;
 	client_lsn = 0;
 	ok(sess.polardb_prepare_client_ready_lsn(
 			backend_conn, true, BACKEND_LSN, &client_lsn) &&
 			client_lsn == BACKEND_LSN,
 		"PolarDB wait bypass client RFQ: next query does not reuse the prior target");
+
+	unit_parse_rfq_lsn(backend_conn->pgsql_conn, BACKEND_LSN);
+	const auto scope_mismatch =
+		PolarDB_SessionUnitAccess::exercise_deferred_scope_mismatch(
+			&sess, &backend_myds, backend_conn, WRITER_HG,
+			writer_scope.epoch, BACKEND_LSN, TARGET_LSN);
+	ok(scope_mismatch.aggregate_target_invalidated &&
+			scope_mismatch.direct_rfq_uses_current_backend_lsn &&
+			scope_mismatch.standalone_sync_uses_current_backend_lsn &&
+			scope_mismatch.released_backend_sync_uses_retained_lsn &&
+			scope_mismatch.attached_backend_sync_uses_retained_lsn &&
+			scope_mismatch.emitter_uses_current_backend_lsn,
+		"PolarDB deferred RFQ: retained values survive backend release or reuse while writer-epoch mismatch cannot publish an old target");
 
 	backend_myds.myconn = nullptr;
 	delete backend_conn;
