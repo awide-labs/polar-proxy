@@ -7549,6 +7549,16 @@ __cleanup:
 		}
 		myds->free_pgsql_real_query();
 	}
+
+	if (mybes) {
+		for (unsigned int i = 0; i < mybes->len; i++) {
+			PgSQL_Backend* be = (PgSQL_Backend*)mybes->index(i);
+			if (be->server_myds) {
+				be->server_myds->max_connect_time = 0;
+			}
+		}
+	}
+
 	if (session_fast_forward == SESSION_FORWARD_TYPE_NONE) {
 		// reset status of the session
 		status = WAITING_CLIENT_DATA;
