@@ -271,6 +271,7 @@ PgSQL_Data_Stream::PgSQL_Data_Stream() {
 	connect_retries_on_failure = 0;
 	max_connect_time = 0;
 	wait_until = 0;
+	killed_at = 0;
 	pause_until = 0;
 	kill_type = 0;
 	cancel_query = false;

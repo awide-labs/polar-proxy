@@ -28,6 +28,7 @@ export PROXYSQL_DATA_DIR
 export POLARDB_DEBUG_SPLIT_FAILURE_FAULT_FILE="$PROXYSQL_DATA_DIR/split_failure_fault"
 export POLARDB_DEBUG_POST_SEND_OFFLINE_FILE="$PROXYSQL_DATA_DIR/post_send_offline_fault"
 export POLARDB_DEBUG_READER_ACQUIRE_FAULT_FILE="$PROXYSQL_DATA_DIR/reader_acquire_fault"
+export POLARDB_DEBUG_CONNECT_DEADLINE_FAULT_FILE="$PROXYSQL_DATA_DIR/connect_deadline_fault"
 
 WRITER_HG="$POLARDB_WRITER_HG"
 READER_HG="$POLARDB_READER_HG"
@@ -290,9 +291,14 @@ run_split_failure_sql() {
 	local warmup_already_before="${5:-0}"
 	local txn_became_before="${6:-0}"
 	local reader_acquire_fault="${7:--}"
+	local connect_deadline_fault="${8:--}"
+	local post_send_fault="${9:--}"
+	local final_read_sql="${10:-SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $row_id;}"
 	local manual_sql=""
 	local fault_sql=""
 	local reader_acquire_fault_sql=""
+	local connect_deadline_fault_sql=""
+	local post_send_fault_sql=""
 	local txn_probe_sql=""
 	local txn_probe_count="${POLARDB_SPLIT_TXN_READY_PROBES:-20}"
 
@@ -309,6 +315,12 @@ run_split_failure_sql() {
 		reader_acquire_fault_sql="\\! : > \"\$POLARDB_DEBUG_READER_ACQUIRE_FAULT_FILE\" || echo POLARDB_READER_ACQUIRE_FAULT_FILE_WRITE_FAILED"
 	else
 		reader_acquire_fault_sql="\\! printf '%s\\n' '$reader_acquire_fault' > \"\$POLARDB_DEBUG_READER_ACQUIRE_FAULT_FILE\" || echo POLARDB_READER_ACQUIRE_FAULT_FILE_WRITE_FAILED"
+	fi
+	if [ "$connect_deadline_fault" != "-" ]; then
+		connect_deadline_fault_sql="\\! printf '%s\\n' '$connect_deadline_fault' > \"\$POLARDB_DEBUG_CONNECT_DEADLINE_FAULT_FILE\" || echo POLARDB_CONNECT_DEADLINE_FAULT_FILE_WRITE_FAILED"
+	fi
+	if [ "$post_send_fault" != "-" ]; then
+		post_send_fault_sql="\\! printf '%s\\n' '$post_send_fault' > \"\$POLARDB_DEBUG_POST_SEND_OFFLINE_FILE\" || echo POLARDB_POST_SEND_FAULT_FILE_WRITE_FAILED"
 	fi
 	for ((probe_i = 1; probe_i <= txn_probe_count; probe_i++)); do
 		txn_probe_sql="${txn_probe_sql}
@@ -328,7 +340,9 @@ INSERT INTO $TEST_TABLE VALUES ($row_id, 'split_failure$row_id') ON CONFLICT (id
 $txn_probe_sql
 $fault_sql
 $reader_acquire_fault_sql
-SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $row_id;
+$connect_deadline_fault_sql
+$post_send_fault_sql
+$final_read_sql
 $manual_sql
 COMMIT;"
 }
@@ -983,8 +997,16 @@ cleanup() {
 	fi
 	clear_debug_fault_file \
 		POLARDB_DEBUG_READER_ACQUIRE_FAULT_FILE >/dev/null 2>&1 || true
+	clear_debug_fault_file \
+		POLARDB_DEBUG_CONNECT_DEADLINE_FAULT_FILE >/dev/null 2>&1 || true
 	stop_proxysql >/dev/null 2>&1 || true
 }
+
+if [ "${TXN_SPLIT_FAILURE_POLICY_TAP_LIBRARY_ONLY:-0}" = "1" ]; then
+	# shellcheck disable=SC2317
+	return 0 2>/dev/null || exit 0
+fi
+
 trap cleanup EXIT
 
 PLAN="$(policy_case_plan)"

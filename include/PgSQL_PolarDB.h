@@ -311,6 +311,16 @@ static constexpr unsigned int POLARDB_REPLICA_FAILURE_ERROR_CODE = 9999;
 //             connection-loss path for ordinary and transaction reads.
 //             (PgSQL_Connection.cpp: polardb_debug_post_send_offline)
 //
+//         POLARDB_DEBUG_CONNECT_DEADLINE_FAULT_FILE
+//             Line == "retry_expired" -> put an expired deadline on the source
+//             and target streams immediately before retry-state transfer.
+//             Line == "ready_expired" -> send an already idle backend through
+//             CONNECTING_SERVER with an expired deadline, covering the rule
+//             that readiness wins over deadline expiry. Both faults are
+//             consumed once. (PgSQL_PolarDB_Failure.cpp:
+//             polardb_prepare_retry_backend; PgSQL_Session.cpp:
+//             handler_again___status_CONNECTING_SERVER)
+//
 //         POLARDB_DEBUG_MONITOR_HEALTH_FILE
 //             Line == "node|avail|lsn" where node is "*" or "addr:port" ->
 //             override the monitor health row for the matching endpoint.

@@ -695,6 +695,7 @@ static void test_wait_bypass_reset_retry_uses_writer() {
 		READER_HG, "polardb-reset-retry-reader", 19565);
 
 	PgSQL_Thread worker;
+	worker.curtime = 5000000;
 	PgSQL_Session sess;
 	attach_test_frontend(sess, &worker);
 	PgSQL_Backend* reader_backend =
@@ -706,10 +707,33 @@ static void test_wait_bypass_reset_retry_uses_writer() {
 	if (!reader_backend || !writer_backend) {
 		return;
 	}
+	PgSQL_Data_Stream* reader_myds = reader_backend->server_myds;
+	PgSQL_Data_Stream* writer_myds = writer_backend->server_myds;
+	ok(reader_myds->killed_at == 0 && writer_myds->killed_at == 0,
+		"PolarDB backend retry: fresh streams have clear cancellation state");
+	const int saved_connect_timeout =
+		pgsql_thread___connect_timeout_server_max;
+	pgsql_thread___connect_timeout_server_max = 10000;
+	const uint64_t expected_writer_deadline =
+		worker.curtime + 10000ULL * 1000ULL;
 
 	auto verify_redirect = [&](const char* reason, const char* label) {
 		sess.current_hostgroup = READER_HG;
 		sess.mybe = reader_backend;
+		reader_myds->query_retries_on_failure = 3;
+		reader_myds->connect_retries_on_failure = 4;
+		reader_myds->max_connect_time = worker.curtime - 1;
+		reader_myds->wait_until = worker.curtime - 1;
+		reader_myds->killed_at = worker.curtime - 1;
+		reader_myds->kill_type = 1;
+		reader_myds->cancel_query = true;
+		writer_myds->query_retries_on_failure = 91;
+		writer_myds->connect_retries_on_failure = 92;
+		writer_myds->max_connect_time = worker.curtime - 1;
+		writer_myds->wait_until = worker.curtime - 1;
+		writer_myds->killed_at = worker.curtime - 1;
+		writer_myds->kill_type = 1;
+		writer_myds->cancel_query = true;
 		sess.polardb_query.reader_plan.fallback_writer_hg = WRITER_HG;
 		sess.polardb_query.reader_plan.replica_loss_action =
 			static_cast<int>(
@@ -723,6 +747,20 @@ static void test_wait_bypass_reset_retry_uses_writer() {
 			sess.polardb_redirect_wait_retry_to_writer(true, reason);
 		ok(retry && sess.current_hostgroup == WRITER_HG &&
 				sess.mybe == writer_backend &&
+				reader_myds->query_retries_on_failure == 0 &&
+				reader_myds->connect_retries_on_failure == 0 &&
+				reader_myds->max_connect_time == 0 &&
+				reader_myds->wait_until == 0 &&
+				reader_myds->killed_at == 0 &&
+				reader_myds->kill_type == 0 &&
+				!reader_myds->cancel_query &&
+				writer_myds->query_retries_on_failure == 3 &&
+				writer_myds->connect_retries_on_failure == 4 &&
+				writer_myds->max_connect_time == expected_writer_deadline &&
+				writer_myds->wait_until == 0 &&
+				writer_myds->killed_at == 0 &&
+				writer_myds->kill_type == 0 &&
+				!writer_myds->cancel_query &&
 				sess.polardb_query.reader_plan.fallback_writer_hg == -1 &&
 				!sess.polardb_query.reader_plan.require_replica &&
 				!sess.polardb_query.wait.spec.has_wait(),
@@ -759,6 +797,7 @@ static void test_wait_bypass_reset_retry_uses_writer() {
 	verify_error(
 		PolarDB_ReplicaLossAction::ERROR,
 		"PolarDB wait bypass reset retry: error does not use primary");
+	pgsql_thread___connect_timeout_server_max = saved_connect_timeout;
 }
 
 static void test_retained_txn_reader_wait_bypass_contract() {

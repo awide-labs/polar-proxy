@@ -568,9 +568,7 @@ bool PgSQL_Session::polardb_prepare_txn_wait_read(
 			"PolarDB TXN_WAIT: prepare declined disconnected reader "
 			"reader_hg=%d\n",
 			reader_hg);
-		if (reader_myds->myconn) {
-			reader_myds->destroy_MySQL_Connection_From_Pool(false);
-		}
+		polardb_return_or_destroy_backend_stream(reader_myds, false);
 		polardb_txn_reader.rfq_writer_scope.reset();
 		request_warmup_after_miss();
 		return false;
@@ -798,7 +796,7 @@ bool PgSQL_Session::polardb_prepare_txn_split_read(
 			"PolarDB TXN_SPLIT: prepare declined disconnected pooled reader "
 			"reader_hg=%d\n",
 			reader_hg);
-		split_myds->destroy_MySQL_Connection_From_Pool(false);
+		polardb_return_or_destroy_backend_stream(split_myds, false);
 		polardb_txn_reader.rfq_writer_scope.reset();
 		POLARDB_THREAD_COUNT_ONE(thread, split_no_backend);
 		return finish_prepare(false);
@@ -1130,6 +1128,7 @@ void PgSQL_Session::polardb_release_txn_reader_backend(bool want_reuse) {
 	}
 	if (split_be->server_myds) {
 		PgSQL_Data_Stream* split_myds = split_be->server_myds;
+		split_myds->max_connect_time = 0;
 		split_myds->pgsql_real_query.reset();
 		if (split_myds->myconn) {
 			PgSQL_Connection* split_conn = split_myds->myconn;
@@ -1177,7 +1176,6 @@ void PgSQL_Session::polardb_release_txn_reader_backend(bool want_reuse) {
 				polardb_return_or_destroy_backend_stream(split_myds, false);
 				POLARDB_THREAD_COUNT_ONE(thread, split_conn_cleanup_failed);
 			}
-			split_myds->fd = 0;
 		}
 	}
 	if (polardb_txn_reader.backend == split_be) {

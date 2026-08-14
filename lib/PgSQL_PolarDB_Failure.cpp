@@ -201,6 +201,21 @@ static bool polardb_debug_writer_changed_after_reader_acquire() {
 	return false;
 }
 
+#if POLARDB_DEBUG
+static bool polardb_debug_consume_connect_deadline_fault(
+		const char* fault_name) {
+	char buf[64] = {0};
+	if (fault_name && polardb_debug_read_fault_file(
+			"POLARDB_DEBUG_CONNECT_DEADLINE_FAULT_FILE",
+			buf, sizeof(buf)) && strcmp(buf, fault_name) == 0) {
+		polardb_debug_clear_fault_file(
+			"POLARDB_DEBUG_CONNECT_DEADLINE_FAULT_FILE");
+		return true;
+	}
+	return false;
+}
+#endif // POLARDB_DEBUG
+
 PolarDB_RequestOutcome PgSQL_Session::polardb_capture_request_outcome(
 		PgSQL_Backend* backend) {
 	PolarDB_RequestOutcome outcome;
@@ -515,6 +530,7 @@ PgSQL_Session::polardb_take_reader_failure(
 		const PolarDB_RequestOutcome& outcome) {
 	PolarDB_ReaderFailure failure;
 	failure.reader_backend = outcome.backend;
+	failure.failed_myds = outcome.backend_myds;
 	failure.connected = outcome.connected;
 	failure.reusable = outcome.reusable;
 	failure.result_started = outcome.result_started;
@@ -898,8 +914,79 @@ void PgSQL_Session::polardb_prepare_extended_retry() {
 }
 
 /**
+ * Move one request from an abandoned backend stream to its retry target.
+ *
+ * Retry limits belong to the request, not to either stream. The source stops
+ * carrying request state, while the target receives the remaining limits and
+ * starts without timeout or cancellation markers from an earlier request. A
+ * target that still needs a connection receives a fresh connection deadline.
+ */
+void PgSQL_Session::polardb_prepare_retry_backend(
+		PgSQL_Data_Stream* source_myds, PgSQL_Data_Stream* target_myds) {
+#if POLARDB_DEBUG
+	const bool injected_expired_deadlines =
+		polardb_debug_consume_connect_deadline_fault("retry_expired");
+	if (injected_expired_deadlines) {
+		const uint64_t expired =
+			thread && thread->curtime > 0 ? thread->curtime - 1 : 1;
+		if (source_myds) {
+			source_myds->max_connect_time = expired;
+		}
+		if (target_myds) {
+			target_myds->max_connect_time = expired;
+		}
+	}
+#endif // POLARDB_DEBUG
+	const int query_retries = source_myds
+		? source_myds->query_retries_on_failure : 0;
+	const int connect_retries = source_myds
+		? source_myds->connect_retries_on_failure : 0;
+
+	if (source_myds && source_myds != target_myds) {
+		source_myds->query_retries_on_failure = 0;
+		source_myds->connect_retries_on_failure = 0;
+		source_myds->max_connect_time = 0;
+		source_myds->wait_until = 0;
+		source_myds->killed_at = 0;
+		source_myds->kill_type = 0;
+		source_myds->cancel_query = false;
+	}
+	if (!target_myds) {
+		return;
+	}
+
+	target_myds->query_retries_on_failure = query_retries;
+	target_myds->connect_retries_on_failure = connect_retries;
+	target_myds->wait_until = 0;
+	target_myds->killed_at = 0;
+	target_myds->kill_type = 0;
+	target_myds->cancel_query = false;
+	const bool target_ready =
+		target_myds->myconn &&
+		target_myds->myconn->async_state_machine == ASYNC_IDLE;
+	target_myds->max_connect_time =
+		!target_ready && pgsql_thread___connect_timeout_server_max > 0
+			? thread->curtime +
+				static_cast<uint64_t>(
+					pgsql_thread___connect_timeout_server_max) * 1000ULL
+			: 0;
+#if POLARDB_DEBUG
+	if (injected_expired_deadlines) {
+		POLARDB_TRACE(
+			"PolarDB CONNECT_DEADLINE DEBUG: retry repaired "
+			"source_cleared=%d target_ready=%d target_deadline=%s\n",
+			!source_myds || source_myds == target_myds ||
+				source_myds->max_connect_time == 0,
+			target_ready ? 1 : 0,
+			target_myds->max_connect_time == 0 ? "clear" : "armed");
+	}
+#endif // POLARDB_DEBUG
+}
+
+/**
  * @brief Hand the retry packet to the writer stream and dispatch from there.
  *
+ * @param source_myds     Stream that owned the failed request state. May be null.
  * @param writer_backend  Backend to dispatch on. Must have a server stream.
  * @param writer_hg       Hostgroup to record as the new current hostgroup.
  * @param retry_pkt       Client packet to retry. Consumed only on success.
@@ -913,13 +1000,14 @@ void PgSQL_Session::polardb_prepare_extended_retry() {
  *         before anything is changed.
  */
 bool PgSQL_Session::polardb_move_retry_packet_to_writer(
-		PgSQL_Backend* writer_backend, int writer_hg, PtrSize_t& retry_pkt,
-		bool extended_query) {
+		PgSQL_Data_Stream* source_myds, PgSQL_Backend* writer_backend,
+		int writer_hg, PtrSize_t& retry_pkt, bool extended_query) {
 	if (!writer_backend || !writer_backend->server_myds || !retry_pkt.ptr) {
 		return false;
 	}
 
 	PgSQL_Data_Stream* writer_myds = writer_backend->server_myds;
+	polardb_prepare_retry_backend(source_myds, writer_myds);
 	current_hostgroup = writer_hg;
 	mybe = writer_backend;
 	writer_myds->free_pgsql_real_query();
@@ -939,9 +1027,27 @@ bool PgSQL_Session::polardb_move_retry_packet_to_writer(
 	return true;
 }
 
+/**
+ * Clear state owned by a completed reader request before releasing its
+ * connection. Transaction-split readers do not use this helper because their
+ * query view is borrowed and must be reset rather than freed.
+ */
+static PgSQL_Connection* polardb_clear_reader_request(
+		PgSQL_Data_Stream& reader_myds) {
+	reader_myds.max_connect_time = 0;
+	reader_myds.free_pgsql_real_query();
+	PgSQL_Connection* conn = reader_myds.myconn;
+	if (!conn) {
+		reader_myds.DSS = STATE_NOT_INITIALIZED;
+		return nullptr;
+	}
+	conn->async_free_result();
+	return conn;
+}
+
 void PgSQL_Session::polardb_return_or_destroy_backend_stream(
 		PgSQL_Data_Stream* myds, bool return_to_pool) {
-	if (!myds) {
+	if (!myds || !myds->myconn) {
 		return;
 	}
 #if POLARDB_PROXY
@@ -1064,15 +1170,12 @@ void PgSQL_Session::polardb_release_reader_backend(
 			"PolarDB FAILURE: reader backend has no data stream\n");
 		return;
 	}
-	reader_myds->free_pgsql_real_query();
-	PgSQL_Connection* conn = reader_myds->myconn;
+	PgSQL_Connection* conn = polardb_clear_reader_request(*reader_myds);
 	if (!conn) {
 		POLARDB_TRACE(
 			"PolarDB FAILURE: reader stream has no connection; reset stream state\n");
-		reader_myds->DSS = STATE_NOT_INITIALIZED;
 		return;
 	}
-	conn->async_free_result();
 	const bool reusable =
 		want_reuse && polardb_failed_connection_is_poolable(conn);
 	if (reusable) {
@@ -1093,8 +1196,6 @@ void PgSQL_Session::polardb_release_reader_backend(
 			conn->MultiplexDisabled() ? 1 : 0,
 			conn->is_pipeline_active() ? 1 : 0);
 		polardb_return_or_destroy_backend_stream(reader_myds, false);
-		reader_myds->fd = 0;
-		reader_myds->DSS = STATE_NOT_INITIALIZED;
 	}
 }
 
@@ -1113,13 +1214,10 @@ void PgSQL_Session::polardb_release_unused_reader_backend(
 		return;
 	}
 	PgSQL_Data_Stream* reader_myds = reader_backend->server_myds;
-	reader_myds->free_pgsql_real_query();
-	PgSQL_Connection* conn = reader_myds->myconn;
+	PgSQL_Connection* conn = polardb_clear_reader_request(*reader_myds);
 	if (!conn) {
-		reader_myds->DSS = STATE_NOT_INITIALIZED;
 		return;
 	}
-	conn->async_free_result();
 	const bool reusable =
 		conn->reusable &&
 		conn->is_connected() &&
@@ -1133,10 +1231,6 @@ void PgSQL_Session::polardb_release_unused_reader_backend(
 		"PolarDB FAILURE: %s unused reader backend after pre-dispatch rejection\n",
 		reusable ? "returning" : "destroying");
 	polardb_return_or_destroy_backend_stream(reader_myds, reusable);
-	if (!reusable) {
-		reader_myds->fd = 0;
-		reader_myds->DSS = STATE_NOT_INITIALIZED;
-	}
 }
 
 /**
@@ -1150,7 +1244,9 @@ void PgSQL_Session::polardb_release_unused_reader_backend(
  *
  * @param failure         Failure record. Mutated: reader_backend is cleared once
  *                        the reader is released and retry_pkt is consumed on
- *                        success.
+ *                        success. failed_myds keeps the request state available
+ *                        if a previous peer-reader attempt already released the
+ *                        backend.
  * @param writer_hg       Hostgroup of the writer backend.
  * @param writer_backend  Writer backend to dispatch on. May be null.
  * @return true when the query was re-dispatched: the reader backend has been
@@ -1225,11 +1321,14 @@ bool PgSQL_Session::polardb_try_redispatch_to_writer(
 		return false;
 	}
 
-	polardb_release_reader_backend(
-		failure.reader_backend, failure.reusable);
-	failure.reader_backend = nullptr;
+	PgSQL_Data_Stream* reader_myds = failure.failed_myds;
+	if (failure.reader_backend) {
+		polardb_release_reader_backend(
+			failure.reader_backend, failure.reusable);
+		failure.reader_backend = nullptr;
+	}
 	if (!polardb_move_retry_packet_to_writer(
-			writer_backend, writer_hg, failure.retry_pkt)) {
+			reader_myds, writer_backend, writer_hg, failure.retry_pkt)) {
 		return false;
 	}
 
@@ -1312,6 +1411,8 @@ bool PgSQL_Session::polardb_try_redispatch_to_other_reader(
 	}
 
 	PgSQL_Backend* old_reader_backend = failure.reader_backend;
+	PgSQL_Data_Stream* old_reader_myds =
+		old_reader_backend ? old_reader_backend->server_myds : nullptr;
 	polardb_release_reader_backend(old_reader_backend, failure.reusable);
 	failure.reader_backend = nullptr;
 
@@ -1353,8 +1454,7 @@ bool PgSQL_Session::polardb_try_redispatch_to_other_reader(
 			"PolarDB FAILURE: reader retry declined reason=acquired_not_connected "
 			"reader_hg=%d\n",
 			failure.reader_hg);
-		retry_myds->destroy_MySQL_Connection_From_Pool(false);
-		retry_myds->fd = 0;
+		polardb_return_or_destroy_backend_stream(retry_myds, false);
 		return false;
 	}
 
@@ -1378,6 +1478,7 @@ bool PgSQL_Session::polardb_try_redispatch_to_other_reader(
 		return false;
 	}
 
+	polardb_prepare_retry_backend(old_reader_myds, retry_myds);
 	current_hostgroup = failure.reader_hg;
 	polardb_begin_txn_split_read(retry_backend, retry_myds, failure.retry_pkt,
 		std::move(wrapped_query), failure.wait_spec, failure.reader_plan,
@@ -1505,21 +1606,17 @@ void PgSQL_Session::polardb_release_reader_stream(PgSQL_Data_Stream* failed_myds
 		return;
 	}
 
-	failed_myds->free_pgsql_real_query();
-	PgSQL_Connection* failed_conn = failed_myds->myconn;
+	PgSQL_Connection* failed_conn =
+		polardb_clear_reader_request(*failed_myds);
 	if (!failed_conn) {
-		failed_myds->DSS = STATE_NOT_INITIALIZED;
 		return;
 	}
 
-	failed_conn->async_free_result();
 	if (can_return_to_pool) {
 		failed_conn->async_state_machine = ASYNC_IDLE;
 		polardb_return_or_destroy_backend_stream(failed_myds, true);
 	} else {
 		polardb_return_or_destroy_backend_stream(failed_myds, false);
-		failed_myds->fd = 0;
-		failed_myds->DSS = STATE_NOT_INITIALIZED;
 	}
 }
 
@@ -1615,8 +1712,9 @@ bool PgSQL_Session::polardb_try_redispatch_reader_read_to_other_reader(
 		return false;
 	}
 
+	PgSQL_Data_Stream* failed_myds = failure.failed_myds;
 	polardb_release_reader_stream(
-		failure.failed_myds, failure.can_return_to_pool);
+		failed_myds, failure.can_return_to_pool);
 	failure.failed_myds = nullptr;
 	PgSQL_Backend* retry_backend = find_or_create_backend(failure.reader_hg);
 	if (!retry_backend || !retry_backend->server_myds) {
@@ -1652,11 +1750,7 @@ bool PgSQL_Session::polardb_try_redispatch_reader_read_to_other_reader(
 
 	retry_myds->attach_connection(reader_result.conn);
 	if (!retry_myds->myconn || !retry_myds->myconn->is_connected()) {
-		if (retry_myds->myconn) {
-			retry_myds->destroy_MySQL_Connection_From_Pool(false);
-			retry_myds->fd = 0;
-			retry_myds->DSS = STATE_NOT_INITIALIZED;
-		}
+		polardb_return_or_destroy_backend_stream(retry_myds, false);
 		return false;
 	}
 	retry_myds->assign_fd_from_pgsql_conn();
@@ -1667,6 +1761,7 @@ bool PgSQL_Session::polardb_try_redispatch_reader_read_to_other_reader(
 	retry_myds->pgsql_real_query.init(&failure.retry_pkt);
 	failure.retry_pkt.ptr = nullptr;
 	failure.retry_pkt.size = 0;
+	polardb_prepare_retry_backend(failed_myds, retry_myds);
 	current_hostgroup = failure.reader_hg;
 	mybe = retry_backend;
 	polardb_query.reader_plan = failure.reader_plan;
@@ -2111,7 +2206,8 @@ PolarDB_FailureAction PgSQL_Session::polardb_handle_failed_reader_read(
 	polardb_query.clear_reader_route();
 
 	if (!polardb_move_retry_packet_to_writer(
-			writer_mybe, failure.fallback_writer_hg, failure.retry_pkt,
+			request_myds, writer_mybe, failure.fallback_writer_hg,
+			failure.retry_pkt,
 			failure.extended_query)) {
 		count_wait_retry(
 			PgHGM->status.polardb_wait_retry_declined_move_failed,
@@ -2150,13 +2246,15 @@ bool PgSQL_Session::polardb_redirect_to_writer(int writer_hg, const char* reason
 	polardb_query.clear_reader_route();
 	current_hostgroup = writer_hg;
 	mybe = find_or_create_backend(current_hostgroup);
-	if (source_myds && mybe && mybe->server_myds != source_myds &&
+	PgSQL_Data_Stream* target_myds = mybe ? mybe->server_myds : nullptr;
+	polardb_prepare_retry_backend(source_myds, target_myds);
+	if (source_myds && target_myds && target_myds != source_myds &&
 			source_myds->pgsql_real_query.QueryPtr) {
 		// The simple-query packet was attached to the reader backend before
 		// acquisition. A one-query writer redirect changes backend streams, so
 		// transfer that packet ownership to the writer stream before RunQuery().
-		mybe->server_myds->free_pgsql_real_query();
-		mybe->server_myds->pgsql_real_query.move_from(
+		target_myds->free_pgsql_real_query();
+		target_myds->pgsql_real_query.move_from(
 			source_myds->pgsql_real_query);
 	}
 	return true;

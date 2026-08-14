@@ -85,6 +85,18 @@ static bool polardb_debug_reset_timeout() {
 	polardb_debug_clear_fault_file(fault_file);
 	return true;
 }
+
+static bool polardb_debug_consume_ready_connect_deadline_fault() {
+	char buf[64] = {0};
+	const char* fault_file =
+		"POLARDB_DEBUG_CONNECT_DEADLINE_FAULT_FILE";
+	if (polardb_debug_read_fault_file(fault_file, buf, sizeof(buf)) &&
+			strcmp(buf, "ready_expired") == 0) {
+		polardb_debug_clear_fault_file(fault_file);
+		return true;
+	}
+	return false;
+}
 #endif // POLARDB_PROXY && POLARDB_DEBUG
 
 /*
@@ -1789,7 +1801,15 @@ bool PgSQL_Session::handler_again___status_CONNECTING_SERVER(int* _rc) {
 		mybe->server_myds->wait_until = thread->curtime + pgsql_thread___connect_timeout_server * 1000;
 		pause_until = 0;
 	}
-	if (mybe->server_myds->max_connect_time ) {
+	const bool backend_ready =
+		mybe->server_myds->myconn &&
+		mybe->server_myds->myconn->async_state_machine == ASYNC_IDLE;
+#if POLARDB_PROXY && POLARDB_DEBUG
+	const bool debug_ready_expired =
+		backend_ready && mybe->server_myds->max_connect_time &&
+		thread->curtime >= mybe->server_myds->max_connect_time;
+#endif // POLARDB_PROXY && POLARDB_DEBUG
+	if (!backend_ready && mybe->server_myds->max_connect_time) {
 		if (thread->curtime >= mybe->server_myds->max_connect_time) {
 #if POLARDB_PROXY
 			if (polardb_reader_capacity_wait.active) {
@@ -1915,6 +1935,14 @@ bool PgSQL_Session::handler_again___status_CONNECTING_SERVER(int* _rc) {
 		}
 		enum session_status st = status;
 		if (mybe->server_myds->myconn->async_state_machine == ASYNC_IDLE) {
+#if POLARDB_PROXY && POLARDB_DEBUG
+			if (debug_ready_expired) {
+				POLARDB_TRACE(
+					"PolarDB CONNECT_DEADLINE DEBUG: accepted ready backend "
+					"before expired deadline\n");
+			}
+#endif // POLARDB_PROXY && POLARDB_DEBUG
+			myds->max_connect_time = 0;
 			st = previous_status.top();
 			previous_status.pop();
 			NEXT_IMMEDIATE_NEW(st);
@@ -3878,6 +3906,17 @@ handler_again:
 		bool conn_active = (mybe->server_myds->myconn != NULL) && (mybe->server_myds->myconn->async_state_machine != ASYNC_IDLE);
 		bool query_timed_out = conn_active && mybe->server_myds->wait_until && (thread->curtime >= mybe->server_myds->wait_until);
 		bool query_cancelled = conn_active && mybe->server_myds->cancel_query;
+
+#if POLARDB_PROXY && POLARDB_DEBUG
+		if (mybe->server_myds->myconn &&
+				mybe->server_myds->myconn->async_state_machine == ASYNC_IDLE &&
+				polardb_debug_consume_ready_connect_deadline_fault()) {
+			mybe->server_myds->max_connect_time =
+				thread->curtime > 0 ? thread->curtime - 1 : 1;
+			set_previous_status_mode3();
+			NEXT_IMMEDIATE(CONNECTING_SERVER);
+		}
+#endif // POLARDB_PROXY && POLARDB_DEBUG
 
 		if (query_timed_out || killed || query_cancelled) {
 			// we only log in case on timing out here. Logging for 'killed' is done in the places that hold that contextual information.

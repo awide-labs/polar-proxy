@@ -127,7 +127,7 @@ endef
 	run-c-libpq-lsn run-c-libpq-xact run-c-libpq-row-run run-c-extended-protocol \
 	run-pgbench-lsn run-sysbench-lsn \
 	build-pgbench-polar-rfq build-sysbench-polar-rfq rfq-bench-tools-check \
-	tap-config tap-frontend-output tap-lsn tap-rfq-lifecycle tap-global-lsn tap-split tap-split-failure-policy tap-wait-timeout \
+	tap-config tap-frontend-output tap-lsn tap-rfq-lifecycle tap-global-lsn tap-split tap-split-failure-policy tap-connect-deadline tap-wait-timeout \
 	tap-parallel-list tap-parallel-safe tap-exclusive tap-parallel tap tap-run tap-debug-binary-check tap-debug-binary-copy tap-port-check tap-debug-trace tap-debug-trace-run \
 	unit \
 	test-case1 test-case2 test-case2-stale-with-warning-success test-case2-stale-with-warning-failure \
@@ -162,6 +162,7 @@ help:
 	@echo "  make -C test/polardb tap-global-lsn         run global LSN consistency TAP"
 	@echo "  make -C test/polardb tap-split              run transaction-split TAP"
 	@echo "  make -C test/polardb tap-split-failure-policy run reader-failure policy TAP"
+	@echo "  make -C test/polardb tap-connect-deadline   run focused backend retry deadline TAP (debug binary)"
 	@echo "  make -C test/polardb tap-wait-timeout       run wait-timeout TAP"
 	@echo "  make -C test/polardb tap-parallel           run parallel-safe TAP groups, then backend-exclusive groups"
 	@echo "  make -C test/polardb tap-parallel-safe      run only parallel-safe TAP groups"
@@ -260,6 +261,9 @@ tap-split:
 tap-split-failure-policy:
 	$(POLARDB_RUN_LOGGED) tap-split-failure-policy $(POLARDB_TEST_DIR)/test-tap/txn_split_failure_policy_tap.sh
 
+tap-connect-deadline:
+	$(POLARDB_RUN_LOGGED) tap-connect-deadline $(POLARDB_TEST_DIR)/test-tap/connect_deadline_retry_tap.sh
+
 tap-wait-timeout:
 	$(POLARDB_RUN_LOGGED) tap-wait-timeout $(POLARDB_TEST_DIR)/test-tap/wait_timeout_cleanup_tap.sh
 
@@ -309,7 +313,7 @@ tap-debug-trace: tap-debug-binary-copy
 tap-debug-trace-run: export POLARDB_PARALLEL_RUN := 1
 tap-debug-trace-run: export POLARDB_MAKE_OUTPUT_DIR := $(POLARDB_DEBUG_TRACE_OUTPUT_DIR)
 tap-debug-trace-run: export POLARDB_REQUIRE_DEBUG_TRACES := 1
-tap-debug-trace-run: tap-debug-binary-check tap-port-check tap-lsn tap-rfq-lifecycle tap-global-lsn tap-split tap-split-failure-policy tap-wait-timeout
+tap-debug-trace-run: tap-debug-binary-check tap-port-check tap-lsn tap-rfq-lifecycle tap-global-lsn tap-split tap-split-failure-policy tap-connect-deadline tap-wait-timeout
 	@echo "Debug TAP listener shard: $(POLARDB_TEST_SHARD)"
 	@cd "$(POLARDB_DEBUG_TRACE_OUTPUT_DIR)" && sha256sum --check proxysql-debug.sha256
 	@echo "Analyzing debug artifacts in $(POLARDB_DEBUG_TRACE_OUTPUT_DIR)"

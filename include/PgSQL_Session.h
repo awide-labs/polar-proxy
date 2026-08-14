@@ -1663,9 +1663,13 @@ private:
 	void polardb_restart_query_dispatch_from_packet(const PtrSize_t& pkt);
 	/** @brief Keep extended-query metadata but resolve its statement on the new backend. */
 	void polardb_prepare_extended_retry();
+	/** @brief Move request retry state from an abandoned backend to its retry target. */
+	void polardb_prepare_retry_backend(
+		PgSQL_Data_Stream* source_myds, PgSQL_Data_Stream* target_myds);
 	/** @brief Move a retry packet to the writer stream and make that writer active. */
-	bool polardb_move_retry_packet_to_writer(PgSQL_Backend* writer_backend,
-		int writer_hg, PtrSize_t& retry_pkt, bool extended_query = false);
+	bool polardb_move_retry_packet_to_writer(PgSQL_Data_Stream* source_myds,
+		PgSQL_Backend* writer_backend, int writer_hg, PtrSize_t& retry_pkt,
+		bool extended_query = false);
 	/** @brief Return or destroy a backend stream after caller-specific cleanup. */
 	void polardb_return_or_destroy_backend_stream(PgSQL_Data_Stream* myds,
 		bool return_to_pool);
