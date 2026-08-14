@@ -4631,6 +4631,12 @@ void admin_session_handler(S* sess, void *_pa, PtrSize_t *pkt) {
 				strcasestr(query_no_space, "pg_get_expr") != nullptr) {
 				matched_describe_pattern = true;
 
+				if (strcasestr(query_no_space, "attcompression")) {
+					SPA->send_error_msg_to_client(sess, (char *)"ProxySQL does not support all \\d+ subqueries. Use \\d; there is no column description anyway.");
+					run_query = false;
+					goto __run_query;
+				}
+
 				// Use table name from session (already escaped in first query)
 				// Execute PRAGMA table_info and transform result
 				if (sess->describe_mode && sess->describe_table_name[0] != '\0') {
