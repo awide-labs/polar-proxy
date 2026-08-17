@@ -30,7 +30,7 @@
  * New-style proxy identity, required by PolarDB to accept proxy RFQ request
  * options. Appended as a suffix when exercising the LSN or xact protocol.
  */
-#define PROXY_IDENTITY " _polar_proxy_client_host=192.0.2.10 _polar_proxy_client_port=54321"
+#define PROXY_IDENTITY " _polar_proxy_client_host=127.0.0.1 _polar_proxy_client_port=54321"
 
 /*
  * getenv_default() - return the value of environment variable `name`, or `def`
