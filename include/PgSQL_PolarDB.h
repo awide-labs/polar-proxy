@@ -538,6 +538,13 @@ enum class PolarDB_ReaderStatus : uint8_t {
     READER_LAG_EXCEEDED,    // Reader is further behind the group LSN than the byte cap allows
 };
 
+// Capacity admission is shared by replica reads and primary/writer requests.
+// Routing still decides the target before this state is created.
+enum class PolarDB_PoolCapacityTarget : uint8_t {
+	READER = 0,
+	WRITER = 1
+};
+
 static inline int polardb_reader_status_priority(
     PolarDB_ReaderStatus status) {
     // Preserve the most actionable cause: RFQ policy first, then

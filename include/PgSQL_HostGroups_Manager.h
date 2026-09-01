@@ -1711,6 +1711,13 @@ class PgSQL_HostGroups_Manager : public Base_HostGroups_Manager<PgSQL_HGC> {
 		std::atomic<unsigned long long> polardb_reader_capacity_wait_le_100ms{0};
 		std::atomic<unsigned long long> polardb_reader_capacity_wait_le_1s{0};
 		std::atomic<unsigned long long> polardb_reader_capacity_wait_gt_1s{0};
+		std::atomic<unsigned long long> polardb_writer_pool_acquire_attempt{0};
+		std::atomic<unsigned long long> polardb_writer_pool_acquire_hit{0};
+		std::atomic<unsigned long long> polardb_writer_pool_acquire_busy{0};
+		std::atomic<unsigned long long> polardb_writer_pool_acquire_group_busy{0};
+		std::atomic<unsigned long long> polardb_writer_capacity_wait_enter{0};
+		std::atomic<unsigned long long> polardb_writer_capacity_wait_exit{0};
+		std::atomic<unsigned long long> polardb_writer_capacity_wait_sum_us{0};
 		std::atomic<unsigned long long> polardb_reader_pool_capacity_ownership_local{0};
 		std::atomic<unsigned long long> polardb_reader_pool_capacity_ownership_active{0};
 		std::atomic<unsigned long long> polardb_reader_pool_capacity_ownership_reservation{0};

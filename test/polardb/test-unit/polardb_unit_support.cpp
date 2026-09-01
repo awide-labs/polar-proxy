@@ -57,16 +57,20 @@ SQLite3_result* make_polardb_replication_row(
 
 SQLite3_result* make_pgsql_servers_result(
 		int writer_hg, const char* writer_addr, int writer_port,
-		int reader_hg, const char* reader_addr, int reader_port) {
+		int reader_hg, const char* reader_addr, int reader_port,
+		int writer_max_connections) {
 	SQLite3_result* result = new SQLite3_result(11);
 	char writer_hg_buf[16];
 	char writer_port_buf[16];
 	char reader_hg_buf[16];
 	char reader_port_buf[16];
+	char writer_max_connections_buf[16];
 	snprintf(writer_hg_buf, sizeof(writer_hg_buf), "%d", writer_hg);
 	snprintf(writer_port_buf, sizeof(writer_port_buf), "%d", writer_port);
 	snprintf(reader_hg_buf, sizeof(reader_hg_buf), "%d", reader_hg);
 	snprintf(reader_port_buf, sizeof(reader_port_buf), "%d", reader_port);
+	snprintf(writer_max_connections_buf,
+		sizeof(writer_max_connections_buf), "%d", writer_max_connections);
 
 	char* writer_row[] = {
 		writer_hg_buf,
@@ -75,7 +79,7 @@ SQLite3_result* make_pgsql_servers_result(
 		(char*)"ONLINE",
 		(char*)"1",
 		(char*)"0",
-		(char*)"50",
+		writer_max_connections_buf,
 		(char*)"0",
 		(char*)"0",
 		(char*)"0",

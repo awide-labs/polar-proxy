@@ -69,8 +69,7 @@ bool PgSQL_Thread::polardb_reader_connection_matches_wait(
 		conn, active_connection, wait.reservation_profile_generation,
 		wait.reservation_pool_key,
 			static_cast<unsigned int>(waiting_session->current_hostgroup),
-			waiting_session->polardb_query.reader_plan,
-			waiting_session->polardb_query.wait.spec);
+			wait.reservation_plan, wait.reservation_wait_spec);
 }
 
 /**
@@ -209,7 +208,7 @@ void PgSQL_Thread::polardb_reader_adopt_retention(
 		wait.scope_hash, wait.reservation_server->myhgc,
 		static_cast<unsigned int>(sess->current_hostgroup),
 		wait.reservation_profile_generation, wait.reservation_pool_key,
-		sess->polardb_query.reader_plan, sess->polardb_query.wait.spec);
+		wait.reservation_plan, wait.reservation_wait_spec);
 }
 
 void PgSQL_Thread::polardb_reader_clear_inactive_retention() {
@@ -319,8 +318,7 @@ PolarDB_ReaderOwnership PgSQL_Thread::polardb_reader_ownership(
 			PgHGM->polardb_reader_server_can_serve_request(
 				static_cast<unsigned int>(waiting_session->current_hostgroup),
 				polardb_reader_pool_reservation.server,
-				waiting_session->polardb_query.reader_plan,
-				waiting_session->polardb_query.wait.spec)) {
+				wait.reservation_plan, wait.reservation_wait_spec)) {
 		return PolarDB_ReaderOwnership::RESERVATION;
 	}
 	if (cached_connections) {
@@ -418,8 +416,7 @@ void PgSQL_Thread::polardb_register_reader_capacity_request(PgSQL_Session* sess)
 	// may use exclusions but do not enter this worker wait/reservation path.
 	if (!hostgroup || !hostgroup->register_reader_pool_capacity_request(
 			polardb_worker_index, token, wait.scope_hash, match_key,
-			sess->polardb_query.reader_plan,
-			sess->polardb_query.wait.spec)) {
+			wait.reservation_plan, wait.reservation_wait_spec)) {
 		return;
 	}
 	polardb_reader_pool_reservation.token = token;
@@ -503,6 +500,11 @@ PgSQL_Connection* PgSQL_Thread::polardb_take_reader_reservation(
 			polardb_reader_pool_reservation.session_id != sess->thread_session_id) {
 		return nullptr;
 	}
+	const auto& wait = sess->polardb_reader_capacity_wait;
+	if (!wait.active) {
+		polardb_cancel_reader_reservation(sess->thread_session_id);
+		return nullptr;
+	}
 	PgSQL_SrvC* server = polardb_reader_pool_reservation.server;
 	const unsigned int hostgroup_id = server && server->myhgc
 		? server->myhgc->hid : UINT_MAX;
@@ -513,11 +515,11 @@ PgSQL_Connection* PgSQL_Thread::polardb_take_reader_reservation(
 	const bool current = PgHGM && hostgroup_id != UINT_MAX &&
 		sess->current_hostgroup == static_cast<int>(hostgroup_id) &&
 		PgHGM->polardb_reader_pool_reservation_match_key(
-			hostgroup_id, sess, sess->polardb_query.wait.spec, &current_key) &&
+			hostgroup_id, sess, wait.reservation_wait_spec, &current_key) &&
 		current_key == registered_key &&
 		PgHGM->polardb_reader_server_can_serve_request(
-			hostgroup_id, server, sess->polardb_query.reader_plan,
-			sess->polardb_query.wait.spec);
+			hostgroup_id, server, wait.reservation_plan,
+			wait.reservation_wait_spec);
 	if (!current) {
 		polardb_cancel_reader_reservation(sess->thread_session_id);
 		return nullptr;
@@ -545,8 +547,8 @@ PgSQL_Connection* PgSQL_Thread::polardb_take_reader_reservation(
 	polardb_reader_start_retention(
 		polardb_reader_pool_reservation.scope_hash, polardb_reader_pool_reservation.hostgroup,
 		hostgroup_id, polardb_reader_pool_reservation.profile_generation,
-		polardb_reader_pool_reservation.pool_key, sess->polardb_query.reader_plan,
-		sess->polardb_query.wait.spec);
+		polardb_reader_pool_reservation.pool_key, wait.reservation_plan,
+		wait.reservation_wait_spec);
 	polardb_reader_pool_reservation.clear_local();
 	return result.conn;
 }

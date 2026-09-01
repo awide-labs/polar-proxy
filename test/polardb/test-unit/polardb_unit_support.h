@@ -42,7 +42,8 @@ SQLite3_result* make_polardb_replication_row(
 	int writer_hg, int reader_hg);
 SQLite3_result* make_pgsql_servers_result(
 	int writer_hg, const char* writer_addr, int writer_port,
-	int reader_hg, const char* reader_addr, int reader_port);
+	int reader_hg, const char* reader_addr, int reader_port,
+	int writer_max_connections = 50);
 SQLite3_result* make_pgsql_servers_result_two_readers(
 	int writer_hg, const char* writer_addr, int writer_port,
 	int reader_hg,

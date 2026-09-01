@@ -8,6 +8,7 @@ using json = nlohmann::json;
 #include <algorithm>
 #include <cerrno>
 #include <cctype>
+#include <optional>
 #include <vector>
 
 #include "proxysql_utils.h"
@@ -6993,6 +6994,13 @@ PgSQL_Connection* PgSQL_Thread::get_MyConn_local(unsigned int _hid, PgSQL_Sessio
 #if POLARDB_PROXY
 	const bool polardb_hostgroup =
 		PgHGM && PgHGM->is_polardb_hostgroup(_hid);
+	const bool polardb_keyed_writer_reuse =
+		sess->polardb_query.profile_enabled &&
+		sess->polardb_query.request_writer_scope.valid() &&
+		sess->polardb_query.request_writer_scope.hg ==
+			static_cast<int>(_hid) &&
+		gtid_uuid == NULL && max_lag_ms < 0;
+	std::optional<PolarDB_PoolRequest> writer_pool_request;
 	PolarDB_StartupProfile startup_profile;
 	PolarDB_StartupClientContext startup_client;
 	const PolarDB_StartupClientContext* startup_client_ptr = nullptr;
@@ -7005,8 +7013,38 @@ PgSQL_Connection* PgSQL_Thread::get_MyConn_local(unsigned int _hid, PgSQL_Sessio
 			continue;
 		}
 #if POLARDB_PROXY
-		if (!c->polardb_pool_key.empty()) {
-			continue;
+		const bool polardb_keyed_connection =
+			!c->polardb_pool_key.empty();
+		if (polardb_keyed_connection) {
+			if (!polardb_keyed_writer_reuse) {
+				continue;
+			}
+			if (!writer_pool_request) {
+				const PolarDB_StartupProfile writer_startup_profile =
+					PgHGM->polardb_startup_profile_for_hostgroup(
+						_hid, pgsql_thread___polardb_proxy_protocol);
+				writer_pool_request.emplace(
+					polardb_prepare_pool_request_for_session(
+						writer_startup_profile, /*only_pooled=*/false,
+						/*require_rfq_profile=*/false, sess));
+			}
+			if (!writer_pool_request->ready_for_matching() ||
+					polardb_classify_pool_conn_for_reuse(
+						c, sess, *writer_pool_request).state !=
+							PolarDB_PoolReuseState::EXACT) {
+				continue;
+			}
+			c = static_cast<PgSQL_Connection*>(
+				cached_connections->remove_index_fast(i));
+			if (polardb_reader_local_connection_count == 0) {
+				polardb_repair_local_reader_count(
+					"writer local take",
+					&polardb_reader_local_connection_count,
+					polardb_scan_cached_readers(cached_connections) + 1);
+			}
+			assert(polardb_reader_local_connection_count > 0);
+			--polardb_reader_local_connection_count;
+			return c;
 		}
 		// Removing a PolarDB hostgroup mapping does not make an RFQ-started
 		// backend compatible with ordinary PostgreSQL sessions.

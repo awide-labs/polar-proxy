@@ -81,10 +81,10 @@
 		"Wait-wrapper packet install latency samples") \
 	T(reader_acquire_sum_us, "PolarDB_Reader_Acquire_Sum_Us", \
 		"proxysql_polardb_reader_acquire_microseconds_total", \
-		"Total time spent in ReaderPool acquisition, in microseconds") \
+		"Total selected-server pool acquisition time, including primary writers, in microseconds") \
 	T(reader_acquire_count, "PolarDB_Reader_Acquire_Count", \
 		"proxysql_polardb_reader_acquire_count_total", \
-		"ReaderPool acquisition latency samples") \
+		"Selected-server pool acquisition samples, including primary writers") \
 	T(selected_server_pool_lock_wait_sum_us, "PolarDB_Selected_Server_Pool_Lock_Wait_Sum_Us", \
 		"proxysql_polardb_selected_server_pool_lock_wait_microseconds_total", \
 		"Total time spent waiting for the selected server pool lock") \
@@ -897,7 +897,7 @@
 		"Reader pool readers closed instead of pooled because backend startup identity is client-specific") \
 	T(reader_pool_lookup, "PolarDB_Reader_Pool_Lookup", \
 		"proxysql_polardb_reader_pool_lookup_total", \
-		"PolarDB reader-pool lookup attempts") \
+		"Selected-server pool lookups, including primary writers; metric name is retained for compatibility") \
 	T(reader_pool_retry_after_config_change, "PolarDB_Reader_Pool_Retry_After_Config_Change", \
 		"proxysql_polardb_reader_pool_retry_after_config_change_total", \
 		"Cold reader creations retried after topology or startup configuration changed") \
@@ -945,58 +945,79 @@
 		"Excess shared FREE connections destroyed after remaining idle across a maintenance pass") \
 	T(reader_capacity_wait_enter, "PolarDB_Reader_Capacity_Wait_Enter", \
 		"proxysql_polardb_reader_capacity_wait_enter_total", \
-		"Sessions entering worker-local ReaderPool capacity waiting") \
+		"Sessions entering selected-server capacity waiting, including primary writers") \
 	T(reader_capacity_wait_exit, "PolarDB_Reader_Capacity_Wait_Exit", \
 		"proxysql_polardb_reader_capacity_wait_exit_total", \
-		"Sessions leaving worker-local ReaderPool capacity waiting") \
+		"Sessions leaving selected-server capacity waiting, including primary writers") \
 	T(reader_capacity_wait_sum_us, "PolarDB_Reader_Capacity_Wait_Sum_Us", \
 		"proxysql_polardb_reader_capacity_wait_microseconds_total", \
-		"Total completed ReaderPool capacity wait time, in microseconds") \
+		"Total completed selected-server capacity wait time, including primary writers, in microseconds") \
 	T(reader_capacity_wait_max_us, "PolarDB_Reader_Capacity_Wait_Max_Us", \
 		"proxysql_polardb_reader_capacity_wait_max_microseconds_total", \
-		"Largest completed ReaderPool capacity wait observed, in microseconds") \
+		"Largest completed selected-server capacity wait, including primary writers, in microseconds") \
 	T(reader_capacity_retry_pass, "PolarDB_Reader_Capacity_Retry_Pass", \
 		"proxysql_polardb_reader_capacity_retry_pass_total", \
-		"Worker passes admitted to retry ReaderPool capacity waiters") \
+		"Worker passes admitted to retry selected-server capacity waiters") \
 	T(reader_capacity_retry_pass_deadline, "PolarDB_Reader_Capacity_Retry_Pass_Deadline", \
 		"proxysql_polardb_reader_capacity_retry_pass_deadline_total", \
-		"ReaderPool capacity retry passes started by the worker deadline") \
+		"Selected-server capacity retry passes started by the worker deadline") \
 	T(reader_capacity_retry_pass_local, "PolarDB_Reader_Capacity_Retry_Pass_Local", \
 		"proxysql_polardb_reader_capacity_retry_pass_local_total", \
-		"ReaderPool capacity retry passes started by a same-pass local return") \
+		"Selected-server capacity retry passes started by a same-pass local return") \
 	T(reader_capacity_retry_attempt, "PolarDB_Reader_Capacity_Retry_Attempt", \
 		"proxysql_polardb_reader_capacity_retry_attempt_total", \
-		"Worker-admitted ReaderPool capacity retry attempts") \
+		"Worker-admitted selected-server capacity retry attempts") \
 	T(reader_capacity_retry_acquired, "PolarDB_Reader_Capacity_Retry_Acquired", \
 		"proxysql_polardb_reader_capacity_retry_acquired_total", \
-		"Worker-admitted capacity retries that acquired a reader") \
+		"Worker-admitted capacity retries that acquired a selected-server connection") \
 	T(reader_capacity_retry_selected_busy, "PolarDB_Reader_Capacity_Retry_Selected_Busy", \
 		"proxysql_polardb_reader_capacity_retry_selected_busy_total", \
-		"Worker-admitted retries that could not establish complete reader-group saturation") \
+		"Worker-admitted retries that could not establish complete target-group saturation") \
 	T(reader_capacity_retry_group_busy, "PolarDB_Reader_Capacity_Retry_Group_Busy", \
 		"proxysql_polardb_reader_capacity_retry_group_busy_total", \
-		"Worker-admitted retries that found every currently eligible reader full") \
+		"Worker-admitted retries that found every currently eligible target server full") \
 	T(reader_capacity_retry_scope_skipped, "PolarDB_Reader_Capacity_Retry_Scope_Skipped", \
 		"proxysql_polardb_reader_capacity_retry_scope_skipped_total", \
 		"Capacity waiters deferred after the same scope was confirmed full in a worker pass") \
 	T(reader_capacity_wait_le_1ms, "PolarDB_Reader_Capacity_Wait_Le_1ms", \
 		"proxysql_polardb_reader_capacity_wait_le_1ms_total", \
-		"Completed ReaderPool capacity waits no longer than one millisecond") \
+		"Completed selected-server capacity waits, including primary writers, no longer than one millisecond") \
 	T(reader_capacity_wait_le_5ms, "PolarDB_Reader_Capacity_Wait_Le_5ms", \
 		"proxysql_polardb_reader_capacity_wait_le_5ms_total", \
-		"Completed ReaderPool capacity waits over one and no longer than five milliseconds") \
+		"Completed selected-server capacity waits, including primary writers, over one and no longer than five milliseconds") \
 	T(reader_capacity_wait_le_20ms, "PolarDB_Reader_Capacity_Wait_Le_20ms", \
 		"proxysql_polardb_reader_capacity_wait_le_20ms_total", \
-		"Completed ReaderPool capacity waits over five and no longer than twenty milliseconds") \
+		"Completed selected-server capacity waits, including primary writers, over five and no longer than twenty milliseconds") \
 	T(reader_capacity_wait_le_100ms, "PolarDB_Reader_Capacity_Wait_Le_100ms", \
 		"proxysql_polardb_reader_capacity_wait_le_100ms_total", \
-		"Completed ReaderPool capacity waits over twenty and no longer than one hundred milliseconds") \
+		"Completed selected-server capacity waits, including primary writers, over twenty and no longer than one hundred milliseconds") \
 	T(reader_capacity_wait_le_1s, "PolarDB_Reader_Capacity_Wait_Le_1s", \
 		"proxysql_polardb_reader_capacity_wait_le_1s_total", \
-		"Completed ReaderPool capacity waits over one hundred milliseconds and no longer than one second") \
+		"Completed selected-server capacity waits, including primary writers, over one hundred milliseconds and no longer than one second") \
 	T(reader_capacity_wait_gt_1s, "PolarDB_Reader_Capacity_Wait_Gt_1s", \
 		"proxysql_polardb_reader_capacity_wait_gt_1s_total", \
-		"Completed ReaderPool capacity waits longer than one second") \
+		"Completed selected-server capacity waits, including primary writers, longer than one second") \
+	T(writer_pool_acquire_attempt, "PolarDB_Writer_Pool_Acquire_Attempt", \
+		"proxysql_polardb_writer_pool_acquire_attempt_total", \
+		"Primary writer requests entering selected-server pool acquisition after a local miss") \
+	T(writer_pool_acquire_hit, "PolarDB_Writer_Pool_Acquire_Hit", \
+		"proxysql_polardb_writer_pool_acquire_hit_total", \
+		"Primary writer selected-server pool acquisitions that returned a connection") \
+	T(writer_pool_acquire_busy, "PolarDB_Writer_Pool_Acquire_Busy", \
+		"proxysql_polardb_writer_pool_acquire_busy_total", \
+		"Primary writer acquisitions deferred because the selected pool was busy") \
+	T(writer_pool_acquire_group_busy, "PolarDB_Writer_Pool_Acquire_Group_Busy", \
+		"proxysql_polardb_writer_pool_acquire_group_busy_total", \
+		"Primary writer acquisitions deferred after complete writer-group saturation") \
+	T(writer_capacity_wait_enter, "PolarDB_Writer_Capacity_Wait_Enter", \
+		"proxysql_polardb_writer_capacity_wait_enter_total", \
+		"Primary writer requests entering event-driven capacity waiting") \
+	T(writer_capacity_wait_exit, "PolarDB_Writer_Capacity_Wait_Exit", \
+		"proxysql_polardb_writer_capacity_wait_exit_total", \
+		"Primary writer requests leaving event-driven capacity waiting") \
+	T(writer_capacity_wait_sum_us, "PolarDB_Writer_Capacity_Wait_Sum_Us", \
+		"proxysql_polardb_writer_capacity_wait_microseconds_total", \
+		"Total completed primary writer capacity wait time, in microseconds") \
 	T(reader_pool_capacity_ownership_local, "PolarDB_ReaderPool_Capacity_Ownership_Local", \
 		"proxysql_polardb_reader_pool_capacity_ownership_local_total", \
 		"Capacity requests avoided because the worker held compatible local capacity") \
@@ -1008,34 +1029,34 @@
 		"Reserved diagnostic; current registration exits before checking ownership when a reservation is active") \
 	T(reader_pool_capacity_ownership_zero, "PolarDB_ReaderPool_Capacity_Ownership_Zero", \
 		"proxysql_polardb_reader_pool_capacity_ownership_zero_total", \
-		"Complete reader-group busy results for workers with no compatible owned capacity") \
+		"Complete selected-group busy results for workers with no compatible owned capacity") \
 	T(reader_pool_retention_started, "PolarDB_ReaderPool_Retention_Started", \
 		"proxysql_polardb_reader_pool_retention_started_total", \
-		"Workers allowed to retain a compatible reader while local work remains") \
+		"Workers allowed to retain a compatible selected-server connection while local work remains") \
 	T(reader_pool_retention_cleared, "PolarDB_ReaderPool_Retention_Cleared", \
 		"proxysql_polardb_reader_pool_retention_cleared_total", \
-		"Reader retention scopes cleared after compatible local work ended") \
+		"Selected-server retention scopes cleared after compatible local work ended") \
 	T(reader_pool_retained_connection_shared, "PolarDB_ReaderPool_Retained_Connection_Shared", \
 		"proxysql_polardb_reader_pool_retained_connection_shared_total", \
-		"Retained reader connections returned to shared matching or reserved for remote requests") \
+		"Retained selected-server connections returned to shared matching or reserved for remote requests") \
 	T(reader_pool_remote_request_seen, "PolarDB_ReaderPool_Remote_Request_Seen", \
 		"proxysql_polardb_reader_pool_remote_request_seen_total", \
-		"Compatible remote requests found while returning retained readers") \
+		"Compatible remote requests found while returning retained selected-server connections") \
 	T(reader_pool_remote_reservation_attempt, "PolarDB_ReaderPool_Remote_Reservation_Attempt", \
 		"proxysql_polardb_reader_pool_remote_reservation_attempt_total", \
-		"Attempts to reserve retained readers for compatible remote requests") \
+		"Attempts to reserve retained selected-server connections for compatible remote requests") \
 	T(reader_pool_remote_reservation_created, "PolarDB_ReaderPool_Remote_Reservation_Created", \
 		"proxysql_polardb_reader_pool_remote_reservation_created_total", \
-		"Retained readers successfully reserved for remote workers") \
+		"Retained selected-server connections successfully reserved for remote workers") \
 	T(reader_pool_remote_reservation_not_created, "PolarDB_ReaderPool_Remote_Reservation_Not_Created", \
 		"proxysql_polardb_reader_pool_remote_reservation_not_created_total", \
 		"Remote reservation attempts that found no eligible request or connection") \
 	T(reader_pool_capacity_request_registered, "PolarDB_ReaderPool_Capacity_Request_Registered", \
 		"proxysql_polardb_reader_pool_capacity_request_registered_total", \
-		"Cold-worker ReaderPool capacity requests registered") \
+		"Cold-worker selected-server capacity requests registered") \
 	T(reader_pool_capacity_request_cancelled, "PolarDB_ReaderPool_Capacity_Request_Cancelled", \
 		"proxysql_polardb_reader_pool_capacity_request_cancelled_total", \
-		"Pending ReaderPool capacity requests cancelled before a connection was reserved") \
+		"Pending selected-server capacity requests cancelled before a connection was reserved") \
 	T(reader_pool_capacity_request_duplicate_token, "PolarDB_ReaderPool_Capacity_Request_Duplicate_Token", \
 		"proxysql_polardb_reader_pool_capacity_request_duplicate_token_total", \
 		"Capacity request registrations that repeated an active token") \
@@ -1044,7 +1065,7 @@
 		"Capacity request registrations rejected because the worker already had an active request") \
 	T(reader_pool_connection_reserved, "PolarDB_ReaderPool_Connection_Reserved", \
 		"proxysql_polardb_reader_pool_connection_reserved_total", \
-		"Connections reserved for waiting workers instead of normal ReaderPool matching") \
+		"Connections reserved for waiting workers instead of normal selected-server matching") \
 	T(reader_pool_reservation_acquired, "PolarDB_ReaderPool_Reservation_Acquired", \
 		"proxysql_polardb_reader_pool_reservation_acquired_total", \
 		"Worker-assigned FREE reader connections acquired") \

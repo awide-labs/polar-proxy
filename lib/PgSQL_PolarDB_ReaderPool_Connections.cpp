@@ -623,7 +623,7 @@ void PgSQL_PolarDB_ReaderPool::account_connection_return_rejection(
 }
 
 /**
- * @brief Return where a finished reader connection goes when a worker releases it.
+ * @brief Return where a finished selected-server connection goes when a worker releases it.
  *
  * The caller must own conn. No hostgroup manager or pool lock is taken.
  *
@@ -642,7 +642,7 @@ void PgSQL_PolarDB_ReaderPool::account_connection_return_rejection(
  *         - USE_SHARED_POOL: hand it to the shared pool without asserting its
  *           state. This is also the fall-through for a connection this pool does
  *           not manage - one with no pool key, or on a server that is not a
- *           configured PolarDB reader hostgroup - in which case no reuse check has
+ *           configured PolarDB reader or writer hostgroup - in which case no reuse check has
  *           run at all and the caller must still have the connection checked.
  */
 PolarDB_ReaderLocalReturnDecision
@@ -653,12 +653,15 @@ PgSQL_PolarDB_ReaderPool::local_return_decision(
 		return decision;
 	}
 	PgSQL_SrvC* server = static_cast<PgSQL_SrvC*>(conn->parent);
-	const auto hostgroup_config = server->myhgc
-		? hgm_->get_polardb_hg_config(server->myhgc->hid)
-		: PgSQL_HostGroups_Manager::PolarDB_HG_Config{};
+	if (!server->myhgc) {
+		return decision;
+	}
+	const auto hostgroup_config =
+		hgm_->get_polardb_hg_config(server->myhgc->hid);
+	const int server_hg = static_cast<int>(server->myhgc->hid);
 	if (!hostgroup_config.is_polardb_hostgroup ||
-			hostgroup_config.reader_hostgroup !=
-				static_cast<int>(server->myhgc->hid)) {
+			(hostgroup_config.reader_hostgroup != server_hg &&
+			 hostgroup_config.writer_hostgroup != server_hg)) {
 		return decision;
 	}
 	const ConnectionReturnDecision return_decision =

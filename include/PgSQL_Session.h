@@ -708,6 +708,10 @@ public:
 	struct PolarDB_ReaderCapacityWaitState {
 		uint64_t started_at_us = 0;
 		uint64_t scope_hash = 0;
+		PolarDB_PoolCapacityTarget target =
+			PolarDB_PoolCapacityTarget::READER;
+		PolarDB_Query_ReaderPlan reservation_plan;
+		PolarDB_WaitSpec reservation_wait_spec;
 		PgSQL_SrvC* reservation_server = nullptr;
 		std::shared_ptr<const void> reservation_server_snapshot;
 		uint32_t reservation_profile_generation = 0;
@@ -721,6 +725,9 @@ public:
 		void reset() {
 			started_at_us = 0;
 			scope_hash = 0;
+			target = PolarDB_PoolCapacityTarget::READER;
+			reservation_plan.reset();
+			reservation_wait_spec.reset();
 			reservation_server = nullptr;
 			reservation_server_snapshot.reset();
 			reservation_profile_generation = 0;
@@ -1417,7 +1424,11 @@ public:
 		PgSQL_SrvC* reservation_server = nullptr,
 		std::shared_ptr<const void> reservation_server_snapshot = nullptr,
 		uint32_t reservation_profile_generation = 0,
-		const PolarDB_PoolKey* reservation_pool_key = nullptr);
+		const PolarDB_PoolKey* reservation_pool_key = nullptr,
+		PolarDB_PoolCapacityTarget target =
+			PolarDB_PoolCapacityTarget::READER,
+		const PolarDB_Query_ReaderPlan* reservation_plan = nullptr,
+		const PolarDB_WaitSpec* reservation_wait_spec = nullptr);
 	/**
 	 * @brief End a reader-pool capacity wait and release its thread-side reservation.
 	 *

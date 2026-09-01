@@ -947,6 +947,119 @@ static void test_reader_capacity_group_confirmation() {
 	delete peer_conn;
 }
 
+static void test_writer_capacity_admission_shape() {
+	const int writer_hg = 1120;
+	const int reader_hg = 1121;
+	ok(PgHGM->servers_add(make_pgsql_servers_result(
+			writer_hg, "polardb-writer-capacity-writer", 25120,
+			reader_hg, "polardb-writer-capacity-reader", 25121,
+			/*writer_max_connections=*/1)) == 0,
+		"PolarDB writer capacity: bounded writer and reader are staged");
+	PgHGM->save_incoming_pgsql_table(
+		make_polardb_replication_row(writer_hg, reader_hg),
+		"pgsql_replication_hostgroups");
+	ok(PgHGM->commit({}, {}, false, false),
+		"PolarDB writer capacity: bounded topology commits");
+	PgSQL_SrvC* writer = find_pgsql_server(
+		PgHGM->MyHGC_lookup(writer_hg),
+		"polardb-writer-capacity-writer", 25120);
+	ok(writer != nullptr,
+		"PolarDB writer capacity: writer server is available");
+	if (!writer) {
+		return;
+	}
+
+	PgSQL_Connection* writer_conn = make_cached_reader_connection(writer);
+	writer_conn->pgsql_conn = unit_connected_pgconn();
+	unit_reader_pool_add_matching(writer, writer_conn);
+	const PgSQL_PoolMatchKey writer_key =
+		unit_reader_pool_match_key(writer_conn);
+	PgSQL_Connection* writer_used =
+		writer->take_matching_connection(writer_key);
+
+	std::unique_ptr<PgSQL_Thread> worker(new PgSQL_Thread());
+	PgSQL_Session sess;
+	attach_test_frontend(sess, worker.get());
+	sess.current_hostgroup = writer_hg;
+	PolarDB_Query_ReaderPlan writer_plan;
+	writer_plan.fallback_writer_hg = writer_hg;
+	writer_plan.read_target =
+		static_cast<int>(PolarDB_ReadTarget::PRIMARY);
+	PolarDB_WaitSpec no_wait;
+	PolarDB_ReaderResult full = PgHGM->polardb_acquire_reader_connection(
+		writer_hg, &sess, writer_plan, no_wait, /*only_pooled=*/false,
+		nullptr, -1, /*confirm_reader_group_capacity=*/true);
+	ok(writer_used == writer_conn && !full.acquired() &&
+			full.status == PolarDB_ReaderStatus::READER_GROUP_BUSY &&
+			full.srv == writer && full.retry_scope_hash != 0 &&
+			full.reservation_profile_generation != 0 &&
+			!full.reservation_pool_key.empty(),
+		"PolarDB writer capacity: saturated writer returns a complete group-busy retry identity");
+
+	const uint64_t writer_wait_enter_before =
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_writer_capacity_wait_enter];
+	sess.polardb_enter_reader_capacity_wait(
+		full.retry_scope_hash, full.status, full.srv,
+		std::move(full.selected_server_snapshot),
+		full.reservation_profile_generation, &full.reservation_pool_key,
+		PolarDB_PoolCapacityTarget::WRITER, &writer_plan, &no_wait);
+	writer_plan.fallback_writer_hg = -1;
+	ok(sess.polardb_reader_capacity_wait.active &&
+			sess.polardb_reader_capacity_wait.target ==
+				PolarDB_PoolCapacityTarget::WRITER &&
+			sess.polardb_reader_capacity_wait.reservation_plan.
+				fallback_writer_hg == writer_hg &&
+			!sess.polardb_reader_capacity_wait.reservation_wait_spec.has_wait(),
+		"PolarDB writer capacity: wait state owns an immutable writer reservation plan");
+	const uint64_t writer_wait_exit_before =
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_writer_capacity_wait_exit];
+	sess.polardb_leave_reader_capacity_wait(
+		PolarDB_ReaderStatus::ACQUIRED);
+	ok(!sess.polardb_reader_capacity_wait.active &&
+			sess.polardb_reader_capacity_wait.target ==
+				PolarDB_PoolCapacityTarget::READER &&
+			sess.polardb_reader_capacity_wait.reservation_plan.
+				fallback_writer_hg < 0,
+		"PolarDB writer capacity: leaving the wait clears writer-specific state");
+	ok(worker->polardb_status_variables.stvar[
+			polardb_st_var_writer_capacity_wait_enter] ==
+				writer_wait_enter_before + 1 &&
+		worker->polardb_status_variables.stvar[
+			polardb_st_var_writer_capacity_wait_exit] ==
+				writer_wait_exit_before + 1,
+		"PolarDB writer capacity: writer waits have explicit enter and exit observability");
+
+	ok(worker->polardb_reader_local_return_decision(writer_used).action ==
+			PolarDB_ReaderLocalReturn::KEEP_WITH_WORKER,
+		"PolarDB writer capacity: an exact writer connection can remain worker-local");
+	worker->push_MyConn_local(writer_used);
+	const auto writer_cfg = PgHGM->get_polardb_hg_config(writer_hg);
+	sess.polardb_query.profile_enabled = true;
+	sess.polardb_query.effective_consistency_mode =
+		static_cast<int>(PolarDB_ConsistencyMode::OFF);
+	sess.polardb_query.request_writer_scope = PolarDB_WriterScope{
+		writer_hg, writer_cfg.writer_epoch};
+	PgSQL_Connection* local_writer = worker->get_MyConn_local(
+		writer_hg, &sess, nullptr, 0, -1);
+	ok(local_writer == writer_conn &&
+			PolarDB_ReaderRetentionUnitAccess::local_connection_count(
+				worker.get()) == 0,
+		"PolarDB writer capacity: an active profile reuses an exact local writer even with consistency off");
+	worker->push_MyConn_local(local_writer);
+	sess.polardb_query.profile_enabled = false;
+	ok(worker->get_MyConn_local(
+			writer_hg, &sess, nullptr, 0, -1) == nullptr,
+		"PolarDB writer capacity: profile-off requests cannot enter keyed writer reuse");
+	worker->return_local_connections();
+	ok(writer->pool_used_count_value() == 0 &&
+			writer->pool_free_count_value() == 1,
+		"PolarDB writer capacity: local writer fixture returns to FREE accounting");
+	writer->remove_free_connection(writer_conn);
+	delete writer_conn;
+}
+
 static void test_reader_capacity_pass_admission_shape() {
 	const uint64_t first_scope = 0x1111;
 	const uint64_t second_scope = 0x2222;
@@ -1074,6 +1187,15 @@ static void test_reader_pool_local_return_request_scope() {
 			unmanaged.connection_status ==
 				PolarDB_ReaderConnectionReturnStatus::NOT_MANAGED,
 		"PolarDB local return request: unmanaged connection uses normal shared return checks");
+	PgSQL_HGC* attached_hgc = reader->myhgc;
+	reader->myhgc = nullptr;
+	const PolarDB_ReaderLocalReturnDecision detached =
+		worker.polardb_reader_local_return_decision(conn);
+	reader->myhgc = attached_hgc;
+	ok(detached.action == PolarDB_ReaderLocalReturn::USE_SHARED_POOL &&
+			detached.connection_status ==
+				PolarDB_ReaderConnectionReturnStatus::NOT_MANAGED,
+		"PolarDB local return request: detached server uses normal shared return checks");
 	const PolarDB_ReaderLocalReturnDecision reusable =
 		worker.polardb_reader_local_return_decision(conn);
 	ok(reusable.action == PolarDB_ReaderLocalReturn::KEEP_WITH_WORKER &&
@@ -1581,6 +1703,7 @@ void run_polardb_reader_reservation_lifecycle_tests() {
 
 void run_polardb_reader_capacity_admission_tests() {
 	test_reader_capacity_group_confirmation();
+	test_writer_capacity_admission_shape();
 	test_reader_capacity_pass_admission_shape();
 }
 
