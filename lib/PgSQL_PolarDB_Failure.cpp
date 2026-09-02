@@ -978,7 +978,7 @@ void PgSQL_Session::polardb_prepare_retry_backend(
 			!source_myds || source_myds == target_myds ||
 				source_myds->max_connect_time == 0,
 			target_ready ? 1 : 0,
-			target_myds->max_connect_time == 0 ? "clear" : "armed");
+			target_myds->max_connect_time == 0 ? "clear" : "set");
 	}
 #endif // POLARDB_DEBUG
 }

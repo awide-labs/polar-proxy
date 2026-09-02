@@ -22,7 +22,7 @@ unset TXN_SPLIT_FAILURE_POLICY_TAP_LIBRARY_ONLY
 PLAN=10
 FAIL=0
 REPAIR_CLEAR_TRACE="PolarDB CONNECT_DEADLINE DEBUG: retry repaired source_cleared=1 target_ready=1 target_deadline=clear"
-REPAIR_ARMED_TRACE="PolarDB CONNECT_DEADLINE DEBUG: retry repaired source_cleared=1 target_ready=0 target_deadline=armed"
+REPAIR_SET_TRACE="PolarDB CONNECT_DEADLINE DEBUG: retry repaired source_cleared=1 target_ready=0 target_deadline=set"
 READY_ACCEPT_TRACE="PolarDB CONNECT_DEADLINE DEBUG: accepted ready backend before expired deadline"
 
 runtime_online_reader_count() {
@@ -247,7 +247,7 @@ SELECT polar_node_type();" 2>&1)
 }
 
 run_capacity_redirect_deadline_case() {
-	local label="capacity fallback replaces the reader deadline and arms the writer"
+	local label="capacity fallback replaces the reader deadline and sets the writer deadline"
 	local old_timeout out rc repair_before repair_delta redirect_before redirect_delta
 
 	reset_case_table || {
@@ -268,7 +268,7 @@ run_capacity_redirect_deadline_case() {
 	proxysql_admin "UPDATE global_variables SET variable_value='50' WHERE variable_name='pgsql-connect_timeout_server_max';" >/dev/null
 	proxysql_admin "LOAD PGSQL VARIABLES TO RUNTIME;" >/dev/null
 
-	repair_before=$(policy_trace_count "$REPAIR_ARMED_TRACE")
+	repair_before=$(policy_trace_count "$REPAIR_SET_TRACE")
 	redirect_before=$(policy_trace_count "replica capacity deadline reached")
 	out=$(proxy_script "\\set ON_ERROR_STOP on
 INSERT INTO $TEST_TABLE VALUES (105, 'capacity_deadline') ON CONFLICT (id) DO UPDATE SET data='capacity_deadline';
@@ -276,7 +276,7 @@ INSERT INTO $TEST_TABLE VALUES (105, 'capacity_deadline') ON CONFLICT (id) DO UP
 \\! printf '%s\\n' retry_expired > \"\$POLARDB_DEBUG_CONNECT_DEADLINE_FAULT_FILE\"
 SELECT polar_node_type();" 2>&1)
 	rc=$?
-	repair_delta=$(deadline_trace_delta "$REPAIR_ARMED_TRACE" "$repair_before")
+	repair_delta=$(deadline_trace_delta "$REPAIR_SET_TRACE" "$repair_before")
 	redirect_delta=$(deadline_trace_delta "replica capacity deadline reached" "$redirect_before")
 	clear_debug_fault_file POLARDB_DEBUG_READER_ACQUIRE_FAULT_FILE >/dev/null 2>&1 || true
 	if [ -n "$old_timeout" ]; then
@@ -407,8 +407,8 @@ run_ordinary_loss_deadline_case \
 	replica_then_error replica "$REPAIR_CLEAR_TRACE" 1
 
 run_ordinary_loss_deadline_case \
-	"ordinary reader-to-writer retry arms a fresh deadline on an unconnected writer" \
-	primary primary "$REPAIR_ARMED_TRACE" 0
+	"ordinary reader-to-writer retry sets a fresh deadline on an unconnected writer" \
+	primary primary "$REPAIR_SET_TRACE" 0
 
 run_capacity_redirect_deadline_case
 run_ready_backend_deadline_case

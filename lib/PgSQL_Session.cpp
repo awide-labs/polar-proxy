@@ -1801,15 +1801,22 @@ bool PgSQL_Session::handler_again___status_CONNECTING_SERVER(int* _rc) {
 		mybe->server_myds->wait_until = thread->curtime + pgsql_thread___connect_timeout_server * 1000;
 		pause_until = 0;
 	}
-	const bool backend_ready =
+#if POLARDB_PROXY
+	const bool polardb_backend_ready =
 		mybe->server_myds->myconn &&
 		mybe->server_myds->myconn->async_state_machine == ASYNC_IDLE;
+#endif // POLARDB_PROXY
 #if POLARDB_PROXY && POLARDB_DEBUG
 	const bool debug_ready_expired =
-		backend_ready && mybe->server_myds->max_connect_time &&
+		polardb_backend_ready && mybe->server_myds->max_connect_time &&
 		thread->curtime >= mybe->server_myds->max_connect_time;
 #endif // POLARDB_PROXY && POLARDB_DEBUG
-	if (!backend_ready && mybe->server_myds->max_connect_time) {
+#if POLARDB_PROXY
+	if (!polardb_backend_ready &&
+			mybe->server_myds->max_connect_time) {
+#else
+	if (mybe->server_myds->max_connect_time) {
+#endif // POLARDB_PROXY
 		if (thread->curtime >= mybe->server_myds->max_connect_time) {
 #if POLARDB_PROXY
 			if (polardb_reader_capacity_wait.active) {
@@ -1942,7 +1949,9 @@ bool PgSQL_Session::handler_again___status_CONNECTING_SERVER(int* _rc) {
 					"before expired deadline\n");
 			}
 #endif // POLARDB_PROXY && POLARDB_DEBUG
+#if POLARDB_PROXY
 			myds->max_connect_time = 0;
+#endif // POLARDB_PROXY
 			st = previous_status.top();
 			previous_status.pop();
 			NEXT_IMMEDIATE_NEW(st);
