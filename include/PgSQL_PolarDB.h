@@ -34,6 +34,7 @@ class PgSQL_Backend;
 class PgSQL_Data_Stream;
 class PgSQL_SrvC;
 class PgSQL_Session;
+struct pg_result;
 
 // ===========================================================================
 // PolarDB tracing facility  (debugging map)
@@ -216,11 +217,14 @@ static inline bool polardb_zero_lsn_payload_can_skip_wait_target(
     return false;
 }
 
-// Stable PolarDB15 errdetail_internal() marker emitted by the backend for
-// proxy LSN wait timeouts. ProxySQL uses this structured field instead of
-// matching human-readable WARNING/ERROR text.
+// Expected DETAIL and source-function values for an LSN wait timeout.
 static constexpr const char* POLARDB_LSN_WAIT_TIMEOUT_DETAIL =
     "polar_proxy_lsn_wait_timeout";
+static constexpr const char* POLARDB_LSN_WAIT_TIMEOUT_SOURCE_FUNCTION =
+    "polar_proxy_wait_for_lsn";
+
+// Return true when the result contains both expected values.
+bool polardb_is_lsn_wait_timeout_result(const pg_result* result);
 static constexpr unsigned int POLARDB_REPLICA_FAILURE_ERROR_CODE = 9999;
 
 // =============================================================================
@@ -3426,7 +3430,7 @@ struct PolarDB_WaitProfileState {
  * This is the accounting policy PgSQL_Connection's result loop uses, kept
  * side-effect-free so unit tests exercise the same decision table without
  * constructing a live connection, session, or PGresult. The caller still owns
- * the actual state mutation and counter updates.
+ * the actual state changes and counter updates.
  */
 struct PolarDB_WrapperErrorAccounting {
     bool mark_wrapper_failed = false;
@@ -4638,10 +4642,12 @@ static inline const char* polardb_route_action_reason_name(
 struct PolarDB_RequestOutcome {
     bool result_started = false;
     bool reusable = false;
+    bool can_return_to_pool = false;
     bool connected = false;
     bool timeout_error = false;
     bool timeout_already_accounted = false;
     bool wrapper_set_failure = false;
+    bool wrapper_is_consistency_wait = false;
 
     int backend_hg = -1;
     std::string backend_address;

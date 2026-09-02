@@ -32,6 +32,20 @@
 
 #if POLARDB_PROXY
 
+bool polardb_is_lsn_wait_timeout_result(const pg_result* result) {
+	if (!result) {
+		return false;
+	}
+	const char* detail =
+		PQresultErrorField(result, PG_DIAG_MESSAGE_DETAIL);
+	const char* source_function =
+		PQresultErrorField(result, PG_DIAG_SOURCE_FUNCTION);
+	return detail && source_function &&
+		strcmp(detail, POLARDB_LSN_WAIT_TIMEOUT_DETAIL) == 0 &&
+		strcmp(source_function,
+			POLARDB_LSN_WAIT_TIMEOUT_SOURCE_FUNCTION) == 0;
+}
+
 /**
  * @brief Empty and destroy the pending-notice queue.
  *
@@ -249,15 +263,7 @@ void polardb_handle_lsn_wait_timeout_notice(PgSQL_Connection* conn, const PGresu
 		return;
 	}
 
-	// Detect an LSN wait-timeout WARNING from PolarDB using the structured
-	// backend marker. Do not match human-readable message text: user SQL can
-	// raise the same text, while the errdetail_internal() marker is emitted only
-	// by PolarDB's proxy LSN wait path.
-	const char* detail = PQresultErrorField(result, PG_DIAG_MESSAGE_DETAIL);
-	const bool is_lsn_timeout = detail &&
-		strcmp(detail, POLARDB_LSN_WAIT_TIMEOUT_DETAIL) == 0;
-
-	if (!is_lsn_timeout) {
+	if (!polardb_is_lsn_wait_timeout_result(result)) {
 		return;
 	}
 
@@ -337,6 +343,7 @@ void polardb_handle_lsn_wait_timeout_notice(PgSQL_Connection* conn, const PGresu
 		PQresultErrorField(result, PG_DIAG_SEVERITY_NONLOCALIZED);
 	const char* sqlstate = PQresultErrorField(result, PG_DIAG_SQLSTATE);
 	const char* primary = PQresultErrorField(result, PG_DIAG_MESSAGE_PRIMARY);
+	const char* detail = PQresultErrorField(result, PG_DIAG_MESSAGE_DETAIL);
 
 	if (!sess->polardb_enqueue_notice_packet(
 			severity, sqlstate, primary, detail, severity_nonlocalized)) {

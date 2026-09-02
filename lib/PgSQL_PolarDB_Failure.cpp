@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <utility>
 
 extern PgSQL_HostGroups_Manager* PgHGM;
 
@@ -110,11 +111,6 @@ static bool polardb_reader_matches_writer_scope(
 static bool polardb_failed_connection_is_reusable(PgSQL_Connection* conn) {
 	return conn && conn->is_connected() && conn->is_error_present() &&
 		conn->is_connection_in_reusable_state();
-}
-
-static bool polardb_error_text_is_wait_timeout(const std::string& message) {
-	return message.find("LSN wait timeout") != std::string::npos ||
-		message.find("polar_wait_lsn timeout") != std::string::npos;
 }
 
 #if POLARDB_DEBUG
@@ -233,19 +229,22 @@ PolarDB_RequestOutcome PgSQL_Session::polardb_capture_request_outcome(
 	PgSQL_Connection* conn = backend->server_myds->myconn;
 	outcome.connected = conn->is_connected();
 	outcome.reusable = polardb_failed_connection_is_reusable(conn);
+	outcome.can_return_to_pool =
+		polardb_failed_connection_is_poolable(conn);
 	outcome.result_started = conn->query_result &&
 		conn->query_result->is_transfer_started();
-	outcome.timeout_error = polardb_query.wait.timeout_error ||
-		polardb_error_text_is_wait_timeout(conn->get_error_message());
+	outcome.timeout_error = polardb_query.wait.timeout_error;
 	outcome.wrapper_set_failure =
 		conn->polardb_query_wrap_state.wrapper_set_failed() ||
 		conn->polardb_query_wrap_state.consuming_wrapper_set();
+	outcome.wrapper_is_consistency_wait =
+		conn->polardb_query_wrap_state.is_consistency_wait();
 	outcome.timeout_already_accounted =
 		outcome.timeout_error && polardb_query.wait.wait_started_at_us == 0;
 	if (outcome.wrapper_set_failure &&
 			polardb_txn_reader.split_active &&
 			backend == polardb_txn_reader.backend &&
-			polardb_txn_reader.wait_start_us == 0) {
+			polardb_txn_reader.wait_timeout_error) {
 		outcome.timeout_error = true;
 		outcome.timeout_already_accounted = true;
 	}
@@ -294,7 +293,7 @@ PolarDB_FailureAction PgSQL_Session::polardb_handle_reader_failure(
 		// cleanup/retry here so PgSQL_Session.cpp reaches PolarDB failure
 		// classification in one call, before falling through to ProxySQL's
 		// generic rc==-1 path.
-		failure = polardb_capture_wait_read_failure(outcome.backend_myds);
+		failure = polardb_capture_wait_read_failure(std::move(failure));
 		POLARDB_TRACE(
 			"PolarDB WAIT: rc=-1 wait_active=%d wait_read=%d wrapper_set_failure=%d "
 			"timeout_error=%d connection_lost=%d result_started=%d "
@@ -318,8 +317,6 @@ PolarDB_FailureAction PgSQL_Session::polardb_handle_reader_failure(
 			polardb_txn_reader.backend &&
 			polardb_txn_reader.backend->server_myds == outcome.backend_myds;
 		if (txn_wait_reader_failed && !failure.is_wait()) {
-			PgSQL_Connection* failed_conn =
-				outcome.backend_myds ? outcome.backend_myds->myconn : nullptr;
 			PgSQL_MyDS_real_query& failed_query =
 				outcome.backend_myds->pgsql_real_query;
 			if (failure.retry_query.empty() && failed_query.QueryPtr &&
@@ -331,12 +328,6 @@ PolarDB_FailureAction PgSQL_Session::polardb_handle_reader_failure(
 				failure.retry_query.assign(failed_query.QueryPtr, query_size);
 			}
 			failure.request_kind = PolarDB_ReaderRequestKind::WAIT;
-			failure.failed_myds = outcome.backend_myds;
-			failure.result_started = outcome.result_started;
-			failure.connected = outcome.connected;
-			failure.reusable = outcome.reusable;
-			failure.can_return_to_pool =
-				polardb_failed_connection_is_poolable(failed_conn);
 			if (failure.fallback_writer_hg < 0) {
 				failure.fallback_writer_hg =
 					polardb_txn_reader_failure.writer_hg >= 0 ?
@@ -349,7 +340,8 @@ PolarDB_FailureAction PgSQL_Session::polardb_handle_reader_failure(
 				failure.reader_hg, failure.fallback_writer_hg);
 		}
 		if (!failure.is_wait()) {
-			failure = polardb_capture_ordinary_reader_failure(outcome);
+			failure = polardb_capture_ordinary_reader_failure(
+				std::move(failure));
 		}
 		if (failure.is_wait() || failure.is_ordinary()) {
 			// Same policy selector as transaction split. The wait-read adapter
@@ -509,33 +501,25 @@ PolarDB_FailureAction PgSQL_Session::polardb_handle_reader_failure(
 }
 
 /**
- * @brief Build the reader-failure record from a captured request outcome.
+ * @brief Convert one backend outcome into the common reader-failure record.
  *
- * For transaction-split reads, the client packet is moved out of
- * polardb_txn_reader.original_pkt into failure.retry_pkt when the failed backend
- * is the active split reader. The session's copy is cleared because split
- * cleanup would otherwise free the packet needed for retry. The split wait
- * target, writer scope, reader plan and transaction XIDs
- * are copied for the same reason: the active wrapper is discarded during cleanup
- * and has to be rebuilt for a replacement reader.
- *
- * @param outcome  Snapshot of the failed backend.
- * @return The failure record. When split_read is true the caller owns
- *         failure.retry_pkt and must either install it into a backend stream or
- *         release it with polardb_free_retry_pkt_if_owned(); dropping the record
- *         leaks the client packet.
+ * Request-specific functions add the request kind and packet ownership.
  */
 PgSQL_Session::PolarDB_ReaderFailure
-PgSQL_Session::polardb_take_reader_failure(
+PgSQL_Session::polardb_failure_from_outcome(
 		const PolarDB_RequestOutcome& outcome) {
 	PolarDB_ReaderFailure failure;
 	failure.reader_backend = outcome.backend;
 	failure.failed_myds = outcome.backend_myds;
 	failure.connected = outcome.connected;
 	failure.reusable = outcome.reusable;
+	failure.can_return_to_pool = outcome.can_return_to_pool;
 	failure.result_started = outcome.result_started;
 	failure.timeout = outcome.timeout_error;
 	failure.timeout_already_accounted = outcome.timeout_already_accounted;
+	failure.wrapper_set_failure = outcome.wrapper_set_failure;
+	failure.wrapper_is_consistency_wait =
+		outcome.wrapper_is_consistency_wait;
 	failure.reader_hg = outcome.backend_hg;
 	failure.reader_address = outcome.backend_address;
 	failure.reader_port = outcome.backend_port;
@@ -545,6 +529,20 @@ PgSQL_Session::polardb_take_reader_failure(
 		failure.backend_error_code =
 			static_cast<PGSQL_ERROR_CODES>(outcome.backend_error_code);
 	}
+	return failure;
+}
+
+/**
+ * @brief Add transaction-split state and take the retry packet when applicable.
+ *
+ * The original client packet is moved out of polardb_txn_reader before split
+ * cleanup can free it. The caller must install failure.retry_pkt into another
+ * stream or release it with polardb_free_retry_pkt_if_owned().
+ */
+PgSQL_Session::PolarDB_ReaderFailure
+PgSQL_Session::polardb_take_reader_failure(
+		const PolarDB_RequestOutcome& outcome) {
+	PolarDB_ReaderFailure failure = polardb_failure_from_outcome(outcome);
 
 	if (polardb_txn_reader.split_active &&
 			failure.reader_backend == polardb_txn_reader.backend) {
@@ -575,7 +573,7 @@ PgSQL_Session::polardb_take_reader_failure(
  *
  * The mapping comes from the reader-to-writer configuration. When no mapping is
  * configured the result falls back to current_hostgroup, so the returned value
- * can be the reader's own hostgroup and is not by itself proof that a writer was
+ * can be the reader's own hostgroup and does not confirm that a writer was
  * found. A caller that routes a failed read on this value alone can send it back
  * to the same replica; check the result against the reader hostgroup first.
  *
@@ -1790,34 +1788,25 @@ bool PgSQL_Session::polardb_try_redispatch_reader_read_to_other_reader(
 }
 
 /**
- * @brief Capture the retry-relevant state of a failed wait-wrapped replica read.
+ * @brief Add wait-request state to a captured backend failure.
  *
- * The returned request kind is deliberately narrow: WAIT is set
- * only when a wait is still active, the wrapper kind read from the connection
- * (conn->polardb_query_wrap_state) is a consistency wait, the wrapper was
- * finalized and the original query text was snapshotted. The wrapper kind must
- * come from the connection because the session-side dispatch fields have already
- * been cleared by this point.
+ * WAIT requires an active consistency wrapper, a finalized wrapper, and the
+ * saved original query. Query dispatch stores the wrapper type on the connection.
  *
- * Split-read fields are not the subject of this capture: split_read,
- * reader_backend and the split can-retry state are never populated, and a caller
- * that recovers a transaction wait-reader has to fill them in itself.
+ * This function never marks the request as SPLIT and never takes its packet. A
+ * caller that recovers a transaction wait reader still adds its request-specific
+ * retry text and fallback state.
  *
- * @param failed_myds  Stream of the failed reader. May be null.
- * @return The failure record, with reader identity, error text, pool-return
- *         eligibility and the snapshotted query filled in as far as the failed
- *         connection still provides them.
+ * @param failure  Backend fields captured before cleanup starts.
+ * @return The captured backend fields plus the request's wait and retry state.
  */
 PgSQL_Session::PolarDB_ReaderFailure
-PgSQL_Session::polardb_capture_wait_read_failure(PgSQL_Data_Stream* failed_myds) {
-	PolarDB_ReaderFailure failure;
-	failure.failed_myds = failed_myds;
-	failure.timeout = polardb_query.wait.timeout_error;
+PgSQL_Session::polardb_capture_wait_read_failure(
+		PolarDB_ReaderFailure failure) {
 	failure.fallback_writer_hg = polardb_query.wait.fallback_writer_hg;
 	failure.reader_plan = polardb_query.reader_plan;
 	failure.wait_spec = polardb_query.wait.spec;
-	// Snapshot the original query before the normal error path can clear
-	// per-query wait state; the primary retry rebuilds a fresh simple-query packet.
+	// Preserve the original query for a possible writer retry.
 	failure.retry_query = polardb_query.original_query;
 
 	if (polardb_debug_consume_wait_retry_fault(
@@ -1825,44 +1814,16 @@ PgSQL_Session::polardb_capture_wait_read_failure(PgSQL_Data_Stream* failed_myds)
 		failure.fallback_writer_hg = -1;
 	}
 
-	PgSQL_Connection* failed_conn = failed_myds ? failed_myds->myconn : NULL;
-	failure.wrapper_set_failure = failed_conn &&
-		(failed_conn->polardb_query_wrap_state.wrapper_set_failed() ||
-		 failed_conn->polardb_query_wrap_state.consuming_wrapper_set());
-	failure.result_started = failed_conn && failed_conn->query_result &&
-		failed_conn->query_result->is_transfer_started();
 	if (polardb_debug_consume_wait_retry_fault(
 			"POLARDB_DEBUG_WAIT_RETRY_RESULT_STARTED_ONCE")) {
 		failure.result_started = true;
 	}
-	failure.connected = failed_conn && failed_conn->is_connected();
-	failure.reusable = polardb_failed_connection_is_reusable(failed_conn);
-	failure.can_return_to_pool = polardb_failed_connection_is_poolable(failed_conn);
-	// Dispatch wrapper fields move from the session to the connection when the
-	// query starts. Capture must therefore use the connection-owned wrapper kind;
-	// the session fields have already been cleared by this point.
-	const bool consistency_wait = failed_conn &&
-		failed_conn->polardb_query_wrap_state.is_consistency_wait();
+	// The wrapper kind belongs to the backend after query dispatch.
 	if (polardb_wait_active() &&
-			consistency_wait &&
+			failure.wrapper_is_consistency_wait &&
 			polardb_query.wait.wrapper_finalized &&
 			!failure.retry_query.empty()) {
 		failure.request_kind = PolarDB_ReaderRequestKind::WAIT;
-	}
-
-	if (failed_conn) {
-		failure.has_backend_error = !failed_conn->get_error_message().empty();
-		failure.backend_error_message =
-			polardb_truncate_error_message(failed_conn->get_error_message());
-		failure.backend_error_code =
-			static_cast<PGSQL_ERROR_CODES>(failed_conn->get_error_code());
-	}
-
-	if (failed_conn && failed_conn->parent) {
-		PgSQL_SrvC* srv = failed_conn->parent;
-		failure.reader_hg = srv->myhgc ? (int)srv->myhgc->hid : -1;
-		failure.reader_address = srv->address ? srv->address : "";
-		failure.reader_port = (int)srv->port;
 	}
 
 	return failure;
@@ -1877,8 +1838,7 @@ PgSQL_Session::polardb_capture_wait_read_failure(PgSQL_Data_Stream* failed_myds)
  */
 PgSQL_Session::PolarDB_ReaderFailure
 PgSQL_Session::polardb_capture_ordinary_reader_failure(
-		const PolarDB_RequestOutcome& outcome) {
-	PolarDB_ReaderFailure failure = polardb_take_reader_failure(outcome);
+		PolarDB_ReaderFailure failure) {
 	const PolarDB_Query_ReaderPlan& plan = polardb_query.reader_plan;
 	const bool query_status =
 		status == PROCESSING_QUERY ||
@@ -1891,8 +1851,8 @@ PgSQL_Session::polardb_capture_ordinary_reader_failure(
 		plan.fallback_writer_hg >= 0 &&
 		plan.read_target == static_cast<int>(PolarDB_ReadTarget::REPLICA) &&
 		plan.consistency_mode != PolarDB_ConsistencyMode::OFF &&
-		outcome.backend_hg >= 0 &&
-		outcome.backend_hg != plan.fallback_writer_hg;
+		failure.reader_hg >= 0 &&
+		failure.reader_hg != plan.fallback_writer_hg;
 	if (!automatic_replica) {
 		return failure;
 	}
@@ -1901,13 +1861,8 @@ PgSQL_Session::polardb_capture_ordinary_reader_failure(
 	failure.extended_query = status != PROCESSING_QUERY;
 	failure.wait_was_bypassed =
 		polardb_query.wait_bypass_target != 0;
-	failure.failed_myds = outcome.backend_myds;
 	failure.reader_plan = plan;
 	failure.fallback_writer_hg = plan.fallback_writer_hg;
-	PgSQL_Connection* failed_conn =
-		outcome.backend_myds ? outcome.backend_myds->myconn : nullptr;
-	failure.can_return_to_pool =
-		polardb_failed_connection_is_poolable(failed_conn);
 	POLARDB_TRACE(
 		"PolarDB FAILURE: captured ordinary replica read reader_hg=%d "
 		"writer_hg=%d extended=%d wait_bypassed=%d reusable=%d\n",
@@ -2218,7 +2173,7 @@ PolarDB_FailureAction PgSQL_Session::polardb_handle_failed_reader_read(
 // requested guarantee cannot be enforced). The writer/primary already holds the latest
 // WAL, so any required LSN is satisfied there and the LSN wait intent is
 // dropped: clear_reader_route() makes sure no stale consistency-target LSN or
-// completed-wait bypass proof is carried onto the writer connection. Return false when
+// completed wait target is carried onto the writer connection. Return false when
 // no writer hostgroup is known, leaving the caller to use the normal pool path.
 bool PgSQL_Session::polardb_redirect_to_writer(int writer_hg, const char* reason) {
 	if (writer_hg < 0) {

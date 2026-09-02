@@ -36,6 +36,28 @@ extern PgSQL_Threads_Handler* GloPTH;
 
 #if POLARDB_PROXY
 
+static void test_wait_timeout_fields() {
+	PGresult* result = PQmakeEmptyPGresult(nullptr, PGRES_FATAL_ERROR);
+	ok(result != nullptr,
+		"PolarDB timeout fields: result fixture created");
+	if (!result) {
+		return;
+	}
+	pqSaveMessageField(result, PG_DIAG_MESSAGE_DETAIL,
+		POLARDB_LSN_WAIT_TIMEOUT_DETAIL);
+	ok(!polardb_is_lsn_wait_timeout_result(result),
+		"PolarDB timeout fields: DETAIL alone is rejected");
+	pqSaveMessageField(result, PG_DIAG_SOURCE_FUNCTION,
+		"client_controlled_function");
+	ok(!polardb_is_lsn_wait_timeout_result(result),
+		"PolarDB timeout fields: another source function is rejected");
+	pqSaveMessageField(result, PG_DIAG_SOURCE_FUNCTION,
+		POLARDB_LSN_WAIT_TIMEOUT_SOURCE_FUNCTION);
+	ok(polardb_is_lsn_wait_timeout_result(result),
+		"PolarDB timeout fields: exact DETAIL and source function are accepted");
+	PQclear(result);
+}
+
 static void test_reader_target_selection_counter_contract() {
 	std::unique_ptr<PgSQL_Thread> worker(new PgSQL_Thread());
 	const uint64_t TARGET = 0x20000;
@@ -1293,6 +1315,7 @@ static void test_collect_is_const_stable_snapshot() {
 }
 
 void run_polardb_consistency_counter_tests() {
+	test_wait_timeout_fields();
 	test_reader_target_selection_counter_contract();
 	test_wait_histogram_boundary_contract();
 }

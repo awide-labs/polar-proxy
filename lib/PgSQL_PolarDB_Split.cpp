@@ -366,6 +366,7 @@ void PgSQL_Session::polardb_begin_txn_reader_read(
 	polardb_txn_reader.writer_scope = writer_scope;
 	mybe = reader_backend;
 	polardb_txn_reader.read_start_us = monotonic_time();
+	polardb_txn_reader.wait_timeout_error = false;
 }
 
 /**
@@ -1224,6 +1225,8 @@ bool PgSQL_Session::polardb_account_txn_split_wait_timeout(const char* source) {
 	const unsigned long long elapsed_us =
 		now_us >= wait_start_us ? now_us - wait_start_us : 0;
 	(void)elapsed_us; // used only by POLARDB_TRACE in POLARDB_DEBUG builds
+	// Record the timeout before latency accounting clears wait_start_us.
+	polardb_txn_reader.wait_timeout_error = true;
 	polardb_record_txn_split_wait_latency();
 	POLARDB_THREAD_COUNT_ONE(thread, split_error_timeout);
 	POLARDB_THREAD_COUNT_ONE(thread, split_error_lsn_wait_timeout);

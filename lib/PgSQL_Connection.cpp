@@ -208,17 +208,6 @@ static inline bool polardb_try_add_row_run(PgSQL_Connection* conn) {
 #undef POLARDB_ROW_RUN_COUNT
 #endif // POLARDB_PROXY
 
-/// @brief Is this error/notice the PolarDB LSN wait-timeout?
-///
-/// The PolarDB backend tags its wait-timeout with a fixed marker in the
-/// structured DETAIL diagnostic field. We match that field, never the
-/// human-readable message text, so a user query that happens to contain the
-/// same words cannot be mistaken for a wait timeout.
-static bool polardb_is_lsn_wait_timeout_result(const PGresult* result) {
-	const char* detail = result ? PQresultErrorField(result, PG_DIAG_MESSAGE_DETAIL) : nullptr;
-	return detail && strcmp(detail, POLARDB_LSN_WAIT_TIMEOUT_DETAIL) == 0;
-}
-
 /// @brief Account a wrapper-statement error and stop consuming wrapper results.
 ///
 /// A consistency read is sent as several SET statements glued in front of the

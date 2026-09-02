@@ -555,6 +555,9 @@ public:
 		PgSQL_Backend* primary_backend = nullptr;
 		bool split_active = false;
 		bool wait_read_active = false;
+		// Set when the backend reports a wait timeout. Latency accounting clears
+		// wait_start_us before failure handling reads this state.
+		bool wait_timeout_error = false;
 		std::string wrapped_query;
 		PtrSize_t original_pkt{};
 		PolarDB_WaitSpec wait_spec;
@@ -579,6 +582,7 @@ public:
 			writer_scope.reset();
 			read_start_us = 0;
 			wait_start_us = 0;
+			wait_timeout_error = false;
 			primary_backend = nullptr;
 			split_active = false;
 			wait_read_active = false;
@@ -1548,7 +1552,7 @@ private:
 	void polardb_record_txn_split_latency();
 	/** @brief Add the current split wait wrapper's elapsed time to wait buckets. */
 	void polardb_record_txn_split_wait_latency();
-	/** @brief Snapshot the failed backend before the normal rc==-1 error path mutates it. */
+	/** @brief Copy failed backend state before normal rc==-1 error handling changes it. */
 	PolarDB_RequestOutcome polardb_capture_request_outcome(PgSQL_Backend* backend);
 	/** @brief Classify a PolarDB rc==-1 replica-reader failure and apply its
 	 *         retry/forward/terminate policy before generic retries. */
@@ -1581,6 +1585,7 @@ private:
 		bool has_backend_error = false;
 		bool timeout_already_accounted = false;
 		bool wrapper_set_failure = false;
+		bool wrapper_is_consistency_wait = false;
 		bool can_return_to_pool = false;
 		int reader_hg = -1;
 		std::string reader_address;
@@ -1620,6 +1625,9 @@ private:
 		bool allow_writer_retry = true;
 	};
 
+	/** @brief Copy captured backend fields into the common failure record. */
+	static PolarDB_ReaderFailure polardb_failure_from_outcome(
+		const PolarDB_RequestOutcome& outcome);
 	/** @brief Build the failure record and take its retry packet when needed. */
 	PolarDB_ReaderFailure polardb_take_reader_failure(
 		const PolarDB_RequestOutcome& outcome);
@@ -1722,11 +1730,12 @@ private:
 	 */
 	PolarDB_WrapFinalizeResult polardb_fail_wrap_and_disable_session_waits(
 		const char* reason);
-	/** @brief Capture retry-relevant details from a failed wait-wrapped replica read. */
-	PolarDB_ReaderFailure polardb_capture_wait_read_failure(PgSQL_Data_Stream* failed_myds);
+	/** @brief Add wait-request fields to a reader failure. */
+	PolarDB_ReaderFailure polardb_capture_wait_read_failure(
+		PolarDB_ReaderFailure failure);
 	/** @brief Capture one automatic replica read that has no active wrapper. */
 	PolarDB_ReaderFailure polardb_capture_ordinary_reader_failure(
-		const PolarDB_RequestOutcome& outcome);
+		PolarDB_ReaderFailure failure);
 	/**
 	 * @brief Retry or finish a failed ordinary or wait-wrapped replica read.
 	 *
