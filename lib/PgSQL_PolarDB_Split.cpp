@@ -94,8 +94,8 @@ static void polardb_append_sql_literal(std::string_view value, std::string& out)
  * @brief Return whether a reader the session already holds may skip the LSN wait.
  *
  * Skipping the wait wrapper removes the server-side guarantee, so a wrong true
- * here returns stale data to the client with no other check behind it. The proof
- * has to cover both the reader and the conditions it was picked under: the
+ * here returns stale data to the client with no other check behind it. The check
+ * covers both the reader and the conditions it was picked under: the
  * connection is idle, reusable and connected; the session's cached
  * rfq_writer_scope still matches the writer scope of this request; the
  * connection carries an LSN payload that has already reached wait_spec.target;
@@ -446,9 +446,7 @@ void PgSQL_Session::polardb_begin_txn_split_read(
 	polardb_txn_reader.split_active = true;
 	polardb_txn_reader.wait_start_us =
 		wait_bypassed ? 0 : polardb_txn_reader.read_start_us;
-	polardb_transaction_split.stage =
-		PolarDB_TransactionSplitStage::TXN_SPLIT_READ_ACTIVE;
-	polardb_transaction_split.was_splittable = true;
+	polardb_transaction_split.begin_split_read();
 	polardb_query.dispatch_wrapper_stmts = wrapper_stmts;
 	polardb_query.dispatch_wrapper_kind =
 		PolarDB_Query_WrapperKind::TXN_SPLIT_WAIT;
@@ -578,8 +576,7 @@ bool PgSQL_Session::polardb_prepare_txn_wait_read(
 	}
 	if (needs_wait && bypass_wait) {
 		POLARDB_THREAD_COUNT_ONE(thread, wait_wrap_bypassed);
-		polardb_query.wait_bypass_target = plan.wait_spec.target;
-		polardb_query.reset_wait();
+		polardb_query.mark_wait_satisfied(plan.wait_spec.target);
 		POLARDB_TRACE(
 			"PolarDB TXN_WAIT: selected reader already reached "
 			"target_lsn=%lu; wait wrapper bypassed\n",
@@ -592,10 +589,9 @@ bool PgSQL_Session::polardb_prepare_txn_wait_read(
 		}
 		POLARDB_THREAD_COUNT_ONE(thread, wait_wrap_prepared);
 		polardb_query.reader_plan = plan.reader;
-		polardb_query.wait.prepare_from_spec(plan.wait_spec);
-		polardb_query.wait.wait_stage = PolarDB_WaitStage::WAITING;
-		polardb_query.wait.wait_started_at_us = monotonic_time();
-		polardb_query.wait.fallback_writer_hg = plan.reader.fallback_writer_hg;
+		polardb_query.begin_wait(
+			plan.wait_spec, monotonic_time(),
+			plan.reader.fallback_writer_hg);
 		polardb_query.original_query.assign(orig_query, orig_len);
 	}
 
@@ -824,8 +820,7 @@ bool PgSQL_Session::polardb_prepare_txn_split_read(
 	POLARDB_THREAD_COUNT_ONE(thread, split_reads_total);
 	if (bypass_wait) {
 		POLARDB_THREAD_COUNT_ONE(thread, wait_wrap_bypassed);
-		polardb_query.wait_bypass_target = plan.wait_spec.target;
-		polardb_query.reset_wait();
+		polardb_query.mark_wait_satisfied(plan.wait_spec.target);
 	} else {
 		POLARDB_THREAD_COUNT_ONE(thread, split_lsn_wait_count);
 	}
@@ -976,8 +971,6 @@ void PgSQL_Session::polardb_finish_txn_reader_read(
 	}
 	if (split_success) {
 		POLARDB_THREAD_COUNT_ONE(thread, split_reads_success);
-		polardb_transaction_split.did_split = true;
-		polardb_transaction_split.was_splittable = true;
 	}
 	if (split_error) {
 		if (mark_reader_not_reusable &&
@@ -1006,15 +999,12 @@ void PgSQL_Session::polardb_finish_txn_reader_read(
 	}
 	polardb_reset_txn_reader_request();
 	if (split_success) {
-		polardb_transaction_split.stage =
-			PolarDB_TransactionSplitStage::TXN_SPLITTABLE;
+		polardb_transaction_split.complete_split_read();
 		POLARDB_TRACE("PolarDB TXN_SPLIT: completed split read; primary backend restored\n");
 		return;
 	}
 	if (split_error) {
-		polardb_transaction_split.stage =
-			PolarDB_TransactionSplitStage::TXN_ON_PRIMARY;
-		polardb_transaction_split.blocked = true;
+		polardb_transaction_split.fail_split_read();
 		POLARDB_TRACE(
 			"PolarDB TXN_SPLIT: aborted split read (%s); later reads use primary\n",
 			reason ? reason : "unknown");

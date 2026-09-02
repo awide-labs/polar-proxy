@@ -1892,18 +1892,13 @@ bool PgSQL_Session::polardb_apply_extended_route()
 		return false;
 	}
 
-	// Extended protocol never carries a wait wrapper. Clear any request-local
-	// wait state before planning so an earlier simple-query wait cannot leak into
-	// this request.
-	polardb_query.reset_reader_plan();
-	polardb_query.reset_wait();
+	// Extended protocol does not use wait wrappers. Clear request-local wait
+	// state before planning.
+	polardb_query.clear_reader_route();
 
 	polardb_observe_route_inputs(current_hostgroup);
 	if (pgsql_thread___polardb_profile_off) {
-		// observe() has already reconciled writer scope and torn down any old
-		// transaction-reader state. Clear every request-local reader artifact,
-		// then leave placement to ordinary ProxySQL without planner counters.
-		polardb_query.clear_reader_route();
+		// Reader routing state is clear; ordinary ProxySQL chooses the backend.
 		POLARDB_TRACE(
 			"PolarDB EXTENDED: named profile off after request cleanup; "
 			"routing left unchanged\n");

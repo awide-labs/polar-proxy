@@ -1479,7 +1479,6 @@ bool PgSQL_Session::polardb_try_redispatch_to_other_reader(
 		std::move(wrapped_query), failure.wait_spec, failure.reader_plan,
 		failure.writer_scope, wrapper_stmts, false);
 	polardb_query.reader_retry_attempts++;
-	polardb_transaction_split.blocked = false;
 
 	POLARDB_THREAD_COUNT_ONE(thread, split_reads_retried_on_reader);
 	POLARDB_TRACE(

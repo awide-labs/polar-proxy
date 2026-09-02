@@ -106,7 +106,7 @@ static void test_query_state_named_reset_subsets() {
 			!query.reader_wait_spec.has_wait() &&
 			!query.wait.spec.has_wait() &&
 			query.wait_bypass_target == 0,
-		"reader-route clear removes the reader plan, wait, and bypass proof");
+		"reader-route clear removes the reader plan, wait, and satisfied target");
 	ok(query.request_writer_scope.valid() && query.keep_session_lsn,
 		"reader-route clear preserves request scope and response LSN choice");
 
@@ -193,6 +193,34 @@ static void test_query_state_extended_message_reset() {
 		"extended-message reset clears wait and query buffers");
 	ok(!query.keep_session_lsn && query.wait_bypass_target == 0,
 		"extended-message reset clears response-only state");
+}
+
+static void test_query_wait_transitions() {
+	PolarDB_QueryState query;
+	const PolarDB_WaitSpec wait_spec = PolarDB_WaitSpec::from_lsn(
+		500, POLARDB_DEFAULT_WAIT_TIMEOUT_MS,
+		PolarDB_WaitMode::STRICT);
+	query.wait_bypass_target = 400;
+
+	query.begin_wait(wait_spec, 42, 10);
+	ok(query.wait.spec.target == 500 &&
+			query.wait.wait_stage == PolarDB_WaitStage::WAITING &&
+			query.wait.wait_started_at_us == 42 &&
+			query.wait.fallback_writer_hg == 10,
+		"wait transition: begin records the complete active wait");
+	ok(query.wait_bypass_target == 0,
+		"wait transition: begin clears the satisfied target");
+
+	query.wait.timeout_error = true;
+	query.mark_wait_satisfied(500);
+	ok(!query.wait.spec.has_wait() &&
+			query.wait.wait_stage == PolarDB_WaitStage::IDLE &&
+			query.wait.wait_started_at_us == 0 &&
+			!query.wait.timeout_error &&
+			query.wait.fallback_writer_hg == -1,
+		"wait transition: satisfied target clears active wait state");
+	ok(query.wait_bypass_target == 500,
+		"wait transition: satisfied target records the target");
 }
 
 static void test_reader_plan_lag_cap_helpers() {
@@ -361,6 +389,32 @@ static void test_transaction_split_state_rfq_observation() {
 		"transaction split observation: idle RFQ clears XIDs");
 }
 
+static void test_transaction_split_read_transitions() {
+	PolarDB_TransactionSplitState state;
+	state.observe_primary_rfq('T', "", true, false, 100, true);
+
+	state.begin_split_read();
+	ok(state.stage == PolarDB_TransactionSplitStage::TXN_SPLIT_READ_ACTIVE &&
+			state.was_splittable,
+		"transaction split read: begin records the active read");
+
+	state.complete_split_read();
+	ok(state.stage == PolarDB_TransactionSplitStage::TXN_SPLITTABLE &&
+			state.was_splittable && state.did_split && !state.blocked,
+		"transaction split read: completion restores splittable state");
+
+	state.begin_split_read();
+	state.fail_split_read();
+	ok(state.stage == PolarDB_TransactionSplitStage::TXN_ON_PRIMARY &&
+			state.blocked,
+		"transaction split read: failure keeps later reads on the writer");
+
+	state.begin_split_read();
+	ok(state.stage == PolarDB_TransactionSplitStage::TXN_SPLIT_READ_ACTIVE &&
+			!state.blocked,
+		"transaction split read: retry begins without the failure block");
+}
+
 static void test_no_write_xids_marker() {
 	ok(polardb_rfq_is_prewrite_split_candidate('T', "", true, false),
 		"no-write-XID marker: active split-safe transaction with empty XIDs matches");
@@ -378,15 +432,17 @@ static void test_no_write_xids_marker() {
 
 int main() {
 #if POLARDB_PROFILE
-	plan(105);
+	plan(113);
 #else
-	plan(103);
+	plan(111);
 #endif // POLARDB_PROFILE
 	test_query_state_named_reset_subsets();
 	test_query_state_extended_message_reset();
+	test_query_wait_transitions();
 	test_reader_plan_lag_cap_helpers();
 	test_transaction_split_state_reset_contract();
 	test_transaction_split_state_rfq_observation();
+	test_transaction_split_read_transitions();
 	test_no_write_xids_marker();
 	return exit_status();
 }

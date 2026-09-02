@@ -684,8 +684,8 @@ PgSQL_Session::polardb_install_wait_wrapper(
  *
  * The route planner records only reader_wait_spec. This is the first point at
  * which the concrete backend is known. A fresh cached LSN at or above the target
- * is a complete proof for this dispatch, so keep wait inactive and remember the
- * confirmed target for RFQ and failure handling. Only a behind reader activates
+ * allows direct dispatch, so keep wait inactive and remember the confirmed
+ * target for RFQ and failure handling. Only a behind reader activates
  * the wrapper state and its timer.
  */
 bool PgSQL_Session::polardb_finish_reader_wait_selection(
@@ -697,8 +697,7 @@ bool PgSQL_Session::polardb_finish_reader_wait_selection(
 	}
 
 	if (target_reached) {
-		polardb_query.wait_bypass_target = wait_spec.target;
-		polardb_query.reset_wait();
+		polardb_query.mark_wait_satisfied(wait_spec.target);
 		POLARDB_THREAD_COUNT_ONE(thread, wait_wrap_bypassed);
 		POLARDB_TRACE(
 			"PolarDB DIRECT READ: selected reader reached target_lsn=%lu\n",
@@ -706,11 +705,8 @@ bool PgSQL_Session::polardb_finish_reader_wait_selection(
 		return false;
 	}
 
-	polardb_query.wait_bypass_target = 0;
-	polardb_query.wait.prepare_from_spec(wait_spec);
-	polardb_query.wait.wait_stage = PolarDB_WaitStage::WAITING;
-	polardb_query.wait.wait_started_at_us = monotonic_time();
-	polardb_query.wait.fallback_writer_hg = fallback_writer_hg;
+	polardb_query.begin_wait(
+		wait_spec, monotonic_time(), fallback_writer_hg);
 	POLARDB_THREAD_COUNT_ONE(thread, wait_wrap_prepared);
 	POLARDB_TRACE(
 		"PolarDB WAIT: selected reader is behind target_lsn=%lu; "

@@ -1045,7 +1045,7 @@ static void test_collect_is_const_stable_snapshot() {
 				before_session.observed_lsn &&
 			sess.polardb_txn_wait_safety.local_state_changed ==
 				before_local_state,
-		"PolarDB collect snapshot: collect does not mutate session state");
+		"PolarDB collect snapshot: collect leaves session state unchanged");
 
 	PolarDB_Query_RouteCtx read_only_ctx;
 	read_only_ctx.is_polar_hg = true;

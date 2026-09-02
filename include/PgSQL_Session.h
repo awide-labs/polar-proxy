@@ -1283,7 +1283,7 @@ public:
 	 * @brief Finish reader selection for an ordinary consistency read.
 	 *
 	 * A reader whose fresh cached LSN already reached @p wait_spec is ready for
-	 * direct dispatch: record that proof and leave the wrapper state inactive.
+	 * direct dispatch: record the satisfied target and leave the wrapper inactive.
 	 * Otherwise activate the wait wrapper immediately before the selected
 	 * connection continues through backend setup.
 	 *

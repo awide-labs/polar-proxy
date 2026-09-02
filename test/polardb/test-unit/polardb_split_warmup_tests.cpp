@@ -1110,7 +1110,7 @@ static void test_retained_txn_reader_wait_bypass_contract() {
 	run_case(Case::LAG_CAP, false,
 		"PolarDB retained txn reader bypass: byte-lag cap failure keeps the pre-write wait");
 	run_case(Case::NO_RETAINED_PROOF, false,
-		"PolarDB retained txn reader bypass: backend replacement without RFQ proof keeps the pre-write wait");
+		"PolarDB retained txn reader bypass: backend replacement without RFQ confirmation keeps the pre-write wait");
 	run_case(Case::RETRY_EXCLUDED, false,
 		"PolarDB retained txn reader bypass: retry-excluded reader falls back to primary");
 	run_case(Case::SPLIT_MATCH, true,

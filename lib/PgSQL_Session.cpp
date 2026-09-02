@@ -6713,8 +6713,6 @@ bool PgSQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 				POLARDB_TRACE(
 					"PolarDB consistency: selected reader cannot enforce the "
 					"required LSN; returning a client error\n");
-				polardb_query.reset_reader_plan();
-				polardb_query.reset_wait();
 				polardb_return_consistency_error(
 					PolarDB_Query_RoutePlan::RouteActionReason::
 						READER_RFQ_UNAVAILABLE);
@@ -6750,8 +6748,6 @@ bool PgSQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 					}
 					break;
 				case PolarDB_ReaderAcquireAction::RETURN_ERROR:
-					polardb_query.reset_reader_plan();
-					polardb_query.reset_wait();
 					polardb_return_consistency_error(
 						PolarDB_Query_RoutePlan::RouteActionReason::
 							READ_FALLBACK_ERROR);

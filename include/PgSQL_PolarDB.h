@@ -2971,7 +2971,7 @@ struct PolarDB_TransactionSplitState {
     std::string xids;          // RFQ transaction ID list for future replica import
     uint64_t primary_lsn = 0;  // LSN observed for this transaction's primary side
     bool splittable = false;   // RFQ reports the transaction is eligible for split reads
-    bool wal_pending = false;  // RFQ reports WAL pending; replica proof is required
+    bool wal_pending = false;  // RFQ reports WAL pending; replica confirmation is required
     bool failed = false;       // latest primary RFQ reports failed transaction status 'E'
     bool blocked = false;      // A prior split fault blocks further split attempts
     bool was_splittable = false; // Transaction was split-readable at least once
@@ -2983,6 +2983,23 @@ struct PolarDB_TransactionSplitState {
 
     bool has_backend_evidence() const {
         return !xids.empty() || primary_lsn != 0 || splittable || wal_pending;
+    }
+
+    void begin_split_read() {
+        stage = PolarDB_TransactionSplitStage::TXN_SPLIT_READ_ACTIVE;
+        blocked = false;
+        was_splittable = true;
+    }
+
+    void complete_split_read() {
+        stage = PolarDB_TransactionSplitStage::TXN_SPLITTABLE;
+        was_splittable = true;
+        did_split = true;
+    }
+
+    void fail_split_read() {
+        stage = PolarDB_TransactionSplitStage::TXN_ON_PRIMARY;
+        blocked = true;
     }
 
     /**
@@ -3095,7 +3112,7 @@ struct PolarDB_TransactionSplitSnapshot {
     bool splittable = false;
     bool wal_pending = false;
     bool failed = false;
-    bool blocked = false;
+    bool blocked = false; // Failed split keeps planner on writer; a reader retry clears it
     bool was_splittable = false;
     bool did_split = false;
 };
@@ -4212,6 +4229,20 @@ struct PolarDB_QueryState {
 #if POLARDB_PROFILE
         wait_profile.reset();
 #endif // POLARDB_PROFILE
+    }
+
+    void begin_wait(const PolarDB_WaitSpec& spec, uint64_t started_at_us,
+            int fallback_writer_hg) {
+        wait_bypass_target = 0;
+        wait.prepare_from_spec(spec);
+        wait.wait_stage = PolarDB_WaitStage::WAITING;
+        wait.wait_started_at_us = started_at_us;
+        wait.fallback_writer_hg = fallback_writer_hg;
+    }
+
+    void mark_wait_satisfied(uint64_t target) {
+        reset_wait();
+        wait_bypass_target = target;
     }
 
     void clear_reader_route() {
