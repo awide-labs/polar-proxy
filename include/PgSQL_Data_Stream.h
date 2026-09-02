@@ -29,17 +29,21 @@ typedef struct _pgsql_queue_t {
 // this class avoid copying data
 class PgSQL_MyDS_real_query {
 public:
-	PtrSize_t pkt; // packet coming from the client
-	char* QueryPtr;	// pointer to beginning of the query
-	unsigned int QuerySize;	// size of the query
-	void init(PtrSize_t* _pkt) {
-		/*
-				assert(QueryPtr==NULL);
-				assert(QuerySize==0);
-				assert(pkt.ptr==NULL);
-				assert(pkt.size==0);
-		*/
-		pkt = *_pkt;
+	PtrSize_t pkt{}; // packet coming from the client
+	char* QueryPtr = nullptr;	// pointer to beginning of the query
+	unsigned int QuerySize = 0;	// size of the query
+	// Transfer packet ownership from source without copying its buffer.
+	// This clears source. end() frees the packet unless release_packet() transfers
+	// it. Borrowed descriptors are not accepted because end() owns the buffer.
+	void take_packet(PtrSize_t& source) {
+		assert(pkt.ptr == nullptr);
+		assert(QueryPtr == nullptr);
+		assert(QuerySize == 0);
+		assert(source.ptr != nullptr);
+		assert(source.size >= PGSQL_V3_MESSAGE_HEADER_SIZE);
+		assert(!ptrsize_is_borrowed_owner(&source));
+		pkt = source;
+		source = {};
 		QuerySize = pkt.size - PGSQL_V3_MESSAGE_HEADER_SIZE;
 		if (QuerySize == 0) {
 			QueryPtr = const_cast<char*>("");
@@ -48,22 +52,20 @@ public:
 			QueryPtr = (char*)pkt.ptr + PGSQL_V3_MESSAGE_HEADER_SIZE;
 		}
 	}
+	// Transfer packet ownership out and clear the stored packet.
+	PtrSize_t release_packet() {
+		PtrSize_t result = pkt;
+		reset();
+		return result;
+	}
 	void end() {
 		l_free(pkt.size, pkt.ptr);
-		pkt.size = 0;
-		QuerySize = 0;
-		pkt.ptr = NULL;
-		pkt.flags = 0;
-		pkt.owner = NULL;
-		QueryPtr = NULL;
+		reset();
 	}
 	void reset() {
-		pkt.size = 0;
+		pkt = {};
 		QuerySize = 0;
-		pkt.ptr = NULL;
-		pkt.flags = 0;
-		pkt.owner = NULL;
-		QueryPtr = NULL;
+		QueryPtr = nullptr;
 	}
 	void move_from(PgSQL_MyDS_real_query& other) {
 		// Transfer ownership of the client packet without copying bytes. This is
@@ -121,13 +123,13 @@ private:
 	 *
 	 * On success the fully sent packets are retired from PSarrayOUT, pkts_sent
 	 * and bytes_info are advanced, and polardb_write_head_partial records how far
-	 * into the first surviving packet a short write reached. pollout is re-armed
+	 * into the first surviving packet a short write reached. pollout is enabled
 	 * on every outcome that leaves the socket usable.
 	 *
 	 * @param byte_budget  Maximum number of bytes to offer the kernel in this
 	 *                     call; 0 means QUEUE_T_DEFAULT_SIZE.
 	 * @return  > 0 the number of bytes the kernel accepted; -1 the write would
-	 *          block (EINTR/EAGAIN/EWOULDBLOCK) and pollout has been re-armed;
+	 *          block (EINTR/EAGAIN/EWOULDBLOCK) and pollout is enabled again;
 	 *          0 either nothing could be sent or the write failed fatally, in
 	 *          which case shut_soft() has already run — check net_failure rather
 	 *          than retrying.
@@ -286,7 +288,7 @@ public:
 	 * @param byte_budget  Maximum number of bytes to offer the kernel; 0 selects
 	 *                     polardb_direct_write_budget_bytes().
 	 * @return  > 0 the number of bytes the kernel accepted; -1 the write would
-	 *          block and pollout has been re-armed; 0 either declined (fall back
+	 *          block and pollout is enabled again; 0 either declined (fall back
 	 *          to the buffered path) or a fatal write error, in which case
 	 *          shut_soft() has already run. Callers seeing 0 must re-check
 	 *          net_failure instead of assuming the buffered path is still viable.

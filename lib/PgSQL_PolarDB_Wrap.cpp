@@ -312,6 +312,7 @@ static void replace_simple_query_packet(PgSQL_Data_Stream* myds, const std::stri
 	new_ptr[new_size - 1] = '\0';
 
 	l_free(pkt.size, pkt.ptr);
+	pkt = {};
 	pkt.ptr = new_ptr;
 	pkt.size = new_size;
 	// QueryPtr/QuerySize address the query body only (after the 'Q' byte and the

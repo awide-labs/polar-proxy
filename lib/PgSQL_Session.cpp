@@ -3050,7 +3050,7 @@ __implicit_sync:
 #if POLARDB_PROXY
 								if (!polardb_txn_reader_read_active()) {
 #endif // POLARDB_PROXY
-									mybe->server_myds->pgsql_real_query.init(&pkt);
+									mybe->server_myds->pgsql_real_query.take_packet(pkt);
 #if POLARDB_PROXY
 								}
 #endif // POLARDB_PROXY
@@ -5481,7 +5481,7 @@ bool PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___handle_
 			// algorithms 0/1/2 (PgSQL_Set_Stmt_Parser::set_query() runs
 			// remove_spaces() to collapse all whitespace to single spaces,
 			// even inside string literals -- a destructive behaviour that
-			// silently mutates user-visible SET values like `SET app.note =
+			// silently changes user-visible SET values like `SET app.note =
 			// 'a   b'` to `'a b'`). The walker preserves the original input
 			// and is the more correct behaviour; the regex-parser quirk is
 			// preserved on the algo 0/1/2 path for backward compatibility.
@@ -8207,7 +8207,7 @@ int PgSQL_Session::handle_post_sync_parse_message(PgSQL_Parse_Message* parse_msg
 	mybe->server_myds->killed_at = 0;
 	mybe->server_myds->kill_type = 0;
 	mybe->server_myds->cancel_query = false;
-	mybe->server_myds->pgsql_real_query.init(&parse_pkt); // Transfer packet ownership
+	mybe->server_myds->pgsql_real_query.take_packet(parse_pkt);
 	mybe->server_myds->statuses.questions++;
 
 	client_myds->setDSS_STATE_QUERY_SENT_NET();
@@ -8362,7 +8362,7 @@ int PgSQL_Session::handle_post_sync_describe_message(PgSQL_Describe_Message* des
 	mybe->server_myds->kill_type = 0;
 	mybe->server_myds->cancel_query = false;
 	auto describe_pkt = describe_msg->detach(); // detach the packet from the describe message
-	mybe->server_myds->pgsql_real_query.init(&describe_pkt); // Transfer packet ownership
+	mybe->server_myds->pgsql_real_query.take_packet(describe_pkt);
 	mybe->server_myds->statuses.questions++;
 	client_myds->setDSS_STATE_QUERY_SENT_NET();
 	return 1;
@@ -8649,7 +8649,7 @@ int PgSQL_Session::handle_post_sync_execute_message(PgSQL_Execute_Message* execu
 	mybe->server_myds->kill_type = 0;
 	mybe->server_myds->cancel_query = false;
 	auto execute_pkt = execute_msg->detach(); // detach the packet from the execute message
-	mybe->server_myds->pgsql_real_query.init(&execute_pkt); // Transfer ownership of the packet
+	mybe->server_myds->pgsql_real_query.take_packet(execute_pkt);
 	mybe->server_myds->statuses.questions++;
 	client_myds->setDSS_STATE_QUERY_SENT_NET();
 	return 1;

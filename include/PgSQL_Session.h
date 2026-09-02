@@ -556,7 +556,7 @@ public:
 		bool split_active = false;
 		bool wait_read_active = false;
 		std::string wrapped_query;
-		PtrSize_t original_pkt{0, nullptr};
+		PtrSize_t original_pkt{};
 		PolarDB_WaitSpec wait_spec;
 		PolarDB_WriterScope writer_scope;
 		// Writer scope for the retained reader's last RFQ LSN.
@@ -574,8 +574,7 @@ public:
 
 		void clear_request_state() {
 			wrapped_query.clear();
-			original_pkt.size = 0;
-			original_pkt.ptr = nullptr;
+			original_pkt = {};
 			wait_spec.reset();
 			writer_scope.reset();
 			read_start_us = 0;
@@ -583,6 +582,17 @@ public:
 			primary_backend = nullptr;
 			split_active = false;
 			wait_read_active = false;
+		}
+
+		void take_original_packet(PtrSize_t& packet) {
+			original_pkt = packet;
+			packet = {};
+		}
+
+		PtrSize_t release_original_packet() {
+			PtrSize_t packet = original_pkt;
+			original_pkt = {};
+			return packet;
 		}
 
 		void clear_backend() {

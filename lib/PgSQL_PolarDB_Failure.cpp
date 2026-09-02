@@ -554,9 +554,7 @@ PgSQL_Session::polardb_take_reader_failure(
 		// Reader-retry also needs the split wait target and XIDs because the
 		// active split wrapper is discarded during failure cleanup and rebuilt
 		// for the replacement reader.
-		failure.retry_pkt = polardb_txn_reader.original_pkt;
-		polardb_txn_reader.original_pkt.ptr = nullptr;
-		polardb_txn_reader.original_pkt.size = 0;
+		failure.retry_pkt = polardb_txn_reader.release_original_packet();
 		failure.reader_plan = polardb_query.reader_plan;
 		failure.wait_spec = polardb_txn_reader.wait_spec;
 		failure.writer_scope = polardb_txn_reader.writer_scope;
@@ -873,8 +871,7 @@ void PgSQL_Session::polardb_free_retry_pkt_if_owned(
 			CurrentQuery.QueryLength = 0;
 		}
 		l_free(failure.retry_pkt.size, failure.retry_pkt.ptr);
-		failure.retry_pkt.ptr = nullptr;
-		failure.retry_pkt.size = 0;
+		failure.retry_pkt = {};
 	}
 }
 
@@ -1011,9 +1008,7 @@ bool PgSQL_Session::polardb_move_retry_packet_to_writer(
 	current_hostgroup = writer_hg;
 	mybe = writer_backend;
 	writer_myds->free_pgsql_real_query();
-	writer_myds->pgsql_real_query.init(&retry_pkt);
-	retry_pkt.ptr = nullptr;
-	retry_pkt.size = 0;
+	writer_myds->pgsql_real_query.take_packet(retry_pkt);
 
 	// A simple-query packet owns the SQL text used by CurrentQuery, so rebind
 	// the parser to its new owner. Extended protocol keeps its prepared-statement
@@ -1634,8 +1629,7 @@ void PgSQL_Session::polardb_release_reader_stream(PgSQL_Data_Stream* failed_myds
  */
 void PgSQL_Session::polardb_build_simple_query_packet(const std::string& sql,
 		PtrSize_t& out) {
-	out.ptr = NULL;
-	out.size = 0;
+	out = {};
 	if (sql.empty() ||
 			sql.size() > static_cast<size_t>(
 				UINT32_MAX - PGSQL_SIMPLE_QUERY_MESSAGE_OVERHEAD)) {
@@ -1682,8 +1676,8 @@ bool PgSQL_Session::polardb_prepare_reader_retry_packet(
 			!failure.failed_myds->pgsql_real_query.pkt.ptr) {
 		return false;
 	}
-	failure.retry_pkt = failure.failed_myds->pgsql_real_query.pkt;
-	failure.failed_myds->pgsql_real_query.reset();
+	failure.retry_pkt =
+		failure.failed_myds->pgsql_real_query.release_packet();
 	return failure.retry_pkt.ptr && failure.retry_pkt.size > 0;
 }
 
@@ -1758,9 +1752,7 @@ bool PgSQL_Session::polardb_try_redispatch_reader_read_to_other_reader(
 	retry_myds->DSS = STATE_READY;
 
 	retry_myds->free_pgsql_real_query();
-	retry_myds->pgsql_real_query.init(&failure.retry_pkt);
-	failure.retry_pkt.ptr = nullptr;
-	failure.retry_pkt.size = 0;
+	retry_myds->pgsql_real_query.take_packet(failure.retry_pkt);
 	polardb_prepare_retry_backend(failed_myds, retry_myds);
 	current_hostgroup = failure.reader_hg;
 	mybe = retry_backend;
@@ -2005,9 +1997,7 @@ PolarDB_FailureAction PgSQL_Session::polardb_handle_failed_reader_read(
 			// simple-query or Parse packet stays valid until logging and query
 			// accounting are complete.
 			request_myds->free_pgsql_real_query();
-			request_myds->pgsql_real_query.init(&failure.retry_pkt);
-			failure.retry_pkt.ptr = nullptr;
-			failure.retry_pkt.size = 0;
+			request_myds->pgsql_real_query.take_packet(failure.retry_pkt);
 			return;
 		}
 		polardb_free_retry_pkt_if_owned(failure);
@@ -2021,8 +2011,8 @@ PolarDB_FailureAction PgSQL_Session::polardb_handle_failed_reader_read(
 		// CurrentQuery borrows the SQL text inside this packet. Keep the
 		// packet alive across reader release even when policy returns an error
 		// without attempting a retry.
-		failure.retry_pkt = failure.failed_myds->pgsql_real_query.pkt;
-		failure.failed_myds->pgsql_real_query.reset();
+		failure.retry_pkt =
+			failure.failed_myds->pgsql_real_query.release_packet();
 	};
 	auto release_failed_reader = [&](bool want_reuse) {
 		if (!failure.failed_myds) {

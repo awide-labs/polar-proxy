@@ -379,11 +379,7 @@ void PgSQL_Session::polardb_begin_txn_reader_read(
  * @param reader_myds     Stream of that backend.
  * @param pkt             Client simple-query packet. Ownership of the buffer
  *                        moves to reader_myds->pgsql_real_query, which frees it
- *                        in end(). The caller's PtrSize_t is deliberately left
- *                        aliasing that buffer: do not free it, re-install it into
- *                        another stream, or reuse it. Callers check
- *                        polardb_txn_reader_read_active() to know the packet is
- *                        already owned.
+ *                        in end(). The caller's PtrSize_t is cleared.
  * @param writer_scope    Writer hostgroup and epoch this read was planned under.
  */
 void PgSQL_Session::polardb_begin_txn_wait_read(
@@ -394,7 +390,7 @@ void PgSQL_Session::polardb_begin_txn_wait_read(
 	polardb_begin_txn_reader_read(reader_backend, reader_myds, writer_scope);
 	polardb_txn_reader.wait_read_active = true;
 	reader_myds->free_pgsql_real_query();
-	reader_myds->pgsql_real_query.init(&pkt);
+	reader_myds->pgsql_real_query.take_packet(pkt);
 }
 
 /**
@@ -411,7 +407,7 @@ void PgSQL_Session::polardb_begin_txn_wait_read(
  * @param reader_myds     Stream of that backend.
  * @param pkt             Original client packet. Ownership moves into
  *                        polardb_txn_reader.original_pkt and the caller's
- *                        PtrSize_t is cleared to {nullptr, 0}.
+ *                        complete PtrSize_t descriptor is cleared.
  * @param wrapped_query   Full wrapper text, moved into
  *                        polardb_txn_reader.wrapped_query. Must not be empty.
  * @param wait_spec       LSN wait the wrapper enforces.
@@ -446,9 +442,7 @@ void PgSQL_Session::polardb_begin_txn_split_read(
 		const_cast<char*>(polardb_txn_reader.wrapped_query.c_str());
 	reader_myds->pgsql_real_query.QuerySize =
 		(unsigned int)polardb_txn_reader.wrapped_query.size();
-	polardb_txn_reader.original_pkt = pkt;
-	pkt.ptr = nullptr;
-	pkt.size = 0;
+	polardb_txn_reader.take_original_packet(pkt);
 	polardb_txn_reader.split_active = true;
 	polardb_txn_reader.wait_start_us =
 		wait_bypassed ? 0 : polardb_txn_reader.read_start_us;
@@ -478,11 +472,8 @@ void PgSQL_Session::polardb_begin_txn_split_read(
  * @param plan       Route plan; plan.target_hg selects the reader hostgroup.
  * @param route_ctx  Route context. Must report an open transaction.
  * @param pkt        Client simple-query packet.
- * @return true when the read was installed: the reader stream has consumed pkt
- *         (see polardb_begin_txn_wait_read() for the aliasing rule), mybe now
- *         points at the reader and the caller must not install pkt anywhere else.
- *         false when the read was declined; pkt is untouched and the caller
- *         proceeds on the primary backend.
+ * @return true when the reader stream takes pkt and becomes active; false when
+ *         pkt remains with the caller and the request stays on the writer.
  */
 bool PgSQL_Session::polardb_prepare_txn_wait_read(
 		const PolarDB_Query_RoutePlan& plan,
@@ -935,8 +926,7 @@ void PgSQL_Session::polardb_reset_txn_reader_request() {
 	if (polardb_txn_reader.original_pkt.ptr) {
 		l_free(polardb_txn_reader.original_pkt.size,
 			polardb_txn_reader.original_pkt.ptr);
-		polardb_txn_reader.original_pkt.ptr = nullptr;
-		polardb_txn_reader.original_pkt.size = 0;
+		polardb_txn_reader.original_pkt = {};
 	}
 	if (polardb_txn_reader.primary_backend) {
 		mybe = polardb_txn_reader.primary_backend;

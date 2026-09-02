@@ -1668,11 +1668,8 @@ bool PgSQL_Session::polardb_handle_locked_hostgroup_route(
  * Packet ownership differs per branch. REPLICA_WITH_WAIT leaves @p pkt with the
  * caller; if the selected reader really needs a wrapper, finalization copies the
  * SQL immediately before replacing the backend packet. Both transaction reader
- * paths take ownership: REPLICA_TXN_SPLIT saves the packet for split-read cleanup
- * and nulls pkt.ptr and pkt.size, while the pre-write wait path hands @p pkt to
- * the reader stream's pgsql_real_query.init(), which copies the fields and frees
- * the buffer when that stream ends — the caller's PtrSize_t is left as a dangling
- * alias and must be neither freed nor reused.
+ * paths take ownership: REPLICA_TXN_SPLIT saves the packet for split-read cleanup,
+ * while the pre-write wait path moves it to the reader stream. Both clear @p pkt.
  *
  * @param plan Routing plan from polardb_plan().
  * @param route_ctx  Route context from polardb_collect().

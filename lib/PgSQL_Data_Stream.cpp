@@ -262,10 +262,6 @@ PgSQL_Data_Stream::PgSQL_Data_Stream() {
 	proxy_addr.port = 0;
 
 	sess = NULL;
-	pgsql_real_query.pkt.ptr = NULL;
-	pgsql_real_query.pkt.size = 0;
-	pgsql_real_query.QueryPtr = NULL;
-	pgsql_real_query.QuerySize = 0;
 
 	query_retries_on_failure = 0;
 	connect_retries_on_failure = 0;
@@ -1667,7 +1663,7 @@ void PgSQL_Data_Stream::return_MySQL_Connection_To_Pool() {
 }
 
 void PgSQL_Data_Stream::free_pgsql_real_query() {
-	if (pgsql_real_query.QueryPtr) {
+	if (pgsql_real_query.QueryPtr || pgsql_real_query.pkt.ptr) {
 		pgsql_real_query.end();
 	}
 }

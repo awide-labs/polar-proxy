@@ -506,13 +506,55 @@ static void test_wait_wrapper_keeps_original_query_alive() {
 	PgSQL_Session sess;
 	attach_test_frontend(sess, worker.get());
 
+	PtrSize_t txn_packet = unit_simple_query_packet("SELECT txn");
+	txn_packet.flags = 2;
+	txn_packet.owner = &txn_packet;
+	sess.polardb_txn_reader.take_original_packet(txn_packet);
+	ok(!txn_packet.ptr && txn_packet.size == 0 && txn_packet.flags == 0 &&
+			!txn_packet.owner &&
+			sess.polardb_txn_reader.original_pkt.flags == 2 &&
+			sess.polardb_txn_reader.original_pkt.owner == &txn_packet,
+		"transaction reader: taking a packet moves the complete descriptor");
+	PtrSize_t released_txn_packet =
+		sess.polardb_txn_reader.release_original_packet();
+	ok(released_txn_packet.ptr && released_txn_packet.flags == 2 &&
+			released_txn_packet.owner == &txn_packet &&
+			!sess.polardb_txn_reader.original_pkt.ptr &&
+			sess.polardb_txn_reader.original_pkt.size == 0 &&
+			sess.polardb_txn_reader.original_pkt.flags == 0 &&
+			!sess.polardb_txn_reader.original_pkt.owner,
+		"transaction reader: releasing a packet clears its stored descriptor");
+	l_free(released_txn_packet.size, released_txn_packet.ptr);
+
 	const char* original_sql = "SELECT 42";
 	PtrSize_t packet = unit_simple_query_packet(original_sql);
+	packet.flags = 2;
+	packet.owner = &packet;
 	sess.CurrentQuery.begin(
 		static_cast<unsigned char*>(packet.ptr), packet.size, true);
 
 	PgSQL_Data_Stream backend_myds;
-	backend_myds.pgsql_real_query.init(&packet);
+	ok(!backend_myds.pgsql_real_query.pkt.ptr &&
+			backend_myds.pgsql_real_query.pkt.size == 0 &&
+			backend_myds.pgsql_real_query.pkt.flags == 0 &&
+			!backend_myds.pgsql_real_query.pkt.owner &&
+			!backend_myds.pgsql_real_query.QueryPtr &&
+			backend_myds.pgsql_real_query.QuerySize == 0,
+		"real query: construction initializes the complete owned descriptor");
+	backend_myds.pgsql_real_query.take_packet(packet);
+	ok(!packet.ptr && packet.size == 0 && packet.flags == 0 && !packet.owner,
+		"real query: taking a packet clears the complete source descriptor");
+	ok(backend_myds.pgsql_real_query.pkt.flags == 2 &&
+			backend_myds.pgsql_real_query.pkt.owner == &packet,
+		"real query: taking a packet preserves its packet metadata");
+	PtrSize_t released = backend_myds.pgsql_real_query.release_packet();
+	ok(released.ptr && !backend_myds.pgsql_real_query.pkt.ptr &&
+			!backend_myds.pgsql_real_query.QueryPtr,
+		"real query: releasing a packet clears the stream descriptor");
+	backend_myds.pgsql_real_query.take_packet(released);
+	ok(!released.ptr && released.size == 0 && released.flags == 0 &&
+			!released.owner,
+		"real query: taking a released packet clears its temporary owner");
 	PgSQL_Connection backend_conn(false);
 
 	sess.polardb_query.wait.prepare_from_spec(PolarDB_WaitSpec::from_lsn(
@@ -528,6 +570,9 @@ static void test_wait_wrapper_keeps_original_query_alive() {
 			sess.polardb_query.wait.wrapper_finalized &&
 			sess.polardb_query.original_query == original_sql,
 		"PolarDB wait wrapper: finalization copies the original SQL and installs the wrapper");
+	ok(backend_myds.pgsql_real_query.pkt.flags == 0 &&
+			!backend_myds.pgsql_real_query.pkt.owner,
+		"PolarDB wait wrapper: replacement owns fresh packet metadata");
 	ok(sess.CurrentQuery.QueryPointer ==
 			reinterpret_cast<unsigned char*>(
 				sess.polardb_query.original_query.data()) &&
