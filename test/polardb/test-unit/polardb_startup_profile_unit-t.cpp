@@ -301,11 +301,27 @@ static void test_string_converters() {
 		{"eventual", static_cast<int>(PolarDB_ConsistencyMode::EVENTUAL)},
 		{"session_lsn", static_cast<int>(PolarDB_ConsistencyMode::SESSION_LSN)},
 		{"global_lsn", static_cast<int>(PolarDB_ConsistencyMode::GLOBAL_LSN)},
+		{"primary", fallback},
 		{"bad", fallback},
 	};
 	check_string_conversions(
 		consistency_cases, polardb_consistency_mode_from_string, fallback,
 		"consistency");
+
+	const PolarDB_StringConversionCase hostgroup_consistency_cases[] = {
+		{nullptr, fallback},
+		{"default", fallback},
+		{"off", static_cast<int>(PolarDB_ConsistencyMode::OFF)},
+		{"eventual", static_cast<int>(PolarDB_ConsistencyMode::EVENTUAL)},
+		{"session_lsn", static_cast<int>(PolarDB_ConsistencyMode::SESSION_LSN)},
+		{"global_lsn", static_cast<int>(PolarDB_ConsistencyMode::GLOBAL_LSN)},
+		{"primary", static_cast<int>(PolarDB_ConsistencyMode::PRIMARY_ONLY)},
+		{"bad", fallback},
+	};
+	check_string_conversions(
+		hostgroup_consistency_cases,
+		polardb_hostgroup_consistency_mode_from_string, fallback,
+		"hostgroup consistency");
 
 	const PolarDB_StringConversionCase protocol_cases[] = {
 		{nullptr, fallback},

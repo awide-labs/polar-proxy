@@ -932,6 +932,24 @@ static void test_collect_is_const_stable_snapshot() {
 			no_reader_plan.target_hg == -1,
 		"PolarDB placement: consistency off leaves routing to ordinary ProxySQL");
 
+	no_reader_ctx.read_target =
+		static_cast<int>(PolarDB_ReadTarget::PRIMARY);
+	no_reader_plan = sess.polardb_plan(no_reader_ctx);
+	ok(no_reader_plan.action ==
+			PolarDB_Query_RoutePlan::RouteAction::FORCE_PRIMARY &&
+			no_reader_plan.target_hg == first.writer_scope.hg,
+		"PolarDB placement: primary read target remains effective when consistency is off");
+
+	no_reader_ctx.read_target =
+		static_cast<int>(PolarDB_ReadTarget::REPLICA);
+	no_reader_ctx.effective_consistency_mode =
+		static_cast<int>(PolarDB_ConsistencyMode::PRIMARY_ONLY);
+	no_reader_plan = sess.polardb_plan(no_reader_ctx);
+	ok(no_reader_plan.action ==
+			PolarDB_Query_RoutePlan::RouteAction::FORCE_PRIMARY &&
+			no_reader_plan.target_hg == first.writer_scope.hg,
+		"PolarDB placement: legacy per-hostgroup primary mode remains on the writer");
+
 	no_reader_ctx.effective_consistency_mode =
 		static_cast<int>(PolarDB_ConsistencyMode::EVENTUAL);
 	no_reader_ctx.force_primary_hint = true;

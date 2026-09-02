@@ -3791,7 +3791,8 @@ void PgSQL_HostGroups_Manager::generate_pgsql_replication_hostgroups_table() {
 			continue;
 		}
 		const int configured_mode =
-			polardb_consistency_mode_from_string(row->fields[4], -1);
+			polardb_hostgroup_consistency_mode_from_string(
+				row->fields[4], -1);
 		const int effective_mode = configured_mode >= 0
 			? configured_mode : global_config.consistency_mode;
 		const int configured_protocol =
@@ -3868,7 +3869,8 @@ void PgSQL_HostGroups_Manager::generate_pgsql_replication_hostgroups_table() {
 		const char* proxy_protocol = r->fields[7];
 		const bool is_polardb_check = (strcasecmp(check_type, "polardb") == 0);
 		const int parsed_consistency_mode =
-			polardb_consistency_mode_from_string(consistency_mode, -1);
+			polardb_hostgroup_consistency_mode_from_string(
+				consistency_mode, -1);
 		const int parsed_proxy_protocol =
 			polardb_proxy_protocol_from_string(proxy_protocol, -1);
 

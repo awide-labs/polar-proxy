@@ -476,8 +476,8 @@ static void test_pgsql_repl_hg_upgrade_from_v3_0_5() {
 		"pgsql_replication_hostgroups: global aliases become global_lsn");
 	ok(query_string(db,
 			"SELECT consistency_mode FROM pgsql_replication_hostgroups"
-			" WHERE writer_hostgroup=106") == "off",
-		"pgsql_replication_hostgroups: legacy primary becomes off because consistency no longer controls placement");
+			" WHERE writer_hostgroup=106") == "primary",
+		"pgsql_replication_hostgroups: legacy per-hostgroup primary placement is preserved");
 	ok(query_int(db,
 			"SELECT COUNT(*) FROM pgsql_replication_hostgroups"
 			" WHERE txn_split_enabled=1 AND max_lag_bytes=12345"

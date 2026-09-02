@@ -1567,7 +1567,8 @@ enum class PolarDB_ConsistencyMode : uint8_t {
     OFF = 0,            // Bypass PolarDB query routing
     SESSION_LSN = 1,    // Wait on max(session write LSN, observed LSN)
     GLOBAL_LSN = 2,     // Wait on max(session target, latest group LSN)
-    EVENTUAL = 3        // PolarDB placement without an LSN wait
+    EVENTUAL = 3,       // PolarDB placement without an LSN wait
+    PRIMARY_ONLY = 4    // Compatibility for legacy per-hostgroup primary placement
 };
 
 /// @brief Validate the actions that may knowingly return a degraded reader result.
@@ -1599,6 +1600,8 @@ inline PolarDB_ConsistencyMode polardb_consistency_from_int(int v) {
             return PolarDB_ConsistencyMode::GLOBAL_LSN;
         case static_cast<int>(PolarDB_ConsistencyMode::EVENTUAL):
             return PolarDB_ConsistencyMode::EVENTUAL;
+        case static_cast<int>(PolarDB_ConsistencyMode::PRIMARY_ONLY):
+            return PolarDB_ConsistencyMode::PRIMARY_ONLY;
         default:
             return PolarDB_ConsistencyMode::OFF;
     }
@@ -1627,6 +1630,20 @@ static inline int polardb_consistency_mode_from_string(
         return static_cast<int>(PolarDB_ConsistencyMode::EVENTUAL);
     }
     return default_value;
+}
+
+/// @brief Parse a per-hostgroup consistency value.
+///
+/// Older replication-hostgroup rows used "primary" for both consistency and
+/// placement. Keep that value only for hostgroups so upgraded rows retain
+/// primary placement; global and session settings accept only current names.
+static inline int polardb_hostgroup_consistency_mode_from_string(
+    const char* value,
+    int default_value) {
+    if (value && strcasecmp(value, "primary") == 0) {
+        return static_cast<int>(PolarDB_ConsistencyMode::PRIMARY_ONLY);
+    }
+    return polardb_consistency_mode_from_string(value, default_value);
 }
 
 static inline bool polardb_consistency_mode_uses_lsn_wait(
@@ -1685,6 +1702,8 @@ static inline const char* polardb_consistency_mode_name(
         return "session_lsn";
     case PolarDB_ConsistencyMode::GLOBAL_LSN:
         return "global_lsn";
+    case PolarDB_ConsistencyMode::PRIMARY_ONLY:
+        return "primary";
     }
     return "unknown";
 }
@@ -3278,6 +3297,7 @@ struct PolarDB_Query_WaitPlan {
             break;
         case PolarDB_ConsistencyMode::OFF:
         case PolarDB_ConsistencyMode::EVENTUAL:
+        case PolarDB_ConsistencyMode::PRIMARY_ONLY:
         default:
             break;
         }

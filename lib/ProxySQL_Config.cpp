@@ -1872,7 +1872,7 @@ int ProxySQL_Config::Read_PgSQL_Servers_from_configfile(std::string& error) {
 			}
 			line.lookupValue("consistency_mode", consistency_mode);
 			if (strcasecmp(consistency_mode.c_str(), (char*)"default") &&
-					polardb_consistency_mode_from_string(
+					polardb_hostgroup_consistency_mode_from_string(
 						consistency_mode.c_str(), -1) < 0) {
 				proxy_error(
 					"Admin: invalid PolarDB consistency_mode '%s' in "

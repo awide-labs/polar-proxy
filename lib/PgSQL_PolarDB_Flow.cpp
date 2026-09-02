@@ -316,14 +316,15 @@ bool PgSQL_Session::polardb_query_cache_is_disabled() const {
 		pgsql_thread___polardb_consistency_mode);
 	const PolarDB_ConsistencyMode consistency_mode =
 		polardb_consistency_from_int(mode);
-	if (consistency_mode == PolarDB_ConsistencyMode::OFF) {
-		return false;
-	}
 	const PolarDB_ReadTarget read_target =
 		polardb_read_target_from_int(
 			pgsql_thread___polardb_read_target);
-	if (read_target == PolarDB_ReadTarget::PRIMARY) {
+	if (read_target == PolarDB_ReadTarget::PRIMARY ||
+			consistency_mode == PolarDB_ConsistencyMode::PRIMARY_ONLY) {
 		return true;
+	}
+	if (consistency_mode == PolarDB_ConsistencyMode::OFF) {
+		return false;
 	}
 	switch (consistency_mode) {
 	case PolarDB_ConsistencyMode::OFF:
@@ -335,6 +336,8 @@ bool PgSQL_Session::polardb_query_cache_is_disabled() const {
 	case PolarDB_ConsistencyMode::GLOBAL_LSN:
 		// GLOBAL_LSN always uses the group LSN, so routing cannot be
 		// resolved from the ordinary backend cache before the PolarDB planner runs.
+		return true;
+	case PolarDB_ConsistencyMode::PRIMARY_ONLY:
 		return true;
 	}
 
@@ -992,14 +995,6 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(
 	if (route_ctx.effective_consistency_mode >= 0) {
 		mode = polardb_consistency_from_int(route_ctx.effective_consistency_mode);
 	}
-	if (mode == PolarDB_ConsistencyMode::OFF) {
-		plan.action = PolarDB_Query_RoutePlan::RouteAction::PASSTHROUGH;
-		plan.target_hg = -1;
-		plan.reader.consistency_mode = mode;
-		POLARDB_TRACE(
-			"PolarDB PLAN: consistency=off -> ordinary ProxySQL routing\n");
-		return plan;
-	}
 	const PolarDB_ReadTarget read_target =
 		polardb_read_target_from_int(route_ctx.read_target);
 	const PolarDB_ReadFallbackAction read_fallback =
@@ -1013,6 +1008,24 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(
 			"PolarDB PLAN: read_target=%s -> FORCE_PRIMARY writer=%d\n",
 			polardb_read_target_name(read_target),
 			route_ctx.writer_scope.hg);
+		return plan;
+	}
+	if (mode == PolarDB_ConsistencyMode::PRIMARY_ONLY) {
+		plan = PolarDB_Query_RoutePlan::force_primary(
+			route_ctx.writer_scope.hg,
+			PolarDB_Query_RoutePlan::RouteActionReason::READ_TARGET_PRIMARY);
+		POLARDB_TRACE(
+			"PolarDB PLAN: legacy hostgroup primary placement -> "
+			"FORCE_PRIMARY writer=%d\n",
+			route_ctx.writer_scope.hg);
+		return plan;
+	}
+	if (mode == PolarDB_ConsistencyMode::OFF) {
+		plan.action = PolarDB_Query_RoutePlan::RouteAction::PASSTHROUGH;
+		plan.target_hg = -1;
+		plan.reader.consistency_mode = mode;
+		POLARDB_TRACE(
+			"PolarDB PLAN: consistency=off -> ordinary ProxySQL routing\n");
 		return plan;
 	}
 	if (route_ctx.reader_hg < 0) {
