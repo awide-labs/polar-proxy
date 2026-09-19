@@ -1,0 +1,57 @@
+name: Sign CLA
+description: Sign the Individual Contributor License Agreement for Polar Proxy
+title: "[CLA] "
+labels:
+  - cla
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for contributing to Polar Proxy.
+
+        Read the full agreement before submitting:
+        [legal/INDIVIDUAL-CLA.md](https://github.com/awide-labs/polar-proxy/blob/v3.0/legal/INDIVIDUAL-CLA.md)
+
+        For company-sponsored contributions, email `info@awide.io` to sign the
+        [Corporate CLA](https://github.com/awide-labs/polar-proxy/blob/v3.0/legal/CORPORATE-CLA.md)
+        instead of using this form.
+
+        Your GitHub username is recorded automatically from this issue.
+
+  - type: input
+    id: legal_name
+    attributes:
+      label: Full legal name
+      description: Name as it should appear on the CLA record
+      placeholder: Jane Doe
+    validations:
+      required: true
+
+  - type: input
+    id: email
+    attributes:
+      label: Email address
+      description: Used for CLA records and follow-up only; not published in the repo
+      placeholder: jane@example.com
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: agreement
+    attributes:
+      label: Agreement
+      options:
+        - label: >-
+            I have read and agree to the Individual Contributor License
+            Agreement (version 1.0) for Polar Proxy
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: employer
+    attributes:
+      label: Employer (optional)
+      options:
+        - label: >-
+            I confirm I have permission from my employer to make open source
+            contributions, or this contribution is not related to my employment

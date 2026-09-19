@@ -1,4 +1,4 @@
-# Codecov server-side configuration for ProxySQL.
+# Codecov server-side configuration for Polar Proxy.
 #
 # ---------------------------------------------------------------------------
 # Coverage path alignment (the `fixes` block below)
@@ -7,7 +7,7 @@
 # historically disagreed on the *root* of every source path, which left the
 # daemon's lib/ coverage filed under a phantom folder Codecov could not align
 # to the git tree. Symptom: lib/MySQL_Monitor.cpp (and every other daemon-only
-# file) showing a flat 0% on https://app.codecov.io/gh/sysown/proxysql even
+# file) showing a flat 0% on https://app.codecov.io/gh/awide-labs/polar-proxy even
 # though the integration suite exercises it heavily.
 #
 # The two pipelines:

@@ -15,8 +15,8 @@
 
 ## 1. Purpose
 
-This directory holds the manual and integration tests for ProxySQL's PolarDB
-LSN-only session-consistency feature — the behavior a compile can't check on its
+This directory holds the manual and integration tests for Polar Proxy's Awide
+Polar LSN-only session-consistency feature — the behavior a compile can't check on its
 own:
 
 - the primary reports its LSN, and the session tracks it so a client reads its own writes;
@@ -28,7 +28,7 @@ own:
 - both `PQexecParams` and reused `PQprepare`/`PQexecPrepared` reads preserve RYW;
 - PolarDB config fields survive a save and reload.
 
-These tests need a live PolarDB primary/replica setup and a ProxySQL binary built
+These tests need a live Awide Polar primary/replica setup and a Polar Proxy binary built
 with `POLARDB_PROXY=1`. They aren't generic CI tests unless the CI runner provides
 a PolarDB topology.
 

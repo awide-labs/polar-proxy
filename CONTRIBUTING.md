@@ -1,86 +1,89 @@
-# Contributing to ProxySQL
+# Contributing to Polar Proxy
 
-Thank you for your interest in contributing to ProxySQL! We welcome contributions from the community.
+Thank you for your interest in contributing to Polar Proxy! This document
+outlines the guidelines and requirements for contributing to this project.
 
-## Code of Conduct
+Polar Proxy is a database proxy maintained by [Awide Labs](https://awide.tech).
+It extends [ProxySQL](https://github.com/sysown/proxysql) with routing and
+session consistency for [Awide Polar](https://github.com/awide-labs/polar).
 
-We expect all contributors to be respectful and constructive. Please help us maintain a welcoming environment for everyone.
+## Before Contributing
 
-## Before You Start
+- Sign the [Individual Contributor License Agreement](legal/INDIVIDUAL-CLA.md)
+  (or have your employer sign the [Corporate CLA](legal/CORPORATE-CLA.md))
+  via a [CLA signing issue](https://github.com/awide-labs/polar-proxy/issues/new?template=cla_signing.yml)
+  or email to `info@awide.io`. A maintainer adds the `cla-signed` label on your
+  pull request after verification.
 
-Discuss major changes: For significant features or architectural changes, please open an issue first to discuss.
+## Getting Started
 
-Check existing issues: Someone might already be working on something similar.
-
-Reference issues: When fixing bugs or implementing requested features, mention the issue number in your PR.
-
-## Contributor License Agreement (CLA)
-
-Before we can merge your pull request you must agree to the [ProxySQL Contributor License Agreement](.github/CLA.md).
-
-Signing is automated: when you open your first PR, the [CLA assistant](https://cla-assistant.io/) bot comments with a link. Click it, review the agreement, and confirm — the signature is recorded and applies to all of your future contributions. No PDF, no email.
-
-Two variants exist in the same document:
-
-- **Individual CLA** — default, for contributions you make personally.
-- **Corporate CLA** — for contributions made on behalf of an employer. If your employer owns the IP in code you write, your employer must sign the Corporate CLA (or give you a written waiver so you can sign the Individual CLA).
+1. Fork [`awide-labs/polar-proxy`](https://github.com/awide-labs/polar-proxy)
+2. Clone your fork locally
+3. Create a new branch for your changes
+4. Make your changes following the guidelines below
+5. Submit a pull request
 
 ## Development Setup
 
-ProxySQL provides Docker build images for development. The required packages for building are listed in the Dockerfiles at: https://github.com/ProxySQL/docker-images/tree/main/build-images
+Polar Proxy provides Docker build images for development. Build dependencies
+are listed in the Dockerfiles under `docker/images/`.
 
-For example, to see packages needed for Ubuntu 24.04, check: https://github.com/ProxySQL/docker-images/blob/main/build-images/build-ubuntu24/Dockerfile
+To build locally:
+
+```bash
+git submodule update --init --recursive
+make
+```
 
 ## Making Changes
 
-- Fork the repository
-- Create a feature branch: `git checkout -b feature/your-feature-name`
-- Make your changes
-- Ensure your code builds successfully
-- Submit a Pull Request
+- Follow the existing code style and patterns in the codebase
+- Use clear, descriptive names for variables and functions
+- Add comments for complex logic where behavior is non-obvious
+- Keep functions focused and maintainable
 
-## Coding Standards
-
-Follow the existing code style and patterns in the codebase
-
-Use clear, descriptive names for variables and functions
-
-Add comments for complex logic
-
-Keep functions focused and maintainable
-
-### For C++ Code:
+### C++ guidelines
 
 - Use C++11/14 features appropriately
 - Follow RAII principles for resource management
-- Consider performance implications (ProxySQL is performance-critical)
+- Consider performance implications — Polar Proxy is performance-critical
 
 ## Testing
 
-All PRs will go through our automated testing suite. While the full testing framework isn't publicly available, we encourage you to test your changes as thoroughly as possible.
+All pull requests go through automated testing. Run relevant tests locally
+before submitting:
+
+- PolarDB integration tests: see [test/polardb/README.md](test/polardb/README.md)
+- General test layout: see [test/README.md](test/README.md)
 
 ## Commit Messages
 
-Recommendations (not strict requirements):
+Use descriptive messages that explain what changed and why. Reference issue
+identifiers in the footer when applicable:
 
-- Use descriptive messages that explain what changed and why
-- Reference issue numbers when applicable (`#123`)
-- Keep the first line under 72 characters
+```
+<type>: <description>
 
-**Example:** `Fix memory leak in connection pooling (#456)`
+Refs: GH-1234
+```
 
-## Pull Request Guidelines
+**Example:** `fix(polardb): correct reader lag timeout handling` with footer
+`Refs: GH-456`.
 
-- Use a clear title and description
-- Explain what was changed and why
-- Note any breaking changes or performance impacts
-- Update documentation if functionality changes
+## Pull Request Process
+
+1. Ensure all CI checks pass
+2. Ensure the `cla-signed` label is present (see Before Contributing)
+3. Update documentation if functionality changes
+4. Request review from maintainers
+5. Address feedback
+6. Once approved, your PR will be merged
 
 ## Reporting Bugs
 
 Please include in bug reports:
 
-- ProxySQL version
+- Polar Proxy / `proxysql` version (`proxysql --version`)
 - Steps to reproduce
 - Expected vs actual behavior
 - Relevant configuration details
@@ -88,27 +91,24 @@ Please include in bug reports:
 
 ## Feature Requests
 
-For new features, please:
+For new features:
 
-- Describe the feature/problem clearly
+- Describe the feature or problem clearly
 - Explain the use case
 - Consider performance implications
 - Note any backward compatibility concerns
 
 ## Questions and Support
 
-- **Mailing list**: Join the ProxySQL mailing list for discussions
-- **GitHub issues**: Use GitHub issues for questions, bugs, and feature requests
-- **Search existing issues** before creating new ones
-
-## Recognition
-
-Contributors will be credited in the release notes for their contributions.
+- **GitHub issues:** bugs, features, and questions
+- **Email:** `info@awide.io` for contribution or CLA questions
+- Search existing issues before creating new ones
 
 ## License
 
-By contributing to ProxySQL, you agree that your contributions will be licensed under the project's GPLv3 license.
+By contributing to Polar Proxy, you agree that your contributions will be
+licensed under the project's GPLv3 license, subject to the signed CLA.
 
 ---
 
-Thank you for helping make ProxySQL better!
+Thank you for helping make Polar Proxy better!

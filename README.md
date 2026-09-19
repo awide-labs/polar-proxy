@@ -1,448 +1,85 @@
-[![CI-selftests](https://github.com/sysown/proxysql/actions/workflows/CI-selftests.yml/badge.svg)](https://github.com/sysown/proxysql/actions/workflows/CI-selftests.yml)
-[![CI-repltests](https://github.com/sysown/proxysql/actions/workflows/CI-repltests.yml/badge.svg)](https://github.com/sysown/proxysql/actions/workflows/CI-repltests.yml)
-[![CodeQL](https://github.com/sysown/proxysql/actions/workflows/CI-codeql.yml/badge.svg)](https://github.com/sysown/proxysql/actions/workflows/CI-codeql.yml)
-[![Package-Build](https://github.com/sysown/proxysql/actions/workflows/CI-package-build.yml/badge.svg)](https://github.com/sysown/proxysql/actions/workflows/-CI-package-build.yml)
+<div align="center">
 
-<a><img src="https://i0.wp.com/proxysql.com/wp-content/uploads/2020/04/ProxySQL-Colour-Logo.png?fit=800%2C278&ssl=1" alt="ProxySQL"></a>
+# Polar Proxy
 
-Table of Contents
-=================
+**A high-performance proxy for MySQL, PostgreSQL, and Awide Polar**
 
-- [Introduction](#introduction)
-- [Useful links](#useful-links)
-- [Getting started](#getting-started)
-  - [Installation](#installation)
-    - [Ubuntu / Debian](#ubuntu--debian)
-    - [Red Hat / CentOS](#red-hat--centos)
-    - [Amazon Linux](#amazon-linux)
-    - [Almalinux](#almalinux)
-    - [OpenSUSE](#opensuse)
-    - [FreeBSD](#freebsd)
-  - [Service management](#service-management)
-    - [Starting ProxySQL](#starting-proxysql)
-    - [Stopping ProxySQL](#stopping-proxysql)
-    - [Restarting ProxySQL](#restarting-proxysql)
-    - [Reinitializing ProxySQL](#reinitializing-proxysql-from-the-config-file-after-first-startup-the-db-file-is-used-instead-of-the-config-file)
-  - [Upgrades](#upgrades)
-  - [How to check the ProxySQL version](#how-to-check-the-proxysql-version)
-  - [Configuring ProxySQL via the admin interface](#configuring-proxysql-via-the-admin-interface)
-    - [Configuring ProxySQL through the admin interface](#configuring-proxysql-through-the-admin-interface)
-    - [Configuring ProxySQL through the config file](#configuring-proxysql-through-the-config-file)
+[![official site](https://img.shields.io/badge/official%20site-blueviolet?style=flat)](https://awide.tech/awidepolar)
 
-Introduction<a name="introduction"></a>
-============
+[![GitHub License](https://img.shields.io/badge/license-GPL--3.0-blue?style=flat)](./LICENSE)
+[![github-issues](https://img.shields.io/github/issues/awide-labs/polar-proxy?style=flat&logo=github)](https://github.com/awide-labs/polar-proxy/issues)
+[![github-pullrequest](https://img.shields.io/github/issues-pr/awide-labs/polar-proxy?style=flat&logo=github)](https://github.com/awide-labs/polar-proxy/pulls)
+[![github-forks](https://img.shields.io/github/forks/awide-labs/polar-proxy?style=flat&logo=github)](https://github.com/awide-labs/polar-proxy/network/members)
+[![github-stars](https://img.shields.io/github/stars/awide-labs/polar-proxy?style=flat&logo=github)](https://github.com/awide-labs/polar-proxy/stargazers)
 
-ProxySQL is a high-performance, high-availability, protocol-aware proxy for MySQL and its forks (such as Percona Server and MariaDB), as well as PostgreSQL.
-All the while getting the unlimited freedom that comes with a GPL license.
+</div>
 
-Its development is driven by the lack of open source proxies that provide high performance.
+## Overview
 
-Useful links<a name="useful-links"></a>	
-===============	
+Polar Proxy is a high-performance, protocol-aware database proxy for MySQL and
+PostgreSQL. It is maintained by [Awide Labs](https://awide.tech) and extends
+[ProxySQL](https://github.com/sysown/proxysql) with routing and session
+consistency for [Awide Polar](https://github.com/awide-labs/polar).
 
-- [Official website](https://www.proxysql.com/)	
-- [Subscriptions and Support](https://proxysql.com/services/support/) 
-- [Documentation](https://www.proxysql.com/Documentation)
-- [DockerHub Repository](https://hub.docker.com/r/proxysql/proxysql)
-- [Benchmarks and blog posts](http://www.proxysql.blogspot.com/)	
-- [Forum](https://groups.google.com/forum/#!forum/proxysql/)
-- [Facebook](https://www.facebook.com/proxysql)	
-- [Linkedin](https://www.linkedin.com/groups/13581070/)	
-- [Twitter](https://twitter.com/proxysql)
+The `proxysql` binary name, configuration paths, and admin interfaces remain
+compatible with ProxySQL unless documented otherwise.
 
-Getting started<a name="getting-started"></a>
-===============
+## Changelog
 
-### Installation
-Released packages can be found here: https://github.com/sysown/proxysql/releases
+See [CHANGELOG.md](CHANGELOG.md).
 
-Just download a package and use your systems package manager to install it:
+## Quick Start
+
+### Docker
+
+If you have Docker installed, you can pull a Polar Proxy image and run it
+directly:
+
 ```bash
-wget https://github.com/sysown/proxysql/releases/download/v3.0.4/proxysql_3.0.4-ubuntu24_amd64.deb
-dpkg -i proxysql_3.0.4-ubuntu24_amd64.deb
+docker pull awide-labs/polar-proxy:3.0
+docker run --name polar-proxy -p 6033:6033 -p 6032:6032 -d awide-labs/polar-proxy:3.0
 ```
 
-Alternatively you can also use the available repositories:
+### Build from source
 
-#### Ubuntu / Debian:
+Polar Proxy provides Docker build images for development and packaging. Clone
+the repository, initialize submodules, and build:
 
-Adding repository:
 ```bash
-apt-get update && apt-get install -y --no-install-recommends lsb-release wget apt-transport-https ca-certificates
-wget -nv -O /etc/apt/trusted.gpg.d/proxysql-3.0.x-keyring.gpg 'https://repo.proxysql.com/ProxySQL/proxysql-3.0.x/repo_pub_key.gpg'
-echo "deb https://repo.proxysql.com/ProxySQL/proxysql-3.0.x/$(lsb_release -sc)/ ./" | tee /etc/apt/sources.list.d/proxysql.list
+git clone https://github.com/awide-labs/polar-proxy.git
+cd polar-proxy
+git submodule update --init --recursive
+make
 ```
 
-Installing:
-```bash
-apt-get update
-apt-get install proxysql OR apt-get install proxysql=version
-```
+For detailed build and runtime instructions, see [INSTALL.md](INSTALL.md) and
+[RUNNING.md](RUNNING.md).
 
-#### Red Hat / CentOS:
+### Awide Polar integration
 
-Adding repository:
-```bash
-cat > /etc/yum.repos.d/proxysql.repo << EOF
-[proxysql]
-name=ProxySQL YUM repository
-baseurl=https://repo.proxysql.com/ProxySQL/proxysql-3.0.x/centos/\$releasever
-gpgcheck=1
-gpgkey=https://repo.proxysql.com/ProxySQL/proxysql-3.0.x/repo_pub_key
-EOF
-```
+Polar Proxy adds LSN-based session consistency and reader routing for Awide
+Polar PostgreSQL backends. Architecture and operator documentation:
 
-Installing:
-```bash
-yum install proxysql OR yum install proxysql-version
-```
+- [PolarDB proxy architecture](doc/polardb-arch/README.md)
+- [PolarDB integration tests](test/polardb/README.md)
 
-#### Amazon Linux:
+## Contributing
 
-Adding repository:
-```bash
-cat > /etc/yum.repos.d/proxysql.repo << EOF
-[proxysql]
-name=ProxySQL YUM repository
-baseurl=https://repo.proxysql.com/ProxySQL/proxysql-3.0.x/centos/8
-gpgcheck=1
-gpgkey=https://repo.proxysql.com/ProxySQL/proxysql-3.0.x/repo_pub_key
-EOF
-```
+We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
-Installing:
-```bash
-yum install proxysql OR yum install proxysql-version
-```
+## Software License
 
-#### Almalinux:
+Polar Proxy is released under the
+[GNU General Public License v3.0](https://www.gnu.org/licenses/gpl-3.0.html)
+(GPLv3). See [LICENSE](./LICENSE) for the full license text.
 
-Adding repository:
-```bash
-cat > /etc/yum.repos.d/proxysql.repo << EOF
-[proxysql]
-name=ProxySQL YUM repository
-baseurl=https://repo.proxysql.com/ProxySQL/proxysql-3.0.x/almalinux/\$releasever
-gpgcheck=1
-gpgkey=https://repo.proxysql.com/ProxySQL/proxysql-3.0.x/repo_pub_key
-EOF
-```
+This project is developed from ProxySQL, which is licensed under GPLv3.
+Portions of the codebase retain upstream licensing as described in
+[NOTICE](./NOTICE). Polar Proxy also contains third-party components under
+other open source licenses; see [NOTICE](./NOTICE) for details.
 
-Installing:
-```bash
-yum install proxysql OR yum install proxysql-version
-```
+## Contact
 
-#### OpenSUSE:
+For product information, see the [Awide Polar website](https://awide.tech/awidepolar).
 
-Adding repository:
-```bash
-cat > /etc/zypp/repos.d/proxysql.repo << EOF
-[proxysql]
-name=ProxySQL Zypper repository
-enabled=1
-autorefresh=0
-baseurl=https://repo.proxysql.com/ProxySQL/proxysql-3.0.x/opensuse/\$releasever_major
-gpgcheck=1
-EOF
-```
-or
-```bash
-zypper addrepo -g -n 'ProxySQL Zypper repository' 'https://repo.proxysql.com/ProxySQL/proxysql-3.0.x/opensuse/$releasever_major' proxysql
-```
-
-Installing:
-```bash
-yum install proxysql OR yum install proxysql-version
-```
-
-#### FreeBSD:
-
-Installing (via pkg):
-```bash
-pkg install proxysql
-```
-
-Installing (via ports):
-```bash
-cd /usr/ports/databases/proxysql/ && make install clean
-```
-
-### Service management
-Once the software is installed, you can use the `service` command to control the process:  
-
-#### Starting ProxySQL:
-```bash
-service proxysql start
-```
-#### Stopping ProxySQL:
-```bash
-service proxysql stop
-```
-
-Or alternatively via the Admin interface (MySQL admin example):
-```
-$ mysql -u admin -padmin -h 127.0.0.1 -P6032 --prompt='Admin> '
-Warning: Using a password on the command line interface can be insecure.
-Welcome to the MySQL monitor.  Commands end with ; or \g.
-Your MySQL connection id is 4
-Server version: 5.5.30 (ProxySQL Admin Module)
-
-Copyright (c) 2000, 2016, Oracle and/or its affiliates. All rights reserved.
-
-Oracle is a registered trademark of Oracle Corporation and/or its
-affiliates. Other names may be trademarks of their respective
-owners.
-
-Type 'help;' or '\h' for help. Type '\c' to clear the current input statement.
-
-Admin> proxysql stop
-```
-
-For PostgreSQL admin interface the same Admin commands apply and the admin port defaults to 6132. 
-You can connect using the psql client as follows:
-```
-$ export PGPASSWORD=admin
-$ psql -U admin -h 127.0.0.1 -p6132
-psql (17.4 (Ubuntu 17.4-1.pgdg22.04+2), server 16.1)
-SSL connection (protocol: TLSv1.3, cipher: TLS_AES_256_GCM_SHA384, compression: off, ALPN: none)
-Type "help" for help.
-
-admin=# proxysql stop
-```
-
-_(The examples above show the Admin interface workflow - the Admin SQL commands are the same for both MySQL and PostgreSQL modes.)_
-
-#### Restarting ProxySQL:
-```bash
-service proxysql restart
-```
-
-Or alternatively via the Admin interface (MySQL example):
-```
-$ mysql -u admin -padmin -h 127.0.0.1 -P6032 --prompt='Admin> '
-Warning: Using a password on the command line interface can be insecure.
-Welcome to the MySQL monitor.  Commands end with ; or \g.
-Your MySQL connection id is 4
-Server version: 5.5.30 (ProxySQL Admin Module)
-
-Copyright (c) 2000, 2016, Oracle and/or its affiliates. All rights reserved.
-
-Oracle is a registered trademark of Oracle Corporation and/or its
-affiliates. Other names may be trademarks of their respective
-owners.
-
-Type 'help;' or '\h' for help. Type '\c' to clear the current input statement.
-
-Admin> proxysql restart
-```
-
-Or via the PostgreSQL admin port:
-```
-$ export PGPASSWORD=admin
-$ psql -U admin -h 127.0.0.1 -p6132
-psql (17.4 (Ubuntu 17.4-1.pgdg22.04+2), server 16.1)
-SSL connection (protocol: TLSv1.3, cipher: TLS_AES_256_GCM_SHA384, compression: off, ALPN: none)
-Type "help" for help.
-
-admin=# proxysql restart
-```
-
-#### Reinitializing ProxySQL from the config file (after first startup the DB file is used instead of the config file):
-```bash
-# If you are using the init script run:
-/etc/init.d/proxysql initial
-# or
-service proxysql initial
- 
-# If you are using the systemd unit file run:
-systemctl start proxysql-initial
-# or
-service proxysql-initial start
-```
-
-### Upgrades
-Just install the new package and restart ProxySQL:
-```bash
-wget https://github.com/sysown/proxysql/releases/download/v3.0.4/proxysql_3.0.4-ubuntu24_amd64.deb
-dpkg -i proxysql_3.0.4-ubuntu24_amd64.deb
-service proxysql restart
-```
-
-### How to check the ProxySQL version
-```bash
-$ proxysql --version
-```
-```bash
-ProxySQL version 3.0.4-162-gfaa64a5, codename Truls
-```
-A debug version has `_DEBUG` in its version string.
-It is slower than non-debug version, but easier to debug in case of failures.
-```bash
-$ proxysql --version
-```
-```bash
-ProxySQL version 3.0.4-162-gfaa64a5_DEBUG, codename Truls
-```
-
-### Configuring ProxySQL via the `admin interface`
-
-First of all, bear in mind that the best way to configure ProxySQL is through its admin interface. This lends itself to online configuration (without having to restart the proxy) via SQL queries to its admin database. It's an effective way to configure it both manually and in an automated fashion.
-
-As a secondary way to configure it, we have the configuration file. 
-
-#### Configuring ProxySQL through the admin interface
-
-To log into the admin interface for MySQL (with the default credentials) use a mysql client and connect using the following `admin` credentials locally on port (6032):
-```bash
-$ mysql -u admin -padmin -h 127.0.0.1 -P6032 --prompt='Admin> '
-Warning: Using a password on the command line interface can be insecure.
-Welcome to the MySQL monitor.  Commands end with ; or \g.
-Your MySQL connection id is 4
-Server version: 5.5.30 (ProxySQL Admin Module)
-
-Copyright (c) 2000, 2016, Oracle and/or its affiliates. All rights reserved.
-
-Oracle is a registered trademark of Oracle Corporation and/or its
-affiliates. Other names may be trademarks of their respective
-owners.
-
-Type 'help;' or '\h' for help. Type '\c' to clear the current input statement.
-
-Admin>
-```
-note: If your MySQL client version is version 8.04 or higher add `--default-auth=mysql_native_password` to the above command to connect to the admin interface.
-
-To log into the admin interface for PostgreSQL use the psql client and connect using admin on port 6132 (the Admin SQL commands are the same):
-```bash
-$ export PGPASSWORD=admin
-$ psql -U admin -h 127.0.0.1 -p6132
-psql (17.4 (Ubuntu 17.4-1.pgdg22.04+2), server 16.1)
-SSL connection (protocol: TLSv1.3, cipher: TLS_AES_256_GCM_SHA384, compression: off, ALPN: none)
-Type "help" for help.
-
-admin=#
-```
-Once connected to the admin interface, you will have a list of databases and tables at your disposal that can be queried using the SQL language:
-```mysql
-Admin> SHOW DATABASES;
-+-----+---------+-------------------------------+
-| seq | name    | file                          |
-+-----+---------+-------------------------------+
-| 0   | main    |                               |
-| 2   | disk    | /var/lib/proxysql/proxysql.db |
-| 3   | stats   |                               |
-| 4   | monitor |                               |
-+-----+---------+-------------------------------+
-4 rows in set (0.00 sec)
-```
-This will allow you to control the list of the backend servers, how traffic is routed to them, and other important settings (such as caching, access control, etc). Once you've made modifications to the in-memory data structure, you must load the new configuration to the runtime, or persist the new settings to disk (so that they are still there after a restart of the proxy). A detailed tutorial on how to configure ProxySQL through the Admin interface is available [here](https://github.com/sysown/proxysql/wiki/ProxySQL-Configuration).
-
-#### Configuring ProxySQL through the config file
-
-Even though the config file should only be regarded as a secondary way to configure the proxy, we must not discard its value as a valid way to bootstrap a fresh ProxySQL install.
-
-Let's quickly go over the main sections of the configuration file (this overview serves as a very high level overview of ProxySQL configuration).
-
-Top-level sections:
-* `admin_variables`: contains global variables that control the functionality of the admin interface.
-* `mysql_variables`: contains global variables that control the functionality for handling the incoming MySQL traffic.
-* `mysql_servers`: contains rows for the `mysql_servers` table from the admin interface. Basically, these define the backend servers towards which the incoming MySQL traffic is routed. Rows are encoded as per the `.cfg` file format, here is an example:
-	
-	```bash
-	mysql_servers =
-	(
-		{
-			address="127.0.0.1"
-			port=3306
-			hostgroup=0
-			max_connections=200
-		}
-	)
-	```
-* `mysql_users`: contains rows for the `mysql_users` table from the admin interface. Basically, these define the users which can connect to the proxy, and the users with which the proxy can connect to the backend servers. Rows are encoded as per the `.cfg` file format, here is an example:
-	
-	```bash
-	mysql_users:
-	(
-		{
-			username="root"
-			password="root"
-			default_hostgroup=0
-			max_connections=1000
-			default_schema="information_schema"
-			active=1
-		}
-	)
-	```
-* `mysql_query_rules`: contains rows for the `mysql_query_rules` table from the admin interface. Basically, these define the rules used to classify and route the incoming MySQL traffic, according to various criteria (patterns matched, user used to run the query, etc.). Rows are encoded as per the `.cfg` file format, here is an example (Note: the example is a very generic query routing rule and it is recommended to create specific rules for queries rather than using a generic rule such as this):
-	
-	```bash
-	mysql_query_rules:
-	(
-		{
-			rule_id=1
-			active=1
-			match_pattern="^SELECT .* FOR UPDATE$"
-			destination_hostgroup=0
-			apply=1
-		},
-		{
-			rule_id=2
-			active=1
-			match_pattern="^SELECT"
-			destination_hostgroup=1
-			apply=1
-		}
-	)
-	```
-* `pgsql_variables`: contains global variables that control the functionality for handling the incoming PostgreSQL traffic.
-* `pgsql_servers`: contains rows for the `pgsql_servers` table from the admin interface. Basically, these define the backend servers towards which the incoming PostgreSQL traffic is routed. Rows are encoded as per the `.cfg` file format, here is an example:
-	
-	```bash
-	pgsql_servers =
-	(
-		{
-			address="127.0.0.1"
-			port=5432
-			hostgroup=0
-			max_connections=200
-		}
-	)
-	```
-* `pgsql_users`: contains rows for the `pgsql_users` table from the admin interface. Basically, these define the users which can connect to the proxy, and the users with which the proxy can connect to the backend servers. Rows are encoded as per the `.cfg` file format, here is an example:
-	
-	```bash
-	pgsql_users:
-	(
-		{
-			username="postgres"
-			password="postgres"
-			default_hostgroup=0
-			max_connections=1000
-			active=1
-		}
-	)
-	```
-* `pgsql_query_rules`: contains rows for the `pgsql_query_rules` table from the admin interface. Basically, these define the rules used to classify and route the incoming PostgreSQL traffic, according to various criteria (patterns matched, user used to run the query, etc.). Rows are encoded as per the `.cfg` file format, here is an example (Note: the example is a very generic query routing rule and it is recommended to create specific rules for queries rather than using a generic rule such as this):
-	
-	```bash
-	pgsql_query_rules:
-	(
-		{
-			rule_id=1
-			active=1
-			match_pattern="^SELECT .* FOR UPDATE$"
-			destination_hostgroup=0
-			apply=1
-		},
-		{
-			rule_id=2
-			active=1
-			match_pattern="^SELECT"
-			destination_hostgroup=1
-			apply=1
-		}
-	)
-	```
-* top-level configuration item: `datadir`, as a string, to point to the data dir.
+For support or contribution questions, open an issue or email `info@awide.io`.

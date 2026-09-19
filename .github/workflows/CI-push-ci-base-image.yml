@@ -10,7 +10,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: sysown/proxysql-ci-base
+  IMAGE_NAME: awide-labs/polar-proxy-ci-base
 
 jobs:
   build-and-push:

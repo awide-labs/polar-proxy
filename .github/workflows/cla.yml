@@ -1,0 +1,30 @@
+# Manual CLA gate: passes only after a maintainer adds the `cla-signed` label.
+name: cla
+
+on:
+  pull_request:
+    branches: [ v3.0 ]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  verify-cla:
+    name: Verify CLA
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check cla-signed label
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          if echo "$LABELS" | grep -q '"cla-signed"'; then
+            echo "CLA verified (cla-signed label present)."
+            exit 0
+          fi
+
+          echo "::error::CLA not verified for @${{ github.event.pull_request.user.login }}."
+          echo "Contributor: sign the CLA via a CLA signing issue or info@awide.io."
+          echo "Maintainer: confirm the signature record, then add the cla-signed label."
+          exit 1
