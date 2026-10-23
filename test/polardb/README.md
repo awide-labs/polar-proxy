@@ -107,7 +107,7 @@ checking is not possible.
 
 ## 4. DCS / Replay-Lag Control
 
-Timeout-edge tests need a way to change `polar_replay_min_lag_size`. Configure
+Timeout-edge tests need a way to change `polar_startup_replay_delay_size`. Configure
 one of these modes in `.env`.
 
 Polarctl-style environment:
