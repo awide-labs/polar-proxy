@@ -6927,7 +6927,8 @@ bool PgSQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 					"required LSN; returning a client error\n");
 				polardb_return_consistency_error(
 					PolarDB_Query_RoutePlan::RouteActionReason::
-						READER_RFQ_UNAVAILABLE);
+						READER_RFQ_UNAVAILABLE,
+					mybe->server_myds);
 				thread->note_pool_attempt(true);
 				return true;
 			} else if (polardb_wait_spec.has_wait() &&
@@ -6962,7 +6963,8 @@ bool PgSQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 				case PolarDB_ReaderAcquireAction::RETURN_ERROR:
 					polardb_return_consistency_error(
 						PolarDB_Query_RoutePlan::RouteActionReason::
-							READ_FALLBACK_ERROR);
+							READ_FALLBACK_ERROR,
+						mybe->server_myds);
 					thread->note_pool_attempt(true);
 					return true;
 				case PolarDB_ReaderAcquireAction::RETRY_READER:

@@ -1478,7 +1478,8 @@ PolarDB_Query_RoutePlan PgSQL_Session::polardb_plan(
 // ======================================================================
 
 void PgSQL_Session::polardb_return_consistency_error(
-		PolarDB_Query_RoutePlan::RouteActionReason reason)
+		PolarDB_Query_RoutePlan::RouteActionReason reason,
+		PgSQL_Data_Stream* myds)
 {
 	const char* message =
 		"PolarDB cannot enforce the required LSN because the LSN target is unavailable";
@@ -1497,7 +1498,7 @@ void PgSQL_Session::polardb_return_consistency_error(
 		true, is_extended_query_ready_for_query(), message,
 		PGSQL_ERROR_CODES::ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE,
 		false, true);
-	RequestEnd(NULL, true);
+	RequestEnd(myds, true);
 }
 
 /**
