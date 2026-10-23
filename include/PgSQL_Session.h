@@ -1623,9 +1623,13 @@ public:
 	 * Used when an action is configured as error and no backend result
 	 * exists to forward. The client receives one PostgreSQL ErrorResponse and
 	 * the request is completed normally, so the connection remains usable.
+	 *
+	 * @param myds Backend data stream that owns the attached request packet
+	 * 			   (optional)
 	 */
 	void polardb_return_consistency_error(
-		PolarDB_Query_RoutePlan::RouteActionReason reason);
+		PolarDB_Query_RoutePlan::RouteActionReason reason,
+		PgSQL_Data_Stream* myds = nullptr);
 	struct PolarDB_ManualRoute {
 		int scope_hg{-1};
 		int destination_hg{-1};
