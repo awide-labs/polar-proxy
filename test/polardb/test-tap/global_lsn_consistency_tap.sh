@@ -182,11 +182,11 @@ wait_for_backend_setting() {
 set_replay_lag_bytes() {
 	local lag_bytes="$1"
 
-	if ! polardb_set_guc polar_replay_min_lag_size "$lag_bytes" >/dev/null 2>&1; then
+	if ! polardb_set_guc polar_startup_replay_delay_size "$lag_bytes" >/dev/null 2>&1; then
 		return 1
 	fi
-	if ! wait_for_backend_setting "$REPLICA_HOST" "$REPLICA_PORT" polar_replay_min_lag_size "$lag_bytes" 15; then
-		diag "polar_replay_min_lag_size=$lag_bytes was set but is not visible on $REPLICA_HOST:$REPLICA_PORT"
+	if ! wait_for_backend_setting "$REPLICA_HOST" "$REPLICA_PORT" polar_startup_replay_delay_size "$lag_bytes" 15; then
+		diag "polar_startup_replay_delay_size=$lag_bytes was set but is not visible on $REPLICA_HOST:$REPLICA_PORT"
 		return 1
 	fi
 	if [ "$lag_bytes" != "0" ]; then
@@ -665,7 +665,7 @@ case_global_lsn_rejects_stale_timeout_action() {
 
 	if ! set_replay_lag_bytes "${POLARDB_GLOBAL_LSN_TIMEOUT_REPLAY_LAG_BYTES:-50000}"; then
 		set_global_lsn_policy
-		skip_ok "GLOBAL_LSN rejects warning and uses the writer on timeout" "cannot set polar_replay_min_lag_size through managed DCS"
+		skip_ok "GLOBAL_LSN rejects warning and uses the writer on timeout" "cannot set polar_startup_replay_delay_size through managed DCS"
 		return
 	fi
 

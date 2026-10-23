@@ -357,7 +357,7 @@ cleanup_all() {
 	stop_wal_generator
 
 	# Reset replica settings
-	polardb_set_guc polar_replay_min_lag_size 0 >/dev/null 2>&1 || true
+	polardb_set_guc polar_startup_replay_delay_size 0 >/dev/null 2>&1 || true
 
 	# Drop test table
 	polardb_primary_sql "DROP TABLE IF EXISTS $TEST_TABLE;" 2>/dev/null || true
@@ -562,12 +562,12 @@ set_replay_lag_guc() {
 	local attempt
 
 	for ((attempt = 1; attempt <= attempts; attempt++)); do
-		if polardb_set_guc polar_replay_min_lag_size "$lag_bytes" >/dev/null &&
-			wait_for_guc_value "$REPLICA_HOST" "$REPLICA_PORT" polar_replay_min_lag_size "$lag_bytes" 15; then
+		if polardb_set_guc polar_startup_replay_delay_size "$lag_bytes" >/dev/null &&
+			wait_for_guc_value "$REPLICA_HOST" "$REPLICA_PORT" polar_startup_replay_delay_size "$lag_bytes" 15; then
 			return 0
 		fi
 		if [ "$attempt" -lt "$attempts" ]; then
-			log_warning "polar_replay_min_lag_size=$lag_bytes attempt $attempt/$attempts failed; retrying"
+			log_warning "polar_startup_replay_delay_size=$lag_bytes attempt $attempt/$attempts failed; retrying"
 			sleep "$delay_sec"
 		fi
 	done

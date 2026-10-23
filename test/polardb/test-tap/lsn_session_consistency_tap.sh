@@ -156,12 +156,12 @@ wait_for_backend_setting() {
 set_replay_lag_bytes() {
     local lag_bytes="$1"
 
-    if ! polardb_set_guc polar_replay_min_lag_size "$lag_bytes" >/dev/null 2>&1; then
+    if ! polardb_set_guc polar_startup_replay_delay_size "$lag_bytes" >/dev/null 2>&1; then
         return 1
     fi
     [ "$lag_bytes" != "0" ] && TIMEOUT_EDGE_LAG_SET=1
-    if ! wait_for_backend_setting "$REPLICA_HOST" "$REPLICA_PORT" polar_replay_min_lag_size "$lag_bytes" 15; then
-        diag "polar_replay_min_lag_size=$lag_bytes was set but is not visible on $REPLICA_HOST:$REPLICA_PORT"
+    if ! wait_for_backend_setting "$REPLICA_HOST" "$REPLICA_PORT" polar_startup_replay_delay_size "$lag_bytes" 15; then
+        diag "polar_startup_replay_delay_size=$lag_bytes was set but is not visible on $REPLICA_HOST:$REPLICA_PORT"
         return 1
     fi
     sleep 1
@@ -3398,13 +3398,13 @@ SQL
             set_lsn_wait_timeout_action warning
             set_hg_policy session_lsn -1 5000
             if ! wait_for_replica_replay_catchup 20; then
-                diag "replica did not catch up after disabling polar_replay_min_lag_size"
+                diag "replica did not catch up after disabling polar_startup_replay_delay_size"
             fi
         else
-            skip_ok "primary action: timed-out replica read retries on primary" "cannot set polar_replay_min_lag_size through managed DCS"
-            skip_ok "v15_wait extended strict timeout retries on primary after a real W" "cannot set polar_replay_min_lag_size through managed DCS"
-            skip_ok "warning action: timeout notice is forwarded and query continues" "cannot set polar_replay_min_lag_size through managed DCS"
-            skip_ok "warning action followed by extended protocol leaves no LSN wait notice" "cannot set polar_replay_min_lag_size through managed DCS"
+            skip_ok "primary action: timed-out replica read retries on primary" "cannot set polar_startup_replay_delay_size through managed DCS"
+            skip_ok "v15_wait extended strict timeout retries on primary after a real W" "cannot set polar_startup_replay_delay_size through managed DCS"
+            skip_ok "warning action: timeout notice is forwarded and query continues" "cannot set polar_startup_replay_delay_size through managed DCS"
+            skip_ok "warning action followed by extended protocol leaves no LSN wait notice" "cannot set polar_startup_replay_delay_size through managed DCS"
         fi
     else
         skip_ok "primary action: timed-out replica read retries on primary" "set POLARDB_TIMEOUT_EDGE_TESTS=1 to alter managed replay lag"
