@@ -2193,6 +2193,9 @@ EOSQL
 				# different frontend. Proxy mode uses ProxySQL's listener identity
 				# and may reuse it.
 				split_run_kind="cross_frontend"
+				# Disable warmup so the probe session can never create
+				# its own reader
+				local probe_preamble="SET proxysql.polardb_txn_split_warmup TO 'off';"
 				cat >"$split_seed_sql" <<EOSQL
 $split_session_preamble
 BEGIN;
@@ -2204,7 +2207,7 @@ SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
 COMMIT;
 EOSQL
 				cat >"$split_probe_sql" <<EOSQL
-$split_session_preamble
+$probe_preamble
 BEGIN;
 INSERT INTO $TEST_TABLE VALUES ($test_id, 'split_identity_probe$CASE_NUM') ON CONFLICT (id) DO UPDATE SET data = 'split_identity_probe$CASE_NUM';
 \sleep ${sleep_ms}ms
