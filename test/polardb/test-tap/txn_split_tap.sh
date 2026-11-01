@@ -176,7 +176,7 @@ verify_split_trace() {
 		case "$split_variant" in
 		warmup_demand)
 			tap_trace_must_have "$log_file" "PolarDB SET: txn_split_warmup_mode=demand" || trace_ok=1
-			tap_trace_must_have "$log_file" "PolarDB WARMUP: requested split pool reason=selected_pool_miss" || trace_ok=1
+			tap_trace_must_have "$log_file" "PolarDB WARMUP: requested split pool reason=demand" || trace_ok=1
 			;;
 		warmup_begin | warmup_begin_prompt)
 			tap_trace_must_have "$log_file" "PolarDB SET: txn_split_warmup_mode=begin" || trace_ok=1
