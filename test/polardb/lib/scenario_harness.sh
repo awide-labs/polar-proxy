@@ -651,6 +651,56 @@ lsn_to_decimal() {
 	printf "%d" $((16#$hi * 4294967296 + 16#$lo))
 }
 
+split_install_wait_for_wal_flush() {
+	local sql
+	sql=$(cat <<'EOSQL'
+CREATE SCHEMA IF NOT EXISTS test_helpers;
+
+CREATE OR REPLACE FUNCTION test_helpers.wait_for_wal_flush(
+    p_timeout interval DEFAULT interval '5 seconds',
+    p_poll_seconds double precision DEFAULT 0.01
+)
+RETURNS pg_lsn
+LANGUAGE plpgsql
+VOLATILE
+PARALLEL UNSAFE
+AS $function$
+DECLARE
+    target_lsn pg_lsn;
+    flushed_lsn pg_lsn;
+    deadline timestamptz;
+BEGIN
+    IF p_timeout IS NULL OR p_timeout <= interval '0 seconds'
+       OR p_poll_seconds IS NULL OR p_poll_seconds <= 0 THEN
+        RAISE EXCEPTION 'Timeout and polling interval must be positive';
+    END IF;
+
+    -- Capture the target once, after the preceding test write.
+    target_lsn := pg_current_wal_insert_lsn();
+    deadline := clock_timestamp() + p_timeout;
+
+    LOOP
+        flushed_lsn := pg_current_wal_flush_lsn();
+
+        IF flushed_lsn >= target_lsn THEN
+            RETURN target_lsn;
+        END IF;
+
+        IF clock_timestamp() >= deadline THEN
+            RAISE EXCEPTION
+                'WAL flush timeout: target=%, flushed=%, timeout=%',
+                target_lsn, flushed_lsn, p_timeout;
+        END IF;
+
+        PERFORM pg_sleep(p_poll_seconds);
+    END LOOP;
+END;
+$function$;
+EOSQL
+)
+	polardb_primary_sql "$sql" >/dev/null
+}
+
 #------------------------------------------------------------------------------
 # ProxySQL Admin Functions
 #------------------------------------------------------------------------------
@@ -1893,6 +1943,12 @@ run_consistency_test() {
 	echo ""
 	echo "[$(ts)] STEP 4: Setup '$outcome'"
 	local early_fail=0
+
+	if ! split_install_wait_for_wal_flush; then
+		echo "[$(ts)]   FAIL: could not install test_helpers.wait_for_wal_flush on the primary"
+		early_fail=1
+	fi
+
 	if [ "$outcome" = "failure" ]; then
 		# Force replica lag even for small writes.
 		# Use a sizable min lag so replay waits until the gap is large enough.
@@ -1986,6 +2042,8 @@ run_consistency_test() {
 
 			local sleep_ms=200
 			[ "$outcome" = "failure" ] && sleep_ms=500
+
+
 			local split_run_kind="single"
 			local split_seed_sql="$RUN_DIR/split_identity_seed.sql"
 			local split_probe_sql="$RUN_DIR/split_identity_probe.sql"
@@ -2005,6 +2063,8 @@ SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
 SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
 INSERT INTO $TEST_TABLE VALUES ($test_id, 'split_test_case$CASE_NUM') ON CONFLICT (id) DO UPDATE SET data = 'split_test_case$CASE_NUM';
 \sleep ${sleep_ms}ms
+/* route=primary */
+SELECT test_helpers.wait_for_wal_flush();
 SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
 SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
 COMMIT;
@@ -2019,6 +2079,8 @@ SELECT 1;
 BEGIN;
 INSERT INTO $TEST_TABLE VALUES ($test_id, 'split_test_case$CASE_NUM') ON CONFLICT (id) DO UPDATE SET data = 'split_test_case$CASE_NUM';
 \sleep ${sleep_ms}ms
+/* route=primary */
+SELECT test_helpers.wait_for_wal_flush();
 SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
 \sleep ${sleep_ms}ms
 SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
@@ -2109,6 +2171,8 @@ $split_session_preamble
 BEGIN;
 INSERT INTO $TEST_TABLE VALUES ($test_id, 'split_lazy_cold$CASE_NUM') ON CONFLICT (id) DO UPDATE SET data = 'split_lazy_cold$CASE_NUM';
 \sleep ${sleep_ms}ms
+/* route=primary */
+SELECT test_helpers.wait_for_wal_flush();
 SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
 SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
 COMMIT;
@@ -2116,6 +2180,8 @@ COMMIT;
 BEGIN;
 INSERT INTO $TEST_TABLE VALUES ($test_id, 'split_lazy_warm$CASE_NUM') ON CONFLICT (id) DO UPDATE SET data = 'split_lazy_warm$CASE_NUM';
 \sleep ${sleep_ms}ms
+/* route=primary */
+SELECT test_helpers.wait_for_wal_flush();
 SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
 SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
 COMMIT;
@@ -2132,8 +2198,8 @@ $split_session_preamble
 BEGIN;
 INSERT INTO $TEST_TABLE VALUES ($test_id, 'split_identity_seed$CASE_NUM') ON CONFLICT (id) DO UPDATE SET data = 'split_identity_seed$CASE_NUM';
 \sleep ${sleep_ms}ms
-SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
-\sleep ${sleep_ms}ms
+/* route=primary */
+SELECT test_helpers.wait_for_wal_flush();
 SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
 COMMIT;
 EOSQL
@@ -2142,6 +2208,8 @@ $split_session_preamble
 BEGIN;
 INSERT INTO $TEST_TABLE VALUES ($test_id, 'split_identity_probe$CASE_NUM') ON CONFLICT (id) DO UPDATE SET data = 'split_identity_probe$CASE_NUM';
 \sleep ${sleep_ms}ms
+/* route=primary */
+SELECT test_helpers.wait_for_wal_flush();
 SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
 \sleep ${sleep_ms}ms
 SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
@@ -2264,6 +2332,8 @@ SELECT 1;
 BEGIN;
 INSERT INTO $TEST_TABLE VALUES ($test_id, 'split_test_case$CASE_NUM') ON CONFLICT (id) DO UPDATE SET data = 'split_test_case$CASE_NUM';
 \sleep ${sleep_ms}ms
+/* route=primary */
+SELECT test_helpers.wait_for_wal_flush();
 SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
 SELECT COUNT(*) FROM $TEST_TABLE WHERE id = $test_id;
 COMMIT;
