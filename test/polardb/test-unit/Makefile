@@ -163,6 +163,7 @@ POLARDB_COMPONENT_TESTS := \
 	polardb_routing_lsn_unit-t \
 	polardb_client_rfq_unit-t \
 	polardb_query_digest_unit-t \
+	polardb_ssl_startup_unit-t \
 	polardb_hgm_lsn_unit-t
 
 POLARDB_HGM_TEST_SOURCES := \

@@ -48,7 +48,7 @@ __run-job)
 esac
 
 DEFAULT_SAFE_JOBS="config frontend-output rfq-lifecycle lsn-session global-core global-split split-core split-warmup"
-DEFAULT_EXCLUSIVE_JOBS="global-timeout split-timeout split-failure-policy wait-timeout"
+DEFAULT_EXCLUSIVE_JOBS="global-timeout split-timeout split-failure-policy wait-timeout ssl-hba"
 SAFE_JOBS="${POLARDB_TAP_SAFE_JOBS:-$DEFAULT_SAFE_JOBS}"
 EXCLUSIVE_JOBS="${POLARDB_TAP_EXCLUSIVE_JOBS:-$DEFAULT_EXCLUSIVE_JOBS}"
 PARALLEL_JOBS="${POLARDB_TAP_PARALLEL_JOBS:-${JOBS:-4}}"
@@ -191,6 +191,7 @@ split:9,11,17,18,19,20,23,24,25 | split-warmup | parallel | 10 total | txn_split
 split:15,16 | split-timeout | backend_exclusive | 3 total | txn_split timeout selected cases
 split-failure-policy | split-failure-policy | backend_exclusive | 19 | txn_split_failure_policy_tap.sh
 wait-timeout | wait-timeout | backend_exclusive | 69 | wait_timeout_cleanup_tap.sh
+ssl-hba | ssl-hba | backend_exclusive | 13 | ssl_hba_tap.sh
 EOF
 }
 
@@ -240,6 +241,9 @@ job_command() {
 		;;
 	wait-timeout)
 		exec "$TAP_DIR/wait_timeout_cleanup_tap.sh"
+		;;
+	ssl-hba)
+		exec "$TAP_DIR/ssl_hba_tap.sh"
 		;;
 	*)
 		echo "unknown TAP job: $job" >&2

@@ -127,7 +127,7 @@ endef
 	run-c-libpq-lsn run-c-libpq-xact run-c-libpq-row-run run-c-extended-protocol \
 	run-pgbench-lsn run-sysbench-lsn \
 	build-pgbench-polar-rfq build-sysbench-polar-rfq rfq-bench-tools-check \
-	tap-config tap-frontend-output tap-lsn tap-rfq-lifecycle tap-global-lsn tap-split tap-split-failure-policy tap-connect-deadline tap-wait-timeout \
+	tap-config tap-frontend-output tap-lsn tap-rfq-lifecycle tap-global-lsn tap-split tap-split-failure-policy tap-connect-deadline tap-wait-timeout tap-ssl-hba \
 	tap-parallel-list tap-parallel-safe tap-exclusive tap-parallel tap tap-run tap-debug-binary-check tap-debug-binary-copy tap-port-check tap-debug-trace tap-debug-trace-run \
 	unit \
 	test-case1 test-case2 test-case2-stale-with-warning-success test-case2-stale-with-warning-failure \
@@ -267,6 +267,9 @@ tap-connect-deadline:
 tap-wait-timeout:
 	$(POLARDB_RUN_LOGGED) tap-wait-timeout $(POLARDB_TEST_DIR)/test-tap/wait_timeout_cleanup_tap.sh
 
+tap-ssl-hba:
+	$(POLARDB_RUN_LOGGED) tap-ssl-hba $(POLARDB_TEST_DIR)/test-tap/ssl_hba_tap.sh
+
 tap-parallel-list:
 	$(POLARDB_TAP_RUNNER) list
 
@@ -283,7 +286,7 @@ tap:
 	$(call POLARDB_RUN_ISOLATED_TAP,tap-run,)
 
 tap-run: export POLARDB_PARALLEL_RUN := 1
-tap-run: tap-port-check tap-config tap-frontend-output tap-lsn tap-rfq-lifecycle tap-global-lsn tap-split tap-split-failure-policy tap-wait-timeout
+tap-run: tap-port-check tap-config tap-frontend-output tap-lsn tap-rfq-lifecycle tap-global-lsn tap-split tap-split-failure-policy tap-wait-timeout tap-ssl-hba
 
 tap-debug-binary-check:
 	@test -x "$(PROXYSQL_BINARY)" || { echo "Missing ProxySQL binary: $(PROXYSQL_BINARY)" >&2; exit 1; }

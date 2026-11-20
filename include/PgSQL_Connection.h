@@ -1137,6 +1137,8 @@ public:
 	bool is_polardb_txn_wal_pending();
 #endif // POLARDB_PROXY
 
+	friend struct PolarDB_ConnectionUnitAccess;
+
 private:
 	// Set end state for the fetch result to indicate that it originates from a simple query or statement execution.
 	ASYNC_ST fetch_result_end_st = ASYNC_QUERY_END;
