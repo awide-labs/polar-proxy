@@ -2,14 +2,22 @@
 
 
 ### NOTES:
-### version string is fetched from git history
-### when not available, specify GIT_VERSION_BASE during make:
+### Polar Proxy versions are X.Y.Z.N: X.Y.Z is the upstream ProxySQL release
+### the code is rebased on, N counts Polar Proxy releases on it from 0.
+### POLAR_VERSION holds the next release; the version string is
+### vX.Y.Z.N-<commits>-g<hash>, the commits counted since the last change of
+### POLAR_VERSION or vX.Y.Z.N tag (0 at a release tag), as with git describe.
+### To set it by hand, specify GIT_VERSION_BASE during make:
 ###
 ### ```
-### make GIT_VERSION_BASE="v3.x.y"
+### make GIT_VERSION_BASE="v3.x.y.n"
 ### ```
 
-GIT_VERSION_BASE := $(shell git describe --long --abbrev=7 2>/dev/null || git describe --long --abbrev=7 --always)
+POLAR_VERSION := $(shell . "$(CURDIR)/POLAR_VERSION" && echo "$${VERSION_MAJOR}.$${VERSION_MINOR}.$${VERSION_PATCH}.$${VERSION_POLAR}$${VERSION_EXTRA}")
+POLAR_VERSION_SINCE := $(shell git log -1 --format=%H -- "$(CURDIR)/POLAR_VERSION" 2>/dev/null)
+POLAR_VERSION_COMMITS := $(shell git rev-list --count HEAD --not $(POLAR_VERSION_SINCE) --tags='v[0-9]*.[0-9]*.[0-9]*.[0-9]*' 2>/dev/null || echo 0)
+POLAR_VERSION_HASH := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo 0000000)
+GIT_VERSION_BASE := v$(POLAR_VERSION)-$(POLAR_VERSION_COMMITS)-g$(POLAR_VERSION_HASH)
 ifndef GIT_VERSION_BASE
     $(error GIT_VERSION_BASE is not set)
 endif
@@ -91,14 +99,14 @@ endif
 
 export GIT_VERSION
 
-# Extract CURVER from GIT_VERSION (first 3 numbers, e.g., 3.0.6 from 3.0.6-388-ga94b7d6)
-CURVER := $(shell echo "$(GIT_VERSION)" | sed -nE 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -1)
+# Extract CURVER from GIT_VERSION (first 3 or 4 numbers, e.g., 3.0.10.0 from 3.0.10.0-12-ga94b7d6)
+CURVER := $(shell echo "$(GIT_VERSION)" | sed -nE 's/^v?([0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/p' | head -1)
 
-# Validate CURVER has 3 numbers separated by dots
-CURVER_CHECK := $(shell echo "$(CURVER)" | grep -cE '^[0-9]+\.[0-9]+\.[0-9]+$$')
+# Validate CURVER has 3 or 4 numbers separated by dots
+CURVER_CHECK := $(shell echo "$(CURVER)" | grep -cE '^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$$')
 
 ifeq ($(CURVER_CHECK),0)
-    $(error CURVER "$(CURVER)" derived from GIT_VERSION "$(GIT_VERSION)" does not have 3 numbers separated by dots. Expected format: X.Y.Z)
+    $(error CURVER "$(CURVER)" derived from GIT_VERSION "$(GIT_VERSION)" does not have 3 or 4 numbers separated by dots. Expected format: X.Y.Z.N)
 endif
 
 export CURVER
