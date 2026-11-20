@@ -12,10 +12,10 @@ on, and `N` counts Polar Proxy releases on that base, starting from 0.
 
 ### Added
 
-- With `pgsql-polardb_proxy_identity_mode` set to `client`, `hostssl` and
-  `hostnossl` rules in PolarDB's `pg_hba.conf` now apply to the
-  application client's connection to Polar Proxy, according to whether the
-  client connected over SSL (XCOM-254)
+- When `pgsql-polardb_proxy_identity_mode` is set to `client`, the proxy
+  forwards the client’s SSL status to the PolarDB server, allowing it
+  to apply the pg_hba.conf rules using the client’s original SSL status.
+  (XCOM-254)
 - Support for PolarDB clusters. Set `check_type` to `'polardb'` for a
   writer/reader pair in `pgsql_replication_hostgroups` to enable it. The
   monitor then takes each node's role and replay position from PolarDB
