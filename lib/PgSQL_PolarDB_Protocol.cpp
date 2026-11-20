@@ -323,6 +323,31 @@ static bool polardb_proxy_identity_from_client_stream(
 }
 
 /**
+ * @brief Capture the frontend TLS descriptor onto a startup-client context.
+ */
+void polardb_capture_frontend_ssl_descriptor(
+        const PgSQL_Data_Stream* client_myds,
+        PolarDB_StartupClientContext* startup_client) {
+    if (!client_myds->encrypted || !client_myds->ssl) {
+        return;
+    }
+
+    const SSL_CIPHER *cipher = SSL_get_current_cipher(client_myds->ssl);
+    if (!cipher) {
+        return;
+    }
+
+    const char* cipher_name = SSL_CIPHER_get_name(cipher);
+    if (!cipher_name) {
+        return;
+    }
+
+    startup_client->ssl_cipher = cipher_name;
+    startup_client->frontend_ssl = client_myds->encrypted;
+    startup_client->ssl_version = SSL_get_version(client_myds->ssl);
+}
+
+/**
  * @brief Derive the startup identity that keys this session's ReaderPool entry.
  *
  * @p startup_client is reset to a default-constructed value on entry and stays
@@ -360,26 +385,23 @@ bool polardb_startup_client_from_session(
     if (use_client_identity) {
         if (identity.valid(false)) {
             startup_client->identity = std::move(identity);
-            return true;
-        }
-
-        if (polardb_startup_identity_from_sockaddr(
+        } else if (polardb_startup_identity_from_sockaddr(
                 client_myds->client_addr,
                 &identity,
                 PolarDB_StartupIdentitySource::CLIENT)) {
             startup_client->identity = std::move(identity);
-            return true;
+        } else {
+            return false;
         }
 
+        polardb_capture_frontend_ssl_descriptor(client_myds, startup_client);
+    } else if (polardb_proxy_identity_from_client_stream(client_myds, &identity)) {
+        startup_client->identity = std::move(identity);
+    } else {
         return false;
     }
 
-	if (polardb_proxy_identity_from_client_stream(client_myds, &identity)) {
-        startup_client->identity = std::move(identity);
-        return true;
-    }
-
-    return false;
+    return true;
 }
 
 // See the declaration in PgSQL_PolarDB.h for the @brief and the full read/write

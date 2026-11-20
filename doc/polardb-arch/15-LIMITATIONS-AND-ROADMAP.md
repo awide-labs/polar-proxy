@@ -165,11 +165,11 @@ The PolarDB libpq patch (`deps/postgresql/polardb_libpq.patch`) registers **13**
 
 | Effective profile | Params emitted | Purpose |
 |---|---|---|
-| `v15` | `_polar_proxy_client_host`, `_polar_proxy_client_port`, `_polar_proxy_send_lsn=true`, `_polar_proxy_send_xact=true` | v15 RFQ LSN/XID request plus client/fallback identity passthrough |
+| `v15` | `_polar_proxy_client_host`, `_polar_proxy_client_port`, `_polar_proxy_send_lsn=true`, `_polar_proxy_send_xact=true`, plus `_polar_proxy_use_ssl`/`_ssl_version`/`_ssl_cipher_name` (client identity + TLS frontend only) | v15 RFQ LSN/XID request plus client/fallback identity passthrough |
 | `legacy` | `_polar_origin_client_ip`, `_polar_origin_client_port`, `_polar_send_lsn=true`, `_polar_send_xact=true` | legacy RFQ LSN/XID request plus client/fallback identity passthrough |
 | `off` | none | no RFQ LSN startup request |
 
-The cancel-routing metadata (`_polar_proxy_session_id` / `_polar_proxy_cancel_key`) and SSL passthrough metadata (`_polar_proxy_use_ssl` / `_polar_proxy_ssl_version` / `_polar_proxy_ssl_cipher_name`) are **unused in this branch**: accepted by the patch but never emitted by ProxySQL. The transaction-split RFQ flags (`_polar_send_xact` / `_polar_proxy_send_xact`) are emitted for non-`off` PolarDB profiles because startup parameters are fixed for pooled backend connections; `txn_split_enabled` decides whether result processing uses XID/splittable state for split routing.
+The cancel-routing metadata (`_polar_proxy_session_id` / `_polar_proxy_cancel_key`) is **unused in this branch**: accepted by the patch but never emitted by ProxySQL. The SSL passthrough metadata (`_polar_proxy_use_ssl` / `_polar_proxy_ssl_version` / `_polar_proxy_ssl_cipher_name`) is emitted only by `v15`/`v15_wait` profiles when the startup identity is client-sourced and the frontend is TLS-encrypted ([22-FUTURE-SSL-PROXY-DESIGN.md](22-FUTURE-SSL-PROXY-DESIGN.md)). The transaction-split RFQ flags (`_polar_send_xact` / `_polar_proxy_send_xact`) are emitted for non-`off` PolarDB profiles because startup parameters are fixed for pooled backend connections; `txn_split_enabled` decides whether result processing uses XID/splittable state for split routing.
 
 ---
 

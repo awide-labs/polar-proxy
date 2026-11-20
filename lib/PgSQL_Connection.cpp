@@ -2003,6 +2003,12 @@ bool PgSQL_Connection::polardb_append_startup_params(std::ostringstream& conninf
 		return false;
 	}
 	polardb_startup_client.identity = identity;
+
+	if (identity.source == PolarDB_StartupIdentitySource::CLIENT &&
+			myds && myds->sess) {
+		polardb_capture_frontend_ssl_descriptor(myds->sess->client_myds, &polardb_startup_client);
+	}
+
 	if (startup_settings_unset) {
 		set_polardb_startup_settings(
 			profile, polardb_startup_identity_mode,
@@ -2032,6 +2038,14 @@ bool PgSQL_Connection::polardb_append_startup_params(std::ostringstream& conninf
 		}
 		if (profile.requests_extended_wait()) {
 			conninfo << " _pq_.polar_proxy_wait_v1=1";
+		}
+
+		if (identity.source == PolarDB_StartupIdentitySource::CLIENT &&
+			polardb_startup_client.frontend_ssl) {
+			/* add one more space before append_conninfo_param */
+			conninfo << " _polar_proxy_use_ssl=true ";
+			append_conninfo_param(conninfo, "_polar_proxy_ssl_version", polardb_startup_client.ssl_version.data());
+			append_conninfo_param(conninfo, "_polar_proxy_ssl_cipher_name", polardb_startup_client.ssl_cipher.data());
 		}
 		return true;
 	}

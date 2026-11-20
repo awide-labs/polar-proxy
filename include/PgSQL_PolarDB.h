@@ -1399,8 +1399,8 @@ struct PolarDB_StartupIdentity {
 /**
  * @brief Startup-client metadata tied to one backend connection.
  *
- * Today only @ref identity is emitted in PolarDB startup parameters. The SSL and
- * proxy session/cancel fields are intentionally reserved placeholders: PolarDB
+ * Today only @ref identity and the frontend SSL descriptor are emitted in PolarDB startup parameters.
+ * The proxy session/cancel fields are intentionally reserved placeholders: PolarDB
  * has backend support for these startup keys, but ProxySQL does not send them
  * yet. Keeping them here gives pooling and warmup one compatibility key to
  * extend later instead of scattering new checks through the split path.
@@ -1456,6 +1456,13 @@ bool polardb_connection_startup_settings_match(
 
 bool polardb_startup_client_from_session(
     PgSQL_Session* sess, PolarDB_StartupClientContext* startup_client);
+
+/**
+ * @brief Capture the frontend TLS descriptor onto a startup-client context.
+ */
+void polardb_capture_frontend_ssl_descriptor(
+    const PgSQL_Data_Stream* client_myds,
+    PolarDB_StartupClientContext* startup_client);
 
 /**
  * @brief Convert a raw socket address into a startup identity.
