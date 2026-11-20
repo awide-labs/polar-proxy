@@ -353,6 +353,23 @@ A focused test for timeout and notice behavior. It checks:
 - that a warning whose text merely looks like a timeout is not counted as one unless
   the backend sends the structured timeout marker.
 
+### `ssl_hba_tap.sh`
+
+A backend-HBA test for client-sourced identity. The client connects to
+ProxySQL over TCP while ProxySQL connects to the primary over a Unix socket.
+It rewrites the primary's `pg_hba.conf` with `hostssl`/`local`/`reject` lines
+scoped to a throwaway role and database, and checks that:
+
+- an SSL client passes `hostssl`, while a plaintext client is rejected;
+- an SSL client is rejected after flipping to `hostnossl`, while a plaintext
+  client passes.
+
+The proxy<->backend transport remains local and unencrypted; only frontend
+SSL state changes the advertised-client HBA result. The
+`polardb_ssl_startup_unit-t` component test covers key emission for a
+client-sourced identity, suppression for proxy-sourced identity, and the
+V15/LEGACY/plaintext distinctions.
+
 ## 7. Unit And Coverage Targets
 
 The PolarDB unit tests live under `test/polardb/test-unit/`. The
