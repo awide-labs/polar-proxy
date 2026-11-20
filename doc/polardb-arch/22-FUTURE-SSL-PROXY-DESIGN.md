@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | DESIGN (authoritative; design/research only — no code changes) |
+| **Status** | IMPLEMENTED (simplified: emission is gated on `polardb_proxy_identity_mode = client` instead of a propagation knob, and the §6.7 counters are omitted) |
 | **Scope** | Propagating the **frontend (client↔ProxySQL) TLS state** to a PolarDB proxy-mode backend via the `_polar_proxy_use_ssl` / `_polar_proxy_ssl_version` / `_polar_proxy_ssl_cipher_name` startup contract, and making that state safe under connection pooling. |
 | **Audience** | ProxySQL engineers working on the PolarDB integration (startup-param builder, pooling, warmup) and reviewers familiar with the PostgreSQL wire protocol. |
 | **Verified against** | ProxySQL branch `polardb-dev` and PolarDB backend branch `POLARDB_15_PROXY`. All `file:line` references below were checked in those revisions. |
